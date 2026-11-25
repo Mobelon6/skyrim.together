@@ -1,4 +1,6 @@
 # Campaign33: native home interactions (experimental)
+
+> Current design: [HOME-CONCEPT-RU.md](HOME-CONCEPT-RU.md). Campaign39 CI check/build succeeded (45616396577); the following chronological notes are historical implementation details, not current completion claims.
 Generate metadata from the identical effective MO2 plugin profile on both clients:
 ```
 python tools/build_guest_homes.py SNAPSHOT.zip loadorder.txt plugins.txt OUTPUT --native-capabilities
