@@ -73,12 +73,27 @@ def build(out, order, reader, grp, unpack):
         raise ValueError("No recognized player-house interiors in active profile")
     # Winning references, including moves/deletions out of candidate cells.
     placed = {}
+    stable_actors = {}
+    def plain_actor_ref(data):
+        return (set(data) <= {b"EDID", b"NAME", b"DATA", b"XSCL"} and
+                len(data.get(b"NAME", b"")) == 4 and len(data.get(b"DATA", b"")) == 24 and
+                len(data.get(b"XSCL", bytes(4))) == 4)
     for kind, key, flags, ctx, resolve, read in reader({b"REFR", b"ACHR", b"NAVM", b"PGRE", b"PHZD"}):
+        data = None
+        if kind == b"ACHR":
+            if flags & 32:
+                stable_actors.pop(key, None)
+            else:
+                data = read()
+                if plain_actor_ref(data):
+                    stable_actors[key] = (data, resolve)
+                else:
+                    stable_actors.pop(key, None)
         cell = next((resolve(unpack(g)) for g in reversed(ctx) if unpack(g[4:]) in (6,8,9,10)), None)
         if cell not in candidates or flags & 32:
             placed.pop(key, None)
             continue
-        placed[key] = (cell, kind, flags, read(), resolve)
+        placed[key] = (cell, kind, flags, data if data is not None else read(), resolve)
     destinations = {resolve(unpack(d[b"XTEL"])) for _, kind, _, d, resolve in placed.values()
                     if kind == b"REFR" and len(d.get(b"XTEL", b"")) == 28}
     exits = {}
@@ -93,6 +108,7 @@ def build(out, order, reader, grp, unpack):
             exits[key] = (data, resolve, parent)
     wanted = {resolve(unpack(data[b"NAME"])) for _, kind, _, data, resolve in placed.values()
               if kind in (b"REFR", b"ACHR") and len(data.get(b"NAME", b"")) == 4}
+    wanted.update(resolve(unpack(data[b"NAME"])) for data, resolve in stable_actors.values())
     bases = {}
     for kind, key, flags, _, resolve, read in reader(TYPES | {b"NPC_"}):
         if key not in wanted:
@@ -101,6 +117,23 @@ def build(out, order, reader, grp, unpack):
             bases.pop(key, None)
         else:
             bases[key] = (kind, read(), resolve)
+    def resident_base(key, data, resolve):
+        if key == ("skyrim.esm", 0x14) or not plain_actor_ref(data):
+            return None
+        base = resolve(unpack(data[b"NAME"]))
+        if (base in bases and base != ("skyrim.esm", 7) and bases[base][0] == b"NPC_" and
+                not ({b"VMAD", b"TPLT"} & bases[base][1].keys())):
+            return base
+        return None
+    # Profile-wide identity pool: metadata only, no new ACHR or NPC_ forms.
+    movable = {}
+    for key, (data, resolve) in stable_actors.items():
+        base = resident_base(key, data, resolve)
+        if base:
+            try:
+                movable[stable(key)] = stable(base)
+            except ValueError:
+                continue
     # Each source ref has a dedicated target; order is reproducible for a
     # frozen profile. Never regenerate this layer over an existing save.
     sequence = itertools.count(0x800)
@@ -129,13 +162,8 @@ def build(out, order, reader, grp, unpack):
             # Only an explicit NPC_ base and a plain placed reference can be
             # represented. Do not copy scripts, aliases, enable parents,
             # templates, linked refs or native actor records.
-            base = resolve(unpack(data[b"NAME"])) if len(data.get(b"NAME", b"")) == 4 else None
-            if (base in bases and bases[base][0] == b"NPC_" and
-                not ({b"VMAD", b"TPLT"} & bases[base][1].keys()) and
-                set(data) <= {b"EDID", b"NAME", b"DATA", b"XSCL"} and
-                len(data.get(b"DATA", b"")) == 24 and
-                len(data.get(b"XSCL", bytes(4))) == 4 and
-                len(residents[cell]) < 128):
+            base = resident_base(key, data, resolve)
+            if base and len(residents[cell]) < 128:
                 residents[cell].append((key, base))
             else:
                 unsupported[cell].append((key, "ACHR"))
@@ -204,7 +232,8 @@ def build(out, order, reader, grp, unpack):
                 if k: data += sub(tag, form(k))
         containers += record(b"CONT", 0, own | ident, data)
     groups = defaultdict(list)
-    manifest = ["STM-HOME-INSTANCES 2"]
+    manifest = ["STM-HOME-INSTANCES 3"]
+    manifest.extend(f"M {key} {base}" for key, base in sorted(movable.items()))
     nav_entries = {}
     for root, ident in sorted(cell_ids.items()):
         data, resolve = candidates[root]

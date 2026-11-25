@@ -118,6 +118,7 @@ jobs:
       - run: git -C upstream apply ../HomeOwnerRecovery.patch
       - run: git -C upstream apply ../HomeLegacyPlacement.patch
       - run: git -C upstream apply ../HomeResidentRecovery.patch
+      - run: git -C upstream apply ../HomeResidentPresence.patch
       - uses: actions/checkout@v4
         with:
           repository: tiltedphoques/TiltedConnect
@@ -251,6 +252,7 @@ jobs:
           git apply ../HomeOwnerRecovery.patch
           git apply ../HomeLegacyPlacement.patch
           git apply ../HomeResidentRecovery.patch
+          git apply ../HomeResidentPresence.patch
           git -C Libraries/TiltedConnect apply ../../../TiltedConnectLifecycle.patch
           git -C Libraries/TiltedUI apply ../../../OverlayProcess.patch
       - name: Cache compiled xmake packages

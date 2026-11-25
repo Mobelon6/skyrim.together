@@ -48,10 +48,20 @@ def validate(root):
     cells, refs, sources, unknown = {}, set(), set(), set()
     exits, entrances, navigation, residents = set(), set(), set(), set()
     lines = (root/"CoopHomeInstances.txt").read_text().splitlines()
-    assert lines.pop(0) == "STM-HOME-INSTANCES 2"
+    version=lines.pop(0)
+    assert version in ("STM-HOME-INSTANCES 2", "STM-HOME-INSTANCES 3")
+    movable={}
     for line in lines:
         t,*f = line.split()
-        if t=="H":
+        if t=="M":
+            assert version=="STM-HOME-INSTANCES 3"
+            source, base = f
+            assert source not in movable
+            for encoded in (source,base):
+                plugin, ident=key(encoded)
+                assert plugin!="skyrimcoophomeinstances.esp" and 0<ident<=0xffffff
+            movable[source]=base
+        elif t=="H":
             r, c = f
             assert r not in cells and records[own|int(c)][0]==b"CELL"
             cells[r] = own|int(c)
@@ -98,6 +108,7 @@ def validate(root):
             for encoded in (source,base):
                 plugin, ident=key(encoded)
                 assert plugin!="skyrimcoophomeinstances.esp" and 0<ident<=0xffffff
+            if version=="STM-HOME-INSTANCES 3": assert movable.get(source)==base
             sources.add(source);residents.add(source)
         else:
             assert t=="U"

@@ -40,7 +40,7 @@ int main(int argc,char** argv)
     altered=s;altered.Reference.Local++;
     assert(RecoveryPlan(s,altered)==Recovery::Conflict);
     auto bad=s;bad.Transform[0]=0x7f800000;assert(!Decode(bad.Encode()));
-    bad=s;bad.Flags=8;assert(!Decode(bad.Encode()));
+    bad=s;bad.Flags=16;assert(!Decode(bad.Encode()));
     assert(!Decode(s.Encode()+" "));
     assert(!Set(j,202,a->Slot,0,0,s));
     assert(Set(j,101,a->Slot,0,0,s));
@@ -65,6 +65,23 @@ int main(int argc,char** argv)
     bad=dead;bad.Base.Local++;
     assert(!Set(j,101,a->Slot,3,head.Revision,bad));
     assert(Read(j,b->Slot)->at(key).Value.Flags==0);
+    auto away=dead;away.Flags|=8u;
+    assert(Decode(away.Encode()) && away.Away() && away.Hidden());
+    assert(!dead.Away() && !dead.Hidden());
+    assert(RecoveryPlan(dead,away)==Recovery::Conflict);
+    assert(RecoveryPlan(away,dead)==Recovery::Conflict);
+    auto outsidePose=away;outsidePose.Transform[0]=std::bit_cast<uint32_t>(512.f);
+    assert(RecoveryPlan(away,outsidePose)==Recovery::Matched && !away.Significant(outsidePose));
+    const auto last=latest->at(key);
+    assert(last.JournalRevision>last.SaveRevision);
+    assert(!CanObservePresence(last,last.JournalRevision-1,away));
+    assert(CanObservePresence(last,last.JournalRevision,away));
+    auto changedLife=away;changedLife.Flags^=2u;
+    assert(!CanObservePresence(last,last.JournalRevision,changedLife));
+    assert(Set(j,101,a->Slot,3,head.Revision,away));
+    assert(Read(j,a->Slot)->at(key).Value.Away());
+    assert(!Set(j,101,a->Slot,3,head.Revision,dead));
+    assert(Set(j,101,a->Slot,4,head.Revision,dead));
     for(uint32_t i=1;i<=j.Current().Revision;++i)
         assert(replica.Import(i,*j.Export(i))==Result::Committed);
     assert(Read(replica,a->Slot)->at(key).Value.Encode()==dead.Encode());
@@ -89,6 +106,8 @@ assert "RestoreResident(cell,old->Value,*state,slots)" in client
 assert "HomeResidents::RecoveryPlan(committed,observed)" in client
 assert "ctx.SaveRevision<old->SaveRevision" in client
 assert "ctx.Tracks.insert_or_assign(key,ResidentTrack{revision,{},{}})" in client
+assert "HomeResidents::CanObservePresence(*old,ctx.SaveRevision,*state)" in client
+assert "actor->parentCell" in client and "if (!state) continue;" in client
 restore=client.split("HomeResidents::Recovery RestoreResident(",1)[1].split("void SyncResidents(",1)[0]
 assert "actor->MoveTo(&cell" in restore and "actor->Enable()" in restore and "actor->Disable()" in restore
 assert all(x not in restore for x in ("->Kill(", "->Respawn(", "->RestoreRemoteLife(", "->Reset(", "->Delete("))

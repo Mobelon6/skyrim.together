@@ -41,6 +41,28 @@ int main()
     cell.Unsupported.insert(resident.Encode());assert(!HomeResidentPlan::Build(cell,*restored,records));
     for (const auto& bad:{header+row+exit+actor+actor,header+row+exit+actor+"U "+root.Encode()+" "+resident.Encode()+" ACHR\n"})
     {std::istringstream stream(bad);assert(!HomeCatalog::Read(stream));}
+    // A stable arrival outside the original house can be projected only
+    // with an explicit profile-wide binding. Old catalog v2 stays strict.
+    const FormKey moved{"house.esp",104},movedBase{"skyrim.esm",204};
+    auto extra=records;
+    auto newcomer=observed;newcomer.Reference=moved;newcomer.Base=movedBase;
+    extra.emplace(moved.Encode(),HomeResidents::Record{1,0,newcomer});
+    assert(!HomeResidentPlan::Build(catalog->at(root.Encode()),baseline,extra));
+    const std::string v3="STM-HOME-INSTANCES 3\nM "+resident.Encode()+" "+npc.Encode()+"\nM "+
+        moved.Encode()+" "+movedBase.Encode()+"\nH "+root.Encode()+" 2048\n";
+    std::istringstream newInput(v3+row+exit+actor);
+    auto newCatalog=HomeCatalog::Read(newInput);assert(newCatalog);
+    auto newer=newCatalog->at(root.Encode());
+    assert(HomeResidentPlan::Build(newer,baseline,extra));
+    extra.at(moved.Encode()).Value.Flags=8;
+    assert(HomeResidentPlan::Build(newer,baseline,extra));
+    extra.at(moved.Encode()).Value.Base.Local++;
+    assert(!HomeResidentPlan::Build(newer,baseline,extra));
+    std::istringstream duplicate(v3+"M "+moved.Encode()+" "+movedBase.Encode()+"\n"+row+exit+actor);
+    assert(!HomeCatalog::Read(duplicate));
+    const std::string missing="STM-HOME-INSTANCES 3\nH "+root.Encode()+" 2048\n";
+    std::istringstream missingStatic(missing+row+exit+actor);
+    assert(!HomeCatalog::Read(missingStatic));
     baseline.ResidentKeys.insert(src.Encode());assert(!baseline.Valid());
 }
 '''
@@ -54,7 +76,7 @@ assert "HomeResidentPlan::Build(cell,state,*records)" in client
 assert "HomeResidentProjection::Sync(world,target,slot,entries)" in client
 assert "state.ResidentKeys.insert(encoded)" in client
 assert "HomeResidentProjection::Clear();residentDisplayNext={};" in client
-assert "if (LiveResident(world,slot,reference) || (s.Flags&5u))" in actor
+assert "if (LiveResident(world,slot,reference) || s.Hidden())" in actor
 assert "actor->GetHandle().handle.iBits!=display.Handle" in actor
 assert "if (actor) DropResidentDisplay" in actor
 print("PASS resident coverage, legacy incompatibility, explicit catalog bindings, replica projection integration")
