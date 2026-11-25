@@ -17,6 +17,7 @@ harness=r"""
 #include <netdb.h>
 #include <netinet/in.h>
 #include <cstdint>
+#include "SpatialEpoch.h"
 constexpr int k_HSteamNetConnection_Invalid=0, UV_ECANCELED=-125;
 struct uv_loop_t {void* data;};
 struct uv_getaddrinfo_t {uv_loop_t* loop;};
@@ -72,6 +73,7 @@ struct TransportService {
  using EDisconnectReason=Client::EDisconnectReason;
  static constexpr auto kAborted=Client::kAborted;
  bool m_connected{},m_connectionRequested{},title{};
+ SpatialEpoch::Counter m_spatialEpoch;
  std::string m_serverPassword="secret";
  unsigned m_localPlayerId=42;
  World m_world;Dispatcher m_dispatcher;
@@ -101,7 +103,8 @@ int main(){
  TransportService t;t.m_connectionRequested=true;t.OnDisconnected(Client::kCannotResolve);
  assert(!t.m_dispatcher.game&&t.m_dispatcher.errors==1&&t.m_world.ui.overlay.calls==1);
  assert(!t.m_connectionRequested&&t.m_serverPassword.empty()&&!t.m_localPlayerId);
- t.m_connected=true;t.m_connectionRequested=true;t.OnDisconnected(Client::kKicked);
+ t.m_connected=true;t.m_connectionRequested=true;assert(t.m_spatialEpoch.Next());t.OnDisconnected(Client::kKicked);
+ assert(t.m_spatialEpoch.Value()==0);
  assert(t.m_dispatcher.game==1&&t.m_dispatcher.errors==1);
  t.OnDisconnected(Client::kAborted);assert(t.m_dispatcher.game==1);
 }
@@ -109,6 +112,6 @@ int main(){
 with tempfile.TemporaryDirectory() as tmp:
     src=Path(tmp,"test.cpp");src.write_text(harness+dns+close+status+disconnect+main)
     exe=Path(tmp,"test")
-    subprocess.run(["g++","-std=c++20","-Wall","-Wextra","-Werror",str(src),"-o",str(exe)],check=True)
+    subprocess.run(["g++","-std=c++20","-Wall","-Wextra","-Werror","-I",str(Path(sys.argv[2],"Code/common").resolve()),str(src),"-o",str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
 print("PASS cancelled DNS completion, duplicate request, submission failure, stale connection status and unauthenticated disconnect")
