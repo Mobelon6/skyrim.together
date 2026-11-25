@@ -56,6 +56,15 @@ int main(){
     assert(!cx.IsInRange(ca,true)&&!ca.IsInRange(cx,true));
     assert(!ca.IsInRange(bad,true)&&!bad.IsInRange(ca,true));
     assert(cx.IsInRange(cx,false));
+    CellIdComponent estateA(ordinary,world,{0,0}),estateB(ordinary,world,{0,0}),guest(ordinary,world,{0,0});
+    estateA.Estate={71,1};estateB.Estate={71,2};guest.Estate={71,1};
+    assert(estateA.IsInRange(guest,false));
+    assert(!estateA.IsInRange(estateB,false)&&!estateB.IsInRange(estateA,true));
+    assert(!estateA.IsInRange(cx,false)&&!cx.IsInRange(estateA,false));
+    guest.Estate={72,1};assert(!estateA.IsInRange(guest,false));
+    guest.Estate={0,1};assert(!guest.IsInRange(guest,false));
+    guest.Estate={71,1};guest.CenterCoords={1,0};
+    assert(!estateA.IsInRange(guest,false)); // physical range is still required
 }
 '''
 with tempfile.TemporaryDirectory() as tmp:

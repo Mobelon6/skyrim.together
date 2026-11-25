@@ -257,10 +257,38 @@ def collect(reader, unpack):
             "enable_children": {k: sorted(v) for k, v in children.items()}}
 
 
+def compact_index(catalog):
+    """One owner-independent estate identity, with no approved boundary."""
+    rows = ["STM-ESTATE-INDEX 1"]
+    seen = set()
+    for e in sorted(catalog["estates"], key=lambda v: v["key"]):
+        table = catalog["refs"][e["drafting_table"]]
+        rooms = e["interiors"]
+        if e["house"] not in rooms or len(rooms) > 128 or seen.intersection(rooms):
+            raise ValueError("ambiguous estate interior membership")
+        seen.update(rooms)
+        rows.append(" ".join(("E", e["key"], e["house"], table["world"],
+                              e["drafting_table"], e["site_marker"])))
+        rows.extend(" ".join(("I", e["key"], room)) for room in sorted(rooms))
+        # Diagnostic bounds of original anchor points, NOT terrain/mesh bounds.
+        poses = [table["pose"]]
+        poses.extend(catalog["refs"][k]["pose"] for k in e["construction"]
+                     if k in catalog["refs"] and catalog["refs"][k]["world"] == table["world"]
+                     and catalog["refs"][k]["pose"])
+        e["anchor_extent_xy"] = [min(p[0] for p in poses), min(p[1] for p in poses),
+                                 max(p[0] for p in poses), max(p[1] for p in poses)]
+    return "\n".join(rows) + "\n"
+
+
 def build(out, reader, unpack, order):
     catalog = collect(reader, unpack)
     catalog["plugin_order"] = [n.casefold() for n in order]
+    index = compact_index(catalog)
+    if any((out / name).exists() for name in ("CoopEstateEvidence.json", "CoopEstateIndex.txt")):
+        raise FileExistsError("estate output already exists")
     with (out / "CoopEstateEvidence.json").open("x", encoding="utf-8") as f:
         json.dump(catalog, f, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
         f.write("\n")
+    with (out / "CoopEstateIndex.txt").open("x", encoding="utf-8", newline="\n") as f:
+        f.write(index)
     print(f"Estate evidence: {len(catalog['estates'])} estates, {len(catalog['refs'])} reference rows; not runtime-ready")

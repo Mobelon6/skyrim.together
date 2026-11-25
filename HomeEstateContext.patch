@@ -1,0 +1,189 @@
+diff --git a/Code/common/HomeEstateCatalog.h b/Code/common/HomeEstateCatalog.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/HomeEstateCatalog.h
+@@ -0,0 +1,113 @@
++#pragma once
++#include "HomeRegistry.h"
++#include <map>
++#include <set>
++#include <sstream>
++#include <fstream>
++#include <filesystem>
++#include <cstdlib>
++
++namespace HomeEstateCatalog
++{
++// Derived from the same frozen winning plugin profile as native capabilities.
++// No boundary or safe-arrival assertion is encoded in this index.
++struct Estate
++{
++    std::string Quest,Main,World,Table,Marker;
++    std::set<std::string> Rooms;
++};
++struct Catalog
++{
++    std::map<std::string,Estate> Estates;
++    std::map<std::string,std::string> RoomEstate;
++    const Estate* ForRoom(const std::string& room) const
++    {
++        const auto it=RoomEstate.find(room);
++        if (it==RoomEstate.end()) return nullptr;
++        const auto found=Estates.find(it->second);
++        return found==Estates.end()?nullptr:&found->second;
++    }
++};
++inline bool Key(const std::string& s)
++{
++    const auto k=TradeProperties::DecodeForm(s);
++    return k&&k->Valid()&&k->Encode()==s;
++}
++inline std::optional<Catalog> Read(std::istream& input)
++{
++    Catalog result;std::string line;
++    if (!std::getline(input,line)||line!="STM-ESTATE-INDEX 1") return {};
++    std::set<std::string> tables,markers;
++    while (std::getline(input,line))
++    {
++        if (line.size()>1400) return {};
++        std::istringstream row(line);char tag{};std::string extra;
++        if (!(row>>tag)) return {};
++        if (tag=='E')
++        {
++            Estate e;
++            if (!(row>>e.Quest>>e.Main>>e.World>>e.Table>>e.Marker)||row>>extra||
++                !Key(e.Quest)||!Key(e.Main)||!Key(e.World)||!Key(e.Table)||!Key(e.Marker)||
++                e.Table==e.Marker||!tables.insert(e.Table).second||!markers.insert(e.Marker).second||
++                result.Estates.size()>=128) return {};
++            const auto key=e.Quest;
++            if (!result.Estates.emplace(key,std::move(e)).second) return {};
++        }
++        else if (tag=='I')
++        {
++            std::string quest,room;
++            if (!(row>>quest>>room)||row>>extra||!Key(room)) return {};
++            auto found=result.Estates.find(quest);
++            if (found==result.Estates.end()||found->second.Rooms.size()>=128||
++                !result.RoomEstate.emplace(room,quest).second) return {};
++            found->second.Rooms.insert(room);
++        }
++        else return {};
++    }
++    if (input.bad()||result.Estates.empty()) return {};
++    for (const auto& [_,e]:result.Estates)
++        if (!e.Rooms.count(e.Main)) return {};
++    return result;
++}
++inline const std::optional<Catalog>& Host()
++{
++    static const auto catalog=[]()->std::optional<Catalog>
++    {
++        const auto* root=std::getenv("STM_CAMPAIGN_ROOT");
++        if (!root||!*root) return Catalog{};
++        const auto file=std::filesystem::path(root)/"CoopEstateIndex.txt";
++        std::error_code ec;
++        const bool exists=std::filesystem::exists(file,ec);
++        if (ec) return {};
++        if (!exists) return Catalog{};
++        std::ifstream input(file);
++        return Read(input);
++    }();
++    return catalog;
++}
++// Main room's existing journal slot is the estate's stable owner-specific
++// identity. No new registration, no ACL inference, no connection ID.
++inline std::optional<HomeScope::EstateContext> Identity(const Catalog& catalog,
++    const CampaignJournal::Journal& journal,uint64_t campaign,const HomeRegistry::Home& room)
++{
++    const auto* e=catalog.ForRoom(room.Root.Encode());
++    if (!campaign||!e) return {};
++    const auto main=TradeProperties::DecodeForm(e->Main);
++    const auto registered=HomeRegistry::BySlot(journal,room.Slot);
++    if (!main||!registered||!registered->Same(room.Owner,room.Root)) return {};
++    const auto root=HomeRegistry::Find(journal,room.Owner,*main);
++    if (!root) return {};
++    return HomeScope::EstateContext{campaign,root->Slot};
++}
++inline std::vector<uint32_t> RegisteredRooms(const Estate& estate,
++    const CampaignJournal::Journal& journal,const HomeRegistry::Home& room)
++{
++    const auto homes=HomeRegistry::Read(journal);
++    if (!homes||!estate.Rooms.count(room.Root.Encode())) return {};
++    std::vector<uint32_t> slots;
++    for (const auto& h:*homes)
++        if (h.Owner==room.Owner&&estate.Rooms.count(h.Root.Encode())) slots.push_back(h.Slot);
++    if (!std::binary_search(slots.begin(),slots.end(),room.Slot)) return {};
++    return slots;
++}
++}
+diff --git a/Code/common/HomeScope.h b/Code/common/HomeScope.h
+--- a/Code/common/HomeScope.h
++++ b/Code/common/HomeScope.h
+@@ -4,5 +4,18 @@
+ namespace HomeScope
+ {
+-// Canonical plugin/form keys remain unchanged; the cell namespace is an
++// Estate presence is separate from the canonical physical cell/world/grid.
++struct EstateContext
++{
++    uint64_t Campaign{};
++    uint32_t RootSlot{};
++    constexpr bool Valid() const noexcept
++    {return (!Campaign&&!RootSlot)||(Campaign&&RootSlot&&RootSlot<=0xffffu);}
++    constexpr bool operator==(const EstateContext&) const noexcept=default;
++};
++inline constexpr bool EstateCompatible(EstateContext a,EstateContext b) noexcept
++{return a.Valid()&&b.Valid()&&a==b;}
++// Default zero context is the ordinary/shared world. Private presence is
++// assigned only after the future authoritative admission and overlay readback.
++// Canonical plugin/form keys remain unchanged; the cell namespace is an
+ // additional discriminator for reference entities, not for base forms.
+ inline constexpr uint32_t Registered=0xFFFD0000u;
+diff --git a/Code/server/Components/CellIdComponent.h b/Code/server/Components/CellIdComponent.h
+--- a/Code/server/Components/CellIdComponent.h
++++ b/Code/server/Components/CellIdComponent.h
+@@ -35,5 +35,6 @@
+     bool IsInRange(const CellIdComponent& acRhs, bool aIsDragon) const noexcept
+     {
+-        if (HomeScope::Private(Cell.ModId) || HomeScope::Private(acRhs.Cell.ModId))
++        if (!HomeScope::EstateCompatible(Estate,acRhs.Estate)) return false;
++        if (HomeScope::Private(Cell.ModId) || HomeScope::Private(acRhs.Cell.ModId))
+             return !WorldSpaceId && !acRhs.WorldSpaceId && Cell==acRhs.Cell;
+         if (IsInInteriorCell())
+@@ -47,4 +48,5 @@
+     GameId Cell{};
+     GameId WorldSpaceId{};
+-    GridCellCoords CenterCoords{};
++    GridCellCoords CenterCoords{};
++    HomeScope::EstateContext Estate{};
+ };
+diff --git a/Code/common/HomeLinkedAccess.h b/Code/common/HomeLinkedAccess.h
+--- a/Code/common/HomeLinkedAccess.h
++++ b/Code/common/HomeLinkedAccess.h
+@@ -2,4 +2,5 @@
+ #include "HomeNativeCapabilities.h"
+-#include "HomePermissions.h"
++#include "HomePermissions.h"
++#include "HomeEstateCatalog.h"
+ #include <cstdlib>
+ namespace HomeLinkedAccess
+@@ -50,5 +51,9 @@
+ inline std::vector<uint32_t> RegisteredRooms(const CampaignJournal::Journal& journal,const HomeRegistry::Home& home)
+ {
+-    static const auto graph=[]()->std::optional<Graph>
++    const auto& catalog=HomeEstateCatalog::Host();
++    if (!catalog) return {};
++    if (const auto* estate=catalog->ForRoom(home.Root.Encode()))
++        return HomeEstateCatalog::RegisteredRooms(*estate,journal,home);
++    static const auto graph=[]()->std::optional<Graph>
+     {
+         const auto* path=std::getenv("STM_CAMPAIGN_ROOT");
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign39"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign41"

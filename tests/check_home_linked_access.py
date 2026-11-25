@@ -26,6 +26,23 @@ int main(int argc,char** argv)
     assert(RegisteredRooms(j,*foreign,*graph).size()==1);
     assert(RegisteredRooms(j,*unrelated,*graph).size()==1);
     auto bad=rows;bad.erase(bad.begin());assert(!BuildGraph(bad));
+    const auto q=c.Encode(),main=a.Encode(),secondKey=b.Encode(),worldKey=x.Encode(),table=y.Encode();
+    const auto marker=TradeProperties::FormKey{"skyrim.esm",12}.Encode();
+    const auto index="STM-ESTATE-INDEX 1\nE "+q+" "+main+" "+worldKey+" "+table+" "+marker+
+        "\nI "+q+" "+main+"\nI "+q+" "+secondKey+"\n";
+    std::istringstream input(index);
+    const auto catalog=HomeEstateCatalog::Read(input);assert(catalog);
+    const auto* estate=catalog->ForRoom(secondKey);assert(estate&&estate->Main==main);
+    assert(HomeEstateCatalog::RegisteredRooms(*estate,j,*second)==slots);
+    const auto mainId=HomeEstateCatalog::Identity(*catalog,j,71,*first);
+    const auto roomId=HomeEstateCatalog::Identity(*catalog,j,71,*second);
+    assert(mainId&&roomId&&*mainId==*roomId&&mainId->RootSlot==first->Slot);
+    assert(!HomeEstateCatalog::Identity(*catalog,j,71,*foreign)); // no main-room registration
+    assert(!HomeEstateCatalog::Identity(*catalog,j,71,*unrelated));
+    std::istringstream duplicate(index+"I "+q+" "+main+"\n");
+    assert(!HomeEstateCatalog::Read(duplicate));
+    std::istringstream incomplete("STM-ESTATE-INDEX 1\nE "+q+" "+main+" "+worldKey+" "+table+" "+marker+"\n");
+    assert(!HomeEstateCatalog::Read(incomplete));
     assert(Set(j,101,first->Slot,303,Right::Visit,0));
     assert(Effective(j,second->Slot,303)==Right::None);
     assert(!SetGroup(j,101,{first->Slot,foreign->Slot},303,Right::Visit,1));

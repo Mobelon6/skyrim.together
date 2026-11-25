@@ -68,7 +68,12 @@ with tempfile.TemporaryDirectory() as tmp:
         pass
     else:
         raise AssertionError("overwrote evidence")
-    assert len(list(p.iterdir())) == 1
+    assert sorted(x.name for x in p.iterdir()) == ["CoopEstateEvidence.json", "CoopEstateIndex.txt"]
+    index = (p / "CoopEstateIndex.txt").read_text().splitlines()
+    assert index[0] == "STM-ESTATE-INDEX 1"
+    assert index[1] == " ".join(("E", stable(1), stable(4), stable(90), stable(6), stable(7)))
+    assert set(index[2:]) == {"I "+stable(1)+" "+stable(4), "I "+stable(1)+" "+stable(5)}
+    assert json.loads((p / "CoopEstateEvidence.json").read_text())["estates"][0]["anchor_extent_xy"] == [0,0,0,0]
 for bad in (vmad([10])[:-1], b"\0" * 6):
     try:
         ec.object_properties(bad, key)
