@@ -398,3 +398,121 @@ diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
  #define BUILD_BRANCH "${GIT_BRANCH}"
 -#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign44"
 +#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign45"
+diff --git a/Code/tests/encoding.cpp b/Code/tests/encoding.cpp
+--- a/Code/tests/encoding.cpp
++++ b/Code/tests/encoding.cpp
+@@ -430,48 +430,70 @@
+     GIVEN("ClientReferencesMoveRequest")
+     {
+-        ClientReferencesMoveRequest sendMessage, recvMessage;
+-        sendMessage.Tick = 1712345678901;
+-        auto& move = sendMessage.Updates[1];
+-        move.Position.x = 1234.5f;
+-        move.Direction = 0.75f;
+-        move.HasLookAt = true;
+-        move.LookOffset.x = -320.f;
+-        move.LookOffset.y = 215.f;
+-        move.LookOffset.z = -48.f;
+-
+-        AnimationVariables vars;
+-        vars.Booleans.resize(76);
+-        String testString("\xDE\xAD\xBE\xEF\x76\xB");
+-        vars.String_to_VectorBool(testString, vars.Booleans);
+-
+-        vars.Floats.push_back(1.f);
+-        vars.Floats.push_back(7.f);
+-        vars.Floats.push_back(12.f);
+-        vars.Floats.push_back(0.f);
+-        vars.Floats.push_back(145.f);
+-        vars.Floats.push_back(100.f);
+-        vars.Floats.push_back(-1.f);
+-
+-        vars.Integers.push_back(0);
+-        vars.Integers.push_back(12000);
+-        vars.Integers.push_back(06);
+-        vars.Integers.push_back(7778);
+-        vars.Integers.push_back(41104539);
+-
+-        move.Variables = vars;
+-
+-        Buffer buff(1000);
+-        Buffer::Writer writer(&buff);
+-        sendMessage.Serialize(writer);
+-
+-        Buffer::Reader reader(&buff);
+-
+-        uint64_t trash;
+-        reader.ReadBits(trash, 8); // pop opcode
+-
+-        recvMessage.DeserializeRaw(reader);
+-
+-        REQUIRE(recvMessage.Tick == sendMessage.Tick);
+-        REQUIRE(recvMessage.Updates[1] == sendMessage.Updates[1]);
++        ClientReferencesMoveRequest sendMessage;
++        sendMessage.SpatialEpoch = 513;
++        sendMessage.Tick = 1712345678901;
++        auto& move = sendMessage.Updates[1];
++        move.OwnershipEpoch = 42;
++        move.Position.x = 1234.5f;
++        move.Direction = 0.75f;
++        move.HasLookAt = true;
++        move.LookOffset.x = -320.f;
++        move.LookOffset.y = 215.f;
++        move.LookOffset.z = -48.f;
++
++        AnimationVariables vars;
++        vars.Booleans.resize(76);
++        String testString("\xDE\xAD\xBE\xEF\x76\xB");
++        vars.String_to_VectorBool(testString, vars.Booleans);
++
++        vars.Floats.push_back(1.f);
++        vars.Floats.push_back(7.f);
++        vars.Floats.push_back(12.f);
++        vars.Floats.push_back(0.f);
++        vars.Floats.push_back(145.f);
++        vars.Floats.push_back(100.f);
++        vars.Floats.push_back(-1.f);
++
++        vars.Integers.push_back(0);
++        vars.Integers.push_back(12000);
++        vars.Integers.push_back(06);
++        vars.Integers.push_back(7778);
++        vars.Integers.push_back(41104539);
++
++        move.Variables = vars;
++
++        Buffer buff(1000);
++        Buffer::Writer writer(&buff);
++        sendMessage.Serialize(writer);
++
++        Buffer::Reader reader(&buff);
++
++        const ClientMessageFactory factory;
++        auto decoded = factory.Extract(reader);
++        REQUIRE(decoded);
++        REQUIRE(decoded->GetOpcode() == sendMessage.GetOpcode());
++        const auto received = CastUnique<ClientReferencesMoveRequest>(std::move(decoded));
++        REQUIRE(received->SpatialEpoch == sendMessage.SpatialEpoch);
++        REQUIRE(received->Tick == sendMessage.Tick);
++        REQUIRE(received->Updates.size() == 1);
++        REQUIRE(received->Updates[1] == sendMessage.Updates[1]);
++
++        ServerReferencesMoveRequest relay;
++        relay.SpatialEpoch = 721;
++        relay.Tick = sendMessage.Tick;
++        relay.Updates[1] = move;
++        Buffer response(1000);
++        Buffer::Writer responseWriter(&response);
++        relay.Serialize(responseWriter);
++        Buffer::Reader responseReader(&response);
++        const ServerMessageFactory serverFactory;
++        auto relayed = serverFactory.Extract(responseReader);
++        REQUIRE(relayed);
++        REQUIRE(relayed->GetOpcode() == relay.GetOpcode());
++        const auto receivedRelay = CastUnique<ServerReferencesMoveRequest>(std::move(relayed));
++        REQUIRE(receivedRelay->SpatialEpoch == relay.SpatialEpoch);
++        REQUIRE(receivedRelay->Tick == relay.Tick);
++        REQUIRE(receivedRelay->Updates.size() == 1);
++        REQUIRE(receivedRelay->Updates[1] == relay.Updates[1]);
+     }
+ 

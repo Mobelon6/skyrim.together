@@ -273,7 +273,9 @@ jobs:
           xmake-version: '3.1.0'
       - run: xmake config --plat=windows --arch=x64 --mode=release --skyrim_version=1.6.1170 --yes
       - run: xmake -y
-      - run: xmake run TPTests
+      - name: Run TPTests with case diagnostics
+        timeout-minutes: 5
+        run: xmake run TPTests -d yes -s
       - name: Prepare runtime
         run: |
           set -eu

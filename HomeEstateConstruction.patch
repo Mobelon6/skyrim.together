@@ -76,21 +76,27 @@ new file mode 100644
 diff --git a/Code/client/Services/CampaignAccess.h b/Code/client/Services/CampaignAccess.h
 --- a/Code/client/Services/CampaignAccess.h
 +++ b/Code/client/Services/CampaignAccess.h
-@@ -6,3 +6,4 @@
+@@ -3,7 +3,8 @@
+ #include <CampaignReplication.h>
+ #include <array>
+ #include <map>
  #include <HomeResidents.h>
  #include <HomeObjects.h>
+ #include <HomePlacement.h>
 +#include <HomeEstateConstruction.h>
  struct World;
-@@ -30,3 +31,4 @@
+@@ -31,6 +32,7 @@
  std::optional<HomeResidents::Residents> HomeResidentView(uint64_t campaign,uint32_t slot);
  std::optional<HomeObjects::Records> HomeObjectView(uint64_t campaign,uint32_t slot);
+ std::optional<std::vector<HomePlacement::Stack>> HomePlacements(uint64_t campaign,uint32_t slot);
 +std::optional<HomeEstateConstruction::Record> EstateConstruction(uint64_t campaign,uint64_t owner,const std::string& plot);
+ bool HomeCanModify(uint64_t campaign,uint32_t slot,uint64_t character);
  bool ConfirmReceipt(World&, uint64_t stream, uint64_t savedStream, uint32_t cursor, uint32_t receipt,
+                     std::string_view plugin, uint32_t base, int count,int64_t before,std::string_view variant={});
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -138,5 +138,10 @@
- std::optional<HomeObjects::Records> CampaignAccess::HomeObjectView(uint64_t campaign,uint32_t slot)
+@@ -161,8 +161,13 @@
  {
      if (Mode()!=CampaignReplication::Link::Mode::Ready || campaign!=campaignLink.Campaign) return {};
      return HomeObjects::Read(campaignLink.Journal,slot);
@@ -100,6 +106,10 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    if (Mode()!=CampaignReplication::Link::Mode::Ready||campaign!=campaignLink.Campaign) return {};
 +    return HomeEstateConstruction::Read(campaignLink.Journal,owner,plot);
 +}
+ std::optional<HomeResidents::Residents> CampaignAccess::HomeResidentView(uint64_t campaign,uint32_t slot)
+ {
+     if (Mode()!=CampaignReplication::Link::Mode::Ready || campaign!=campaignLink.Campaign) return {};
+     return HomeResidents::Read(campaignLink.Journal,slot);
 diff --git a/Code/server/Services/PartyHome.cpp b/Code/server/Services/PartyHome.cpp
 --- a/Code/server/Services/PartyHome.cpp
 +++ b/Code/server/Services/PartyHome.cpp
