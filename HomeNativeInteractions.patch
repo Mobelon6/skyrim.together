@@ -51,15 +51,15 @@ new file mode 100644
 diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
 --- a/Code/client/Services/Generic/PartyHome.cpp
 +++ b/Code/client/Services/Generic/PartyHome.cpp
-@@ -2,6 +2,7 @@
- #include <World.h>
- #include <Services/HomeInstance.h>
- #include <Services/HomeOriginalOverlay.h>
+@@ -5,6 +5,7 @@
  #include <Services/HomeGuestSave.h>
  #include <Services/CampaignCheckpointClient.h>
  #include <Services/PapyrusService.h>
 +#include <HomeNativeCapabilities.h>
-@@ -155,7 +156,30 @@
+ #include <cstdlib>
+ #include <Services/HomePlacementClient.h>
+ #include <Services/CampaignAccess.h>
+@@ -155,7 +156,36 @@
      TradeProperties::FormKey root{key->Plugin,key->Local};
      return root.Valid()?std::optional<TradeProperties::FormKey>(std::move(root)):std::nullopt;
  }
@@ -69,11 +69,15 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +}
 +bool NativeStanding(World& world,const Actor& actor)
 +{
++    // Same ActorState sit/sleep field used by Interaction02's interpolation.
++    if (((actor.actorState.flags1 >> 14) & 15u)!=0) return false;
 +    const auto* get=world.ctx().at<PapyrusService>().Get("Actor","GetSitState");
 +    return !get || PapyrusFunction<int32_t,Actor>(get)(&actor)==0;
 +}
-+bool NativeSeat(World& world,TESObjectREFR& object,PlayerCharacter& player,const std::string& root)
++bool NativeSeat(World& world,TESObjectREFR& object,PlayerCharacter& player,const std::string& root) noexcept
 +{
++    try
++    {
 +    if (object.IsTemporary()||object.IsDeleted()||object.IsDisabled()||!object.baseForm||
 +        static_cast<uint32_t>(object.baseForm->formType)!=40||object.GetParentCellEx()!=player.GetParentCellEx()) return false;
 +    const auto ref=NativeFormKey(object.formID),base=NativeFormKey(object.baseForm->formID);
@@ -85,12 +89,22 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +    const auto* sit=papyrus.Get("Actor","GetSitState");
 +    const auto* use=papyrus.Get("ObjectReference","IsFurnitureInUse");
 +    return sit&&use&&NativeStanding(world,player)&&!PapyrusFunction<bool,TESObjectREFR,bool>(use)(&object,false);
++    }
++    catch (...) {return false;}
 +}
  std::optional<TradeProperties::FormKey> NativeEntranceRoot(uint32_t form)
  {
      auto* cell=NativeDoorDestination(Cast<TESObjectREFR>(TESForm::GetById(form)));
      return cell?NativeFormKey(cell->formID):std::nullopt;
-@@ -770,9 +794,8 @@
+@@ -171,6 +201,6 @@
+     Clock::time_point Until{},Next{};
+     bool Granted{},Moved{},Ready{};
+-    bool Native{},Prepared{},Applied{},Leaving{},Closing{},ExitIssued{},Warned{},Refreshing{};
++    bool Native{},Prepared{},Applied{},Leaving{},Closing{},ExitIssued{},Warned{},Refreshing{},SeatExitWarned{};
+     uint32_t ReturnCell{},ExitDoor{};
+     std::array<uint32_t,12> Pose{};
+     Clock::time_point MoveUntil{},ShapeAt{};
+@@ -770,9 +800,8 @@
              if (n!=1 && n!=3) continue;
              open=n;
          }
@@ -102,7 +116,7 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
          if (state.Disabled) state.Transform=old.Value.Transform;
          if (!HomeObjects::Allowed(old,state)) continue;
          if (tracked==ctx.Tracks.end())
-@@ -1144,6 +1167,13 @@
+@@ -1144,6 +1173,13 @@
          if (object && object->baseForm && object->GetParentCellEx()==cell && !object->IsDisabled() && !object->IsDeleted())
          {
              const auto type=object->baseForm->formType;
@@ -116,21 +130,49 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
              if (type==FormType::Door)
              {
                  if (!visit.Granted || Clock::now()>=visit.Until || visit.Right!=2)
-@@ -1450,6 +1480,7 @@
+@@ -1450,6 +1486,11 @@
              if (!visit.Closing)
              {visit.Closing=true;ClearTrade();HomePlacementClient::Clear();HomeResidentProjection::Clear();}
-+            if (!NativeStanding(m_world,*p)) return;
++            if (current->formID==visit.Copy&&!NativeStanding(m_world,*p))
++            {
++                if (!visit.SeatExitWarned) Utils::ShowHudMessage("Встаньте с мебели для выхода из чужого дома.");
++                visit.SeatExitWarned=true;return;
++            }
              if (visit.Applied)
              {
                  const auto result=HomeOriginalOverlay::Switch(m_world,false);
                  if (result==HomeOriginalOverlay::Result::Pending) return;
-@@ -1540,5 +1571,5 @@
+@@ -1540,5 +1581,5 @@
          if (!p||!cell||!cell->IsAttached()||!visit.Native||!visit.Ready||!visit.Applied||
              visit.Leaving||visit.Refreshing||!visit.Granted||Clock::now()>=visit.Until||cell->formID!=visit.Copy||
 -            !InventoryReady(world)) return {};
 +            !InventoryReady(world)||!NativeStanding(world,*p)) return {};
          const auto shape=NativeVisitShape(visit.Campaign,visit.Slot);
          const auto entrance=NativeFormKey(visit.Door);
+@@ -1670,7 +1711,7 @@
+ {
+     try
+     {
+-        if (ProjectionForm(local) || PrivateCell(local)) return true;
++        if (ProjectionForm(local) || PrivateCell(local) || NativeGuestCell(local)) return true;
+         if (CampaignAccess::Mode()==CampaignReplication::Link::Mode::Disabled) return false;
+         return CatalogCell(local)!=nullptr;
+     }
+diff --git a/Code/client/Services/Generic/ObjectService.cpp b/Code/client/Services/Generic/ObjectService.cpp
+--- a/Code/client/Services/Generic/ObjectService.cpp
++++ b/Code/client/Services/Generic/ObjectService.cpp
+@@ -258,9 +258,11 @@
+         acEvent.pObject->Activate(acEvent.pActivator, acEvent.Unk1, acEvent.pObjectToGet, acEvent.Count, acEvent.DefaultProcessing);
+     }
+ 
++    // Managed interiors use the journal; never publish an unscoped activation.
++    if (auto* cell=acEvent.pObject->GetParentCellEx();cell && HomeInstance::ManagedCell(cell->formID)) return;
+     if (!m_transport.IsConnected())
+         return;
+ 
+     if (Lock* pLock = acEvent.pObject->GetLock())
+     {
+         if (pLock->flags & 0xFF)
 diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
 --- a/Code/common/BuildInfo.h.in
 +++ b/Code/common/BuildInfo.h.in
