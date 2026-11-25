@@ -1777,7 +1777,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        }
 +    }
      if (!pParty) return;
-@@ -115,38 +257,41 @@
+@@ -115,39 +257,42 @@
 -    auto& run = pParty->QuestRuns[message.Id];
 -    // The sender's local quest log and the party's shared lifecycle are independent.
 -    // A late start from a second client must not clear stages the first client sent.
@@ -1857,6 +1857,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +    {
 +        spdlog::error("STM quest progression: {}", error.what());
 +    }
+ }
 diff --git a/Code/server/Services/PartyService.h b/Code/server/Services/PartyService.h
 --- a/Code/server/Services/PartyService.h
 +++ b/Code/server/Services/PartyService.h
