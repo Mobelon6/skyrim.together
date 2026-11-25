@@ -6,6 +6,7 @@ common=up/"Code/common"
 source=r'''
 #include "HomeLinkedAccess.h"
 #include "CampaignCheckpoint.h"
+#include "HomeEstateConstruction.h"
 #include <cassert>
 int main(int argc,char** argv)
 {
@@ -120,6 +121,26 @@ int main(int argc,char** argv)
     assert(Read(finalRead)->Revision==6&&CampaignCheckpoint::HadHomeAccess(finalRead,saved));
     assert(Effective(finalRead,late->Slot,505)==Right::None&&EstateRight(*Read(finalRead),202,q,505)==Right::None);
     assert(!DecodeEstate("202 505 1 "+q+" 2 "+main+" "+main));
+    const auto buildRows=index+"C "+q+" "+table+" "+main+"\nC "+q+" "+marker+" "+main+"\n";
+    std::istringstream buildIndex(buildRows);const auto buildCatalog=HomeEstateCatalog::Read(buildIndex);assert(buildCatalog);
+    const auto* buildEstate=buildCatalog->ForRoom(main);assert(buildEstate&&buildEstate->Construction.size()==2);
+    const auto binding=HomeEstateConstruction::Binding(*buildEstate);assert(binding);
+    assert(HomeEstateConstruction::Read(finalRead,101,q)->Revision==0);
+    assert(!HomeEstateConstruction::Publish(finalRead,*buildEstate,101,0,0,binding,"1"));
+    assert(!HomeEstateConstruction::Publish(finalRead,*buildEstate,101,0,0,binding+1,"01"));
+    assert(HomeEstateConstruction::Publish(finalRead,*buildEstate,101,0,0,binding,"01"));
+    assert(HomeEstateConstruction::Read(finalRead,202,q)->Revision==0);
+    const auto buildHead=finalRead.Current();
+    assert(HomeEstateConstruction::Publish(finalRead,*buildEstate,101,1,0,binding,"01")&&finalRead.Current()==buildHead);
+    assert(!HomeEstateConstruction::Publish(finalRead,*buildEstate,101,0,0,binding,"11"));
+    assert(HomeEstateConstruction::Publish(finalRead,*buildEstate,101,1,buildHead.Revision,binding,"11"));
+    assert(!HomeEstateConstruction::Publish(finalRead,*buildEstate,101,2,0,binding,"00"));
+    CampaignJournal::Journal buildRestart;assert(buildRestart.Open(argv[1],71,"profile",false));
+    const auto buildState=HomeEstateConstruction::Read(buildRestart,101,q);
+    assert(buildState&&buildState->Revision==2&&buildState->Bits=="11");
+    assert(!HomeEstateConstruction::Decode(buildState->Encode()+" "));
+    std::istringstream duplicateBuild(buildRows+"C "+q+" "+table+" "+main+"\n");
+    assert(!HomeEstateCatalog::Read(duplicateBuild));
     assert(!DecodeGroup("101 303 2 2 2 1"));
     assert(!DecodeGroup("101 303 2 2 1 1"));
 }

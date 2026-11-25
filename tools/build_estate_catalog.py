@@ -368,6 +368,27 @@ def compact_index(catalog):
         e["anchor_extent_xy"] = [min(p[0] for p in poses), min(p[1] for p in poses),
                                  max(p[0] for p in poses), max(p[1] for p in poses)]
         e["spatial_candidate"] = spatial_candidate(catalog, e)
+        # Observe original exterior construction flags, not arbitrary nearby objects.
+        bindings = set(e["construction"]) | {e["drafting_table"], e["site_marker"]}
+        bindings.update(stable((HF, n)) for n in SITE_IMPROVEMENTS.get(e["name"], ()))
+        exterior, unresolved = [], []
+        for k in sorted(bindings):
+            r = catalog["refs"].get(k)
+            if not r:
+                unresolved.append(k)
+                continue
+            if r["world"] != table["world"] or r["kind"] != "REFR":
+                continue
+            if not r["base"] or r["base"] not in catalog["bases"] or not r["pose"]:
+                unresolved.append(k)
+            else:
+                exterior.append((k, r["base"]))
+        e["construction_observation_missing"] = unresolved
+        if (unresolved or e["construction_shared"] or e["construction_foreign_interior"]
+                or not exterior or len(exterior) > 1024):
+            exterior = []
+        e["construction_observation"] = exterior
+        rows.extend(" ".join(("C", e["key"], k, base)) for k, base in exterior)
         for region in e["spatial_candidate"]["regions"]:
             polygon = region["polygon_xy"]
             rows.append(" ".join(["B", e["key"], region["region"], str(len(polygon))] +

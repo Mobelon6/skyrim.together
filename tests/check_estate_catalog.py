@@ -50,6 +50,11 @@ e = a["estates"][0]
 assert not a["runtime_ready"] and e["approved_boundary"] is None and e["approved_arrival"] is None
 assert e["construction"] == sorted(stable(n) for n in (10, 11, 13))
 assert e["construction_missing"] == [stable(13)]
+complete = catalog(rows + [ref(13, 21, world)])
+ci = ec.compact_index(complete).splitlines()
+assert {line for line in ci if line.startswith("C ")} == {
+    " ".join(("C", stable(1), stable(n), stable(b))) for n,b in ((6,20),(7,21),(10,21),(13,21))}
+assert len(complete["estates"][0]["construction_observation"]) == 4
 assert a["refs"][stable(11)]["cell"] == stable(5)
 assert a["refs"][stable(6)]["world"] == stable(90)
 assert a["refs"][stable(14)]["parent_flags"] == 1

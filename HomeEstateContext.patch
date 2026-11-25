@@ -2,7 +2,7 @@ diff --git a/Code/common/HomeEstateCatalog.h b/Code/common/HomeEstateCatalog.h
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/HomeEstateCatalog.h
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,177 @@
 +#pragma once
 +#include "HomeRegistry.h"
 +#include <map>
@@ -41,6 +41,7 @@ new file mode 100644
 +{
 +    std::string Quest,Main,World,Table,Marker;
 +    std::set<std::string> Rooms;
++    std::map<std::string,std::string> Construction;
 +    std::map<std::string,Polygon> CandidateRegions;
 +    bool ContainsCandidate(const std::string& world,double x,double y) const noexcept
 +    {
@@ -95,6 +96,14 @@ new file mode 100644
 +                !result.RoomEstate.emplace(room,quest).second) return {};
 +            found->second.Rooms.insert(room);
 +        }
++        else if (tag=='C')
++        {
++            std::string quest,ref,base;
++            if (!(row>>quest>>ref>>base)||row>>extra||!Key(ref)||!Key(base)) return {};
++            auto found=result.Estates.find(quest);
++            if (found==result.Estates.end()||found->second.Construction.size()>=1024||
++                !found->second.Construction.emplace(ref,base).second) return {};
++        }
 +        else if (tag=='B')
 +        {
 +            std::string quest,region;size_t count{};
@@ -113,8 +122,14 @@ new file mode 100644
 +        else return {};
 +    }
 +    if (input.bad()||result.Estates.empty()) return {};
++    std::set<std::string> construction;
 +    for (const auto& [_,e]:result.Estates)
++    {
 +        if (!e.Rooms.count(e.Main)||(!e.CandidateRegions.empty()&&!e.CandidateRegions.count("main"))) return {};
++        if (!e.Construction.empty()&&(!e.Construction.count(e.Marker)||!e.Construction.count(e.Table))) return {};
++        for (const auto& [ref,base]:e.Construction)
++            if (!construction.insert(ref).second||result.RoomEstate.count(ref)) return {};
++    }
 +    return result;
 +}
 +inline const std::optional<Catalog>& Host()
