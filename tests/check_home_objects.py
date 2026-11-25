@@ -110,7 +110,7 @@ with tempfile.TemporaryDirectory() as tmp:
     subprocess.run([str(exe),str(Path(tmp,"journal"))],check=True)
 home=(root/"Code/client/Services/Generic/PartyHome.cpp").read_text()
 server=(root/"Code/server/Services/PartyHome.cpp").read_text()
-assert "SyncObjects(world,*cell,*identity,slot,encoded)" in home
+assert "SyncObjects(world,*cell,*identity,slot,encoded,*state)" in home
 assert "ApplyObjectChanges(m_world,*current,*copy,*state,visit.Campaign,visit.Slot)" in home
 assert "TryTrade(form); // Always consume activation" in home
 assert "if (IsExit(copy,*binding)) continue;" in home
