@@ -199,6 +199,45 @@ int main(){
 }
 ''')
 
+pickup=extract('client/Games/Skyrim/Actor.cpp','void* TP_MAKE_THISCALL(HookPickUpObject','void Actor::PickUpObject(')
+run('native quest pickup requires actual inventory increase',headers+'''
+#define TP_MAKE_THISCALL(name,cls,...) name(cls* apThis, __VA_ARGS__)
+struct Base {uint32_t formID=10;};
+struct Extra {bool quest=true;};
+struct TESObjectREFR {Base* baseForm;Extra extra;bool temporary=false;
+ Extra* GetExtraDataList(){return &extra;}bool IsTemporary(){return temporary;}};
+struct Inventory {struct Entry{uint32_t BaseId{};int32_t Count{};bool IsQuestItem{};};};
+struct Actor{uint32_t formID=20;int64_t count=0;int32_t actual=0;int calls=0;
+ int64_t GetItemCountInInventory(Base*){return count;}
+ void GetItemFromExtraData(Inventory::Entry& item,Extra* e){item.IsQuestItem=e->quest;}};
+struct PlayerCharacter:Actor{static PlayerCharacter* Get(){static PlayerCharacter player;return &player;}};
+namespace HomeActorProtection{bool Resident(Actor*){return false;}bool PickupBlocked(TESObjectREFR*){return false;}}
+struct ScopedInventoryOverride{static bool IsOverriden(){return false;}};
+struct ScopedActivateOverride{static bool IsOverriden(){return false;}};
+struct ModSystem{void GetServerModId(uint32_t id,uint32_t& out){out=id;}};
+struct World{static World& Get(){static World world;return world;}ModSystem mods;ModSystem& GetModSystem(){return mods;}};
+struct InventoryChangeEvent{uint32_t id;Inventory::Entry Item;bool Drop,UpdateClients;};
+std::vector<InventoryChangeEvent> sent;
+void QueueActorInventoryChange(InventoryChangeEvent e){sent.push_back(e);}
+void* RealPickUpObject(Actor* actor,TESObjectREFR*,int32_t,bool,float){++actor->calls;actor->count+=actor->actual;return actor;}
+namespace TiltedPhoques{template<class F,class... A>auto ThisCall(F f,A... a){return f(a...);}}
+namespace spdlog{template<class... A>void debug(A...){}}
+'''+pickup+'''
+int main(){
+ Base base;TESObjectREFR object{&base};auto* player=PlayerCharacter::Get();
+ player->actual=0;assert(HookPickUpObject(player,&object,1,false,0)==player);
+ assert(sent.empty()&&player->calls==1);
+ player->actual=1;HookPickUpObject(player,&object,2,false,0);
+ assert(sent.size()==1&&sent[0].Item.Count==1&&sent[0].Item.IsQuestItem&&!sent[0].UpdateClients&&player->calls==2);
+ object.temporary=true;player->actual=2;HookPickUpObject(player,&object,2,false,0);
+ assert(sent.size()==2&&sent.back().Item.Count==2&&sent.back().UpdateClients);
+ Actor npc;npc.actual=0;HookPickUpObject(&npc,&object,1,false,0);
+ assert(sent.size()==3&&npc.calls==1);
+ object.extra.quest=false;player->actual=0;HookPickUpObject(player,&object,1,false,0);
+ assert(sent.size()==4&&!sent.back().Item.IsQuestItem);
+}
+''')
+
 hp=extract('server/Services/ActorValueService.cpp','void ActorValueService::OnHealthChangeBroadcast(','void ActorValueService::OnDeathStateChange')
 run('actual server health relay over an actor ownership transfer',headers+'''
 #include <cmath>

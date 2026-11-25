@@ -1727,7 +1727,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +void OfferKnownStages(Player& player, const PartyService::Party& party,
 +                      const QuestRun& run, const NotifyQuestUpdate& notice)
 +{
-+    if (run.Stopped || run.OrderedStages.empty()) return;
++    if (run.Stopped || run.Generation != 1 || run.OrderedStages.empty()) return;
 +    auto speaker = party.LeaderPlayerId;
 +    if (speaker == player.GetId())
 +        for (auto* member : party.Members)
@@ -1749,9 +1749,10 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
  }
  
  QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
-@@ -44,3 +162,27 @@
+@@ -44,3 +162,29 @@
      PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
      const PartyService::Party::Conversation* participants = nullptr;
++    bool knownSharedQuest = false;
 +    if (pParty && message.JournalObjective &&
 +        (message.Status == RequestQuestUpdate::Started || message.Status == RequestQuestUpdate::StageUpdate))
 +    {
@@ -1768,7 +1769,8 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +                const auto found = pParty->QuestRuns.find(message.Id);
 +                if (found != pParty->QuestRuns.end()) { run = found.value(); known = true; }
 +            }
-+            if (known && (message.Status == RequestQuestUpdate::Started || run.Stages.contains(message.Stage)))
++            knownSharedQuest = known && !run.Stopped && run.Generation == 1 && (run.Started || !run.OrderedStages.empty());
++            if (knownSharedQuest && (message.Status == RequestQuestUpdate::Started || run.Stages.contains(message.Stage)))
 +                OfferKnownStages(*pPlayer, *pParty, run, notify);
 +        }
 +        catch (const std::exception& error)
@@ -1777,7 +1779,15 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        }
 +    }
      if (!pParty) return;
-@@ -115,39 +257,42 @@
+@@ -61,6 +205,6 @@
+         // During an interaction, only the quest of the witnessed topic has provenance.
+         if (inTalk || inFight) return;
+         if (!bEnableMiscQuestSync && !(message.JournalObjective && message.Status == RequestQuestUpdate::StageUpdate &&
+-            pParty->LeaderPlayerId == pPlayer->GetId())) return;
++            (pParty->LeaderPlayerId == pPlayer->GetId() || knownSharedQuest))) return;
+     }
+ 
+@@ -115,39 +259,42 @@
 -    auto& run = pParty->QuestRuns[message.Id];
 -    // The sender's local quest log and the party's shared lifecycle are independent.
 -    // A late start from a second client must not clear stages the first client sent.

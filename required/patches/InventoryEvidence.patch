@@ -500,3 +500,37 @@ new file mode 100644
 +    return result;
 +}
 +}
+diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor.cpp
+--- a/Code/client/Games/Skyrim/Actor.cpp
++++ b/Code/client/Games/Skyrim/Actor.cpp
+@@ -1142,11 +1142,30 @@
+         if (apObject->GetExtraDataList())
+             apThis->GetItemFromExtraData(item, apObject->GetExtraDataList());
+ 
+         // This is here so that objects that are picked up on both clients, aka non temps, are synced through activation sync.
+         // The inventory change event should always be sent to the server, otherwise the server inventory won't be updated.
+         bool shouldUpdateClients = apObject->IsTemporary() && !ScopedActivateOverride::IsOverriden();
+ 
++        // A quest pickup is not proven by entering the native pickup function.
++        // Confirm the actual local inventory change before publishing it.
++        // Keep the ordinary item and remote actor paths unchanged.
++        if (item.IsQuestItem && apThis == PlayerCharacter::Get())
++        {
++            auto* base = apObject->baseForm;
++            const auto before = apThis->GetItemCountInInventory(base);
++            auto* result = TiltedPhoques::ThisCall(RealPickUpObject, apThis, apObject, aCount, aUnk1, aUnk2);
++            const auto delta = apThis->GetItemCountInInventory(base) - before;
++            if (delta > 0 && delta <= INT32_MAX)
++            {
++                item.Count = static_cast<int32_t>(delta);
++                QueueActorInventoryChange(InventoryChangeEvent(apThis->formID, std::move(item), false, shouldUpdateClients));
++            }
++            else
++                spdlog::debug("Quest pickup not confirmed in local inventory: count delta {}", delta);
++            return result;
++        }
++
+         QueueActorInventoryChange(InventoryChangeEvent(apThis->formID, std::move(item), false, shouldUpdateClients));
+     }
+ 
+     return TiltedPhoques::ThisCall(RealPickUpObject, apThis, apObject, aCount, aUnk1, aUnk2);
