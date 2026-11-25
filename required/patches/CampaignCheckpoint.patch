@@ -359,7 +359,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -9,5 +9,18 @@
+@@ -9,5 +9,20 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
@@ -377,8 +377,10 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +#include <TradeProperties.h>
 +#include <set>
 +#include <sstream>
++#include <Events/InventoryChangeEvent.h>
++#include <Games/Overrides.h>
  #include <HomeRegistry.h>
-@@ -26,6 +39,15 @@
+@@ -26,6 +41,15 @@
  namespace
  {
  CampaignReplication::Link campaignLink;
@@ -394,7 +396,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +243,202 @@
+@@ -221,6 +245,307 @@
      return 2;
  }
  
@@ -548,6 +550,108 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return quests;
 +}
 +
++struct QuestPickup
++{
++    std::string Quest, Reference, Item;
++    uint32_t Generation{}, Alias{};
++    int32_t Count{};
++    uint64_t Character{};
++    bool Consumed{};
++};
++
++std::optional<std::vector<QuestPickup>> QuestPickupHistory(
++    const std::vector<CampaignJournal::Operation>& ops)
++{
++    std::vector<QuestPickup> pickups;
++    for (const auto& op:ops)
++    {
++        if (op.Kind!="quest-pickup-v1"&&op.Kind!="quest-consumed-v1") continue;
++        QuestPickup item;
++        std::istringstream in(op.Payload);
++        std::string extra;
++        if (!(in>>item.Quest>>item.Generation>>item.Alias>>item.Reference>>item.Item>>item.Count>>item.Character)||
++            in>>extra||!item.Generation||item.Count<=0||!item.Character) return {};
++        auto found=std::find_if(pickups.begin(),pickups.end(),[&](const auto& p)
++        {
++            return p.Quest==item.Quest&&p.Generation==item.Generation&&p.Alias==item.Alias;
++        });
++        if (found==pickups.end())
++        {
++            if (op.Kind!="quest-pickup-v1") return {};
++            pickups.push_back(std::move(item));
++            continue;
++        }
++        if (found->Reference!=item.Reference||found->Item!=item.Item||
++            found->Count!=item.Count||found->Character!=item.Character) return {};
++        if (op.Kind=="quest-consumed-v1") found->Consumed=true;
++    }
++    return pickups;
++}
++
++bool ShouldRestorePickup(const QuestPickup& item,uint64_t character,uint32_t generation,bool stopped)
++{
++    return character&&item.Character==character&&generation==1&&item.Generation==generation&&
++        !stopped&&!item.Consumed&&item.Count==1;
++}
++
++// Keep attempts local to the current loaded world. A failed native operation
++// must not be invoked every time a journal reply arrives.
++std::set<std::pair<uint32_t,uint32_t>> attemptedQuestPickups;
++uint32_t LocalQuestForm(const std::string& key)
++{
++    const auto form=TradeProperties::DecodeForm(key);
++    if (!form||!form->Valid()) return 0;
++    auto* mod=ModManager::Get()->GetByName(form->Plugin.c_str());
++    return mod&&mod->IsLoaded()?mod->GetFormId(form->Local):0;
++}
++
++void RestoreOwnQuestPickups(World& world,const CampaignJournal::Journal& journal,uint64_t character)
++{
++    if (!SaveWorldReady()||!world.GetPartyService().IsInParty()) return;
++    auto* player=PlayerCharacter::Get();
++    auto* cell=player?player->GetParentCellEx():nullptr;
++    auto* ui=UI::Get();
++    static const BSFixedString dialogue("Dialogue Menu"), container("ContainerMenu"), inventory("InventoryMenu");
++    if (!cell||!cell->IsAttached()||!ui||ui->GetMenuOpen(dialogue)||
++        ui->GetMenuOpen(container)||ui->GetMenuOpen(inventory)||player->IsInCombat()) return;
++    const auto history=ActiveQuestHistory(journal.Operations());
++    const auto pickups=QuestPickupHistory(journal.Operations());
++    if (!history||!pickups) return;
++    for (const auto& item:*pickups)
++    {
++        auto run=history->find(item.Quest);
++        if (run==history->end()||!ShouldRestorePickup(item,character,run->second.Generation,run->second.Stopped)) continue;
++        const auto questId=LocalQuestForm(item.Quest),referenceId=LocalQuestForm(item.Reference),baseId=LocalQuestForm(item.Item);
++        if (!questId||!referenceId||!baseId) continue;
++        auto* quest=Cast<TESQuest>(TESForm::GetById(questId));
++        if (!quest||quest->IsStopped()||QuestService::IsNonSyncableQuest(quest)||
++            world.GetOverlayService().IsPersonalQuest(questId)) continue;
++        // Never add a base form as a substitute for a missing reference.
++        // A native pickup is possible only if this exact alias is still
++        // bound to its original, loaded, available world object.
++        auto* ref=quest->GetAliasedRef(item.Alias);
++        if (!ref||ref->formID!=referenceId||ref->IsTemporary()||ref->IsDisabled()||ref->IsDeleted()||
++            !ref->baseForm||ref->baseForm->formID!=baseId||ref->GetParentCellEx()!=cell||!ref->GetNiNode()) continue;
++        if (player->GetItemCountInInventory(ref->baseForm)!=0) continue;
++        InventoryChangeEvent check(player->formID,Inventory::Entry{});
++        CaptureQuestItem(ref->GetExtraDataList(),ref,ref->baseForm,check);
++        GameId questNet{},refNet{};
++        if (!world.GetModSystem().GetServerModId(questId,questNet)||
++            !world.GetModSystem().GetServerModId(referenceId,refNet)||
++            check.QuestId!=questNet||check.QuestRef!=refNet||check.QuestAlias!=item.Alias) continue;
++        if (!attemptedQuestPickups.emplace(questId,referenceId).second) continue;
++        auto* base=ref->baseForm;
++        // The authoritative pickup already exists. Do not send a second
++        // inventory delta or create a new campaign operation.
++        ScopedInventoryOverride scope;
++        player->PickUpObject(ref,1,false,0.f);
++        if (player->GetItemCountInInventory(base)==1)
++            spdlog::info("STM restored original quest pickup {:X} for character {}",referenceId,character);
++        else
++            spdlog::warn("STM could not restore original quest pickup {:X}",referenceId);
++    }
++}
++
 +// Session-local suppression of repeated offers. ESS remains the source of
 +// applied stages; no receipt or save cursor is advanced here.
 +std::set<std::pair<uint32_t,uint16_t>> offeredQuestStages;
@@ -595,9 +699,12 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
  void QuestService::PollCampaign(const UpdateEvent&) noexcept
  {
 +    if (!m_world.GetTransport().IsOnline()||!m_world.GetPartyService().IsInParty())
++    {
 +        offeredQuestStages.clear();
++        attemptedQuestPickups.clear();
++    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +468,7 @@
+@@ -250,6 +575,7 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -605,7 +712,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
          request.Credential=credential->Secret.c_str();
 +        request.Checkpoint=NextCheckpoint(*stamp).c_str();
          m_world.GetTransport().Send(request);
-@@ -275,8 +499,19 @@
+@@ -275,8 +601,20 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -617,6 +724,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            // Only after the server confirmed the complete prefix for this save.
 +            try
 +            {
++                RestoreOwnQuestPickups(m_world,campaignLink.Journal,stamp->Character);
 +                for (const auto& update:MissingActiveQuestStages(m_world,campaignLink.Journal))
 +                    ReceiveQuestProgress(update);
 +            }

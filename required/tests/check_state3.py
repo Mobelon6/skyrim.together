@@ -172,7 +172,7 @@ int main(){
 }
 ''')
 
-history=extract('client/Services/Generic/QuestJournal.cpp','struct QuestCatchup','// Session-local suppression')
+history=extract('client/Services/Generic/QuestJournal.cpp','struct QuestCatchup','struct QuestPickup')
 run('active quest catch-up from existing campaign history',headers+'''
 #include <sstream>
 namespace CampaignJournal {struct Operation{std::string Id,Kind,Payload;};}
@@ -260,6 +260,32 @@ int main(){
     ops.push_back({"2","quest-consumed-v1",pickup});
     assert(QuestItemChange(ops,prefix,pickup,true)==D::Duplicate);
     assert(QuestItemChange(ops,prefix,pickup,false)==D::Duplicate);
+}
+''')
+
+pickup_history=extract('client/Services/Generic/QuestJournal.cpp','struct QuestPickup','// Keep attempts local')
+run('recovery selects only unconsumed original pickups of the loaded character',headers+'''
+#include <sstream>
+namespace CampaignJournal {struct Operation{std::string Id,Kind,Payload;};}
+'''+pickup_history+'''
+int main(){
+    using CampaignJournal::Operation;
+    std::vector<Operation> ops={{"1","quest-pickup-v1","q 1 3 ref base 1 101"},
+      {"2","quest-pickup-v1","q 1 4 ref2 base2 1 202"},
+      {"3","quest-pickup-v1","r 1 3 ref3 base3 2 101"}};
+    auto history=QuestPickupHistory(ops);
+    assert(history&&history->size()==3);
+    assert(ShouldRestorePickup(history->at(0),101,1,false));
+    assert(!ShouldRestorePickup(history->at(0),202,1,false));
+    assert(!ShouldRestorePickup(history->at(0),101,2,false));
+    assert(!ShouldRestorePickup(history->at(0),101,1,true));
+    assert(!ShouldRestorePickup(history->at(2),101,1,false));
+    ops.push_back({"4","quest-consumed-v1","q 1 3 ref base 1 101"});
+    history=QuestPickupHistory(ops);assert(history);
+    assert(!ShouldRestorePickup(history->at(0),101,1,false));
+    assert(ShouldRestorePickup(history->at(1),202,1,false));
+    ops.push_back({"5","quest-consumed-v1","q 1 4 wrong base2 1 202"});
+    assert(!QuestPickupHistory(ops));
 }
 ''')
 
