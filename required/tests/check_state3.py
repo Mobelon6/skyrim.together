@@ -21,6 +21,7 @@ def run(name, source, extra=()):
 headers = '''
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -67,7 +68,7 @@ bodies = (extract(qs,'void QuestService::OnUpdate(', 'BSTEventResult QuestServic
         +extract(qs,'void QuestService::HoldStage','void QuestService::NotifyOverlayOfQuestUpdate')
         +extract(qs,'bool QuestService::StopQuest','static constexpr std::array kNonSyncableQuestIds'))
 # The simulator supplies the standard map in place of TiltedCore's map adapter.
-bodies=bodies.replace('it.value()', 'it->second').replace('deferred.value()', 'deferred->second')
+bodies=bodies.replace('it.value()', 'it->second').replace('deferred.value()', 'deferred->second').replace('retry.value()', 'retry->second')
 run('actual client quest handlers with simulated Skyrim scenes',headers+'''
 #define __FUNCTION__ "test"
 struct GameId{uint32_t BaseId;uint32_t ModId=0;GameId(uint32_t x):BaseId(x){}operator uint32_t()const{return BaseId;} uint32_t LogFormat()const{return BaseId;}};
@@ -85,9 +86,9 @@ struct BGSScene{bool isPlaying=true;int currentPhaseIndex=0;PhaseList phases;int
 struct TESQuest:TESForm{
 struct{struct{const char* AsAscii(){return "Quest";}}value;}fullName;enum class Type{Other,None,Miscellaneous};Type type=Type::Other;
 uint32_t formID=2;uint16_t currentStage=0;bool stopped=false;
-std::set<uint16_t> reached;std::vector<int> actions;Vector<BGSScene*> scenes;
+std::set<uint16_t> reached,reject;std::vector<int> actions;Vector<BGSScene*> scenes;
 bool IsStageReached(uint16_t s){return reached.contains(s);}
-bool ScriptSetStage(uint16_t s){if(!reached.insert(s).second)return false;stopped=false;actions.push_back(s);currentStage=s;return true;}
+bool ScriptSetStage(uint16_t s){if(reject.contains(s)||!reached.insert(s).second)return false;stopped=false;actions.push_back(s);currentStage=s;return true;}
 unsigned GetStageItemCount(uint16_t stage){return stage==100?1:0;}
 bool IsStopped(){return stopped;}void SetActive(bool){}
 void SetStopped(){actions.push_back(-1);stopped=true;reached.clear();}
@@ -102,8 +103,9 @@ template<class...T>void info(T&&...){}
 template<class...T>void error(T&&...){}
 }
 struct QuestService{
-World& m_world=World::Get();struct HeldStages{Vector<uint16_t> Stages,PendingItems;};
+World& m_world=World::Get();struct HeldStages{Vector<uint16_t> Stages,PendingItems;std::chrono::steady_clock::time_point RetryAt{};};
 Map<uint32_t,HeldStages> m_heldStages; Map<uint32_t,Vector<NotifyQuestUpdate>> m_afterHeldStages;
+Map<uint32_t,std::chrono::steady_clock::time_point> m_questRetryAt;
 void OnUpdate(const UpdateEvent&) noexcept;void OnDisconnected(const DisconnectedEvent&) noexcept;void OnPartyLeft(const PartyLeftEvent&) noexcept;
 void HoldStage(TESQuest*,uint16_t) noexcept;HeldStages* GetHeldStages(uint32_t,TESQuest*) noexcept;
 void OnQuestUpdate(const NotifyQuestUpdate&) noexcept;static bool StopQuest(uint32_t);
@@ -131,6 +133,22 @@ int main(){
     assert(service.m_afterHeldStages.empty());
     scene.isPlaying=true;send(30,0);send(30,2);service.OnPartyLeft({});assert(service.m_heldStages.empty()&&service.m_afterHeldStages.empty());
     send(40,0);send(40,2);service.OnDisconnected({});assert(service.m_heldStages.empty()&&service.m_afterHeldStages.empty());
+    scene.isPlaying=false;quest.reject.insert(50);send(50,0);send(60,0);
+    assert(!quest.IsStageReached(50)&&!quest.IsStageReached(60));
+    service.OnUpdate({});assert(!quest.IsStageReached(60));
+    quest.reject.erase(50);service.m_questRetryAt.at(2)={};
+    service.OnUpdate({});assert(quest.IsStageReached(50)&&quest.IsStageReached(60));
+    assert(service.m_afterHeldStages.empty()&&service.m_questRetryAt.empty());
+    scene.isPlaying=true;scene.ready=false;quest.reject.insert(70);send(70,0);send(80,0);send(80,2);
+    scene.isPlaying=false;service.OnUpdate({});
+    assert((service.m_heldStages.at(2).Stages==Vector<uint16_t>{70,80}));
+    assert(!quest.IsStageReached(80)&&!quest.IsStopped());
+    quest.reject.erase(70);service.m_heldStages.at(2).RetryAt={};
+    service.OnUpdate({});service.OnUpdate({});
+    assert(quest.IsStopped()&&service.m_afterHeldStages.empty());
+    assert((Vector<int>(quest.actions.end()-3,quest.actions.end())==Vector<int>{70,80,-1}));
+    quest.reject.insert(90);send(90,1);assert(service.m_afterHeldStages.count(2));
+    service.OnDisconnected({});assert(service.m_afterHeldStages.empty()&&service.m_questRetryAt.empty());
 }
 ''')
 

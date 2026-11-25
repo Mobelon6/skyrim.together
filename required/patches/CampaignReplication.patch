@@ -1152,7 +1152,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 diff --git a/Code/client/Services/QuestService.h b/Code/client/Services/QuestService.h
 --- a/Code/client/Services/QuestService.h
 +++ b/Code/client/Services/QuestService.h
-@@ -1,64 +1,68 @@
+@@ -1,64 +1,69 @@
  #pragma once
  #include <chrono>
  struct NotifyQuestJournal;
@@ -1270,6 +1270,7 @@ diff --git a/Code/client/Services/QuestService.h b/Code/client/Services/QuestSer
 +        Vector<uint16_t> Stages{};
 +        // A stage per log entry of the applied stages whose fragment hasn't run yet
 +        Vector<uint16_t> PendingItems{};
++        std::chrono::steady_clock::time_point RetryAt{};
 +    };
 +
 +private:
@@ -1279,6 +1280,14 @@ diff --git a/Code/client/Services/QuestService.h b/Code/client/Services/QuestSer
      void PollJournal(const UpdateEvent&) noexcept;
      void OnJournalRecord(const NotifyQuestJournal&) noexcept;
      uint64_t m_journalStream{};
+@@ -90,6 +95,7 @@
+     Map<uint32_t, HeldStages> m_heldStages{};
+     // From the first deferred stop through any events belonging to the next run of this quest.
+     Map<uint32_t, Vector<NotifyQuestUpdate>> m_afterHeldStages{};
++    Map<uint32_t, std::chrono::steady_clock::time_point> m_questRetryAt{};
+ 
+     entt::scoped_connection m_joinedConnection;
+     entt::scoped_connection m_updateConnection;
 diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Services/Generic/QuestService.cpp
 --- a/Code/client/Services/Generic/QuestService.cpp
 +++ b/Code/client/Services/Generic/QuestService.cpp
@@ -1390,6 +1399,124 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
      m_journalClock = aDispatcher.sink<UpdateEvent>().connect<&QuestService::PollJournal>(this);
      m_journalRecords = aDispatcher.sink<NotifyQuestJournal>().connect<&QuestService::OnJournalRecord>(this);
      m_joinedConnection = aDispatcher.sink<ConnectedEvent>().connect<&QuestService::OnConnected>(this);
+@@ -136,13 +139,20 @@
+     // Dispatching may start a new run and defer its own stop, so detach each batch before dispatch.
+     Vector<uint32_t> ready;
+     for (const auto& [formId, events] : m_afterHeldStages)
+-        if (m_heldStages.find(formId) == m_heldStages.end())
++    {
++        const auto retry = m_questRetryAt.find(formId);
++        if (m_heldStages.find(formId) == m_heldStages.end() &&
++            (retry == m_questRetryAt.end() || std::chrono::steady_clock::now() >= retry.value()))
+             ready.push_back(formId);
++    }
+     for (uint32_t formId : ready)
+     {
+         auto it = m_afterHeldStages.find(formId);
+         auto events = std::move(it.value());
+         m_afterHeldStages.erase(it);
++        const auto retry = m_questRetryAt.find(formId);
++        if (retry != m_questRetryAt.end())
++            m_questRetryAt.erase(retry);
+         for (const auto& update : events)
+             OnQuestUpdate(update);
+     }
+@@ -152,10 +162,12 @@
+ {
+     m_afterHeldStages.clear();
+     m_heldStages.clear();
++    m_questRetryAt.clear();
+ }
+ 
+ void QuestService::OnPartyLeft(const PartyLeftEvent&) noexcept
+ {
+     m_afterHeldStages.clear();
+     m_heldStages.clear();
++    m_questRetryAt.clear();
+ }
+@@ -498,13 +510,26 @@
+-static void ApplyNextHeldStage(TESQuest* apQuest, HeldStages& aHeld) noexcept
++static bool ApplyNextHeldStage(TESQuest* apQuest, HeldStages& aHeld) noexcept
+ {
+     ScopedQuestOverride _;
+     const uint16_t stage = aHeld.Stages.front();
++    if (apQuest->IsStageReached(stage))
++    {
++        aHeld.Stages.erase(aHeld.Stages.begin());
++        aHeld.RetryAt = {};
++        return true;
++    }
++    if (!apQuest->ScriptSetStage(stage))
++    {
++        aHeld.RetryAt = std::chrono::steady_clock::now() + std::chrono::seconds(1);
++        spdlog::error("Held quest {:X} stage {} not reached; retaining it for retry", apQuest->formID, stage);
++        return false;
++    }
+     aHeld.Stages.erase(aHeld.Stages.begin());
+-    if (apQuest->ScriptSetStage(stage))
+-        aHeld.PendingItems.insert(aHeld.PendingItems.end(), apQuest->GetStageItemCount(stage), stage);
++    aHeld.RetryAt = {};
++    aHeld.PendingItems.insert(aHeld.PendingItems.end(), apQuest->GetStageItemCount(stage), stage);
++    return true;
+ }
+ 
+ static void ReleaseStagesForWaitingPhases(TESQuest* apQuest, HeldStages& aHeld) noexcept
+ {
+-    if (!aHeld.PendingItems.empty())
++    if (!aHeld.PendingItems.empty() || std::chrono::steady_clock::now() < aHeld.RetryAt)
+         return;
+@@ -543,8 +568,11 @@
+ static void ReleaseUncheckedStages(TESQuest* apQuest, HeldStages& aHeld) noexcept
+ {
+-    while (!aHeld.Stages.empty() && aHeld.PendingItems.empty() && !IsCheckedByPlayingScene(apQuest, aHeld.Stages.front()))
++    while (!aHeld.Stages.empty() && aHeld.PendingItems.empty() &&
++           std::chrono::steady_clock::now() >= aHeld.RetryAt &&
++           !IsCheckedByPlayingScene(apQuest, aHeld.Stages.front()))
+     {
+         spdlog::info("Applying held member quest stage {} for {:X}, no playing scene checks it", aHeld.Stages.front(), apQuest->formID);
+-        ApplyNextHeldStage(apQuest, aHeld);
++        if (!ApplyNextHeldStage(apQuest, aHeld))
++            return;
+     }
+ }
+@@ -645,15 +673,17 @@
+     case NotifyQuestUpdate::Started:
+     {
+-        pQuest->ScriptSetStage(aUpdate.Stage);
+-        pQuest->SetActive(true);
+-        bResult = true;
+-        spdlog::info("Remote quest started: {:X}, stage: {}", formId, aUpdate.Stage);
++        bResult = (pQuest->IsStageReached(aUpdate.Stage) || pQuest->ScriptSetStage(aUpdate.Stage)) && !pQuest->IsStopped();
++        if (bResult)
++        {
++            pQuest->SetActive(true);
++            spdlog::info("Remote quest started: {:X}, stage: {}", formId, aUpdate.Stage);
++        }
+         break;
+     }
+     case NotifyQuestUpdate::StageUpdate:
+-        pQuest->ScriptSetStage(aUpdate.Stage);
+-        bResult = true;
+-        spdlog::info("Remote quest updated: {:X}, stage: {}", formId, aUpdate.Stage);
++        bResult = pQuest->IsStageReached(aUpdate.Stage) || pQuest->ScriptSetStage(aUpdate.Stage);
++        if (bResult)
++            spdlog::info("Remote quest updated: {:X}, stage: {}", formId, aUpdate.Stage);
+         break;
+     case NotifyQuestUpdate::Stopped:
+         bResult = StopQuest(formId);
+@@ -663,5 +693,12 @@
+     }
+ 
+     if (!bResult)
++    {
+         spdlog::error("Failed to update the client quest state, quest: {:X}, stage: {}, status: {}", formId, aUpdate.Stage, aUpdate.Status);
++        if (aUpdate.Status == NotifyQuestUpdate::Started || aUpdate.Status == NotifyQuestUpdate::StageUpdate)
++        {
++            m_afterHeldStages[formId].push_back(aUpdate);
++            m_questRetryAt[formId] = std::chrono::steady_clock::now() + std::chrono::seconds(1);
++        }
++    }
+ }
 diff --git a/Code/server/Services/QuestService.h b/Code/server/Services/QuestService.h
 --- a/Code/server/Services/QuestService.h
 +++ b/Code/server/Services/QuestService.h

@@ -56,3 +56,7 @@
 - Тип: разработка / проверка. Задачи REL-01, QA-01.
 - Base 20b6faee27255e72f2138b897b5d8090857a2ac6. Причина отказа 45689451616: тест obsolete/tests/check_home_native_residents.py использовал parents[1]/tools, но build_native_home_capabilities.py находится в reusable/tools. Путь исправлен на parents[2]/reusable/tools, как в reusable/tests/check_home_native_capabilities.py. Вложенный импорт build_home_instances из obsolete/tools уже корректен. Игровые патчи и порядок проверок неизменны.
 - Проверки: точный preimage, существование целевого модуля, согласованность с работающим соседним тестом; полный повтор CI требуется. Windows build и игра не проверены. Далее HOME-02 по действующему решению пользователя, не развивать личные инстансы.
+
+### 2026-11-26 — QUEST-01 / BUG-03
+- Base eb3d74ab9f1c6af610beeae932feb3d3ac2988eb. В существующем QuestService отклонённые прямые и held стадии сохраняются в имеющихся очередях до повторной попытки, последующие стадии/stop не обгоняют их; retry не чаще секунды. Started/StageUpdate проверяют результат ScriptSetStage/IsStageReached, retry очищается при disconnect/party left. Без новых протоколов, файлов или систем. Расширен check_state3.py сценариями отказа/порядка/повтора. Preimage CPP изучен, сформированы hunks; полный apply/CI и игровая проверка ещё нужны. BUG-02 и восстановление после disconnect не завершены.
+- HOME-02: пользователь отверг перенос обычного имущества в отдельный ledger; штатные ESS/STR, журнал/кеш только для необходимого восстановления. Попытка HomeSharedStorage не попала в HEAD.
