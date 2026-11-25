@@ -197,25 +197,29 @@ diff --git a/Code/server/Services/CharacterService.cpp b/Code/server/Services/Ch
 diff --git a/Code/server/Services/ObjectService.cpp b/Code/server/Services/ObjectService.cpp
 --- a/Code/server/Services/ObjectService.cpp
 +++ b/Code/server/Services/ObjectService.cpp
-@@ -66,4 +66,5 @@
-     for (const ObjectData& object : acMessage.Packet.Objects)
-     {
-+        if (acMessage.pPlayer->GetCellComponent().HasExteriorEstate()) continue;
-         if (!HomeScope::AdmittedCell(acMessage.pPlayer->GetCellComponent().Cell,object.CellId,object.WorldSpaceId)) continue;
-         const auto iter = std::find_if(
-@@ -71,7 +72,8 @@
-         const auto iter = std::find_if(
-             std::begin(view), std::end(view),
+@@ -66,10 +66,12 @@
+-    for (const ObjectData& object : acMessage.Packet.Objects)
+-    {
+-        if (!HomeScope::AdmittedCell(acMessage.pPlayer->GetCellComponent().Cell,object.CellId,object.WorldSpaceId)) continue;
+-        const auto iter = std::find_if(
+-            std::begin(view), std::end(view),
 -            [view, id = object.Id, cell=object.CellId](auto entity)
 -            {
 -                const auto& formIdComponent = view.get<FormIdComponent>(entity);
 -                return HomeScope::ReferenceMatches(formIdComponent.Id,view.get<CellIdComponent>(entity).Cell,id,cell);
+-            });
++    for (const ObjectData& object : acMessage.Packet.Objects)
++    {
++        if (acMessage.pPlayer->GetCellComponent().HasExteriorEstate()) continue;
++        if (!HomeScope::AdmittedCell(acMessage.pPlayer->GetCellComponent().Cell,object.CellId,object.WorldSpaceId)) continue;
++        const auto iter = std::find_if(
++            std::begin(view), std::end(view),
 +            [view, id = object.Id, cell=object.CellId,sender=acMessage.pPlayer](auto entity)
 +            {
 +                const auto& formIdComponent = view.get<FormIdComponent>(entity);
 +                return sender->GetCellComponent().SamePresence(view.get<CellIdComponent>(entity))&&
 +                    HomeScope::ReferenceMatches(formIdComponent.Id,view.get<CellIdComponent>(entity).Cell,id,cell);
-             });
++            });
 @@ -105,5 +107,7 @@
              objectComponent.CurrentLockData = object.CurrentLockData;
  
