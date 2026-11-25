@@ -17,7 +17,11 @@ rows=[rec(b"CELL",1,{b"DATA":b"\x01"}),rec(b"NPC_",2,{}),
       rec(b"NPC_",3,{b"VMAD":b"x"}),rec(b"NPC_",4,{b"TPLT":u(2)}),
       actor(5,2),actor(6,3),actor(7,4),actor(8,2,XESP=u(9)),actor(9,2),actor(10,2),
       actor(10,2,VMAD=b"x")]
-assert {(t,r[1]) for t,c,r,b in classify(lambda kinds:(x for x in rows if x[0] in kinds),unpack)}=={("A",5)}
+outside=(u(20)+u(6),)
+rows += [rec(b"CELL",20,{b"DATA":b"\x00"}),
+         rec(b"ACHR",21,{b"NAME":u(2),b"DATA":bytes(24)},flags=0x400,context=outside),
+         rec(b"ACHR",22,{b"NAME":u(2),b"DATA":bytes(24),b"VMAD":b"x"},context=outside)]
+assert {(t,r[1]) for t,c,r,b in classify(lambda kinds:(x for x in rows if x[0] in kinds),unpack)}=={("A",5),("M",21)}
 up=Path(sys.argv[1]).resolve()
 home=(up/"Code/client/Services/Generic/PartyHome.cpp").read_text()
 overlay=(up/"Code/client/Services/Generic/HomeOriginalOverlay.cpp").read_text()
@@ -44,10 +48,31 @@ int main()
     assert(HomeNativeCapabilities::Covers(bases,state,records));
     records.at(ref.Encode()).Value.Flags=2;
     assert(!HomeNativeCapabilities::Covers(bases,state,records));
-    records.clear();assert(!HomeNativeCapabilities::Covers(bases,state,records));
+    records.at(ref.Encode()).Value.Flags=0;
+    TradeProperties::FormKey moved{"skyrim.esm",21};
+    auto arrival=rec;arrival.Value.Reference=moved;
+    records.emplace(moved.Encode(),arrival);
+    assert(!HomeNativeCapabilities::Covers(bases,state,records));
+    auto pool=bases;pool.emplace(moved.Encode(),base);
+    assert(HomeNativeCapabilities::Covers(bases,state,records,&pool));
+    records.at(moved.Encode()).Value.Flags=8;
+    assert(HomeNativeCapabilities::Covers(bases,state,records,&pool));
+    records.at(moved.Encode()).Value.Base.Local++;
+    assert(!HomeNativeCapabilities::Covers(bases,state,records,&pool));
+    records.clear();assert(!HomeNativeCapabilities::Covers(bases,state,records,&pool));
+    std::set<HomeNativeCapabilities::Row> rows{
+      {'A',ref.Encode(),ref.Encode(),base.Encode()},
+      {'M',moved.Encode(),moved.Encode(),base.Encode()}};
+    const auto indexed=HomeNativeCapabilities::Index(rows);
+    assert(indexed.Placed.size()==1&&indexed.Movable->size()==2);
 }
 ''',encoding="utf-8")
     exe=Path(d)/"native"
     subprocess.run(["g++","-std=c++20","-Wall","-Wextra","-Werror","-I",str(up/"Code/common"),str(src),"-o",str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-print("PASS native resident classification, coverage and integration source guards")
+assert "catalog.Movable=HomeNativeCapabilities::Movable()" in home
+assert "HomeInstance::NativeResidentBinding(actor->formID,base)" in overlay
+server=(up/"Code/server/Services/CharacterService.cpp").read_text()
+assert "A guest's ephemeral actor is not an authoritative incarnation" in server
+assert "no eligible owner remains" in server
+print("PASS native resident classification, static and moved-in coverage, authority and integration source guards")

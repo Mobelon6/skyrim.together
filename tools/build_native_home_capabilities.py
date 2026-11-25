@@ -43,20 +43,28 @@ def classify(reader, unpack):
         d = read()
         if len(d.get(b"XESP", b"")) >= 4:
             parents[key] = resolve(unpack(d[b"XESP"]))
-        if flags & ~0x800 or len(d.get(b"NAME", b"")) != 4 or len(d.get(b"DATA", b"")) != 24:
+        allowed_flags = 0xc00 if kind == b"ACHR" else 0x800
+        if flags & ~allowed_flags or len(d.get(b"NAME", b"")) != 4 or len(d.get(b"DATA", b"")) != 24:
             continue
         root = next((resolve(unpack(g)) for g in reversed(ctx)
                      if unpack(g[4:]) in (6, 8, 9, 10)), None)
         base = resolve(unpack(d[b"NAME"]))
         tag = bases.get(base)
-        if root not in cells or not tag or any(k[0] in GENERATED for k in (root, key, base)):
+        if not root or not tag or any(k[0] in GENERATED for k in (root, key, base)):
+            continue
+        if tag != "A" and root not in cells:
             continue
         if (kind == b"ACHR") != (tag == "A"):
             continue
-        if set(d) <= (DOOR_FIELDS if tag in ("D", "A") else SEAT_FIELDS):
+        if tag == "A":
+            if key == ("skyrim.esm", 0x14) or base == ("skyrim.esm", 7):
+                continue
+            if set(d) <= {b"EDID", b"NAME", b"DATA", b"XSCL"} and len(d.get(b"XSCL", bytes(4))) == 4:
+                rows[key] = ("A" if root in cells else "M"), root, key, base
+        elif set(d) <= (DOOR_FIELDS if tag == "D" else SEAT_FIELDS):
             rows[key] = tag, root, key, base
     controlled = set(parents.values())
-    return sorted(row for k, row in rows.items() if row[0] not in ("D", "A") or k not in controlled)
+    return sorted(row for k, row in rows.items() if row[0] not in ("D", "A", "M") or k not in controlled)
 
 
 def build(out, reader, unpack):

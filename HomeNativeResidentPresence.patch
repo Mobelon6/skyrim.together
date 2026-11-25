@@ -1,0 +1,283 @@
+diff --git a/Code/common/HomeNativeCapabilities.h b/Code/common/HomeNativeCapabilities.h
+--- a/Code/common/HomeNativeCapabilities.h
++++ b/Code/common/HomeNativeCapabilities.h
+@@ -12,13 +12,15 @@
+ {
+     std::string line;
+     if (!std::getline(in,line)||line!="STM-NATIVE-HOME-OBJECTS 1") return {};
+-    std::set<Row> rows;
+-    while (std::getline(in,line))
++    std::set<Row> rows;
++    std::set<std::string> residentRefs;
++    while (std::getline(in,line))
+     {
+         if (line.empty()||line.size()>2048||rows.size()>=1000000) return {};
+         std::istringstream s(line);
+         char tag{};std::string root,ref,base,extra;
+-        if (!(s>>tag>>root>>ref>>base)||(s>>extra)||(tag!='D'&&tag!='S'&&tag!='A')) return {};
++        if (!(s>>tag>>root>>ref>>base)||(s>>extra)||(tag!='D'&&tag!='S'&&tag!='A'&&tag!='M')) return {};
++        if ((tag=='A'||tag=='M')&&!residentRefs.insert(ref).second) return {};
+         for (const auto* key:{&root,&ref,&base})
+         {
+             const auto k=TradeProperties::DecodeForm(*key);
+@@ -44,29 +46,62 @@
+     try {const auto& rows=Loaded();return rows&&rows->count({tag,root,ref,base});}
+     catch (...) {return false;}
+ }
+-inline std::map<std::string,TradeProperties::FormKey> Residents(const std::string& root)
+-{
+-    std::map<std::string,TradeProperties::FormKey> result;
+-    const auto& rows=Loaded();
+-    if (rows)
+-        for (const auto& [tag,cell,ref,base]:*rows)
+-            if (tag=='A'&&cell==root)
+-                if (auto key=TradeProperties::DecodeForm(base)) result.emplace(ref,*key);
+-    return result;
+-}
+-inline bool Covers(const std::map<std::string,TradeProperties::FormKey>& bases,
+-    const HomeSnapshot::State& state,const HomeResidents::Residents& records)
+-{
+-    if (state.ResidentKeys.size()!=bases.size()||records.size()!=bases.size()||
+-        bases.size()>HomeResidents::MaxResidents) return false;
+-    for (const auto& [key,base]:bases)
+-    {
+-        const auto it=records.find(key);
+-        if (!state.ResidentKeys.count(key)||it==records.end()||!it->second.Revision||
+-            !it->second.Value.Valid()||it->second.Value.Reference.Encode()!=key||
+-            it->second.Value.Base.Encode()!=base.Encode()||
+-            (it->second.Value.Flags&2u)) return false;
+-    }
+-    return true;
+-}
++using Bindings=HomeCatalog::MovableResidents;
++struct ResidentIndex
++{
++    std::map<std::string,Bindings> Placed;
++    std::shared_ptr<Bindings> Movable=std::make_shared<Bindings>();
++};
++inline ResidentIndex Index(const std::set<Row>& rows)
++{
++    ResidentIndex result;
++    for (const auto& [tag,cell,ref,base]:rows)
++        if (tag=='A'||tag=='M')
++            if (auto key=TradeProperties::DecodeForm(base))
++            {
++                result.Movable->emplace(ref,*key);
++                if (tag=='A') result.Placed[cell].emplace(ref,*key);
++            }
++    return result;
++}
++inline const ResidentIndex& ResidentBindings()
++{
++    static const auto index=[]()
++    {
++        const auto& rows=Loaded();
++        return rows?Index(*rows):ResidentIndex{};
++    }();
++    return index;
++}
++inline std::shared_ptr<const Bindings> Movable()
++{return ResidentBindings().Movable;}
++inline Bindings Residents(const std::string& root)
++{
++    const auto& placed=ResidentBindings().Placed;
++    const auto it=placed.find(root);
++    return it==placed.end()?Bindings{}:it->second;
++}
++inline bool ResidentMatches(const Bindings& pool,const std::string& ref,const std::string& base)
++{
++    const auto it=pool.find(ref);
++    return it!=pool.end()&&it->second.Encode()==base;
++}
++inline bool Covers(const Bindings& bases,const HomeSnapshot::State& state,
++    const HomeResidents::Residents& records,const Bindings* movable=nullptr)
++{
++    if (state.ResidentKeys.size()!=bases.size()||records.size()<bases.size()||
++        records.size()>HomeResidents::MaxResidents) return false;
++    for (const auto& [key,base]:bases)
++        if (!state.ResidentKeys.count(key)||!records.count(key)) return false;
++    for (const auto& [key,record]:records)
++    {
++        const auto placed=bases.find(key);
++        const auto& pool=placed!=bases.end()?bases:(movable?*movable:bases);
++        if (!record.Revision||!record.Value.Valid()||record.Value.Reference.Encode()!=key||
++            !ResidentMatches(pool,key,record.Value.Base.Encode())||(record.Value.Flags&2u)) return false;
++        if (std::any_of(state.Refs.begin(),state.Refs.end(),[&](const auto& row){return row.Key.Encode()==key;}))
++            return false;
++    }
++    return true;
++}
+ }
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -164,8 +164,12 @@
+ {
+     HomeCatalog::Cell catalog;
+     const auto key=NativeFormKey(cell);
+-    if (key) {catalog.Root=*key;catalog.ResidentBases=HomeNativeCapabilities::Residents(key->Encode());}
+-    return catalog;
++    if (key)
++    {
++        catalog.Root=*key;catalog.ResidentBases=HomeNativeCapabilities::Residents(key->Encode());
++        catalog.Movable=HomeNativeCapabilities::Movable();
++    }
++    return catalog;
+ }
+ bool NativeStanding(World& world,const Actor& actor)
+ {
+@@ -574,7 +578,8 @@
+     const auto bytes=CampaignAccess::HomeBaseline(campaign,slot);
+     const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
+     const auto records=CampaignAccess::HomeResidentView(campaign,slot);
+-    if (!state||!records||!HomeNativeCapabilities::Covers(HomeNativeCapabilities::Residents(root),*state,*records))
++    if (!state||!records||!HomeNativeCapabilities::Covers(HomeNativeCapabilities::Residents(root),*state,*records,
++        HomeNativeCapabilities::Movable().get()))
+         return false;
+     if (!target.refData.refArray||target.refData.capacity>131072) return false;
+     for (uint32_t i=0;i<target.refData.capacity;++i)
+@@ -608,7 +613,8 @@
+     const auto residents=CampaignAccess::HomeResidentView(campaign,slot);
+     const auto objects=CampaignAccess::HomeObjectView(campaign,slot);
+     if (!state || state->Omitted || !state->Legacy.empty() || !residents || !objects ||
+-        !HomeNativeCapabilities::Covers(HomeNativeCapabilities::Residents(root),*state,*residents)) return {};
++        !HomeNativeCapabilities::Covers(HomeNativeCapabilities::Residents(root),*state,*residents,
++            HomeNativeCapabilities::Movable().get())) return {};
+     for (auto& r:state->Refs)
+     {
+         if (r.Inventory==1 || r.Inventory==3) r.Items.clear();
+@@ -861,9 +867,17 @@
+     {
+         if (next==candidates.end()) next=candidates.begin();
+         const auto& key=*next++;ctx.LastKey=key;
+-        auto state=ObserveResident(key,cell,slots);
+-        if (!state) continue;
+-        const auto* expectedBase=HomeCatalog::ResidentBase(*catalog,key);
++        if (catalog==&nativeCatalog)
++        {
++            const auto binding=TradeProperties::DecodeForm(key);
++            auto* original=binding?Cast<Actor>(TESForm::GetById(CatalogForm(*binding))):nullptr;
++            auto* extra=original?original->GetExtraDataList():nullptr;
++            if (!extra||extra->HasQuestObjectAlias()||extra->Contains(static_cast<ExtraDataType>(0x36))||
++                extra->Contains(static_cast<ExtraDataType>(0x37))) continue;
++        }
++        auto state=ObserveResident(key,cell,slots);
++        if (!state) continue;
++        const auto* expectedBase=HomeCatalog::ResidentBase(*catalog,key);
+         if (!expectedBase || state->Base.Encode()!=expectedBase->Encode())
+         {ctx.Tracks.erase(key);continue;}
+         const auto found=view->find(key);
+@@ -1070,8 +1084,10 @@
+     {
+         auto* ref=cell.refData.refArray[i].Get();
+         if (!ref) continue;
+-        if (ref->formID==0x14 || NativeTrade::IsProxy(ref) || HomePlacementClient::Tracked(ref)) continue;
+-        if (ref->IsTemporary() && !Cast<Actor>(ref) && ref->GetParentCellEx()==&cell)
++        if (ref->formID==0x14 || NativeTrade::IsProxy(ref) || HomePlacementClient::Tracked(ref)) continue;
++        if (auto* actor=Cast<Actor>(ref);actor&&actor->IsTemporary()&&actor->GetExtension()&&
++            actor->GetExtension()->IsRemote()&&actor->GetExtension()->IsPlayer()) continue;
++        if (ref->IsTemporary() && !Cast<Actor>(ref) && ref->GetParentCellEx()==&cell)
+         {
+             if (ref->IsDeleted() || ref->IsDisabled()) continue;
+             if (auto item=HomePlacementClient::CaptureLegacy(*ref))
+@@ -1919,20 +1935,34 @@
+ {return form && form==originalGuestCell.load();}
+ bool HomeInstance::NativeGuestActive() noexcept
+ {return originalGuestCell.load()!=0;}
+-bool HomeInstance::NativeGuestResident(uint32_t source,uint32_t base) noexcept
+-{
+-    try
+-    {
+-        if (!visit.Native||!visit.Ready||visit.Leaving||!visit.Granted||Clock::now()>=visit.Until) return false;
+-        const auto ref=NativeFormKey(source),npc=NativeFormKey(base);
+-        if (!ref||!npc||!NativeCapability('A',visit.Root,ref->Encode(),npc->Encode())) return false;
+-        const auto records=CampaignAccess::HomeResidentView(visit.Campaign,visit.Slot);
+-        if (!records) return false;
+-        const auto found=records->find(ref->Encode());
+-        return found!=records->end()&&found->second.Value.Base.Encode()==npc->Encode();
+-    }
+-    catch (...) {return false;}
+-}
++bool HomeInstance::NativeResidentBinding(uint32_t source,uint32_t base) noexcept
++{
++    try
++    {
++        const auto ref=NativeFormKey(source),npc=NativeFormKey(base);
++        return ref&&npc&&HomeNativeCapabilities::ResidentMatches(*HomeNativeCapabilities::Movable(),
++            ref->Encode(),npc->Encode());
++    }
++    catch (...) {return false;}
++}
++bool HomeInstance::NativeGuestResident(uint32_t source,uint32_t base) noexcept
++{
++    try
++    {
++        if (!visit.Native||!visit.Ready||visit.Leaving||!visit.Granted||Clock::now()>=visit.Until||
++            !NativeResidentBinding(source,base)) return false;
++        const auto ref=NativeFormKey(source),npc=NativeFormKey(base);
++        if (!ref||!npc) return false;
++        const auto records=CampaignAccess::HomeResidentView(visit.Campaign,visit.Slot);
++        if (!records) return false;
++        const auto found=records->find(ref->Encode());
++        // The live spawn is already scope/owner checked by STR and server.
++        // A first arrival can precede its journal observation; only the live
++        // protected clone is allowed, not an uncommitted offline display.
++        return found==records->end()||found->second.Value.Base.Encode()==npc->Encode();
++    }
++    catch (...) {return false;}
++}
+ void HomeInstance::ForgetOriginalVisit() noexcept
+ {
+     if (visit.Native) {visit={};activeHomeRoute.store(0);projectedRoot.store(0);}
+diff --git a/Code/client/Services/Generic/HomeOriginalOverlay.cpp b/Code/client/Services/Generic/HomeOriginalOverlay.cpp
+--- a/Code/client/Services/Generic/HomeOriginalOverlay.cpp
++++ b/Code/client/Services/Generic/HomeOriginalOverlay.cpp
+@@ -166,7 +166,8 @@
+         const auto objects=CampaignAccess::HomeObjectView(campaign,slot);
+         const auto records=CampaignAccess::HomeResidentView(campaign,slot);
+         if (!state||!objects||!records||state->Omitted||!state->Legacy.empty()||
+-            !HomeNativeCapabilities::Covers(HomeNativeCapabilities::Residents(root),*state,*records)) return false;
++            !HomeNativeCapabilities::Covers(HomeNativeCapabilities::Residents(root),*state,*records,
++                HomeNativeCapabilities::Movable().get())) return false;
+         cellId=cell.formID;
+         std::map<uint32_t,Delta> rows;
+         for (const auto& r:state->Refs)
+@@ -218,9 +219,15 @@
+             if (!ref || ref->formID==0x14) continue;
+             if (auto* actor=Cast<Actor>(ref))
+             {
+-                const auto found=residentBases.find(actor->formID);
+-                if (found==residentBases.end()) return false;
+-                Delta d;d.Ref=actor->formID;d.Base=found->second;d.Type=43;d.Scale=actor->scale;
++                if (actor->IsTemporary()&&actor->GetExtension()&&actor->GetExtension()->IsRemote()&&
++                    actor->GetExtension()->IsPlayer()) continue;
++                const auto found=residentBases.find(actor->formID);
++                const auto base=actor->baseForm?actor->baseForm->formID:0u;
++                if (!base||!HomeInstance::NativeResidentBinding(actor->formID,base)||
++                    (found!=residentBases.end()&&found->second!=base)) return false;
++                // Guest's own eligible arrival may not exist in the owner's ledger.
++                // Preserve its personal visibility without registering it there.
++                Delta d;d.Ref=actor->formID;d.Base=base;d.Type=43;d.Scale=actor->scale;
+                 auto* object=Resolve(d);
+                 const auto personal=Observe(world,d);
+                 if (!object||!personal||!CanChange(*object,d)) return false;
+diff --git a/Code/client/Services/HomeInstance.h b/Code/client/Services/HomeInstance.h
+--- a/Code/client/Services/HomeInstance.h
++++ b/Code/client/Services/HomeInstance.h
+@@ -16,6 +16,7 @@
+ bool ManagedCell(uint32_t local) noexcept;
+ bool NativeGuestCell(uint32_t local) noexcept;
+ bool NativeGuestActive() noexcept;
++bool NativeResidentBinding(uint32_t source,uint32_t base) noexcept;
+ bool NativeGuestResident(uint32_t source,uint32_t base) noexcept;
+ void ForgetOriginalVisit() noexcept;
+ void ObserveLock(uint32_t reference) noexcept;
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign35"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign36"
