@@ -58,7 +58,7 @@ assert "relay.SpatialEpoch=pPlayer->LocationEpoch()" in char
 assert "LastMovement.Observe" in char and "Order::Historical" in char
 client=read("Code/client/Services/Generic/CharacterService.cpp")
 assert "movement.OwnershipEpoch=localComponent.OwnershipEpoch" in client
-assert "OwnershipEpoch!=movement.OwnershipEpoch" in client
+assert "remote.OwnershipEpoch!=movement.OwnershipEpoch" in client
 transport=read("Code/client/Services/Generic/TransportService.cpp")
 assert "m_spatialEpoch.Next()" in transport and "m_spatialEpoch.Reset()" in transport
 assert "m_spatialEpoch.Matches(pMessage->SpatialEpoch)" in transport

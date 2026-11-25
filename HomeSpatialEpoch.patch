@@ -162,8 +162,8 @@ diff --git a/Code/encoding/Structs/Movement.cpp b/Code/encoding/Structs/Movement
 @@ -6,4 +6,4 @@
  bool Movement::operator==(const Movement& acRhs) const noexcept
  {
--    return CellId == acRhs.CellId && WorldSpaceId == acRhs.WorldSpaceId && Position == acRhs.Position && Rotation == acRhs.Rotation && Variables == acRhs.Variables && Direction == acRhs.Direction && HasLookAt == acRhs.HasLookAt && LookOffset == acRhs.LookOffset;
-+    return OwnershipEpoch == acRhs.OwnershipEpoch && CellId == acRhs.CellId && WorldSpaceId == acRhs.WorldSpaceId && Position == acRhs.Position && Rotation == acRhs.Rotation && Variables == acRhs.Variables && Direction == acRhs.Direction && HasLookAt == acRhs.HasLookAt && LookOffset == acRhs.LookOffset;
+-    return CombatEpoch == acRhs.CombatEpoch && CombatMode == acRhs.CombatMode && CellId == acRhs.CellId && WorldSpaceId == acRhs.WorldSpaceId && Position == acRhs.Position && Rotation == acRhs.Rotation && Variables == acRhs.Variables && Direction == acRhs.Direction && HasLookAt == acRhs.HasLookAt && LookOffset == acRhs.LookOffset;
++    return OwnershipEpoch == acRhs.OwnershipEpoch && CombatEpoch == acRhs.CombatEpoch && CombatMode == acRhs.CombatMode && CellId == acRhs.CellId && WorldSpaceId == acRhs.WorldSpaceId && Position == acRhs.Position && Rotation == acRhs.Rotation && Variables == acRhs.Variables && Direction == acRhs.Direction && HasLookAt == acRhs.HasLookAt && LookOffset == acRhs.LookOffset;
  }
 @@ -16,4 +16,5 @@
  void Movement::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
@@ -347,20 +347,45 @@ diff --git a/Code/server/Services/CharacterService.cpp b/Code/server/Services/Ch
 diff --git a/Code/client/Services/Generic/CharacterService.cpp b/Code/client/Services/Generic/CharacterService.cpp
 --- a/Code/client/Services/Generic/CharacterService.cpp
 +++ b/Code/client/Services/Generic/CharacterService.cpp
-@@ -1050,7 +1050,8 @@
-         if (itor == std::end(view))
-             continue;
-+        if (!movement.OwnershipEpoch||view.get<RemoteComponent>(*itor).OwnershipEpoch!=movement.OwnershipEpoch) continue;
- 
+@@ -724,23 +724,24 @@
          auto& interpolationComponent = view.get<InterpolationComponent>(*itor);
  
          InterpolationComponent::TimePoint point;
+         auto& remote = view.get<RemoteComponent>(*itor);
++        if (!movement.OwnershipEpoch||remote.OwnershipEpoch!=movement.OwnershipEpoch) continue;
+         if (movement.CombatMode && movement.CombatEpoch == remote.OwnershipEpoch && acMessage.Tick > remote.LastCombatTick)
+         {
+             remote.LastCombatTick = acMessage.Tick;
+             const auto* ref = m_world.try_get<FormIdComponent>(*itor);
+             if (ref && m_world.GetPartyService().IsInParty())
+             {
+                 if (movement.CombatMode == 2 && remote.CombatMode != 2) OverlayService::ObservePartyCombat(ref->Id);
+                 if (movement.CombatMode == 1 && remote.CombatMode == 2)
+                     OverlayService::BeginCombatSettlement(ref->Id);
+                 if (movement.CombatMode != 1 && remote.CombatMode == 1)
+                     OverlayService::CancelCombatSettlement(ref->Id);
+             }
+             // Targetless combat during surrender is still part of the previous encounter.
+             if (movement.CombatMode != 3 || remote.CombatMode != 2)
+                 remote.CombatMode = movement.CombatMode;
+         }
          point.Tick = acMessage.Tick;
-@@ -1700,4 +1701,6 @@
--        AnimationSystem::SerializeMovement(m_world, pActor, movementMessage.Updates[localComponent.Id]);
-+        auto& movement=movementMessage.Updates[localComponent.Id];
-+        AnimationSystem::SerializeMovement(m_world, pActor, movement);
+         point.Position = movement.Position;
+         point.Rotation = {movement.Rotation.x, 0.f, movement.Rotation.y};
+@@ -1980,15 +1980,16 @@
+             movementMessage.Updates.clear();
+         }
+ 
+         auto& movement = movementMessage.Updates[localComponent.Id];
+         AnimationSystem::SerializeMovement(m_world, pActor, movement);
 +        movement.OwnershipEpoch=localComponent.OwnershipEpoch;
+         if (pActor != pPlayer && pActor->GetExtension() && !pActor->GetExtension()->IsPlayer() && !pActor->IsDead())
+         {
+             auto* target = pActor->GetCombatTarget();
+             movement.CombatEpoch = localComponent.OwnershipEpoch;
+             movement.CombatMode = !pActor->IsInCombat() ? 1 :
+                 (target && (target == pPlayer || (target->GetExtension() && target->GetExtension()->IsPlayer()))) ? 2 : 3;
+         }
      }
  
      if (!actionsMessage.Actions.empty())
