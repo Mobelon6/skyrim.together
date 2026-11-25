@@ -57,6 +57,11 @@ int main(int argc,char** argv)
     assert(HomePermissions::Set(server,5,home->Slot,6,HomePermissions::Right::Visit,0));
     assert(CampaignCheckpoint::Publish(server,71,6,foreign)==Result::Invalid);
     foreign.Observed=server.Current();
+    foreign.Entrance={"skyrim.esm",0x5678};foreign.Shape=1234;
+    auto guest=CampaignCheckpoint::Decode(foreign.Encode());
+    assert(guest&&guest->Encode()==foreign.Encode());
+    auto noShape=foreign;noShape.Shape=0;assert(!noShape.Valid());
+    auto noSlot=foreign;noSlot.HomeSlot=0;assert(!noSlot.Valid());
     assert(CampaignCheckpoint::CanResume(server,71,foreign));
     assert(CampaignCheckpoint::Publish(server,71,6,foreign)==Result::Committed);
     const auto historical=foreign.Observed;

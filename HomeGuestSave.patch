@@ -1,0 +1,586 @@
+diff --git a/Code/common/CampaignCheckpoint.h b/Code/common/CampaignCheckpoint.h
+--- a/Code/common/CampaignCheckpoint.h
++++ b/Code/common/CampaignCheckpoint.h
+@@ -27,6 +27,8 @@
+     TradeProperties::FormKey Cell,WorldSpace;
+     uint32_t HomeSlot{};
+     std::array<uint32_t,6> Pose{};
++    TradeProperties::FormKey Entrance;
++    uint64_t Shape{};
+     bool Valid() const
+     {
+         if (!CampaignIdentity::Encode(Save)||!Observed.Tag||Observed.Revision<Save.Applied.Revision||
+@@ -34,6 +36,7 @@
+             (!Cell.Empty()&&!Cell.Valid())||(!WorldSpace.Empty()&&!WorldSpace.Valid())||
+             (Cell.Empty()&&WorldSpace.Empty())||HomeSlot>HomeRegistry::MaxSlot||
+             (HomeSlot&&(!Cell.Valid()||!WorldSpace.Empty()))) return false;
++        if (Entrance.Empty()?Shape!=0:(!Entrance.Valid()||!HomeSlot||!Shape)) return false;
+         for (auto v:Pose) if (!std::isfinite(std::bit_cast<float>(v))) return false;
+         return true;
+     }
+@@ -44,6 +47,7 @@
+             std::to_string(Observed.Revision)+" "+std::to_string(Observed.Tag)+" "+Digest+
+             " "+Cell.Encode()+" "+WorldSpace.Encode()+" "+std::to_string(HomeSlot);
+         for (auto v:Pose) s+=" "+std::to_string(v);
++        if (!Entrance.Empty()) s+=" "+Entrance.Encode()+" "+std::to_string(Shape);
+         return s;
+     }
+ };
+@@ -56,8 +60,14 @@
+           >>r.Observed.Revision>>r.Observed.Tag>>r.Digest>>cell>>world>>r.HomeSlot)) return {};
+     for (auto& v:r.Pose) if (!(in>>v)) return {};
+     auto c=TradeProperties::DecodeForm(cell),w=TradeProperties::DecodeForm(world);
+-    if (!c||!w||in>>extra) return {};
+-    r.Cell=std::move(*c);r.WorldSpace=std::move(*w);
++    if (!c||!w) return {};
++    r.Cell=std::move(*c);r.WorldSpace=std::move(*w);
++    if (in>>extra)
++    {
++        auto entrance=TradeProperties::DecodeForm(extra);
++        if (!entrance||!entrance->Valid()||!(in>>r.Shape)||in>>extra) return {};
++        r.Entrance=std::move(*entrance);
++    }
+     if (!r.Valid()||r.Encode()!=s) return {};
+     return r;
+ }
+diff --git a/Code/client/Services/CampaignCheckpointClient.h b/Code/client/Services/CampaignCheckpointClient.h
+--- a/Code/client/Services/CampaignCheckpointClient.h
++++ b/Code/client/Services/CampaignCheckpointClient.h
+@@ -4,7 +4,7 @@
+ namespace CampaignCheckpointClient
+ {
+ std::optional<CampaignCheckpoint::Record> Capture(World&) noexcept;
+-void Queue(CampaignCheckpoint::Record) noexcept;
++bool Queue(CampaignCheckpoint::Record) noexcept;
+ // Native load target may execute on a worker. Exchange metadata only.
+ void ForgetLoaded() noexcept;
+ void NoteLoadedFile(std::string) noexcept;
+diff --git a/Code/client/Games/SaveLoad.cpp b/Code/client/Games/SaveLoad.cpp
+--- a/Code/client/Games/SaveLoad.cpp
++++ b/Code/client/Games/SaveLoad.cpp
+@@ -10,6 +10,11 @@
+ #include <Services/CampaignCheckpointClient.h>
+ #include <Services/HomeOriginalOverlay.h>
+ #include <Services/HomeInstance.h>
++#include <Services/HomeGuestSave.h>
++#include <Services/CampaignAccess.h>
++#include <Utils.h>
++#include <atomic>
++#include <chrono>
+ #include <Games/CampaignCheckpointFile.h>
+ #include <cstdlib>
+ 
+@@ -161,6 +166,22 @@
+     bool Entered{},Returned{},Invalid{};
+ };
+ thread_local CheckpointWrite* currentWrite{};
++struct PendingGuestSave
++{
++    HomeGuestSave::Context Visit;
++    int32_t Device{};
++    uint32_t Stats{};
++    std::optional<std::string> Name;
++    std::chrono::steady_clock::time_point Until;
++};
++std::optional<PendingGuestSave> pendingGuestSave;
++std::atomic_bool guestSaveBusy{},guestHooksReady{};
++BGSSaveLoadManager* SaveManager()
++{
++    // CommonLibSSE-NG BGSSaveLoadManager::Singleton, AE 403340.
++    auto* address=VersionDb::Get().FindAddressById(403340);
++    return address?*reinterpret_cast<BGSSaveLoadManager**>(address):nullptr;
++}
+ void HookSaveWorld(BGSSaveLoadManager* manager,uint64_t* data)
+ {
+     auto* write=currentWrite;
+@@ -181,49 +202,68 @@
+     realSaveWorld(manager,data);
+     if (write) write->Returned=true;
+ }
+-bool HookSaveRequest(BGSSaveLoadManager* manager,int32_t device,uint32_t stats,const char* name)
+-{
+-    // Fail closed until the guest-save coordinator has restored the original.
+-    if (HomeOriginalOverlay::Dirty() || HomeInstance::NativeGuestActive())
+-    {
+-        spdlog::warn("STM save refused: original home state not restored");
+-        return false;
+-    }
+-
+-    if (currentWrite)
+-    {
+-        currentWrite->Invalid=true;return realSaveRequest(manager,device,stats,name);
+-    }
+-    auto* world=World::Exists()?&World::Get():nullptr;
+-    if (!world||!world->BeginCheckpointWrite()) return realSaveRequest(manager,device,stats,name);
+-    struct Guard
+-    {
+-        World* Instance;
+-        ~Guard(){currentWrite=nullptr;if (Instance) Instance->EndCheckpointWrite();}
+-    } guard{world};
+-    auto record=CampaignCheckpointClient::Capture(*world);
+-    if (!record)
+-    {
+-        world->EndCheckpointWrite();guard.Instance=nullptr;
+-        return realSaveRequest(manager,device,stats,name);
+-    }
+-    CheckpointWrite write;currentWrite=&write;
+-    const bool success=realSaveRequest(manager,device,stats,name);
+-    // Require the actual outer bool, inner return and changed readable ESS.
+-    // A queued/worker write not observed here is left to native Skyrim.
++bool WriteWithCheckpoint(BGSSaveLoadManager* manager,int32_t device,uint32_t stats,const char* name,
++                         CampaignCheckpoint::Record& record,bool& queued)
++{
++    CheckpointWrite write;currentWrite=&write;
++    struct Reset {~Reset(){currentWrite=nullptr;}} reset;
++    const bool success=realSaveRequest(manager,device,stats,name);
++    queued=false;
+     if (success&&write.Entered&&write.Returned&&!write.Invalid)
+     {
+         auto digest=CampaignCheckpointFile::Digest(write.Path);
+         if (digest&&*digest!=write.Before)
+         {
+-            record->Digest=std::move(*digest);
+-            CampaignCheckpointClient::Queue(std::move(*record));
++            record.Digest=std::move(*digest);
++            queued=CampaignCheckpointClient::Queue(record);
+         }
+         else spdlog::warn("STM checkpoint skipped: ESS not changed or not readable after save");
+     }
+     else if (success) spdlog::warn("STM checkpoint skipped: native write boundary not observed");
+     return success;
+ }
++bool HookSaveRequest(BGSSaveLoadManager* manager,int32_t device,uint32_t stats,const char* name)
++{
++    if (currentWrite) {currentWrite->Invalid=true;return false;}
++    if (HomeGuestSave::Busy()) return false;
++    auto* world=World::Exists()?&World::Get():nullptr;
++    if (HomeOriginalOverlay::Dirty()||HomeInstance::NativeGuestActive())
++    {
++        // A deferred native request has NOT saved anything yet. Capture on
++        // the game thread only; never wait on a loading/saving worker.
++        if (!world||!HomeGuestSave::HooksReady()||manager!=SaveManager()||!world->BeginCheckpointWrite()) return false;
++        struct Unlock {World& Instance;~Unlock(){Instance.EndCheckpointWrite();}} unlock{*world};
++        try
++        {
++            PendingGuestSave request;request.Device=device;request.Stats=stats;
++            if (name) request.Name=std::string(name);
++            if (request.Name&&request.Name->size()>1024) return false;
++            auto visit=HomeGuestSave::CaptureAndLeave(*world);
++            if (!visit)
++            {Utils::ShowHudMessage("Сохранение: дождитесь завершения операций в гостях.");return false;}
++            request.Visit=std::move(*visit);
++            request.Until=std::chrono::steady_clock::now()+std::chrono::seconds(60);
++            pendingGuestSave=std::move(request);guestSaveBusy.store(true);
++            Utils::ShowHudMessage("Подготовка личного сохранения. Не перемещайте персонажа.");
++        }
++        catch (...) {spdlog::warn("STM could not defer guest save");}
++        return false;
++    }
++    if (!world||!world->BeginCheckpointWrite()) return realSaveRequest(manager,device,stats,name);
++    struct Guard
++    {
++        World* Instance;
++        ~Guard(){currentWrite=nullptr;if (Instance) Instance->EndCheckpointWrite();}
++    } guard{world};
++    auto record=CampaignCheckpointClient::Capture(*world);
++    if (!record)
++    {
++        world->EndCheckpointWrite();guard.Instance=nullptr;
++        return realSaveRequest(manager,device,stats,name);
++    }
++    bool queued{};
++    return WriteWithCheckpoint(manager,device,stats,name,*record,queued);
++}
+ bool LoadWorldWithCheckpoint(BGSSaveLoadManager* manager,uint64_t* data,uint32_t flags,uint32_t mode,void* context)
+ {
+     const auto* root=_wgetenv(L"STM_CAMPAIGN_ROOT");
+@@ -311,6 +351,44 @@
+     realSaveWorld=reinterpret_cast<SaveWorld*>(write);
+     TP_HOOK(&realSaveRequest,HookSaveRequest);
+     TP_HOOK(&realSaveWorld,HookSaveWorld);
+-    spdlog::info("STM registered native save checkpoint hooks for Steam 1.6.1170");
+-});
+-}
++    guestHooksReady.store(true);
++    spdlog::info("STM registered native save checkpoint hooks for Steam 1.6.1170");
++});
++}
++
++bool HomeGuestSave::HooksReady() noexcept {return guestHooksReady.load();}
++bool HomeGuestSave::Busy() noexcept {return guestSaveBusy.load();}
++void HomeGuestSave::Cancel() noexcept
++{
++    pendingGuestSave.reset();guestSaveBusy.store(false);
++}
++void HomeGuestSave::Pump(World& world) noexcept
++{
++    if (!Busy()||!world.BeginCheckpointWrite()) return;
++    struct Unlock {World& Instance;~Unlock(){Instance.EndCheckpointWrite();}} unlock{world};
++    try
++    {
++        if (!pendingGuestSave) {Cancel();return;}
++        auto& request=*pendingGuestSave;
++        if (std::chrono::steady_clock::now()>=request.Until||!world.GetTransport().IsOnline())
++        {Cancel();Utils::ShowHudMessage("Отложенное сохранение отменено: переход не завершён или нет соединения.");return;}
++        if (HomeInstance::NativeGuestActive()||HomeOriginalOverlay::Dirty()||!CampaignAccess::GameReady()) return;
++        const auto identity=CampaignAccess::Current(world);
++        if (!identity||identity->Save!=request.Visit.Checkpoint.Save||!AtReturn(request.Visit))
++        {Cancel();Utils::ShowHudMessage("Сохранение отменено: личная позиция или персонаж изменились.");return;}
++        if (!InventoryReady(world)) return;
++        auto* manager=SaveManager();
++        if (!manager) {Cancel();return;}
++        auto record=request.Visit.Checkpoint;
++        bool queued{};
++        // Only the personal state and return location can reach the writer.
++        // The saved guest pose is metadata, not a mutation of the ESS.
++        const bool success=WriteWithCheckpoint(manager,request.Device,request.Stats,
++            request.Name?request.Name->c_str():nullptr,record,queued);
++        Cancel();
++        if (success&&queued) Utils::ShowHudMessage("Личное сохранение записано; точка визита ожидает подтверждения сервера.");
++        else Utils::ShowHudMessage("Точка визита не подтверждена: проверьте сохранение.");
++        if (!Resume(world,record)) Utils::ShowHudMessage("Возобновление визита недоступно. Вы остались в личном мире.");
++    }
++    catch (...) {Cancel();spdlog::warn("STM deferred guest save failed");}
++}
+diff --git a/Code/client/World.cpp b/Code/client/World.cpp
+--- a/Code/client/World.cpp
++++ b/Code/client/World.cpp
+@@ -61,6 +61,7 @@
+ 
+ #include <Services/CampaignCheckpointClient.h>
+ #include <Services/HomeOriginalOverlay.h>
++#include <Services/HomeGuestSave.h>
+ 
+ World::~World() = default;
+ 
+@@ -98,6 +99,7 @@
+         spdlog::warn("STM save load deferred: active session must disconnect on game thread; retry load");
+         return false;
+     }
++    HomeGuestSave::Cancel();
+     CampaignCheckpointClient::ForgetLoaded();
+     m_loadedWorld=m_loadFailed=m_successfulLoadPending=false;
+     m_saveLoadDepth.store(1,std::memory_order_release);
+@@ -151,6 +153,7 @@
+ 
+ void World::Update() noexcept
+ {
++    HomeGuestSave::Pump(*this);
+     std::unique_lock lock(m_saveLoadMutex,std::try_to_lock);
+     if (!lock.owns_lock() || IsLoadingSave() || m_inWorldFrame) return;
+     m_inWorldFrame=true;
+@@ -175,7 +178,7 @@
+     if (!m_transport.PrepareWorldFrame())
+     {
+         if (!wasSuspended && m_transport.AtTitle())
+-        {CampaignCheckpointClient::ForgetLoaded();ResetWorldTracking();}
++        {HomeGuestSave::Cancel();CampaignCheckpointClient::ForgetLoaded();ResetWorldTracking();}
+         m_runner.OnUpdate(UpdateEvent(cDeltaSeconds)); // suspended tickets are discarded
+         m_transport.Update();
+         return;
+diff --git a/Code/client/Services/HomeGuestSave.h b/Code/client/Services/HomeGuestSave.h
+new file mode 100644
+--- /dev/null
++++ b/Code/client/Services/HomeGuestSave.h
+@@ -0,0 +1,23 @@
++#pragma once
++#include <CampaignCheckpoint.h>
++struct World;
++
++namespace HomeGuestSave
++{
++struct Context
++{
++    CampaignCheckpoint::Record Checkpoint;
++    uint32_t ReturnCell{};
++    std::array<uint32_t,6> ReturnPose{};
++};
++// Game-thread capture and exit; no engine objects retained across frames.
++std::optional<Context> CaptureAndLeave(World&) noexcept;
++bool AtReturn(const Context&) noexcept;
++bool Resume(World&,const CampaignCheckpoint::Record&) noexcept;
++bool InventoryReady(World&) noexcept;
++// Native save coordinator. Pump runs outside the STR world frame.
++bool HooksReady() noexcept;
++bool Busy() noexcept;
++void Pump(World&) noexcept;
++void Cancel() noexcept;
++}
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -3,4 +3,7 @@
+ #include <Services/HomeInstance.h>
+ #include <Services/HomeOriginalOverlay.h>
++#include <Services/HomeGuestSave.h>
++#include <Services/CampaignCheckpointClient.h>
++#include <Services/PapyrusService.h>
+ #include <cstdlib>
+ #include <Services/HomePlacementClient.h>
+@@ -134,23 +137,25 @@
+     return cell;
+ }
+-std::optional<TradeProperties::FormKey> NativeEntranceRoot(uint32_t form)
+-{
+-    auto* ref=Cast<TESObjectREFR>(TESForm::GetById(form));
+-    auto* cell=NativeDoorDestination(ref);
+-    if (!cell) return {};
+-    std::vector<InventoryEvidence::PluginSlot> slots;
+-    if (auto* mods=ModManager::Get())
+-        for (const auto* mod:mods->mods)
+-        {
+-            if (!mod || !mod->IsLoaded()) continue;
+-            const auto* end=std::find(mod->filename,mod->filename+sizeof(mod->filename),'\0');
+-            if (end!=mod->filename+sizeof(mod->filename))
+-                slots.push_back({mod->GetId(),mod->IsLite(),std::string(mod->filename,end)});
+-        }
+-    const auto key=InventoryEvidence::Resolve(cell->formID,slots);
+-    if (!key) return {};
+-    TradeProperties::FormKey root{key->Plugin,key->Local};
+-    return root.Valid()?std::optional<TradeProperties::FormKey>(std::move(root)):std::nullopt;
++std::optional<TradeProperties::FormKey> NativeFormKey(uint32_t form)
++{
++    std::vector<InventoryEvidence::PluginSlot> slots;
++    if (auto* mods=ModManager::Get())
++        for (const auto* mod:mods->mods)
++        {
++            if (!mod || !mod->IsLoaded()) continue;
++            const auto* end=std::find(mod->filename,mod->filename+sizeof(mod->filename),'\0');
++            if (end!=mod->filename+sizeof(mod->filename))
++                slots.push_back({mod->GetId(),mod->IsLite(),std::string(mod->filename,end)});
++        }
++    const auto key=InventoryEvidence::Resolve(form,slots);
++    if (!key) return {};
++    TradeProperties::FormKey root{key->Plugin,key->Local};
++    return root.Valid()?std::optional<TradeProperties::FormKey>(std::move(root)):std::nullopt;
++}
++std::optional<TradeProperties::FormKey> NativeEntranceRoot(uint32_t form)
++{
++    auto* cell=NativeDoorDestination(Cast<TESObjectREFR>(TESForm::GetById(form)));
++    return cell?NativeFormKey(cell->formID):std::nullopt;
+ }
+ // Prefer the engine's original door. The legacy catalog remains a fallback
+ // for its existing projection route when a linked reference is unloaded.
+@@ -175,5 +180,10 @@
+     std::array<uint32_t,12> Pose{};
+     Clock::time_point MoveUntil{},ShapeAt{};
+     std::string Shape;
+-};
+-VisitState visit;
++    std::optional<std::array<uint32_t,6>> ResumePose;
++    uint64_t ResumeShape{};
++    bool ResumeIssued{};
++};
++VisitState visit;
++std::string lastResumeDigest;
++Clock::time_point resumePoll{};
+@@ -399,6 +409,6 @@
+ bool NativeVisitsEnabled()
+ {
+     const auto* flag=std::getenv("STM_NATIVE_HOME_VISITS");
+-    return flag && std::string_view(flag)=="1";
++    return HomeGuestSave::HooksReady() && flag && std::string_view(flag)=="1";
+ }
+ std::optional<std::string> NativeVisitShape(uint64_t campaign,uint32_t slot)
+@@ -1127,3 +1137,4 @@
+ bool OverlayService::TryHouseDoor(uint32_t form) noexcept
+ {
++    if (HomeGuestSave::Busy()) return true;
+     if (originalGuestCell.load())
+@@ -1303,4 +1314,15 @@
+     if (auto* p=PlayerCharacter::Get();!p || !p->GetParentCellEx() || p->GetParentCellEx()->formID!=lockContext.Cell ||
+         !CampaignAccess::GameReady() || !m_transport.IsOnline()) lockContext={};
++    if (!visit.Nonce && !HomeGuestSave::Busy() && NativeVisitsEnabled() &&
++        CampaignAccess::GameReady() && m_transport.IsOnline() && Clock::now()>=resumePoll)
++    {
++        resumePoll=Clock::now()+1s;
++        if (auto record=CampaignCheckpointClient::Loaded(m_world);record &&
++            !record->Entrance.Empty() && record->Digest!=lastResumeDigest)
++        {
++            lastResumeDigest=record->Digest;
++            HomeGuestSave::Resume(m_world,*record);
++        }
++    }
+     if (visit.Native)
+     {
+@@ -1398,3 +1420,32 @@
++        if (visit.Applied && visit.ResumePose)
++        {
++            const auto& pose=*visit.ResumePose;
++            if (HomeSnapshot::Digest(visit.Shape)!=visit.ResumeShape)
++            {
++                Utils::ShowHudMessage("Обстановка дома изменилась: возвращение у входа.");
++                visit.ResumePose.reset();
++            }
++            else
++            {
++                const auto coord=[&](size_t i){return std::bit_cast<float>(pose[i]);};
++                if (!visit.ResumeIssued)
++                {
++                    const auto* fn=m_world.ctx().at<PapyrusService>().Get("ObjectReference","SetPosition");
++                    if (!fn) {visit.Leaving=true;return;}
++                    p->SetRotation(coord(3),coord(4),coord(5));
++                    auto setter=PapyrusFunction<void,TESObjectREFR,float,float,float>(fn);
++                    setter(p,coord(0),coord(1),coord(2));
++                    visit.ResumeIssued=true;visit.MoveUntil=now+5s;
++                }
++                const auto dx=p->position.x-coord(0),dy=p->position.y-coord(1),dz=p->position.z-coord(2);
++                if (!std::isfinite(dx+dy+dz) || dx*dx+dy*dy+dz*dz>256.f)
++                {
++                    if (now>=visit.MoveUntil) {visit.Leaving=true;Utils::ShowHudMessage("Не удалось восстановить позицию визита.");}
++                    return;
++                }
++                visit.ResumePose.reset();
++            }
++        }
+         if (visit.Applied) visit.Ready=true;
+         if (valid && visit.Nonce && now>=visit.Next)
+         {
+@@ -1524,2 +1575,71 @@
++std::optional<HomeGuestSave::Context> HomeGuestSave::CaptureAndLeave(World& world) noexcept
++{
++    try
++    {
++        auto* p=PlayerCharacter::Get();
++        auto* cell=p?p->GetParentCellEx():nullptr;
++        if (!p||!cell||!cell->IsAttached()||!visit.Native||!visit.Ready||!visit.Applied||
++            visit.Leaving||!visit.Granted||Clock::now()>=visit.Until||cell->formID!=visit.Copy||
++            !InventoryReady(world)) return {};
++        const auto shape=NativeVisitShape(visit.Campaign,visit.Slot);
++        const auto entrance=NativeFormKey(visit.Door);
++        auto record=CampaignCheckpointClient::Capture(world);
++        if (!shape||*shape!=visit.Shape||!entrance||!record||record->HomeSlot!=visit.Slot||
++            record->Save.Campaign!=visit.Campaign||record->Save.Character!=visit.Character||
++            record->Cell.Encode()!=visit.Root) return {};
++        record->Entrance=*entrance;record->Shape=HomeSnapshot::Digest(*shape);
++        if (!record->Shape) return {};
++        Context result;result.Checkpoint=std::move(*record);result.ReturnCell=visit.ReturnCell;
++        std::copy_n(visit.Pose.begin()+6,6,result.ReturnPose.begin());
++        if (!result.ReturnCell) return {};
++        visit.Ready=false;visit.Leaving=true;
++        return result;
++    }
++    catch (...) {return {};}
++}
++bool HomeGuestSave::AtReturn(const Context& context) noexcept
++{
++    auto* p=PlayerCharacter::Get();
++    auto* cell=p?p->GetParentCellEx():nullptr;
++    if (!cell||!cell->IsAttached()||cell->formID!=context.ReturnCell||
++        HomeInstance::NativeGuestActive()||HomeOriginalOverlay::Dirty()) return false;
++    const auto& pos=context.ReturnPose;
++    const auto dx=p->position.x-std::bit_cast<float>(pos[0]);
++    const auto dy=p->position.y-std::bit_cast<float>(pos[1]);
++    const auto dz=p->position.z-std::bit_cast<float>(pos[2]);
++    return std::isfinite(dx+dy+dz)&&dx*dx+dy*dy+dz*dz<=4096.f;
++}
++bool HomeGuestSave::Resume(World& world,const CampaignCheckpoint::Record& record) noexcept
++{
++    try
++    {
++        if (!NativeVisitsEnabled()||visit.Nonce||HomeInstance::NativeGuestActive()||
++            HomeOriginalOverlay::Dirty()||!record.Entrance.Valid()||!record.Shape||!record.HomeSlot||
++            !CampaignAccess::GameReady()) return false;
++        const auto identity=CampaignAccess::Current(world);
++        auto* p=PlayerCharacter::Get();
++        const auto entrance=CatalogForm(record.Entrance);
++        const auto root=NativeEntranceRoot(entrance);
++        if (!identity||identity->Save!=record.Save||!p||!root||root->Encode()!=record.Cell.Encode()||
++            !NearDoor(*p,entrance)) return false;
++        bool allowed=false;
++        for (const auto& [slot,owner]:CampaignAccess::HomeOffers(record.Save.Campaign,record.Save.Character,root->Encode()))
++        {
++            (void)owner;
++            if (slot==record.HomeSlot) allowed=true;
++        }
++        if (!allowed||!NativeVisitShape(record.Save.Campaign,record.HomeSlot)) return false;
++        VisitState next;
++        if (!++token) ++token;
++        next.Campaign=record.Save.Campaign;next.Character=record.Save.Character;
++        next.Slot=record.HomeSlot;next.Nonce=token;next.Door=entrance;next.Root=root->Encode();
++        next.Copy=CatalogForm(*root);next.Base=root->Local;next.Native=true;
++        next.Until=Clock::now()+10s;next.Next=Clock::now()+3s;
++        next.ResumePose=record.Pose;next.ResumeShape=record.Shape;
++        if (!next.Copy||!SendAccess(world,*identity,3,next.Slot,next.Root,0,next.Nonce,0)) return false;
++        visit=std::move(next);return true;
++    }
++    catch (...) {return false;}
++}
+ bool HomeInstance::NativeGuestCell(uint32_t form) noexcept
+ {return form && form==originalGuestCell.load();}
+@@ -1528,5 +1648,5 @@
+ void HomeInstance::ForgetOriginalVisit() noexcept
+ {
+     if (visit.Native) {visit={};activeHomeRoute.store(0);projectedRoot.store(0);}
+-    originalGuestCell.store(0);
++    originalGuestCell.store(0);lastResumeDigest.clear();resumePoll={};
+ }
+diff --git a/Code/client/Services/Generic/PartyTrade.cpp b/Code/client/Services/Generic/PartyTrade.cpp
+--- a/Code/client/Services/Generic/PartyTrade.cpp
++++ b/Code/client/Services/Generic/PartyTrade.cpp
+@@ -26,4 +26,5 @@
+ #include <Services/HomeActorProtection.h>
+ #include <Services/HomePlacementClient.h>
++#include <Services/HomeGuestSave.h>
+ #include <mutex>
+ #include <Forms/TESObjectCELL.h>
+@@ -1673,3 +1674,15 @@
+-bool OverlayService::TryTrade(uint32_t form) noexcept
+-{
++bool HomeGuestSave::InventoryReady(World& world) noexcept
++{
++    try
++    {
++        if (session||nativeRequested||nativeToken.load()||nativeAwaiting||!nativeIntents.empty()||
++            shadowCleanupPending||receiptFailure) return false;
++        if (!CampaignAccess::TradeEnabled()) return true;
++        Wallet w;return w.Load(world)&&Ready(w);
++    }
++    catch (...) {return false;}
++}
++bool OverlayService::TryTrade(uint32_t form) noexcept
++{
++    if (HomeGuestSave::Busy()) return true;
+     auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
+diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
+--- a/Code/client/Services/Generic/QuestJournal.cpp
++++ b/Code/client/Services/Generic/QuestJournal.cpp
+@@ -304,17 +304,17 @@
+     catch (...) {return {};}
+ }
+-void CampaignCheckpointClient::Queue(CampaignCheckpoint::Record r) noexcept
+-{
+-    try
+-    {
+-        if (!CampaignCheckpoint::Known(campaignLink.Journal,campaignLink.Campaign,r)) return;
+-        if (!CampaignCheckpoint::StoreLocal(campaignLink.Root,r))
+-        {spdlog::warn("STM checkpoint local outbox write failed");return;}
+-        const auto id=CampaignCheckpoint::Id(r.Save.Character,r.Digest);
+-        checkpointOutbox.insert_or_assign(id,std::move(r));nextPull={};
+-        spdlog::info("STM exact ESS checkpoint queued");
+-    }
+-    catch (...) {spdlog::warn("STM checkpoint queue failed");}
++bool CampaignCheckpointClient::Queue(CampaignCheckpoint::Record r) noexcept
++{
++    try
++    {
++        if (!CampaignCheckpoint::Known(campaignLink.Journal,campaignLink.Campaign,r)) return false;
++        if (!CampaignCheckpoint::StoreLocal(campaignLink.Root,r))
++        {spdlog::warn("STM checkpoint local outbox write failed");return false;}
++        const auto id=CampaignCheckpoint::Id(r.Save.Character,r.Digest);
++        checkpointOutbox.insert_or_assign(id,std::move(r));nextPull={};
++        spdlog::info("STM exact ESS checkpoint queued");return true;
++    }
++    catch (...) {spdlog::warn("STM checkpoint queue failed");return false;}
+ }
+ void CampaignCheckpointClient::ForgetLoaded() noexcept
+ {
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign29"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign30"
