@@ -157,6 +157,7 @@ jobs:
           run_check python3 tests/check_home_seat_leases.py upstream
           run_check python3 tests/check_home_native_residents.py upstream
           run_check python3 tests/check_home_linked_rooms.py upstream
+          run_check python3 tests/check_estate_catalog.py
           run_check python3 tests/check_home_linked_access.py upstream
           run_check python3 tools/check_life_confirmation.py upstream
           run_check python3 tools/check_observer.py upstream

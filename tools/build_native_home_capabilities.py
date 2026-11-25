@@ -72,7 +72,7 @@ def classify(reader, unpack):
                 continue
             if set(d) <= {b"EDID", b"NAME", b"DATA", b"XSCL"} and len(d.get(b"XSCL", bytes(4))) == 4:
                 rows[key] = ("A" if root in cells else "M"), root, key, base
-        elif tag == "D" and len(d.get(b"XTEL", b"")) == 28 and set(d) <= DOOR_FIELDS | {b"XTEL"}:
+        elif tag == "D" and len(d.get(b"XTEL", b"")) == 32 and unpack(d[b"XTEL"][28:]) == 0 and set(d) <= DOOR_FIELDS | {b"XTEL"}:
             target = resolve(unpack(d[b"XTEL"]))
             if target and target != key:
                 links[key] = (root, target)

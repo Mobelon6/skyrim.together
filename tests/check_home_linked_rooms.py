@@ -11,7 +11,7 @@ def rec(kind,n,d,flags=0,ctx=()):
 def cell(n,loc):
     return rec(b"CELL",n,{b"DATA":b"\x01",b"XLCN":u(loc)})
 def door(n,room,dest,**extra):
-    return rec(b"REFR",n,{b"NAME":u(50),b"DATA":bytes(24),b"XTEL":u(dest)+bytes(24),**{k.encode():v for k,v in extra.items()}},0x400,(u(room)+u(6),))
+    return rec(b"REFR",n,{b"NAME":u(50),b"DATA":bytes(24),b"XTEL":u(dest)+bytes(28),**{k.encode():v for k,v in extra.items()}},0x400,(u(room)+u(6),))
 rows=[rec(b"LCTN",100,{b"KWDA":u(0xfc1a3)}),rec(b"LCTN",200,{b"KWDA":u(0xfc1a3)}),
       cell(1,100),cell(2,100),cell(3,200),rec(b"DOOR",50,{}),
       door(10,1,11),door(11,2,10),door(12,1,13),door(13,3,12),
@@ -20,6 +20,8 @@ def run(rows):
     return {(t,r[1],b[1]) for t,c,r,b in classify(lambda kinds:(x for x in rows if x[0] in kinds),unpack) if t=="L"}
 assert run(rows)=={("L",10,11),("L",11,10)}
 assert not run(rows+[door(11,2,10,VMAD=b"x")])
+assert not run(rows+[door(11,2,10,XTEL=u(10)+bytes(24))])
+assert not run(rows+[door(11,2,10,XTEL=u(10)+bytes(24)+u(1))])
 assert not run(rows+[rec(b"LCTN",100,{},32)])
 src=(Path(sys.argv[1])/"Code/client/Services/Generic/PartyHome.cpp").read_text()
 assert "candidate!=owner||slot==visit.Slot" in src

@@ -21,7 +21,7 @@ records=[
     rec(b"FURN",3,{b"MNAM":pack((1<<30)|1),b"WBDT":bytes(2)}),
     rec(b"FURN",4,{b"MNAM":pack((1<<31)|1),b"WBDT":bytes(2)}),
     rec(b"FURN",5,{b"MNAM":pack((1<<30)|1),b"WBDT":b"\1\0"}),
-    ref(10,2),ref(11,3),ref(12,4),ref(13,5),ref(14,2,XTEL=bytes(28)),
+    ref(10,2),ref(11,3),ref(12,4),ref(13,5),ref(14,2,XTEL=bytes(32)),
     ref(15,2),ref(16,3,XESP=pack(15)+pack(0)),
     ref(17,3),ref(17,3,VMAD=b"x"),
 ]

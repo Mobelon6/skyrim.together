@@ -7,6 +7,7 @@ parser.add_argument('loadorder',type=Path)
 parser.add_argument('plugins',type=Path)
 parser.add_argument('output',type=Path)
 mode=parser.add_mutually_exclusive_group()
+mode.add_argument('--estate-catalog', action='store_true', help='Write Hearthfire evidence only, not runtime permissions')
 mode.add_argument('--native-capabilities', action='store_true', help='Write original interaction metadata only')
 mode.add_argument('--instances', action='store_true', help='Build generic isolated projection cells, not legacy decorative homes')
 args=parser.parse_args()
@@ -108,6 +109,19 @@ def refs(houses):
 def grp(typ,label,data):
  if isinstance(label,int):label=struct.pack('<I',label)
  return struct.pack('<4sI4sIII',b'GRUP',24+len(data),label,typ,0,0)+data
+if args.estate_catalog:
+ # Reject inconsistent MO2 exports rather than silently reading unlisted plugins.
+ implicit={'skyrim.esm','update.esm','dawnguard.esm','hearthfires.esm','dragonborn.esm',
+           'ccbgssse001-fish.esm','ccqdrsse001-survivalmode.esl','ccbgssse037-curios.esl',
+           'ccbgssse025-advdsgs.esm','_resourcepack.esl'}
+ listed={n.lstrip('*').casefold() for n in lines(args.plugins)}
+ active={n[1:].casefold() for n in lines(args.plugins) if n.startswith('*')}
+ selected={n.casefold() for n in order}
+ if active-selected or selected-listed-implicit:
+  raise ValueError('Inconsistent loadorder/plugins exports')
+ from build_estate_catalog import build
+ build(P,reader,unpack,order)
+ sys.exit(0)
 if args.native_capabilities:
  from build_native_home_capabilities import build
  build(P,reader,unpack)
