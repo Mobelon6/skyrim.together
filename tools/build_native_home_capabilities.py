@@ -7,12 +7,22 @@ SEAT_FIELDS = {b"EDID", b"NAME", b"DATA", b"XSCL", b"XESP"}
 
 
 def classify(reader, unpack):
-    cells, bases = set(), {}
-    for kind, key, flags, _, resolve, read in reader({b"CELL", b"DOOR", b"FURN", b"NPC_"}):
+    cells, bases, locations, cell_locs = set(), {}, set(), {}
+    for kind, key, flags, _, resolve, read in reader({b"CELL", b"DOOR", b"FURN", b"NPC_", b"LCTN"}):
+        if kind == b"LCTN":
+            locations.discard(key)
+            keywords = read().get(b"KWDA", b"")
+            if not flags & 32 and len(keywords) % 4 == 0 and any(resolve(unpack(keywords[i:i+4])) == ("skyrim.esm", 0xfc1a3) for i in range(0, len(keywords), 4)):
+                locations.add(key)
+            continue
         if kind == b"CELL":
             cells.discard(key)
-            if not flags & 32 and read().get(b"DATA", b"\0")[0] & 1:
+            cell_locs.pop(key, None)
+            d = read()
+            if not flags & 32 and d.get(b"DATA", b"\0")[0] & 1:
                 cells.add(key)
+                if len(d.get(b"XLCN", b"")) == 4:
+                    cell_locs[key] = resolve(unpack(d[b"XLCN"]))
             continue
         bases.pop(key, None)
         if flags & 32:
@@ -34,16 +44,17 @@ def classify(reader, unpack):
             mask = unpack(marker)
             if mask & (1 << 30) and mask & 0xffffff and not mask & ((1 << 31) | (1 << 25) | (1 << 26)):
                 bases[key] = "S"
-    rows, parents = {}, {}
+    rows, parents, links = {}, {}, {}
     for kind, key, flags, ctx, resolve, read in reader({b"REFR", b"ACHR"}):
         rows.pop(key, None)
+        links.pop(key, None)
         parents.pop(key, None)
         if flags & 32:
             continue
         d = read()
         if len(d.get(b"XESP", b"")) >= 4:
             parents[key] = resolve(unpack(d[b"XESP"]))
-        allowed_flags = 0xc00 if kind == b"ACHR" else 0x800
+        allowed_flags = 0xc00 if kind == b"ACHR" or b"XTEL" in d else 0x800
         if flags & ~allowed_flags or len(d.get(b"NAME", b"")) != 4 or len(d.get(b"DATA", b"")) != 24:
             continue
         root = next((resolve(unpack(g)) for g in reversed(ctx)
@@ -61,9 +72,20 @@ def classify(reader, unpack):
                 continue
             if set(d) <= {b"EDID", b"NAME", b"DATA", b"XSCL"} and len(d.get(b"XSCL", bytes(4))) == 4:
                 rows[key] = ("A" if root in cells else "M"), root, key, base
+        elif tag == "D" and len(d.get(b"XTEL", b"")) == 28 and set(d) <= DOOR_FIELDS | {b"XTEL"}:
+            target = resolve(unpack(d[b"XTEL"]))
+            if target and target != key:
+                links[key] = (root, target)
         elif set(d) <= (DOOR_FIELDS if tag == "D" else SEAT_FIELDS):
             rows[key] = tag, root, key, base
     controlled = set(parents.values())
+    # Admit only mutually linked doors in different interiors with the same explicit player-house location.
+    for key, (root, target) in links.items():
+        other = links.get(target)
+        loc = cell_locs.get(root)
+        if (other and other[1] == key and other[0] != root and loc in locations and
+                cell_locs.get(other[0]) == loc and key not in controlled and target not in controlled):
+            rows[key] = ("L", root, key, target)
     return sorted(row for k, row in rows.items() if row[0] not in ("D", "A", "M") or k not in controlled)
 
 

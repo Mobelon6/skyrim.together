@@ -1,0 +1,308 @@
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -65,7 +65,7 @@
+ // Atomic local cell + wire namespace; never retain game pointers in a route.
+ std::atomic_uint64_t activeHomeRoute{};
+ std::atomic_uint64_t projectedRoot{}; // copy CELL low, canonical root high
+-std::atomic_uint32_t originalGuestCell{};
++std::atomic_uint32_t originalGuestCell{},previousGuestCell{};
+ uint32_t RouteBase(uint32_t local,uint32_t mod)
+ {
+     if (HomeRegistry::Pending(mod)) return local;
+@@ -217,7 +217,7 @@
+     Clock::time_point Until{},Next{};
+     bool Granted{},Moved{},Ready{};
+     bool Native{},Prepared{},Applied{},Leaving{},Closing{},ExitIssued{},Warned{},Refreshing{},SeatExitWarned{};
+-    uint32_t ReturnCell{},ExitDoor{};
++    uint32_t ReturnCell{},ExitDoor{},EntryDoor{},EntryCell{},EntryExit{};
+     std::array<uint32_t,12> Pose{};
+     Clock::time_point MoveUntil{},ShapeAt{};
+     std::string Shape;
+@@ -225,8 +225,9 @@
+     uint64_t ResumeShape{};
+     bool ResumeIssued{};
+ };
+-VisitState visit;
+-struct SeatRequest
++VisitState visit;
++std::optional<VisitState> linkedNext;
++struct SeatRequest
+ {
+     uint64_t Campaign{},Character{},Nonce{};
+     uint32_t Slot{},Cell{},Form{},Await{};
+@@ -650,7 +651,53 @@
+     for (auto x:v.Pose) if (!std::isfinite(std::bit_cast<float>(x))) return false;
+     v.ReturnCell=outside->formID;v.ExitDoor=target->formID;return true;
+ }
+-void AddVisits(const CampaignAccess::Identity& id,std::string_view root,
++// A linked room remains a separate ledger/lease, but never changes house owner.
++bool PlanLinkedVisit(World& world,PlayerCharacter& player,TESObjectREFR& source)
++{
++    if (!visit.Native||!visit.Ready||visit.Leaving||visit.Refreshing||!visit.Granted||
++        Clock::now()>=visit.Until||linkedNext||seat.Nonce||!NativeStanding(world,player)||
++        !HomeGuestSave::InventoryReady(world)||!NearDoor(player,source.formID)) return false;
++    const auto identity=CampaignAccess::Current(world);
++    if (!identity||identity->Save.Campaign!=visit.Campaign||identity->Save.Character!=visit.Character) return false;
++    auto* target=NativeLinkedDoor(&source);
++    auto* cell=NativeDoorDestination(&source);
++    const auto key=NativeFormKey(source.formID);
++    const auto dest=target?NativeFormKey(target->formID):std::nullopt;
++    const auto root=cell?NativeFormKey(cell->formID):std::nullopt;
++    if (!key||!dest||!root||!cell||!NativeCapability('L',visit.Root,key->Encode(),dest->Encode())||
++        !NativeCapability('L',root->Encode(),dest->Encode(),key->Encode())) return false;
++    const auto* extra=source.GetExtraDataList();
++    if (!extra||extra->HasQuestObjectAlias()||extra->Contains(static_cast<ExtraDataType>(0x36))||
++        extra->Contains(static_cast<ExtraDataType>(0x37))||source.IsDisabled()||source.IsDeleted()) return false;
++    if (const auto* lock=source.GetLock();lock&&lock->IsLocked()) return false;
++    uint64_t owner{};
++    for (const auto& [slot,candidate]:CampaignAccess::HomeOffers(visit.Campaign,visit.Character,visit.Root))
++        if (slot==visit.Slot) owner=candidate;
++    if (!owner) return false;
++    for (const auto& [slot,candidate]:CampaignAccess::HomeOffers(visit.Campaign,visit.Character,root->Encode()))
++    {
++        if (candidate!=owner||slot==visit.Slot) continue;
++        const auto shape=NativeVisitShape(visit.Campaign,slot,root->Encode());
++        const auto bytes=CampaignAccess::HomeBaseline(visit.Campaign,slot);
++        const auto snapshot=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
++        if (!shape||!snapshot) continue;
++        const auto row=std::find_if(snapshot->Refs.begin(),snapshot->Refs.end(),
++            [&](const auto& r){return r.Key.Encode()==dest->Encode();});
++        if (row==snapshot->Refs.end()||row->Type!=29||(row->Flags&3u)) continue;
++        VisitState next;
++        next.Native=true;next.Campaign=visit.Campaign;next.Character=visit.Character;
++        next.Slot=slot;next.Copy=cell->formID;next.Base=root->Local;next.Root=root->Encode();next.Door=source.formID;
++        if (!NativeEntry(player,next)) return false;
++        next.EntryDoor=visit.EntryDoor;next.EntryCell=visit.EntryCell;next.EntryExit=visit.EntryExit;
++        next.ReturnCell=visit.ReturnCell;std::copy_n(visit.Pose.begin()+6,6,next.Pose.begin()+6);
++        next.Shape=*shape;next.ExitDoor=next.Copy==next.EntryCell?next.EntryExit:0;
++        linkedNext=std::move(next);
++        visit.Ready=false;visit.Leaving=true;
++        return true;
++    }
++    return false;
++}
++void AddVisits(const CampaignAccess::Identity& id,std::string_view root,
+                const HomeCatalog::Cell* cell,uint32_t entrance,std::string& labels)
+ {
+     accessMenu.Visits.clear();
+@@ -1259,8 +1306,8 @@
+ }
+ void OverlayService::ClearHomes() noexcept
+ {
+-    seat={};
+-    HomeResidentProjection::Clear();residentDisplayNext={};
++    seat={};linkedNext.reset();
++    HomeResidentProjection::Clear();residentDisplayNext={};
+     HomePlacementClient::Clear();
+     if (selection && m_pOverlay && m_gameOverlayClient)
+     {m_pOverlay->ExecuteAsync("hideHome");m_gameOverlayClient->SetUIVisible(false);}
+@@ -1283,9 +1330,17 @@
+             if (!identity || e.Campaign!=identity->Save.Campaign || e.Character!=identity->Save.Character ||
+                 e.Owner!=m_transport.GetLocalPlayerId() || !e.Profile.empty() || !e.Credential.empty()) return;
+             if (e.AccessOp==8) {SeatReply(m_world,e);return;}
+-            if (e.AccessOp==3)
+-            {
+-                if (!visit.Nonce || e.AccessGuest!=visit.Nonce || e.House!=visit.Slot ||
++            if (e.AccessOp==3)
++            {
++                if (linkedNext&&linkedNext->Nonce&&e.AccessGuest==linkedNext->Nonce&&e.House==linkedNext->Slot&&
++                    e.Campaign==linkedNext->Campaign&&e.Character==linkedNext->Character&&e.AccessRight<=2&&
++                    std::string_view(e.Root.data(),e.Root.size())==linkedNext->Root)
++                {
++                    linkedNext->Right=e.AccessRight;linkedNext->Granted=e.AccessRight!=0;
++                    linkedNext->Until=linkedNext->Granted?Clock::now()+20s:Clock::time_point{};
++                    return;
++                }
++                if (!visit.Nonce || e.AccessGuest!=visit.Nonce || e.House!=visit.Slot ||
+                     e.Campaign!=visit.Campaign || e.Character!=visit.Character ||
+                     std::string_view(e.Root.data(),e.Root.size())!=visit.Root || e.AccessRight>2) return;
+                 visit.Right=e.AccessRight;visit.Granted=e.AccessRight!=0;
+@@ -1380,9 +1435,15 @@
+                 if (identity && identity->Save.Campaign==visit.Campaign && identity->Save.Character==visit.Character &&
+                     NativeSeat(m_world,*object,*player,visit.Root)) RequestSeat(m_world,*object,*player);
+             }
+-            if (type==FormType::Door)
+-            {
+-                if (!visit.Granted || Clock::now()>=visit.Until || visit.Right!=2)
++            if (type==FormType::Door)
++            {
++                if (auto* extra=object->GetExtraDataList();extra&&extra->Contains(ExtraDataType::Teleport))
++                {
++                    if (!PlanLinkedVisit(m_world,*player,*object))
++                        Utils::ShowHudMessage("Связанное помещение пока недоступно для посещения.");
++                    return true;
++                }
++                if (!visit.Granted || Clock::now()>=visit.Until || visit.Right!=2)
+                 {Utils::ShowHudMessage("Нет разрешения изменять имущество этого дома.");return true;}
+                 if (!CampaignAccess::GameReady() || !m_transport.IsOnline() || !NearDoor(*player,form)) return true;
+                 const auto identity=CampaignAccess::Current(m_world);
+@@ -1608,8 +1669,9 @@
+             auto* target=Cast<TESObjectCELL>(TESForm::GetById(visit.Copy));
+             if (!target) {visit={};return;}
+             ClearTrade();HomePlacementClient::Clear();
+-            visit.Shape=*shape;visit.Moved=true;visit.MoveUntil=now+15s;
+-            originalGuestCell.store(visit.Copy);
++            visit.Shape=*shape;visit.Moved=true;visit.MoveUntil=now+15s;
++            visit.EntryDoor=visit.Door;visit.EntryCell=visit.Copy;visit.EntryExit=visit.ExitDoor;
++            previousGuestCell.store(0);originalGuestCell.store(visit.Copy);
+             MoveAt(*p,*target,visit.Pose,0);return;
+         }
+         const auto warn=[&]()
+@@ -1621,12 +1683,13 @@
+         if (visit.ExitIssued)
+         {
+             if (current->formID==visit.ReturnCell && current->IsAttached())
+-            {originalGuestCell.store(0);visit={};projectedRoot.store(0);activeHomeRoute.store(0);}
++            {originalGuestCell.store(0);previousGuestCell.store(0);linkedNext.reset();visit={};projectedRoot.store(0);activeHomeRoute.store(0);}
+             else if (now>=visit.MoveUntil) warn();
+             return;
+         }
+-        if (!valid || !visit.Granted) {visit.Leaving=true;visit.Ready=false;}
+-        if (current->formID!=visit.Copy)
++        if (!valid || !visit.Granted) {visit.Leaving=true;visit.Ready=false;}
++        if (current->formID==visit.Copy&&current->IsAttached()) previousGuestCell.store(0);
++        if (current->formID!=visit.Copy)
+         {
+             if (!visit.Prepared && now<visit.MoveUntil) return;
+             visit.Leaving=true;visit.Ready=false;
+@@ -1691,9 +1754,43 @@
+                 if (result!=HomeOriginalOverlay::Result::Ready) {warn();return;}
+                 visit.Applied=false;
+             }
+-            if (!HomeOriginalOverlay::Release()) {warn();return;}
+-            visit.Prepared=false;
+-            auto* out=Cast<TESObjectCELL>(TESForm::GetById(visit.ReturnCell));
++            if (!HomeOriginalOverlay::Release()) {warn();return;}
++            visit.Prepared=false;
++            // Source is restored before requesting a different room lease.
++            // Keep the original route quarantined until the new room attaches.
++            if (linkedNext)
++            {
++                auto& next=*linkedNext;
++                const bool same=identity&&m_transport.IsOnline()&&identity->Save.Campaign==next.Campaign&&
++                    identity->Save.Character==next.Character&&current->formID==visit.Copy&&NearDoor(*p,next.Door);
++                if (!same||(!next.Nonce&&!valid)) linkedNext.reset();
++                else if (!next.Nonce)
++                {
++                    if (!++token) ++token;
++                    next.Nonce=token;next.Until=now+5s;
++                    if (SendAccess(m_world,*identity,3,next.Slot,next.Root,0,next.Nonce,0)) return;
++                    linkedNext.reset();
++                }
++                else if (now>=next.Until) linkedNext.reset();
++                else if (!next.Granted) return;
++                else
++                {
++                    auto* source=Cast<TESObjectREFR>(TESForm::GetById(next.Door));
++                    auto* target=NativeDoorDestination(source);
++                    const auto shape=NativeVisitShape(next.Campaign,next.Slot,next.Root);
++                    if (target&&target->formID==next.Copy&&shape&&*shape==next.Shape)
++                    {
++                        auto moved=std::move(next);linkedNext.reset();
++                        moved.Moved=true;moved.MoveUntil=now+15s;moved.Next=now+3s;
++                        if (moved.Copy==moved.EntryCell) moved.Door=moved.EntryDoor;
++                        previousGuestCell.store(visit.Copy);originalGuestCell.store(moved.Copy);
++                        visit=std::move(moved);
++                        MoveAt(*p,*target,visit.Pose,0);return;
++                    }
++                    linkedNext.reset();
++                }
++            }
++            auto* out=Cast<TESObjectCELL>(TESForm::GetById(visit.ReturnCell));
+             if (!out) {warn();return;}
+             visit.ExitIssued=true;visit.MoveUntil=now+15s;
+             MoveAt(*p,*out,visit.Pose,6);return;
+@@ -1870,7 +1967,12 @@
+         auto* cell=p?p->GetParentCellEx():nullptr;
+         if (!p||!cell||!cell->IsAttached()||!visit.Native||!visit.Ready||!visit.Applied||
+             visit.Leaving||visit.Refreshing||!visit.Granted||Clock::now()>=visit.Until||cell->formID!=visit.Copy||
+-            !InventoryReady(world)||!NativeStanding(world,*p)||seat.Nonce) return {};
++            !InventoryReady(world)||!NativeStanding(world,*p)||seat.Nonce||linkedNext) return {};
++        if (visit.Copy!=visit.EntryCell)
++        {
++            Utils::ShowHudMessage("Для сохранения вернитесь в основное помещение дома.");
++            return {};
++        }
+         const auto shape=NativeVisitShape(visit.Campaign,visit.Slot,visit.Root);
+         const auto entrance=NativeFormKey(visit.Door);
+         auto record=CampaignCheckpointClient::Capture(world);
+@@ -1931,8 +2033,8 @@
+     }
+     catch (...) {return false;}
+ }
+-bool HomeInstance::NativeGuestCell(uint32_t form) noexcept
+-{return form && form==originalGuestCell.load();}
++bool HomeInstance::NativeGuestCell(uint32_t form) noexcept
++{return form && (form==originalGuestCell.load()||form==previousGuestCell.load());}
+ bool HomeInstance::NativeGuestActive() noexcept
+ {return originalGuestCell.load()!=0;}
+ bool HomeInstance::NativeResidentBinding(uint32_t source,uint32_t base) noexcept
+@@ -1966,7 +2068,7 @@
+ void HomeInstance::ForgetOriginalVisit() noexcept
+ {
+     if (visit.Native) {visit={};activeHomeRoute.store(0);projectedRoot.store(0);}
+-    originalGuestCell.store(0);lastResumeDigest.clear();resumePoll={};seat={};
++    originalGuestCell.store(0);previousGuestCell.store(0);linkedNext.reset();lastResumeDigest.clear();resumePoll={};seat={};
+ }
+ bool HomeInstance::ProjectionForm(uint32_t form) noexcept
+ {
+@@ -2053,8 +2155,8 @@
+         {
+             residentContext={};objectContext={};lockContext={};baselineUpload={};
+             if (id>0xFFFFu) {activeHomeRoute.store(0);return;}
+-            const bool ready=visit.Native && visit.Ready && !visit.Leaving && visit.Granted &&
+-                Clock::now()<visit.Until && mode==CampaignReplication::Link::Mode::Ready;
++            const bool ready=visit.Native && visit.Copy==cell->formID && visit.Ready && !visit.Leaving && visit.Granted &&
++                Clock::now()<visit.Until && mode==CampaignReplication::Link::Mode::Ready;
+             activeHomeRoute.store((uint64_t(ready?HomeRegistry::ScopePrefix|visit.Slot:HomeRegistry::PendingPrefix|id)<<32)|cell->formID);
+             return; // no owner observation, registration or inventory recovery
+         }
+@@ -2082,7 +2184,9 @@
+         }
+         const auto now=Clock::now();
+         const auto old=activeHomeRoute.load();
+-        const bool candidate=CatalogCell(cell->formID) || (cell->loadedCellData && cell->loadedCellData->encounterZone &&
++        const auto nativeKey=NativeFormKey(cell->formID);
++        const bool candidate=CatalogCell(cell->formID) || (nativeKey&&HomeNativeCapabilities::LinkedCell(nativeKey->Encode())) ||
++            (cell->loadedCellData && cell->loadedCellData->encounterZone &&
+             cell->loadedCellData->encounterZone->formID==0xF90B1u && cell->formID!=0xEEC55u);
+         if (observed!=cell->formID || observedPlayer!=id || (candidate && !old))
+         {
+diff --git a/Code/common/HomeNativeCapabilities.h b/Code/common/HomeNativeCapabilities.h
+--- a/Code/common/HomeNativeCapabilities.h
++++ b/Code/common/HomeNativeCapabilities.h
+@@ -20,5 +20,5 @@
+         std::istringstream s(line);
+         char tag{};std::string root,ref,base,extra;
+-        if (!(s>>tag>>root>>ref>>base)||(s>>extra)||(tag!='D'&&tag!='S'&&tag!='A'&&tag!='M')) return {};
++        if (!(s>>tag>>root>>ref>>base)||(s>>extra)||(tag!='D'&&tag!='S'&&tag!='A'&&tag!='M'&&tag!='L')) return {};
+         if ((tag=='A'||tag=='M')&&!residentRefs.insert(ref).second) return {};
+         for (const auto* key:{&root,&ref,&base})
+@@ -47,5 +47,17 @@
+     catch (...) {return false;}
+ }
++inline bool LinkedCell(const std::string& root)
++{
++    static const auto cells=[]()
++    {
++        std::set<std::string> result;
++        if (const auto& rows=Loaded();rows)
++            for (const auto& [tag,cell,ref,base]:*rows)
++                if (tag=='L') result.insert(cell);
++        return result;
++    }();
++    return cells.count(root)!=0;
++}
+ using Bindings=HomeCatalog::MovableResidents;
+ struct ResidentIndex
+ {
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign36"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign37"
