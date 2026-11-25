@@ -95,13 +95,33 @@ diff --git a/Code/server/Services/PartyHome.cpp b/Code/server/Services/PartyHome
 +    if (HomeEstateConstruction::SharedMode()) return false;
      auto& link=CampaignAccess::Authority();
      const auto character=CampaignAccess::Character(player);
-@@ -83,6 +84,11 @@
+@@ -83,32 +84,43 @@
              auto root=TradeProperties::DecodeForm({e.Root.data(),e.Root.size()});
              if (!root || !root->Valid()) return;
 -            if (e.AccessOp==9)
 -            {
 -                if (e.House||e.AccessGuest||e.AccessRight||e.SnapshotPart||e.SnapshotParts||!e.SnapshotDigest||
 -                    !HomeEstateConstruction::ValidBits({e.Visible.data(),e.Visible.size()})) return;
+-                const auto& catalog=HomeEstateCatalog::Host();
+-                if (!catalog||!owner->GetCharacter()) return;
+-                const auto found=catalog->Estates.find(root->Encode());
+-                if (found==catalog->Estates.end()) return;
+-                const auto& estate=found->second;
+-                const auto world=TradeProperties::DecodeForm(estate.World);
+-                const auto& location=owner->GetCellComponent();
+-                if (!world||!location.WorldSpaceId||location.WorldSpaceId.BaseId!=world->Local||
+-                    location.HasExteriorEstate()) return;
+-                const auto& mods=m_world.ctx().at<ModsComponent>();
+-                bool sameWorld=false;
+-                for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
+-                    for (const auto& [name,entry]:*list)
+-                        if (entry.id==location.WorldSpaceId.ModId&&
+-                            InventoryEvidence::CanonicalPlugin({name.data(),name.size()})==world->Plugin) sameWorld=true;
+-                const auto* movement=m_world.try_get<MovementComponent>(*owner->GetCharacter());
+-                if (!sameWorld||!movement||!movement->LastMovement.Seen||
+-                    movement->LastMovement.Location!=owner->LocationEpoch()||
+-                    !estate.ContainsCandidate(estate.World,movement->Position.x,movement->Position.y)) return;
+-                const auto character=CampaignAccess::Character(*owner);
 +            const bool shared=HomeEstateConstruction::SharedMode();
 +            if (shared&&e.AccessOp!=10) return; // no private registration/visit in transition campaign
 +            if (e.AccessOp==9||e.AccessOp==10)
@@ -111,8 +131,26 @@ diff --git a/Code/server/Services/PartyHome.cpp b/Code/server/Services/PartyHome
 +                const std::string_view raw(e.Visible.data(),e.Visible.size());
 +                const auto proposal=shared?HomeEstateConstruction::Proposal(raw):std::nullopt;
 +                if (shared?!proposal:!HomeEstateConstruction::ValidBits(raw)) return;
-@@ -107,4 +113,10 @@
-                 const auto character=CampaignAccess::Character(*owner);
++                const auto& catalog=HomeEstateCatalog::Host();
++                if (!catalog||!owner->GetCharacter()) return;
++                const auto found=catalog->Estates.find(root->Encode());
++                if (found==catalog->Estates.end()) return;
++                const auto& estate=found->second;
++                const auto world=TradeProperties::DecodeForm(estate.World);
++                const auto& location=owner->GetCellComponent();
++                if (!world||!location.WorldSpaceId||location.WorldSpaceId.BaseId!=world->Local||
++                    location.HasExteriorEstate()) return;
++                const auto& mods=m_world.ctx().at<ModsComponent>();
++                bool sameWorld=false;
++                for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
++                    for (const auto& [name,entry]:*list)
++                        if (entry.id==location.WorldSpaceId.ModId&&
++                            InventoryEvidence::CanonicalPlugin({name.data(),name.size()})==world->Plugin) sameWorld=true;
++                const auto* movement=m_world.try_get<MovementComponent>(*owner->GetCharacter());
++                if (!sameWorld||!movement||!movement->LastMovement.Seen||
++                    movement->LastMovement.Location!=owner->LocationEpoch()||
++                    !estate.ContainsCandidate(estate.World,movement->Position.x,movement->Position.y)) return;
++                const auto character=CampaignAccess::Character(*owner);
 +                if (shared)
 +                {
 +                    HomeEstateConstruction::ObserveShared(link.Journal,estate,character,e.AccessRevision,
@@ -122,6 +160,9 @@ diff --git a/Code/server/Services/PartyHome.cpp b/Code/server/Services/PartyHome
                  HomeEstateConstruction::Publish(link.Journal,estate,character,e.AccessRevision,
                      e.SaveRevision,e.SnapshotDigest,{e.Visible.data(),e.Visible.size()});
                  return;
+             }
+             if (e.AccessOp==8)
+             {
 diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
 --- a/Code/client/Services/Generic/PartyHome.cpp
 +++ b/Code/client/Services/Generic/PartyHome.cpp
