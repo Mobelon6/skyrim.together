@@ -216,7 +216,8 @@ struct ScopedInventoryOverride{static bool IsOverriden(){return false;}};
 struct ScopedActivateOverride{static bool IsOverriden(){return false;}};
 struct ModSystem{void GetServerModId(uint32_t id,uint32_t& out){out=id;}};
 struct World{static World& Get(){static World world;return world;}ModSystem mods;ModSystem& GetModSystem(){return mods;}};
-struct InventoryChangeEvent{uint32_t id;Inventory::Entry Item;bool Drop,UpdateClients;};
+struct InventoryChangeEvent{uint32_t id;Inventory::Entry Item;bool Drop,UpdateClients;uint32_t QuestId{},QuestRef{},QuestAlias{};};
+void CaptureQuestPickup(TESObjectREFR* object,InventoryChangeEvent& change){if(!object->temporary){change.QuestId=30;change.QuestRef=40;change.QuestAlias=3;}}
 std::vector<InventoryChangeEvent> sent;
 void QueueActorInventoryChange(InventoryChangeEvent e){sent.push_back(e);}
 void* RealPickUpObject(Actor* actor,TESObjectREFR*,int32_t,bool,float){++actor->calls;actor->count+=actor->actual;return actor;}
@@ -229,8 +230,9 @@ int main(){
  assert(sent.empty()&&player->calls==1);
  player->actual=1;HookPickUpObject(player,&object,2,false,0);
  assert(sent.size()==1&&sent[0].Item.Count==1&&sent[0].Item.IsQuestItem&&!sent[0].UpdateClients&&player->calls==2);
+ assert(sent[0].QuestId==30&&sent[0].QuestRef==40&&sent[0].QuestAlias==3);
  object.temporary=true;player->actual=2;HookPickUpObject(player,&object,2,false,0);
- assert(sent.size()==2&&sent.back().Item.Count==2&&sent.back().UpdateClients);
+ assert(sent.size()==2&&sent.back().Item.Count==2&&sent.back().UpdateClients&&!sent.back().QuestId);
  Actor npc;npc.actual=0;HookPickUpObject(&npc,&object,1,false,0);
  assert(sent.size()==3&&npc.calls==1);
  object.extra.quest=false;player->actual=0;HookPickUpObject(player,&object,1,false,0);

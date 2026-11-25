@@ -251,17 +251,19 @@ diff --git a/Code/server/Services/CampaignAccess.h b/Code/server/Services/Campai
 new file mode 100644
 --- /dev/null
 +++ b/Code/server/Services/CampaignAccess.h
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,13 @@
 +#pragma once
 +#include <CampaignIdentity.h>
 +#include <CampaignReplication.h>
 +struct World;
 +struct Player;
++struct RequestInventoryChanges;
 +namespace CampaignAccess
 +{
 +CampaignReplication::Link& Authority();
 +bool Admit(World&, Player&, const CampaignIdentity::Stamp&, std::string_view profile, std::string_view secret);
 +uint64_t Character(const Player&);
++void RecordQuestPickup(World&,Player&,const RequestInventoryChanges&) noexcept;
 +}
 diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJournal.cpp
 --- a/Code/server/Services/QuestJournal.cpp
@@ -1620,15 +1622,16 @@ diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
 diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestService.cpp
 --- a/Code/server/Services/QuestService.cpp
 +++ b/Code/server/Services/QuestService.cpp
-@@ -4,4 +4,7 @@
+@@ -4,4 +4,8 @@
  #include <World.h>
  #include <Services/QuestService.h>
 +#include <Services/CampaignAccess.h>
 +#include <TradeProperties.h>
 +#include <sstream>
++#include <Messages/RequestInventoryChanges.h>
  
  #include <Messages/RequestQuestUpdate.h>
-@@ -15,5 +18,120 @@
+@@ -15,5 +19,156 @@
  Console::Setting bEnableMiscQuestSync{"Gameplay:bEnableMiscQuestSync", "(Experimental) Syncs miscellaneous quests when possible", false};
  
 +using QuestRun = PartyService::Party::QuestRun;
@@ -1748,8 +1751,44 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +
  }
  
++void CampaignAccess::RecordQuestPickup(World& world,Player& player,const RequestInventoryChanges& message) noexcept
++{
++    try
++    {
++        auto& authority=Authority();
++        if (authority.State()!=CampaignReplication::Link::Mode::Ready||
++            !world.GetPartyService().GetPlayerParty(&player)) return;
++        const auto character=Character(player);
++        if (!character||!message.QuestId||!message.QuestRef||!message.Item.IsQuestItem||
++            message.Item.Count<=0||message.Drop) return;
++        const auto key=QuestKey(world,message.QuestId);
++        const auto reference=QuestKey(world,message.QuestRef);
++        const auto item=QuestKey(world,message.Item.BaseId);
++        if (key.empty()||reference.empty()||item.empty()) return;
++        QuestRun run;
++        if (!RestoreQuestRun(authority.Journal,key,run)||run.Stopped||
++            run.Generation!=1||(!run.Started&&run.OrderedStages.empty())) return;
++        const auto prefix=key+" "+std::to_string(run.Generation)+" "+std::to_string(message.QuestAlias)+" ";
++        const auto payload=prefix+reference+" "+item+" "+std::to_string(message.Item.Count)+" "+std::to_string(character);
++        // One observed pickup per quest alias and run. This is evidence, not
++        // an inventory receipt or permission to create/remove an item.
++        for (const auto& op:authority.Journal.Operations())
++            if (op.Kind=="quest-pickup-v1"&&op.Payload.starts_with(prefix))
++            {
++                if (op.Payload!=payload)
++                    spdlog::warn("Conflicting quest pickup evidence for {:X}, alias {}",message.QuestId.LogFormat(),message.QuestAlias);
++                return;
++            }
++        const auto head=authority.Journal.Current();
++        if (authority.Journal.Append(head,{"quest-pickup-"+std::to_string(head.Revision+1),
++            "quest-pickup-v1",payload})!=CampaignJournal::Result::Committed)
++            spdlog::error("STM could not persist quest pickup evidence");
++    }
++    catch (...) {spdlog::error("STM quest pickup evidence failed");}
++}
++
  QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
-@@ -44,3 +162,29 @@
+@@ -44,3 +198,29 @@
      PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
      const PartyService::Party::Conversation* participants = nullptr;
 +    bool knownSharedQuest = false;
@@ -1779,7 +1818,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        }
 +    }
      if (!pParty) return;
-@@ -61,6 +205,6 @@
+@@ -61,6 +241,6 @@
          // During an interaction, only the quest of the witnessed topic has provenance.
          if (inTalk || inFight) return;
          if (!bEnableMiscQuestSync && !(message.JournalObjective && message.Status == RequestQuestUpdate::StageUpdate &&
@@ -1787,7 +1826,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +            (pParty->LeaderPlayerId == pPlayer->GetId() || knownSharedQuest))) return;
      }
  
-@@ -115,39 +259,42 @@
+@@ -115,39 +295,42 @@
 -    auto& run = pParty->QuestRuns[message.Id];
 -    // The sender's local quest log and the party's shared lifecycle are independent.
 -    // A late start from a second client must not clear stages the first client sent.

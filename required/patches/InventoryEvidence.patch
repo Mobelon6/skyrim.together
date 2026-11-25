@@ -212,6 +212,15 @@ diff --git a/Code/client/Services/Generic/InventoryService.cpp b/Code/client/Ser
  void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEvent) noexcept
  {
      if (!m_transport.IsConnected())
+@@ -98,5 +288,8 @@
+     request.Item = acEvent.Item;
+     request.Drop = acEvent.Drop;
+     request.UpdateClients = acEvent.UpdateClients;
++    request.QuestId = acEvent.QuestId;
++    request.QuestRef = acEvent.QuestRef;
++    request.QuestAlias = acEvent.QuestAlias;
+ 
+     m_transport.Send(request);
 diff --git a/Code/client/Services/InventoryService.h b/Code/client/Services/InventoryService.h
 --- a/Code/client/Services/InventoryService.h
 +++ b/Code/client/Services/InventoryService.h
@@ -503,7 +512,87 @@ new file mode 100644
 diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor.cpp
 --- a/Code/client/Games/Skyrim/Actor.cpp
 +++ b/Code/client/Games/Skyrim/Actor.cpp
-@@ -1142,11 +1142,30 @@
+@@ -1129,6 +1129,79 @@
+     TiltedPhoques::ThisCall(RealAddInventoryItem, apThis, apItem, apExtraData, aCount, apOldOwner);
+ }
+ 
++namespace
++{
++// Native SE layouts: CommonLibSSE-NG BGSBaseAlias, BGSRefAliasInstanceData,
++// ExtraAliasInstanceArray; STR GameArray and BSReadWriteLock.
++struct QuestObjectAliasPrefix
++{
++    void* Vtable;
++    void* Name;
++    TESQuest* Owner;
++    uint32_t Id;
++    uint32_t Flags;
++};
++static_assert(offsetof(QuestObjectAliasPrefix,Id)==0x18);
++static_assert(offsetof(QuestObjectAliasPrefix,Flags)==0x1C);
++struct QuestObjectAliasInstance
++{
++    TESQuest* Quest;
++    const QuestObjectAliasPrefix* Alias;
++    const void* Packages;
++};
++static_assert(sizeof(QuestObjectAliasInstance)==0x18);
++struct QuestObjectAliasArray : BSExtraData
++{
++    GameArray<QuestObjectAliasInstance*> Aliases;
++    BSReadWriteLock Lock;
++};
++static_assert(sizeof(QuestObjectAliasArray)==0x30);
++struct QuestAliasReadGuard
++{
++    BSReadWriteLock& Lock;
++    explicit QuestAliasReadGuard(BSReadWriteLock& lock):Lock(lock) {Lock.LockForRead();}
++    ~QuestAliasReadGuard(){Lock.UnlockRead();}
++};
++
++void CaptureQuestPickup(TESObjectREFR* object, InventoryChangeEvent& event)
++{
++    if (!object||object->IsTemporary()||ScopedExtraDataOverride::IsOverriden()) return;
++    auto* extra=object->GetExtraDataList();
++    if (!extra) return;
++    uint32_t questId{},aliasId{};
++    {
++        QuestAliasReadGuard extraGuard(extra->lock);
++        // The list is already locked. Do not acquire the same lock again.
++        ScopedExtraDataOverride scope;
++        auto* data=extra->GetByType(ExtraDataType::AliasInstanceArray);
++        if (!data) return;
++        auto* aliases=static_cast<QuestObjectAliasArray*>(data);
++        QuestAliasReadGuard aliasGuard(aliases->Lock);
++        if (!aliases->Aliases.data||aliases->Aliases.length>aliases->Aliases.capacity||
++            aliases->Aliases.length>128) return;
++        for (const auto* instance:aliases->Aliases)
++        {
++            if (!instance||!instance->Quest||!instance->Alias) continue;
++            const auto* alias=instance->Alias;
++            if (alias->Owner!=instance->Quest||!(alias->Flags&4u)||instance->Quest->IsStopped()) continue;
++            const auto id=instance->Quest->formID;
++            if (!id) continue;
++            // Do not choose arbitrarily between different active quest aliases.
++            if (questId&&(questId!=id||aliasId!=alias->Id)) return;
++            questId=id;aliasId=alias->Id;
++        }
++    }
++    if (!questId) return;
++    GameId quest{},reference{};
++    auto& mods=World::Get().GetModSystem();
++    if (!mods.GetServerModId(questId,quest)||!mods.GetServerModId(object->formID,reference)||
++        !quest||!reference) return;
++    event.QuestId=quest;
++    event.QuestRef=reference;
++    event.QuestAlias=aliasId;
++}
++}
++
+ void* TP_MAKE_THISCALL(HookPickUpObject, Actor, TESObjectREFR* apObject, int32_t aCount, bool aUnk1, float aUnk2)
+ {
+     if (!ScopedInventoryOverride::IsOverriden())
+@@ -1142,11 +1215,32 @@
          if (apObject->GetExtraDataList())
              apThis->GetItemFromExtraData(item, apObject->GetExtraDataList());
  
@@ -516,14 +605,16 @@ diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor
 +        // Keep the ordinary item and remote actor paths unchanged.
 +        if (item.IsQuestItem && apThis == PlayerCharacter::Get())
 +        {
++            InventoryChangeEvent change(apThis->formID, std::move(item), false, shouldUpdateClients);
++            CaptureQuestPickup(apObject, change);
 +            auto* base = apObject->baseForm;
 +            const auto before = apThis->GetItemCountInInventory(base);
 +            auto* result = TiltedPhoques::ThisCall(RealPickUpObject, apThis, apObject, aCount, aUnk1, aUnk2);
 +            const auto delta = apThis->GetItemCountInInventory(base) - before;
 +            if (delta > 0 && delta <= INT32_MAX)
 +            {
-+                item.Count = static_cast<int32_t>(delta);
-+                QueueActorInventoryChange(InventoryChangeEvent(apThis->formID, std::move(item), false, shouldUpdateClients));
++                change.Item.Count = static_cast<int32_t>(delta);
++                QueueActorInventoryChange(std::move(change));
 +            }
 +            else
 +                spdlog::debug("Quest pickup not confirmed in local inventory: count delta {}", delta);
@@ -534,3 +625,69 @@ diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor
      }
  
      return TiltedPhoques::ThisCall(RealPickUpObject, apThis, apObject, aCount, aUnk1, aUnk2);
+diff --git a/Code/client/Events/InventoryChangeEvent.h b/Code/client/Events/InventoryChangeEvent.h
+--- a/Code/client/Events/InventoryChangeEvent.h
++++ b/Code/client/Events/InventoryChangeEvent.h
+@@ -29,3 +29,5 @@
+     uint32_t FormId{};
+     Inventory::Entry Item{};
++    GameId QuestId{}, QuestRef{};
++    uint32_t QuestAlias{};
+     bool Drop = false;
+diff --git a/Code/encoding/Messages/RequestInventoryChanges.h b/Code/encoding/Messages/RequestInventoryChanges.h
+--- a/Code/encoding/Messages/RequestInventoryChanges.h
++++ b/Code/encoding/Messages/RequestInventoryChanges.h
+@@ -19,9 +19,11 @@
+-        return GetOpcode() == acRhs.GetOpcode() && ServerId == acRhs.ServerId && OwnershipEpoch == acRhs.OwnershipEpoch && Item == acRhs.Item && Drop == acRhs.Drop && UpdateClients == acRhs.UpdateClients;
+-    }
+-
+-    uint32_t ServerId{};
+-    uint32_t OwnershipEpoch{};
+-    Inventory::Entry Item{};
++        return GetOpcode() == acRhs.GetOpcode() && ServerId == acRhs.ServerId && OwnershipEpoch == acRhs.OwnershipEpoch && Item == acRhs.Item && Drop == acRhs.Drop && UpdateClients == acRhs.UpdateClients && QuestId == acRhs.QuestId && QuestRef == acRhs.QuestRef && QuestAlias == acRhs.QuestAlias;
++    }
++
++    uint32_t ServerId{};
++    uint32_t OwnershipEpoch{};
++    Inventory::Entry Item{};
++    GameId QuestId{}, QuestRef{};
++    uint32_t QuestAlias{};
+     bool Drop = false;
+     bool UpdateClients = true;
+ };
+diff --git a/Code/encoding/Messages/RequestInventoryChanges.cpp b/Code/encoding/Messages/RequestInventoryChanges.cpp
+--- a/Code/encoding/Messages/RequestInventoryChanges.cpp
++++ b/Code/encoding/Messages/RequestInventoryChanges.cpp
+@@ -9,3 +9,6 @@
+     Serialization::WriteBool(aWriter, Drop);
+     Serialization::WriteBool(aWriter, UpdateClients);
++    QuestId.Serialize(aWriter);
++    QuestRef.Serialize(aWriter);
++    Serialization::WriteVarInt(aWriter, QuestAlias);
+ }
+@@ -20,3 +23,6 @@
+     Drop = Serialization::ReadBool(aReader);
+     UpdateClients = Serialization::ReadBool(aReader);
++    QuestId.Deserialize(aReader);
++    QuestRef.Deserialize(aReader);
++    QuestAlias = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+ }
+diff --git a/Code/server/Services/InventoryService.cpp b/Code/server/Services/InventoryService.cpp
+--- a/Code/server/Services/InventoryService.cpp
++++ b/Code/server/Services/InventoryService.cpp
+@@ -4,4 +4,5 @@
+ #include <World.h>
+ #include <GameServer.h>
++#include <Services/CampaignAccess.h>
+ 
+ #include <Messages/NotifyObjectInventoryChanges.h>
+@@ -81,5 +82,9 @@
+     auto& inventoryComponent = view.get<InventoryComponent>(*it);
+     inventoryComponent.Content.AddOrRemoveEntry(message.Item);
++    if (message.QuestId && message.QuestRef && message.Item.IsQuestItem &&
++        message.Item.Count > 0 && !message.Drop && acMessage.pPlayer->GetCharacter() &&
++        *acMessage.pPlayer->GetCharacter() == *it)
++        CampaignAccess::RecordQuestPickup(m_world,*acMessage.pPlayer,message);
+ 
+     if (!message.UpdateClients && !isRemoteNpcInteraction)
+         return;
