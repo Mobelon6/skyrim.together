@@ -51,3 +51,8 @@
 - Сверены HEAD, дерево, AGENTS, текущий реестр, журнал, действующие требования к недвижимости, карта структуры и Actions. Library: найден Campaign42 handoff, который предшествует отмене инстансов; Interaction06 ZIP, экспорт MO2, compatibility ESP и crash log остаются историческими материалами. Нового игрового результата не установлено.
 - Base 9aa293c38850d3f73a9ed7be2076919aa6bd7fc3. CI 45689451616, job 139470710021: 56/57 проверок PASS, единственный отказ ModuleNotFoundError в obsolete/tests/check_home_native_residents.py (путь к перенесённому reusable/tools/build_native_home_capabilities.py); build и packaged-ui skipped. CI моделей 45689451581 success. Последний зелёный build 06e861b. Причина подтверждена чтением лога и файла теста.
 - Следующее: исправить импорт и проверить CI; далее действующий реестр и согласованная задача. Код и требования в preflight не менялись, Windows/Skyrim/архив не проверялись заново.
+
+### 2026-11-25 — исправление CI после переноса файлов
+- Тип: разработка / проверка. Задачи REL-01, QA-01.
+- Base 20b6faee27255e72f2138b897b5d8090857a2ac6. Причина отказа 45689451616: тест obsolete/tests/check_home_native_residents.py использовал parents[1]/tools, но build_native_home_capabilities.py находится в reusable/tools. Путь исправлен на parents[2]/reusable/tools, как в reusable/tests/check_home_native_capabilities.py. Вложенный импорт build_home_instances из obsolete/tools уже корректен. Игровые патчи и порядок проверок неизменны.
+- Проверки: точный preimage, существование целевого модуля, согласованность с работающим соседним тестом; полный повтор CI требуется. Windows build и игра не проверены. Далее HOME-02 по действующему решению пользователя, не развивать личные инстансы.
