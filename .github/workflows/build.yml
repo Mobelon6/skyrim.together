@@ -88,6 +88,7 @@ jobs:
       - run: git -C upstream apply ../HomeNativeResidents.patch
       - run: git -C upstream apply ../HomeNativeResidentPresence.patch
       - run: git -C upstream apply ../HomeLinkedRooms.patch
+      - run: git -C upstream apply ../HomeLinkedAccess.patch
       - uses: actions/checkout@v4
         with:
           repository: tiltedphoques/TiltedConnect
@@ -155,6 +156,7 @@ jobs:
           run_check python3 tests/check_home_seat_leases.py upstream
           run_check python3 tests/check_home_native_residents.py upstream
           run_check python3 tests/check_home_linked_rooms.py upstream
+          run_check python3 tests/check_home_linked_access.py upstream
           run_check python3 tools/check_life_confirmation.py upstream
           run_check python3 tools/check_observer.py upstream
           run_check python3 tools/check_replica_and_input.py upstream
@@ -244,6 +246,7 @@ jobs:
           git apply ../HomeNativeResidents.patch
           git apply ../HomeNativeResidentPresence.patch
           git apply ../HomeLinkedRooms.patch
+          git apply ../HomeLinkedAccess.patch
           git -C Libraries/TiltedConnect apply ../../../TiltedConnectLifecycle.patch
           git -C Libraries/TiltedUI apply ../../../OverlayProcess.patch
       - name: Cache compiled xmake packages
