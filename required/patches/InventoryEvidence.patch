@@ -1,12 +1,16 @@
 diff --git a/Code/client/Services/Generic/InventoryService.cpp b/Code/client/Services/Generic/InventoryService.cpp
 --- a/Code/client/Services/Generic/InventoryService.cpp
 +++ b/Code/client/Services/Generic/InventoryService.cpp
-@@ -11,6 +11,13 @@
+@@ -11,6 +11,17 @@
  #include <Messages/NotifyDrawWeapon.h>
  
  #include <Events/UpdateEvent.h>
 +#include <Events/DisconnectedEvent.h>
 +#include <Services/CampaignAccess.h>
++#include <Services/QuestService.h>
++#include <Services/OverlayService.h>
++#include <Forms/TESQuest.h>
++#include <Messages/RequestQuestUpdate.h>
 +#include <Components/TESContainer.h>
 +#include <ExtraData/ExtraContainerChanges.h>
 +#include <cstdlib>
@@ -15,7 +19,7 @@ diff --git a/Code/client/Services/Generic/InventoryService.cpp b/Code/client/Ser
  #include <Events/InventoryChangeEvent.h>
  #include <Events/EquipmentChangeEvent.h>
  
-@@ -40,13 +47,196 @@
+@@ -40,13 +51,196 @@
      m_inventoryChangeConnection = m_dispatcher.sink<NotifyInventoryChanges>().connect<&InventoryService::OnNotifyInventoryChanges>(this);
      m_equipmentChangeConnection = m_dispatcher.sink<NotifyEquipmentChanges>().connect<&InventoryService::OnNotifyEquipmentChanges>(this);
      m_inventorySnapshotConnection = m_dispatcher.sink<NotifyInventorySnapshot>().connect<&InventoryService::OnNotifyInventorySnapshot>(this);
@@ -212,15 +216,51 @@ diff --git a/Code/client/Services/Generic/InventoryService.cpp b/Code/client/Ser
  void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEvent) noexcept
  {
      if (!m_transport.IsConnected())
-@@ -98,5 +288,8 @@
+@@ -98,5 +292,44 @@
      request.Item = acEvent.Item;
      request.Drop = acEvent.Drop;
      request.UpdateClients = acEvent.UpdateClients;
 +    request.QuestId = acEvent.QuestId;
 +    request.QuestRef = acEvent.QuestRef;
 +    request.QuestAlias = acEvent.QuestAlias;
++    RequestQuestUpdate observedStage{};
++    bool reportStage=false;
++    if (request.QuestId)
++    {
++        const auto form=m_world.GetModSystem().GetGameId(request.QuestId);
++        auto* quest=Cast<TESQuest>(TESForm::GetById(form));
++        if (!quest||QuestService::IsNonSyncableQuest(quest)||
++            m_world.GetOverlayService().IsPersonalQuest(form))
++        {
++            request.QuestId={};request.QuestRef={};request.QuestAlias=0;
++        }
++        else if (request.Item.Count==1&&!request.Drop&&!quest->IsStopped()&&
++            (quest->flags&TESQuest::RunOnce)&&!(quest->flags&(TESQuest::Failed|TESQuest::Completed|TESQuest::AllowRepeatStages)))
++        {
++            // This check runs on the main thread. An alias alone does not
++            // establish that a background or personal quest is shared.
++            for (const auto& objective:PlayerCharacter::Get()->objectives)
++                if (objective.instance&&objective.instance->quest==quest)
++                {
++                    request.QuestInitialEvidence=true;
++                    break;
++                }
++            if (request.QuestInitialEvidence&&quest->IsStageReached(quest->currentStage))
++            {
++                observedStage.Id=request.QuestId;
++                observedStage.Stage=quest->currentStage;
++                observedStage.Status=RequestQuestUpdate::StageUpdate;
++                observedStage.ClientQuestType=static_cast<uint8_t>(quest->type);
++                observedStage.JournalObjective=true;
++                reportStage=true;
++            }
++        }
++    }
  
      m_transport.Send(request);
++    // Inventory evidence is sent first. If the native stage event already
++    // arrived, the existing server deduplicator ignores this observation.
++    if (reportStage) m_transport.Send(observedStage);
 diff --git a/Code/client/Services/InventoryService.h b/Code/client/Services/InventoryService.h
 --- a/Code/client/Services/InventoryService.h
 +++ b/Code/client/Services/InventoryService.h
@@ -692,14 +732,14 @@ diff --git a/Code/client/Events/InventoryChangeEvent.h b/Code/client/Events/Inve
 diff --git a/Code/encoding/Messages/RequestInventoryChanges.h b/Code/encoding/Messages/RequestInventoryChanges.h
 --- a/Code/encoding/Messages/RequestInventoryChanges.h
 +++ b/Code/encoding/Messages/RequestInventoryChanges.h
-@@ -19,9 +19,11 @@
+@@ -19,9 +19,12 @@
 -        return GetOpcode() == acRhs.GetOpcode() && ServerId == acRhs.ServerId && OwnershipEpoch == acRhs.OwnershipEpoch && Item == acRhs.Item && Drop == acRhs.Drop && UpdateClients == acRhs.UpdateClients;
 -    }
 -
 -    uint32_t ServerId{};
 -    uint32_t OwnershipEpoch{};
 -    Inventory::Entry Item{};
-+        return GetOpcode() == acRhs.GetOpcode() && ServerId == acRhs.ServerId && OwnershipEpoch == acRhs.OwnershipEpoch && Item == acRhs.Item && Drop == acRhs.Drop && UpdateClients == acRhs.UpdateClients && QuestId == acRhs.QuestId && QuestRef == acRhs.QuestRef && QuestAlias == acRhs.QuestAlias;
++        return GetOpcode() == acRhs.GetOpcode() && ServerId == acRhs.ServerId && OwnershipEpoch == acRhs.OwnershipEpoch && Item == acRhs.Item && Drop == acRhs.Drop && UpdateClients == acRhs.UpdateClients && QuestId == acRhs.QuestId && QuestRef == acRhs.QuestRef && QuestAlias == acRhs.QuestAlias && QuestInitialEvidence == acRhs.QuestInitialEvidence;
 +    }
 +
 +    uint32_t ServerId{};
@@ -707,25 +747,28 @@ diff --git a/Code/encoding/Messages/RequestInventoryChanges.h b/Code/encoding/Me
 +    Inventory::Entry Item{};
 +    GameId QuestId{}, QuestRef{};
 +    uint32_t QuestAlias{};
++    bool QuestInitialEvidence{};
      bool Drop = false;
      bool UpdateClients = true;
  };
 diff --git a/Code/encoding/Messages/RequestInventoryChanges.cpp b/Code/encoding/Messages/RequestInventoryChanges.cpp
 --- a/Code/encoding/Messages/RequestInventoryChanges.cpp
 +++ b/Code/encoding/Messages/RequestInventoryChanges.cpp
-@@ -9,3 +9,6 @@
+@@ -9,3 +9,7 @@
      Serialization::WriteBool(aWriter, Drop);
      Serialization::WriteBool(aWriter, UpdateClients);
 +    QuestId.Serialize(aWriter);
 +    QuestRef.Serialize(aWriter);
 +    Serialization::WriteVarInt(aWriter, QuestAlias);
++    Serialization::WriteBool(aWriter, QuestInitialEvidence);
  }
-@@ -20,3 +23,6 @@
+@@ -20,3 +24,7 @@
      Drop = Serialization::ReadBool(aReader);
      UpdateClients = Serialization::ReadBool(aReader);
 +    QuestId.Deserialize(aReader);
 +    QuestRef.Deserialize(aReader);
 +    QuestAlias = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
++    QuestInitialEvidence = Serialization::ReadBool(aReader);
  }
 diff --git a/Code/server/Services/InventoryService.cpp b/Code/server/Services/InventoryService.cpp
 --- a/Code/server/Services/InventoryService.cpp

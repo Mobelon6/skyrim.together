@@ -119,7 +119,7 @@ int main(){
  assert(!sends(200,1,true,e)&&!sends(200,2,true,e));
  owner.id=2;
  auto guest=[&](unsigned status,bool inJournal,bool known,bool completed=false){Notice n{6};int sent=0;route(&data,&owner,{200,status,inJournal,completed},n,sent,known);return sent;};
- assert(!guest(0,true,false));assert(guest(0,true,true));assert(!guest(0,false,true));
+ assert(guest(0,true,false));assert(guest(0,true,true));assert(!guest(0,false,true));
  assert(!guest(1,true,true)&&!guest(2,true,true));
  assert(guest(2,false,true,true)&&!guest(2,false,false,true));
  data.Brawls[2]=talk;assert(!guest(0,true,true));

@@ -396,7 +396,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +245,315 @@
+@@ -221,6 +245,317 @@
      return 2;
  }
  
@@ -624,7 +624,9 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    for (const auto& item:*pickups)
 +    {
 +        auto run=history->find(item.Quest);
-+        if (run==history->end()||!ShouldRestorePickup(item,character,run->second.Generation,run->second.Stopped)) continue;
++        const auto generation=run==history->end()?1u:run->second.Generation;
++        const bool stopped=run!=history->end()&&run->second.Stopped;
++        if (!ShouldRestorePickup(item,character,generation,stopped)) continue;
 +        const auto questId=LocalQuestForm(item.Quest),referenceId=LocalQuestForm(item.Reference),baseId=LocalQuestForm(item.Item);
 +        if (!questId||!referenceId||!baseId) continue;
 +        auto* quest=Cast<TESQuest>(TESForm::GetById(questId));
@@ -712,7 +714,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        attemptedQuestPickups.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +583,7 @@
+@@ -250,6 +585,7 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -720,7 +722,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
          request.Credential=credential->Secret.c_str();
 +        request.Checkpoint=NextCheckpoint(*stamp).c_str();
          m_world.GetTransport().Send(request);
-@@ -275,8 +609,20 @@
+@@ -275,8 +611,20 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();

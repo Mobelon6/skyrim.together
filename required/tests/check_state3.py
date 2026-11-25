@@ -249,12 +249,19 @@ int main(){
 }
 ''')
 
-item_change=extract('server/Services/QuestService.cpp','enum class QuestItemDecision','// A player who has independently accepted')
+item_change=extract('server/Services/QuestService.cpp','bool CanRecordQuestPickup','// A player who has independently accepted')
 run('unique quest item consumption matches original holder and reference',headers+'''
+struct QuestRun{unsigned Generation{1};bool Stopped{},Started{},CompletedRunOnce{};std::vector<uint16_t> OrderedStages;};
 namespace CampaignJournal {struct Operation{std::string Id,Kind,Payload;};}
 '''+item_change+'''
 int main(){
     using D=QuestItemDecision;
+    QuestRun initial;assert(!CanRecordQuestPickup(initial,false,1));
+    assert(CanRecordQuestPickup(initial,true,1)&&!CanRecordQuestPickup(initial,true,2));
+    initial.Started=true;assert(CanRecordQuestPickup(initial,false,1));
+    initial.Stopped=true;assert(!CanRecordQuestPickup(initial,true,1));
+    initial.Stopped=false;initial.Generation=2;assert(!CanRecordQuestPickup(initial,true,1));
+    initial.Generation=1;initial.CompletedRunOnce=true;assert(!CanRecordQuestPickup(initial,true,1));
     std::vector<CampaignJournal::Operation> ops;
     const std::string prefix="q 1 3 ",pickup=prefix+"ref item 1 101";
     assert(QuestItemChange(ops,prefix,pickup,false)==D::Record);
