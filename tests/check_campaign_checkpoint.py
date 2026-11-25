@@ -52,6 +52,25 @@ int main(int argc,char** argv)
     assert(CampaignCheckpoint::Publish(server,71,5,owned)==Result::Committed);
     auto foreign=owned;foreign.Save.Character=6;foreign.Digest=std::string(64,'d');
     assert(CampaignCheckpoint::Publish(server,71,6,foreign)==Result::Invalid);
+    // A registered slot is not enough: authority must have granted access
+    // at the captured prefix. New permission cannot retroactively authorize.
+    assert(HomePermissions::Set(server,5,home->Slot,6,HomePermissions::Right::Visit,0));
+    assert(CampaignCheckpoint::Publish(server,71,6,foreign)==Result::Invalid);
+    foreign.Observed=server.Current();
+    assert(CampaignCheckpoint::CanResume(server,71,foreign));
+    assert(CampaignCheckpoint::Publish(server,71,6,foreign)==Result::Committed);
+    const auto historical=foreign.Observed;
+    assert(HomePermissions::Set(server,5,home->Slot,6,HomePermissions::Right::None,1));
+    assert(!CampaignCheckpoint::CanResume(server,71,foreign));
+    assert(CampaignCheckpoint::Find(server,71,6,foreign.Digest));
+    assert(CampaignCheckpoint::Publish(server,71,6,foreign)==Result::Duplicate);
+    auto after=foreign;after.Digest=std::string(64,'e');after.Observed=server.Current();
+    assert(CampaignCheckpoint::Publish(server,71,6,after)==Result::Invalid);
+    assert(HomePermissions::Set(server,5,home->Slot,6,HomePermissions::Right::Modify,2));
+    assert(CampaignCheckpoint::CanResume(server,71,foreign));
+    assert(CampaignCheckpoint::Find(server,71,6,foreign.Digest)->Observed==historical);
+    auto wrong=foreign;wrong.Digest=std::string(64,'f');wrong.Cell.Local++;
+    assert(CampaignCheckpoint::Publish(server,71,6,wrong)==Result::Invalid);
 }
 """
 with tempfile.TemporaryDirectory() as tmp:
@@ -68,4 +87,4 @@ assert "digest&&*digest!=write.Before" in native
 assert "CampaignCheckpointFile::Digest(path)==before" in native
 assert "0x60FD40" in native and "0x605880" in native
 assert "HomeInstance::ProjectionForm(cell->formID)" in client
-print("PASS exact checkpoint identity, immutable retry, authority, replication, old save, restart and owned scope")
+print("PASS exact checkpoint identity, immutable retry, authority, replication, old save, restart, owned and historical guest scope, revocation and regrant")

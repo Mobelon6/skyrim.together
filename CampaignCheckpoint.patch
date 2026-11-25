@@ -2,10 +2,11 @@ diff --git a/Code/common/CampaignCheckpoint.h b/Code/common/CampaignCheckpoint.h
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/CampaignCheckpoint.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,157 @@
 +#pragma once
 +#include "CampaignIdentity.h"
 +#include "HomeRegistry.h"
++#include "HomePermissions.h"
 +#include "QuestJournalDisk.h"
 +#include <array>
 +#include <bit>
@@ -67,17 +68,40 @@ new file mode 100644
 +}
 +inline std::string Id(uint64_t character,std::string_view digest)
 +{return "save-"+std::to_string(character)+"-"+std::string(digest);}
++// A checkpoint describes a past visit, not a current admission ticket.
++// Read the permission at the captured journal prefix, so a lost ACK or
++// later revocation cannot make an already confirmed save unrecognizable.
++inline bool HadHomeAccess(const CampaignJournal::Journal& journal,const Record& r)
++{
++    const auto home=HomeRegistry::BySlot(journal,r.HomeSlot);
++    if (!home||home->Root.Encode()!=r.Cell.Encode()) return false;
++    const auto& ops=journal.Operations();
++    if (r.Observed.Revision>ops.size()) return false;
++    bool registered=false;
++    auto right=HomePermissions::Right::None;
++    for (size_t i=0;i<r.Observed.Revision;++i)
++    {
++        const auto& op=ops[i];
++        if (op.Kind=="home-register-v1"&&op.Id==HomeRegistry::Id(r.HomeSlot))
++        {
++            if (op.Payload!=HomeRegistry::Payload(*home)) return false;
++            registered=true;
++        }
++        if (op.Kind!="home-access-v1") continue;
++        auto change=HomePermissions::Decode(op.Payload);
++        if (!change) return false;
++        if (change->Slot!=r.HomeSlot) continue;
++        if (!registered||change->Owner!=home->Owner) return false;
++        if (change->Guest==r.Save.Character) right=change->Access;
++    }
++    return registered&&(home->Owner==r.Save.Character||right!=HomePermissions::Right::None);
++}
 +inline bool Known(const CampaignJournal::Journal& journal,uint64_t campaign,const Record& r)
 +{
 +    if (!r.Valid()||!CampaignIdentity::Known(journal,campaign,r.Save)) return false;
 +    const auto observed=journal.At(r.Observed.Revision);
 +    if (!observed||*observed!=r.Observed) return false;
-+    if (r.HomeSlot)
-+    {
-+        // Initial slice: owner's original CELL only, not the old guest projection.
-+        auto home=HomeRegistry::BySlot(journal,r.HomeSlot);
-+        if (!home||home->Owner!=r.Save.Character||home->Root.Encode()!=r.Cell.Encode()) return false;
-+    }
++    if (r.HomeSlot&&!HadHomeAccess(journal,r)) return false;
 +    return true;
 +}
 +inline std::optional<Record> Find(const CampaignJournal::Journal& journal,uint64_t campaign,
@@ -93,6 +117,13 @@ new file mode 100644
 +            return {};
 +        }
 +    return {};
++}
++// Call again immediately before requesting the ordinary server visit lease.
++// A valid past checkpoint never grants current access by itself.
++inline bool CanResume(const CampaignJournal::Journal& journal,uint64_t campaign,const Record& r)
++{
++    return r.HomeSlot&&Known(journal,campaign,r)&&
++        HomePermissions::Effective(journal,r.HomeSlot,r.Save.Character)!=HomePermissions::Right::None;
 +}
 +inline CampaignJournal::Result Publish(CampaignJournal::Journal& journal,uint64_t campaign,
 +                                        uint64_t character,const Record& r)

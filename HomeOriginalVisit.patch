@@ -463,17 +463,18 @@ diff --git a/Code/client/Services/HomeActorProtection.h b/Code/client/Services/H
 diff --git a/Code/client/Services/Generic/PartyTrade.cpp b/Code/client/Services/Generic/PartyTrade.cpp
 --- a/Code/client/Services/Generic/PartyTrade.cpp
 +++ b/Code/client/Services/Generic/PartyTrade.cpp
-@@ -1400,7 +1400,8 @@
+@@ -1400,8 +1400,9 @@
      if (!loose && object->baseForm->formType!=FormType::Container) return {};
      auto* cell=const_cast<TESObjectREFR*>(object)->GetParentCellEx();
      if (!cell || cell->worldspace) return {};
+     auto& world=World::Get();
 -    if (HomeInstance::ProjectionForm(object->formID))
 +    if (HomeInstance::NativeGuestCell(cell->formID) && loose) return {};
 +    if (HomeInstance::ProjectionForm(object->formID) || HomeInstance::NativeGuestCell(cell->formID))
      {
          uint32_t source{};
          const auto slot=HomeInstance::GuestReference(object->formID,source);
-@@ -1430,6 +1431,10 @@
+@@ -1431,6 +1432,10 @@
  }
  bool ProtectHome(const TESObjectREFR* object) noexcept
  {
@@ -484,7 +485,7 @@ diff --git a/Code/client/Services/Generic/PartyTrade.cpp b/Code/client/Services/
      if (object && (HomeInstance::ProjectionForm(object->formID) || HomePlacementClient::Tracked(object) ||
          HomePlacementClient::LegacyBlocked(object))) return true;
      try {return ManagedHome(object).has_value();}
-@@ -1500,7 +1505,7 @@
+@@ -1501,7 +1506,7 @@
  {
      const auto* cell=object?object->GetParentCellEx():nullptr;
      uint32_t mod{},base{};
@@ -493,7 +494,7 @@ diff --git a/Code/client/Services/Generic/PartyTrade.cpp b/Code/client/Services/
          (HomeInstance::Encode(cell->formID,mod,base) && (HomeRegistry::Scoped(mod)||HomeRegistry::Pending(mod))));
  }
  void HomePlacementClient::Forget() noexcept
-@@ -1600,7 +1605,7 @@
+@@ -1601,7 +1606,7 @@
          const auto stacks=CampaignAccess::HomePlacements(displayCampaign,slot);
          if (!baseline || !stacks) return;
          std::set<uint32_t> conflicts;
