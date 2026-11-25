@@ -84,6 +84,7 @@ jobs:
       - run: git -C upstream apply ../HomeNativeLoose.patch
       - run: git -C upstream apply ../HomeNativeDoors.patch
       - run: git -C upstream apply ../HomeNativeInteractions.patch
+      - run: git -C upstream apply ../HomeSeatLeases.patch
       - uses: actions/checkout@v4
         with:
           repository: tiltedphoques/TiltedConnect
@@ -148,6 +149,7 @@ jobs:
           run_check python3 tests/check_home_original_visit.py upstream
           run_check python3 tests/check_home_guest_save.py upstream
           run_check python3 tests/check_home_native_capabilities.py upstream
+          run_check python3 tests/check_home_seat_leases.py upstream
           run_check python3 tools/check_life_confirmation.py upstream
           run_check python3 tools/check_observer.py upstream
           run_check python3 tools/check_replica_and_input.py upstream
@@ -233,6 +235,7 @@ jobs:
           git apply ../HomeNativeLoose.patch
           git apply ../HomeNativeDoors.patch
           git apply ../HomeNativeInteractions.patch
+          git apply ../HomeSeatLeases.patch
           git -C Libraries/TiltedConnect apply ../../../TiltedConnectLifecycle.patch
           git -C Libraries/TiltedUI apply ../../../OverlayProcess.patch
       - name: Cache compiled xmake packages

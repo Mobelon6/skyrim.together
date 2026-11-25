@@ -1,0 +1,357 @@
+diff --git a/Code/common/HomeSeatLeases.h b/Code/common/HomeSeatLeases.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/HomeSeatLeases.h
+@@ -0,0 +1,50 @@
++#pragma once
++#include <chrono>
++#include <cstdint>
++#include <map>
++#include <string>
++#include <tuple>
++
++namespace HomeSeatLeases
++{
++using Clock=std::chrono::steady_clock;
++struct Claim
++{
++    uint64_t Campaign{},Character{},Connection{},Nonce{};
++    uint32_t Player{},Slot{},Cell{};
++    std::string Ref;
++    bool operator==(const Claim&) const=default;
++};
++struct Lease {Claim Who;Clock::time_point Until;};
++using Key=std::tuple<uint64_t,uint32_t,std::string>;
++struct Table
++{
++    std::map<Key,Lease> Seats;
++    template<class Valid> void Prune(Clock::time_point now,Valid valid)
++    {
++        std::erase_if(Seats,[&](const auto& p){return p.second.Until<=now||!valid(p.second.Who);});
++    }
++    bool Change(uint32_t action,const Claim& c,Clock::time_point now)
++    {
++        if (!c.Campaign||!c.Character||!c.Nonce||!c.Slot||!c.Cell||c.Ref.empty()||action>2) return false;
++        Prune(now,[](const Claim&){return true;});
++        const Key key{c.Campaign,c.Slot,c.Ref};
++        auto it=Seats.find(key);
++        if (action==0)
++        {
++            if (it!=Seats.end()&&it->second.Who==c) {Seats.erase(it);return true;}
++            return false;
++        }
++        if (it!=Seats.end())
++        {
++            if (!(it->second.Who==c)) return false;
++            it->second.Until=now+std::chrono::seconds(30);return true;
++        }
++        if (action!=1) return false; // late renewal never recreates a released seat
++        for (const auto& [_,lease]:Seats)
++            if (lease.Who.Campaign==c.Campaign&&lease.Who.Character==c.Character) return false;
++        Seats.emplace(key,Lease{c,now+std::chrono::seconds(30)});
++        return true;
++    }
++};
++}
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -213,8 +213,137 @@
+     uint64_t ResumeShape{};
+     bool ResumeIssued{};
+ };
+-VisitState visit;
+-std::string lastResumeDigest;
++VisitState visit;
++struct SeatRequest
++{
++    uint64_t Campaign{},Character{},Nonce{};
++    uint32_t Slot{},Cell{},Form{},Await{};
++    std::string Root,Ref;
++    Clock::time_point Deadline{},Next{},Grace{},Expires{};
++    bool Started{},SawSit{},Warned{};
++};
++SeatRequest seat;
++uint64_t seatNonce{};
++bool SeatScope(PlayerCharacter& player,uint32_t& slot,std::string& root)
++{
++    auto* cell=player.GetParentCellEx();
++    uint32_t mod{},base{};
++    if (!cell||!cell->IsAttached()||HomeInstance::ProjectionForm(cell->formID)||
++        !HomeInstance::Encode(cell->formID,mod,base)||!HomeRegistry::Scoped(mod)) return false;
++    const auto key=NativeFormKey(cell->formID);
++    if (!key||key->Local!=base) return false;
++    slot=mod&HomeRegistry::MaxSlot;root=key->Encode();
++    if (originalGuestCell.load() && (!visit.Native||!visit.Ready||visit.Leaving||
++        !visit.Granted||Clock::now()>=visit.Until||slot!=visit.Slot||root!=visit.Root)) return false;
++    return slot!=0;
++}
++bool SeatCurrent(World& world,PlayerCharacter& player)
++{
++    uint32_t slot{};std::string root;
++    const auto id=CampaignAccess::Current(world);
++    return world.GetTransport().IsOnline()&&CampaignAccess::GameReady()&&id&&
++        id->Save.Campaign==seat.Campaign&&id->Save.Character==seat.Character&&
++        player.GetParentCellEx()&&player.GetParentCellEx()->formID==seat.Cell&&
++        SeatScope(player,slot,root)&&slot==seat.Slot&&root==seat.Root;
++}
++bool SendSeat(World& world,uint32_t action)
++{
++    const auto id=CampaignAccess::Current(world);
++    if (!id||id->Save.Campaign!=seat.Campaign||id->Save.Character!=seat.Character||
++        !world.GetTransport().IsOnline()) return false;
++    RequestPartyHome req;auto& e=req.Event;
++    e.Campaign=seat.Campaign;e.Character=seat.Character;e.House=seat.Slot;
++    e.SaveRevision=id->Save.Applied.Revision;e.SaveTag=id->Save.Applied.Tag;
++    e.Profile=id->Profile.c_str();e.Credential=id->Credential.Secret.c_str();
++    e.Root=seat.Root.c_str();e.Visible=seat.Ref.c_str();e.AccessOp=8;
++    e.AccessGuest=seat.Nonce;e.AccessRight=action;
++    if (!world.GetTransport().Send(req)) return false;
++    if (action) {seat.Await=action;seat.Deadline=Clock::now()+4s;}
++    return true;
++}
++void ReleaseSeat(World& world)
++{
++    if (seat.Nonce) SendSeat(world,0);
++    seat={};
++}
++bool RequestSeat(World& world,TESObjectREFR& object,PlayerCharacter& player) noexcept
++{
++    try
++    {
++        uint32_t slot{};std::string root;
++        if (!SeatScope(player,slot,root)||!object.baseForm) return false;
++        const auto ref=NativeFormKey(object.formID),base=NativeFormKey(object.baseForm->formID);
++        if (!ref||!base||!NativeCapability('S',root,ref->Encode(),base->Encode())) return false;
++        if (seat.Nonce||!CampaignAccess::GameReady()||!world.GetTransport().IsOnline()) return true;
++        if (!NativeSeat(world,object,player,root)||
++            glm::distance(static_cast<const glm::vec3&>(player.position),static_cast<const glm::vec3&>(object.position))>350.f)
++            return true;
++        const auto id=CampaignAccess::Current(world);
++        if (!id) return true;
++        if (!++seatNonce) ++seatNonce;
++        seat.Campaign=id->Save.Campaign;seat.Character=id->Save.Character;seat.Nonce=seatNonce;
++        seat.Slot=slot;seat.Cell=player.GetParentCellEx()->formID;seat.Form=object.formID;
++        seat.Root=std::move(root);seat.Ref=ref->Encode();
++        if (!SendSeat(world,1)) seat={};
++        return true;
++    }
++    catch (...) {seat={};return true;}
++}
++void SeatReply(World& world,const PartyHome& e) noexcept
++{
++    try
++    {
++    if (!seat.Nonce||!seat.Await||e.AccessGuest!=seat.Nonce||e.AccessRevision!=seat.Await||
++        e.House!=seat.Slot||e.Campaign!=seat.Campaign||e.Character!=seat.Character||
++        std::string_view(e.Root.data(),e.Root.size())!=seat.Root||
++        std::string_view(e.Visible.data(),e.Visible.size())!=seat.Ref||e.AccessRight>1||
++        Clock::now()>=seat.Deadline) return;
++    const auto action=seat.Await;seat.Await=0;
++    if (!e.AccessRight)
++    {
++        if (!seat.Started) {seat={};Utils::ShowHudMessage("Мебель уже занята или недоступна.");}
++        else {seat.Next=Clock::now()+5s;}
++        return;
++    }
++    auto* player=PlayerCharacter::Get();
++    if (!player||!SeatCurrent(world,*player)) {ReleaseSeat(world);return;}
++    seat.Expires=Clock::now()+20s;seat.Next=Clock::now()+5s;
++    if (action==2) return;
++    auto* object=Cast<TESObjectREFR>(TESForm::GetById(seat.Form));
++    if (HomeGuestSave::Busy()||(originalGuestCell.load()&&visit.Refreshing)||!object||!NativeSeat(world,*object,*player,seat.Root)||
++        glm::distance(static_cast<const glm::vec3&>(player->position),static_cast<const glm::vec3&>(object->position))>350.f)
++    {ReleaseSeat(world);return;}
++    // The existing STR wrapper uses ScopedActivateOverride and calls the real engine function.
++    seat.Started=true;seat.Grace=Clock::now()+5s;
++    if (!object->Activate(player,0,nullptr,1,0)) ReleaseSeat(world);
++    }
++    catch (...) {seat={};}
++}
++void UpdateSeat(World& world) noexcept
++{
++    try
++    {
++    if (!seat.Nonce||!CampaignAccess::GameReady()) return;
++    auto* player=PlayerCharacter::Get();
++    if (!player||!SeatCurrent(world,*player)) {ReleaseSeat(world);return;}
++    const auto now=Clock::now();
++    if (!seat.Started)
++    {
++        if (now>=seat.Deadline||HomeGuestSave::Busy()||!NativeStanding(world,*player)) ReleaseSeat(world);
++        return;
++    }
++    const bool sitting=!NativeStanding(world,*player);
++    if (sitting) seat.SawSit=true;
++    if (!sitting&&(seat.SawSit||now>=seat.Grace)) {ReleaseSeat(world);return;}
++    if (seat.Await&&now>=seat.Deadline) seat.Await=0;
++    if (now>=seat.Expires&&!seat.Warned)
++    {seat.Warned=true;Utils::ShowHudMessage("Связь с бронью мебели потеряна. Встаньте с мебели.");}
++    if (!seat.Await&&now>=seat.Next)
++    {seat.Next=now+5s;SendSeat(world,2);}
++    }
++    catch (...) {seat={};}
++}
++std::string lastResumeDigest;
+ Clock::time_point resumePoll{};
+ struct PendingLock {uint32_t Revision{};Clock::time_point Until;};
+ struct LockContext
+@@ -1075,6 +1204,7 @@
+ void OverlayService::ClearHomes() noexcept
+ {
++    seat={};
+     HomePlacementClient::Clear();
+     if (selection && m_pOverlay && m_gameOverlayClient)
+     {m_pOverlay->ExecuteAsync("hideHome");m_gameOverlayClient->SetUIVisible(false);}
+     selection=false;door=0;options.clear();accessMenu={};
+@@ -1094,9 +1224,10 @@
+             auto identity=CampaignAccess::Current(m_world);
+             if (!identity || e.Campaign!=identity->Save.Campaign || e.Character!=identity->Save.Character ||
+                 e.Owner!=m_transport.GetLocalPlayerId() || !e.Profile.empty() || !e.Credential.empty()) return;
+-            if (e.AccessOp==3)
+-            {
+-                if (!visit.Nonce || e.AccessGuest!=visit.Nonce || e.House!=visit.Slot ||
++            if (e.AccessOp==8) {SeatReply(m_world,e);return;}
++            if (e.AccessOp==3)
++            {
++                if (!visit.Nonce || e.AccessGuest!=visit.Nonce || e.House!=visit.Slot ||
+                     e.Campaign!=visit.Campaign || e.Character!=visit.Character ||
+                     std::string_view(e.Root.data(),e.Root.size())!=visit.Root || e.AccessRight>2) return;
+                 visit.Granted=e.AccessRight!=0;
+@@ -1171,7 +1302,15 @@
+ }
+ bool OverlayService::TryHouseDoor(uint32_t form) noexcept
+ {
+-    if (HomeGuestSave::Busy()) return true;
+-    if (originalGuestCell.load())
++    if (HomeGuestSave::Busy()) return true;
++    // Original owners must use the same reservation path as guests.
++    if (!originalGuestCell.load()&&m_transport.IsOnline()&&CampaignAccess::GameReady())
++    {
++        auto* p=PlayerCharacter::Get();
++        auto* ref=Cast<TESObjectREFR>(TESForm::GetById(form));
++        if (p&&ref&&ref->baseForm&&static_cast<uint32_t>(ref->baseForm->formType)==40&&
++            ref->GetParentCellEx()==p->GetParentCellEx()&&RequestSeat(m_world,*ref,*p)) return true;
++    }
++    if (originalGuestCell.load())
+     {
+         auto* player=PlayerCharacter::Get();
+@@ -1190,7 +1329,7 @@
+             {
+                 const auto identity=CampaignAccess::Current(m_world);
+                 if (identity && identity->Save.Campaign==visit.Campaign && identity->Save.Character==visit.Character &&
+-                    NativeSeat(m_world,*object,*player,visit.Root)) return false;
++                    NativeSeat(m_world,*object,*player,visit.Root)) RequestSeat(m_world,*object,*player);
+             }
+             if (type==FormType::Door)
+             {
+@@ -1383,7 +1522,8 @@
+ {
+     if (auto* p=PlayerCharacter::Get();!p || !p->GetParentCellEx() || p->GetParentCellEx()->formID!=lockContext.Cell ||
+         !CampaignAccess::GameReady() || !m_transport.IsOnline()) lockContext={};
+-    if (!visit.Nonce && !HomeGuestSave::Busy() && NativeVisitsEnabled() &&
++    UpdateSeat(m_world);
++    if (!visit.Nonce && !HomeGuestSave::Busy() && NativeVisitsEnabled() &&
+         CampaignAccess::GameReady() && m_transport.IsOnline() && Clock::now()>=resumePoll)
+     {
+         resumePoll=Clock::now()+1s;
+@@ -1581,5 +1721,5 @@
+         if (!p||!cell||!cell->IsAttached()||!visit.Native||!visit.Ready||!visit.Applied||
+             visit.Leaving||visit.Refreshing||!visit.Granted||Clock::now()>=visit.Until||cell->formID!=visit.Copy||
+-            !InventoryReady(world)||!NativeStanding(world,*p)) return {};
++            !InventoryReady(world)||!NativeStanding(world,*p)||seat.Nonce) return {};
+         const auto shape=NativeVisitShape(visit.Campaign,visit.Slot);
+         const auto entrance=NativeFormKey(visit.Door);
+@@ -1688,7 +1828,7 @@
+ void HomeInstance::ForgetOriginalVisit() noexcept
+ {
+     if (visit.Native) {visit={};activeHomeRoute.store(0);projectedRoot.store(0);}
+-    originalGuestCell.store(0);lastResumeDigest.clear();resumePoll={};
++    originalGuestCell.store(0);lastResumeDigest.clear();resumePoll={};seat={};
+ }
+ bool HomeInstance::ProjectionForm(uint32_t form) noexcept
+ {
+diff --git a/Code/server/Services/PartyHome.cpp b/Code/server/Services/PartyHome.cpp
+--- a/Code/server/Services/PartyHome.cpp
++++ b/Code/server/Services/PartyHome.cpp
+@@ -8,7 +8,8 @@
+ #include <HomePermissions.h>
+ #include <HomeLocks.h>
+ #include <HomeResidents.h>
+-#include <HomeObjects.h>
+-#include <Services/HomeVisit.h>
++#include <HomeObjects.h>
++#include <HomeSeatLeases.h>
++#include <Services/HomeVisit.h>
+ #include <chrono>
+ #include <map>
+@@ -62,6 +63,59 @@
+             auto root=TradeProperties::DecodeForm({e.Root.data(),e.Root.size()});
+             if (!root || !root->Valid()) return;
+-            if (e.AccessOp==7)
++            if (e.AccessOp==8)
++            {
++                if (!e.House||!e.AccessGuest||e.AccessRight>2||e.AccessRevision||
++                    e.SnapshotDigest||e.SnapshotPart||e.SnapshotParts||e.Visible.empty()||e.Visible.size()>220) return;
++                const auto key=TradeProperties::DecodeForm({e.Visible.data(),e.Visible.size()});
++                if (!key||!key->Valid()||key->Encode()!=std::string(e.Visible.data(),e.Visible.size())) return;
++                const auto character=CampaignAccess::Character(*owner);
++                const auto home=HomeRegistry::BySlot(link.Journal,e.House);
++                if (!home||home->Root.Encode()!=root->Encode()) return;
++                static HomeSeatLeases::Table seats;
++                const auto now=Clock::now();
++                seats.Prune(now,[&](const HomeSeatLeases::Claim& c)
++                {
++                    auto* p=m_world.GetPlayerManager().GetById(c.Player);
++                    if (!p||c.Campaign!=link.Campaign||uint64_t(p->GetConnectionId())!=c.Connection||
++                        CampaignAccess::Character(*p)!=c.Character) return false;
++                    const auto& cell=p->GetCellComponent().Cell;
++                    return cell.ModId==(HomeRegistry::ScopePrefix|c.Slot)&&cell.BaseId==c.Cell&&
++                        HomeVisit::CanEnter(*p,cell.ModId,cell.BaseId);
++                });
++                HomeSeatLeases::Claim claim{link.Campaign,character,uint64_t(owner->GetConnectionId()),e.AccessGuest,
++                    owner->GetId(),e.House,home->Root.Local,key->Encode()};
++                const auto& cell=owner->GetCellComponent().Cell;
++                bool eligible=e.AccessRight==0;
++                if (e.AccessRight&&cell.ModId==(HomeRegistry::ScopePrefix|e.House)&&
++                    cell.BaseId==claim.Cell&&HomeVisit::CanEnter(*owner,cell.ModId,cell.BaseId)&&owner->GetCharacter())
++                {
++                    if (e.AccessRight==2) eligible=true;
++                    else
++                    {
++                        const auto objects=HomeObjects::Read(link.Journal,e.House);
++                        const auto* movement=m_world.try_get<MovementComponent>(*owner->GetCharacter());
++                        if (objects&&movement)
++                        {
++                            const auto it=objects->find(claim.Ref);
++                            if (it!=objects->end()&&it->second.Type==40&&!it->second.Value.Disabled&&!it->second.Inventory)
++                            {
++                                const auto& pose=it->second.Value.Transform;
++                                const double x=double(movement->Position.x)-std::bit_cast<float>(pose[0]);
++                                const double y=double(movement->Position.y)-std::bit_cast<float>(pose[1]);
++                                const double z=double(movement->Position.z)-std::bit_cast<float>(pose[2]);
++                                eligible=std::isfinite(x+y+z)&&x*x+y*y+z*z<=350.0*350.0;
++                            }
++                        }
++                    }
++                }
++                const bool granted=eligible&&seats.Change(e.AccessRight,claim,now);
++                NotifyPartyHome result;auto& r=result.Event;
++                r.Campaign=link.Campaign;r.Character=character;r.Owner=owner->GetId();r.House=e.House;
++                r.Root=root->Encode().c_str();r.Visible=claim.Ref.c_str();r.AccessOp=8;
++                r.AccessGuest=e.AccessGuest;r.AccessRevision=e.AccessRight;r.AccessRight=granted?1u:0u;
++                owner->Send(result);return;
++            }
++            if (e.AccessOp==7)
+             {
+                 if (!e.House || e.AccessGuest || (e.AccessRight!=1 && e.AccessRight!=3) ||
+                     e.SnapshotDigest || e.SnapshotPart || e.SnapshotParts || e.Visible.empty()) return;
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign33"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign34"

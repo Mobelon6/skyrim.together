@@ -136,3 +136,6 @@ HomeGuestDoors.patch (campaign25): T-метка карты v3 только дл�
 
 
 HomeNativeInteractions.patch (campaign33): см. [native interaction documentation](docs/NATIVE-HOME-INTERACTIONS.md). Метаданные без ESP; локальное сидение, серверный журнал дверей; общая занятость мебели ещё не реализована. Исправление контекста патча и изоляция legacy activation требуют подтверждения CI.
+
+
+HomeSeatLeases.patch (campaign34): transient scoped furniture reservations, see docs/NATIVE-HOME-INTERACTIONS.md; no durable state or generated geometry. CI/runtime not yet confirmed.
