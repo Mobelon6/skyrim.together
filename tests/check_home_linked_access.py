@@ -126,10 +126,17 @@ int main(int argc,char** argv)
     const auto* buildEstate=buildCatalog->ForRoom(main);assert(buildEstate&&buildEstate->Construction.size()==2);
     const auto binding=HomeEstateConstruction::Binding(*buildEstate);assert(binding);
     assert(HomeEstateConstruction::Read(finalRead,101,q)->Revision==0);
+    assert(HomeEstateConstruction::RoomShape(finalRead,*buildCatalog,first->Slot,main)==std::optional<std::string>{""});
+    assert(!HomeEstateConstruction::RoomShape(finalRead,*buildCatalog,first->Slot,secondKey));
     assert(!HomeEstateConstruction::Publish(finalRead,*buildEstate,101,0,0,binding,"1"));
     assert(!HomeEstateConstruction::Publish(finalRead,*buildEstate,101,0,0,binding+1,"01"));
     assert(HomeEstateConstruction::Publish(finalRead,*buildEstate,101,0,0,binding,"01"));
     assert(HomeEstateConstruction::Read(finalRead,202,q)->Revision==0);
+    const auto firstShape=HomeEstateConstruction::RoomShape(finalRead,*buildCatalog,first->Slot,main);
+    assert(firstShape&&!firstShape->empty());
+    assert(firstShape==HomeEstateConstruction::RoomShape(finalRead,*buildCatalog,second->Slot,secondKey));
+    assert(HomeEstateConstruction::RoomShape(finalRead,*buildCatalog,foreign->Slot,secondKey)==std::optional<std::string>{""});
+    assert(HomeEstateConstruction::RoomShape(finalRead,*buildCatalog,unrelated->Slot,q)==std::optional<std::string>{""});
     const auto buildHead=finalRead.Current();
     assert(HomeEstateConstruction::Publish(finalRead,*buildEstate,101,1,0,binding,"01")&&finalRead.Current()==buildHead);
     assert(!HomeEstateConstruction::Publish(finalRead,*buildEstate,101,0,0,binding,"11"));
@@ -138,6 +145,11 @@ int main(int argc,char** argv)
     CampaignJournal::Journal buildRestart;assert(buildRestart.Open(argv[1],71,"profile",false));
     const auto buildState=HomeEstateConstruction::Read(buildRestart,101,q);
     assert(buildState&&buildState->Revision==2&&buildState->Bits=="11");
+    const auto changedShape=HomeEstateConstruction::RoomShape(buildRestart,*buildCatalog,first->Slot,main);
+    assert(changedShape&&changedShape!=firstShape);
+    assert(changedShape==HomeEstateConstruction::RoomShape(buildRestart,*buildCatalog,second->Slot,secondKey));
+    assert(HomeEstateConstruction::RoomShape(buildRestart,*buildCatalog,foreign->Slot,secondKey)==std::optional<std::string>{""});
+    assert(!HomeEstateConstruction::RoomShape(buildRestart,*catalog,first->Slot,main)); // changed binding
     assert(!HomeEstateConstruction::Decode(buildState->Encode()+" "));
     std::istringstream duplicateBuild(buildRows+"C "+q+" "+table+" "+main+"\n");
     assert(!HomeEstateCatalog::Read(duplicateBuild));

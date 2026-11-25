@@ -4,6 +4,8 @@ import tempfile,subprocess,sys
 s=Path(sys.argv[1],'Code/client/Services/Generic/PartyHome.cpp').read_text()
 routes=s[s.index('struct Route'):s.index('std::optional<HomeCatalog::Catalog> projectionCatalog')]
 impl=s[s.index('namespace HomeInstance\n'):s.index('void OverlayService::ClearHomes')]
+# The anonymous construction observer following the route namespace has game dependencies.
+impl=impl.split('\nnamespace\n{\nstruct ConstructionTrack',1)[0]
 source=r'''#include <cstdint>
 #include <atomic>
 #include <cassert>

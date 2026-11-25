@@ -2,7 +2,7 @@ diff --git a/Code/common/HomeEstateConstruction.h b/Code/common/HomeEstateConstr
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/HomeEstateConstruction.h
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,86 @@
 +#pragma once
 +#include "HomeEstateCatalog.h"
 +#include "HomeSnapshot.h"
@@ -72,6 +72,22 @@ new file mode 100644
 +    return journal.Append(journal.Current(),{"home-estate-build-"+std::to_string(journal.Current().Revision+1),
 +        "home-estate-construction-v1",r.Encode()})==CampaignJournal::Result::Committed;
 +}
++// Reuse the native visit shape/restore path: a construction revision is a
++// structural change for every room of this owner's estate, not for other owners.
++inline std::optional<std::string> RoomShape(const CampaignJournal::Journal& journal,
++    const HomeEstateCatalog::Catalog& catalog,uint32_t slot,const std::string& root)
++{
++    const auto home=HomeRegistry::BySlot(journal,slot);
++    if (!home||home->Root.Encode()!=root) return {};
++    const auto* estate=catalog.ForRoom(root);
++    if (!estate) return std::string{};
++    const auto record=Read(journal,home->Owner,estate->Quest);
++    if (!record) return {};
++    if (!record->Revision) return std::string{};
++    if (record->BindingId!=Binding(*estate)||record->Bits.size()!=estate->Construction.size()) return {};
++    return "\nestate-construction "+record->Plot+" "+std::to_string(record->Owner)+" "+
++        std::to_string(record->Revision)+" "+std::to_string(record->BindingId);
++}
 +}
 diff --git a/Code/client/Services/CampaignAccess.h b/Code/client/Services/CampaignAccess.h
 --- a/Code/client/Services/CampaignAccess.h
@@ -85,18 +101,19 @@ diff --git a/Code/client/Services/CampaignAccess.h b/Code/client/Services/Campai
  #include <HomePlacement.h>
 +#include <HomeEstateConstruction.h>
  struct World;
-@@ -31,6 +32,7 @@
+@@ -31,6 +32,8 @@
  std::optional<HomeResidents::Residents> HomeResidentView(uint64_t campaign,uint32_t slot);
  std::optional<HomeObjects::Records> HomeObjectView(uint64_t campaign,uint32_t slot);
  std::optional<std::vector<HomePlacement::Stack>> HomePlacements(uint64_t campaign,uint32_t slot);
 +std::optional<HomeEstateConstruction::Record> EstateConstruction(uint64_t campaign,uint64_t owner,const std::string& plot);
++std::optional<std::string> EstateRoomShape(uint64_t campaign,uint32_t slot,const std::string& root);
  bool HomeCanModify(uint64_t campaign,uint32_t slot,uint64_t character);
  bool ConfirmReceipt(World&, uint64_t stream, uint64_t savedStream, uint32_t cursor, uint32_t receipt,
                      std::string_view plugin, uint32_t base, int count,int64_t before,std::string_view variant={});
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -161,8 +161,13 @@
+@@ -161,8 +161,19 @@
  {
      if (Mode()!=CampaignReplication::Link::Mode::Ready || campaign!=campaignLink.Campaign) return {};
      return HomeObjects::Read(campaignLink.Journal,slot);
@@ -105,6 +122,12 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +{
 +    if (Mode()!=CampaignReplication::Link::Mode::Ready||campaign!=campaignLink.Campaign) return {};
 +    return HomeEstateConstruction::Read(campaignLink.Journal,owner,plot);
++}
++std::optional<std::string> CampaignAccess::EstateRoomShape(uint64_t campaign,uint32_t slot,const std::string& root)
++{
++    const auto& catalog=HomeEstateCatalog::Host();
++    if (!catalog||Mode()!=CampaignReplication::Link::Mode::Ready||campaign!=campaignLink.Campaign) return {};
++    return HomeEstateConstruction::RoomShape(campaignLink.Journal,*catalog,slot,root);
 +}
  std::optional<HomeResidents::Residents> CampaignAccess::HomeResidentView(uint64_t campaign,uint32_t slot)
  {
@@ -163,7 +186,32 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +#include <Forms/TESWorldSpace.h>
  #include <cstdlib>
  #include <Services/HomePlacementClient.h>
-@@ -1307,5 +1309,85 @@
+@@ -630,7 +632,10 @@
+     auto shape=state->Encode();
+     for (const auto& [key,record]:*objects)
+         shape+=" "+key+":"+std::to_string(record.Value.GuestDoor)+":"+
+             std::to_string(record.Value.GuestDoor?0u:record.Value.Open);
++    const auto exterior=CampaignAccess::EstateRoomShape(campaign,slot,root);
++    if (!exterior) return {};
++    shape+=*exterior;
+     return shape;
+ }
+ bool NativeEntry(PlayerCharacter& p,VisitState& v)
+@@ -720,6 +725,13 @@
+ bool PlanLinkedVisit(World& world,PlayerCharacter& player,TESObjectREFR& source)
+ {
+     if (!visit.Native||!visit.Ready||visit.Leaving||visit.Refreshing||!visit.Granted||
+         Clock::now()>=visit.Until||linkedNext||seat.Nonce||!NativeStanding(world,player)||
+         !HomeGuestSave::InventoryReady(world)||!NearDoor(player,source.formID)) return false;
++    const auto currentShape=NativeVisitShape(visit.Campaign,visit.Slot,visit.Root);
++    if (!currentShape||*currentShape!=visit.Shape)
++    {
++        visit.Ready=false;visit.Leaving=true;
++        Utils::ShowHudMessage("Состояние жилья изменилось. Войдите повторно.");
++        return false;
++    }
+     const auto identity=CampaignAccess::Current(world);
+@@ -1307,5 +1319,85 @@
 -void OverlayService::ClearHomes() noexcept
 -{
 +namespace
@@ -251,13 +299,13 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
      seat={};linkedNext.reset();
      HomeResidentProjection::Clear();residentDisplayNext={};
      HomePlacementClient::Clear();
-@@ -1570,4 +1652,5 @@
+@@ -1570,4 +1662,5 @@
      if (auto* p=PlayerCharacter::Get();!p || !p->GetParentCellEx() || p->GetParentCellEx()->formID!=lockContext.Cell ||
          !CampaignAccess::GameReady() || !m_transport.IsOnline()) lockContext={};
      UpdateSeat(m_world);
 +    try {ObserveEstateConstruction(m_world);} catch (...) {constructionTrack={};}
      if (!visit.Nonce && !HomeGuestSave::Busy() && NativeVisitsEnabled() &&
-@@ -2100,5 +2183,6 @@
+@@ -2100,5 +2193,6 @@
  void HomeInstance::ForgetOriginalVisit() noexcept
  {
 +    constructionTrack={};
