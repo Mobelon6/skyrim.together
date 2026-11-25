@@ -93,6 +93,7 @@ jobs:
       - run: git -C upstream apply ../HomeEstateContext.patch
       - run: git -C upstream apply ../HomeEstateRouting.patch
       - run: git -C upstream apply ../HomeEstatePermissions.patch
+      - run: git -C upstream apply ../HomeSpatialEpoch.patch
       - uses: actions/checkout@v4
         with:
           repository: tiltedphoques/TiltedConnect
@@ -122,6 +123,7 @@ jobs:
           run_check python3 tests/check_home_routes.py upstream
           run_check python3 tests/check_home_registry.py upstream
           run_check python3 tests/check_home_scope.py upstream
+          run_check python3 tests/check_home_spatial_epoch.py upstream
           run_check python3 tests/check_home_snapshot.py upstream
           run_check python3 tests/check_home_projection.py upstream
           run_check python3 tests/check_home_catalog.py upstream
@@ -256,6 +258,7 @@ jobs:
           git apply ../HomeEstateContext.patch
           git apply ../HomeEstateRouting.patch
           git apply ../HomeEstatePermissions.patch
+          git apply ../HomeSpatialEpoch.patch
           git -C Libraries/TiltedConnect apply ../../../TiltedConnectLifecycle.patch
           git -C Libraries/TiltedUI apply ../../../OverlayProcess.patch
       - name: Cache compiled xmake packages

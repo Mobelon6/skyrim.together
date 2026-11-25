@@ -1,0 +1,375 @@
+diff --git a/Code/common/SpatialEpoch.h b/Code/common/SpatialEpoch.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/SpatialEpoch.h
+@@ -0,0 +1,49 @@
++#pragma once
++#include <cstdint>
++#include <limits>
++#include <cmath>
++
++namespace SpatialEpoch
++{
++// Per transport connection. It is a freshness fence, not an access grant.
++// A reliable, independently authorized location report installs the epoch.
++class Counter
++{
++public:
++    uint64_t Value() const noexcept {return m_value;}
++    bool Matches(uint64_t value) const noexcept {return value==m_value;}
++    bool Advance(uint64_t value) noexcept
++    {
++        if (!value||value<=m_value) return false;
++        m_value=value;return true;
++    }
++    bool Next() noexcept
++    {
++        if (m_value==std::numeric_limits<uint64_t>::max()) return false;
++        return Advance(m_value+1);
++    }
++    void Reset() noexcept {m_value=0;}
++private:
++    uint64_t m_value{};
++};
++enum class Order { Newest, Historical, Duplicate };
++struct Sample
++{
++    uint32_t Owner{};
++    uint64_t Location{},Tick{};
++    bool Seen{};
++    // The caller checks the actual ownership and connection epochs first.
++    Order Observe(uint32_t owner,uint64_t location,uint64_t tick) noexcept
++    {
++        if (Seen&&Owner==owner&&Location==location)
++        {
++            if (tick==Tick) return Order::Duplicate;
++            if (tick<Tick) return Order::Historical;
++        }
++        Owner=owner;Location=location;Tick=tick;Seen=true;
++        return Order::Newest;
++    }
++};
++inline bool Finite(double x,double y,double z) noexcept
++{return std::isfinite(x)&&std::isfinite(y)&&std::isfinite(z);}
++}
+diff --git a/Code/encoding/SpatialWire.h b/Code/encoding/SpatialWire.h
+new file mode 100644
+--- /dev/null
++++ b/Code/encoding/SpatialWire.h
+@@ -0,0 +1,17 @@
++#pragma once
++#include "Opcodes.h"
++
++namespace SpatialWire
++{
++// Keep authentication, journal, trade and other durable operations outside
++// the location fence. Only unreliable movement and its reliable location
++// fence change their wire representation in this revision.
++inline constexpr bool Location(ClientOpcode op) noexcept
++{
++    return op==kEnterExteriorCellRequest||op==kEnterInteriorCellRequest||op==kShiftGridCellRequest;
++}
++inline constexpr bool Stamped(ClientOpcode op) noexcept
++{return Location(op)||op==kClientReferencesMoveRequest;}
++inline constexpr bool Stamped(ServerOpcode op) noexcept
++{return op==kServerReferencesMoveRequest;}
++}
+diff --git a/Code/encoding/Messages/Message.h b/Code/encoding/Messages/Message.h
+--- a/Code/encoding/Messages/Message.h
++++ b/Code/encoding/Messages/Message.h
+@@ -3,4 +3,5 @@
+ #include "../Opcodes.h"
+ #include "../ChatMessageTypes.h"
++#include "../SpatialWire.h"
+ 
+ using TiltedPhoques::Serialization;
+@@ -17,4 +18,6 @@
+     virtual ~ClientMessage() = default;
+ 
++    // Set by the sending transport only for SpatialWire::Stamped opcodes.
++    mutable uint64_t SpatialEpoch{};
+     void Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept;
+     // Serialize values that are not dependent on previous states
+@@ -42,4 +45,6 @@
+     virtual ~ServerMessage() = default;
+ 
++    // Recipient's admitted location generation, not the sender's generation.
++    uint64_t SpatialEpoch{};
+     void Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept;
+     virtual void SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept;
+diff --git a/Code/encoding/Messages/Message.cpp b/Code/encoding/Messages/Message.cpp
+--- a/Code/encoding/Messages/Message.cpp
++++ b/Code/encoding/Messages/Message.cpp
+@@ -1,3 +1,4 @@
+ #include <Messages/Message.h>
++#include <TiltedCore/Serialization.hpp>
+ 
+ void ClientMessage::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept
+@@ -26,6 +27,7 @@
+ void ClientMessage::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
+ {
+     aWriter.WriteBits(m_opcode, sizeof(m_opcode) * 8);
++    if (SpatialWire::Stamped(m_opcode)) Serialization::WriteVarInt(aWriter, SpatialEpoch);
+ }
+ 
+ void ClientMessage::SerializeDifferential(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
+@@ -56,6 +58,7 @@
+ void ServerMessage::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
+ {
+     aWriter.WriteBits(m_opcode, sizeof(m_opcode) * 8);
++    if (SpatialWire::Stamped(m_opcode)) Serialization::WriteVarInt(aWriter, SpatialEpoch);
+ }
+ 
+ void ServerMessage::SerializeDifferential(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
+diff --git a/Code/encoding/Messages/ClientMessageFactory.cpp b/Code/encoding/Messages/ClientMessageFactory.cpp
+--- a/Code/encoding/Messages/ClientMessageFactory.cpp
++++ b/Code/encoding/Messages/ClientMessageFactory.cpp
+@@ -3,3 +3,4 @@
+ #include <Messages/ClientMessageFactory.h>
++#include <TiltedCore/Serialization.hpp>
+ 
+ static std::function<UniquePtr<ClientMessage>(TiltedPhoques::Buffer::Reader& aReader)> s_clientMessageExtractor[kClientOpcodeMax];
+@@ -17,3 +18,4 @@
+                 auto ptr = TiltedPhoques::MakeUnique<T>();
++                if (SpatialWire::Stamped(T::Opcode)) ptr->SpatialEpoch=Serialization::ReadVarInt(aReader);
+                 ptr->DeserializeRaw(aReader);
+                 return TiltedPhoques::CastUnique<ClientMessage>(std::move(ptr));
+diff --git a/Code/encoding/Messages/ServerMessageFactory.cpp b/Code/encoding/Messages/ServerMessageFactory.cpp
+--- a/Code/encoding/Messages/ServerMessageFactory.cpp
++++ b/Code/encoding/Messages/ServerMessageFactory.cpp
+@@ -3,3 +3,4 @@
+ #include <Messages/ServerMessageFactory.h>
++#include <TiltedCore/Serialization.hpp>
+ 
+ static std::function<UniquePtr<ServerMessage>(TiltedPhoques::Buffer::Reader& aReader)> s_serverMessageExtractor[kServerOpcodeMax];
+@@ -17,3 +18,4 @@
+                 auto ptr = TiltedPhoques::MakeUnique<T>();
++                if (SpatialWire::Stamped(T::Opcode)) ptr->SpatialEpoch=Serialization::ReadVarInt(aReader);
+                 ptr->DeserializeRaw(aReader);
+                 return TiltedPhoques::CastUnique<ServerMessage>(std::move(ptr));
+diff --git a/Code/encoding/Structs/Movement.h b/Code/encoding/Structs/Movement.h
+--- a/Code/encoding/Structs/Movement.h
++++ b/Code/encoding/Structs/Movement.h
+@@ -22,3 +22,5 @@
++    // Current native STR ownership generation, including player actors.
++    uint32_t OwnershipEpoch{};
+     GameId CellId{};
+     GameId WorldSpaceId{};
+     Vector3_NetQuantize Position{};
+diff --git a/Code/encoding/Structs/Movement.cpp b/Code/encoding/Structs/Movement.cpp
+--- a/Code/encoding/Structs/Movement.cpp
++++ b/Code/encoding/Structs/Movement.cpp
+@@ -6,4 +6,4 @@
+ bool Movement::operator==(const Movement& acRhs) const noexcept
+ {
+-    return CellId == acRhs.CellId && WorldSpaceId == acRhs.WorldSpaceId && Position == acRhs.Position && Rotation == acRhs.Rotation && Variables == acRhs.Variables && Direction == acRhs.Direction && HasLookAt == acRhs.HasLookAt && LookOffset == acRhs.LookOffset;
++    return OwnershipEpoch == acRhs.OwnershipEpoch && CellId == acRhs.CellId && WorldSpaceId == acRhs.WorldSpaceId && Position == acRhs.Position && Rotation == acRhs.Rotation && Variables == acRhs.Variables && Direction == acRhs.Direction && HasLookAt == acRhs.HasLookAt && LookOffset == acRhs.LookOffset;
+ }
+@@ -16,4 +16,5 @@
+ void Movement::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
+ {
++    Serialization::WriteVarInt(aWriter, OwnershipEpoch);
+     CellId.Serialize(aWriter);
+     WorldSpaceId.Serialize(aWriter);
+@@ -30,4 +31,6 @@
+ void Movement::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
+ {
++    const auto epoch=Serialization::ReadVarInt(aReader);
++    OwnershipEpoch=epoch<=0xffffffffull?static_cast<uint32_t>(epoch):0;
+     CellId.Deserialize(aReader);
+     WorldSpaceId.Deserialize(aReader);
+diff --git a/Code/client/Services/TransportService.h b/Code/client/Services/TransportService.h
+--- a/Code/client/Services/TransportService.h
++++ b/Code/client/Services/TransportService.h
+@@ -1,4 +1,5 @@
+ #pragma once
+ 
++#include <SpatialEpoch.h>
+ #include "Events/ConnectedEvent.h"
+ #include "Events/DisconnectedEvent.h"
+@@ -65,4 +66,5 @@
+     World& m_world;
+     entt::dispatcher& m_dispatcher;
+     bool m_connected;
++    mutable SpatialEpoch::Counter m_spatialEpoch;
+     std::atomic<bool> m_title{};
+diff --git a/Code/client/Services/Generic/TransportService.cpp b/Code/client/Services/Generic/TransportService.cpp
+--- a/Code/client/Services/Generic/TransportService.cpp
++++ b/Code/client/Services/Generic/TransportService.cpp
+@@ -150,6 +150,9 @@
+         Buffer buffer(1 << 16);
+         Buffer::Writer writer(&buffer);
+         writer.WriteBits(0, 8); // Write first byte as packet needs it
+ 
++        const auto opcode=acMessage.GetOpcode();
++        if (SpatialWire::Location(opcode)&&!m_spatialEpoch.Next()) return false;
++        if (SpatialWire::Stamped(opcode)) acMessage.SpatialEpoch=m_spatialEpoch.Value();
+         acMessage.Serialize(writer);
+         TiltedPhoques::PacketView packet(reinterpret_cast<char*>(buffer.GetWriteData()), writer.Size());
+@@ -184,5 +187,6 @@
+     if (!m_connected && pMessage->GetOpcode()!=AuthenticationResponse::Opcode) return;
++    if (SpatialWire::Stamped(pMessage->GetOpcode())&&!m_spatialEpoch.Matches(pMessage->SpatialEpoch)) return;
+     m_messageHandlers[pMessage->GetOpcode()](pMessage);
+ }
+ 
+ void TransportService::OnConnected()
+@@ -245,4 +249,5 @@
+     const bool authenticated=m_connected;
+     const bool requested=m_connectionRequested;
+     m_connected = false;
++    m_spatialEpoch.Reset();
+     m_connectionRequested=false;
+diff --git a/Code/server/Game/Player.h b/Code/server/Game/Player.h
+--- a/Code/server/Game/Player.h
++++ b/Code/server/Game/Player.h
+@@ -1,4 +1,5 @@
+ #pragma once
+ 
++#include <SpatialEpoch.h>
+ struct ServerMessage;
+ struct Player
+@@ -41,3 +42,5 @@
+     void SetCellComponent(const CellIdComponent& aCellComponent) noexcept;
++    bool AdvanceSpatialEpoch(uint64_t value) noexcept {return m_spatialEpoch.Advance(value);}
++    uint64_t LocationEpoch() const noexcept {return m_spatialEpoch.Value();}
+ 
+     void Send(const ServerMessage& acServerMessage, TiltedPhoques::EPacketFlags aPacketFlags = TiltedPhoques::kReliable) const;
+@@ -55,3 +58,4 @@
+     QuestLogComponent m_questLog;
+     CellIdComponent m_cell;
++    SpatialEpoch::Counter m_spatialEpoch;
+     uint32_t m_stringCacheId{0};
+diff --git a/Code/server/Game/Player.cpp b/Code/server/Game/Player.cpp
+--- a/Code/server/Game/Player.cpp
++++ b/Code/server/Game/Player.cpp
+@@ -26,5 +26,6 @@
+     , m_party{std::exchange(aRhs.m_party, {})}
+     , m_questLog{std::exchange(aRhs.m_questLog, {})}
+     , m_cell{std::exchange(aRhs.m_cell, {})}
++    , m_spatialEpoch{std::exchange(aRhs.m_spatialEpoch, {})}
+ {
+ }
+diff --git a/Code/server/Components/MovementComponent.h b/Code/server/Components/MovementComponent.h
+--- a/Code/server/Components/MovementComponent.h
++++ b/Code/server/Components/MovementComponent.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <SpatialEpoch.h>
+ #ifndef TP_INTERNAL_COMPONENTS_GUARD
+ #error Include Components.h instead
+ #endif
+@@ -12,4 +13,5 @@
+     glm::vec3 Rotation;
+     AnimationVariables Variables;
+     float Direction;
++    SpatialEpoch::Sample LastMovement;
+ };
+diff --git a/Code/server/Services/PlayerService.cpp b/Code/server/Services/PlayerService.cpp
+--- a/Code/server/Services/PlayerService.cpp
++++ b/Code/server/Services/PlayerService.cpp
+@@ -53,4 +53,5 @@
+     auto& message = acMessage.Packet;
+     if (HomeScope::Private(message.PlayerCell.ModId) || HomeScope::Private(message.WorldSpaceId.ModId)) return;
++    if (!pPlayer->AdvanceSpatialEpoch(message.SpatialEpoch)) return;
+ 
+     const GameId oldCell = pPlayer->GetCellComponent().Cell;
+@@ -94,5 +95,6 @@
+     auto& message = acMessage.Packet;
+     auto* pPlayer = acMessage.pPlayer;
+     if (HomeScope::Private(message.CellId.ModId) || HomeScope::Private(message.WorldSpaceId.ModId)) return;
++    if (!pPlayer->AdvanceSpatialEpoch(message.SpatialEpoch)) return;
+ 
+     if (pPlayer->GetCharacter())
+@@ -130,5 +132,6 @@
+     if (HomeRegistry::Pending(message.CellId.ModId) &&
+         (pPlayer->GetId()>0xFFFFu || (message.CellId.ModId&0xFFFFu)!=pPlayer->GetId())) return;
++    if (!pPlayer->AdvanceSpatialEpoch(message.SpatialEpoch)) return;
+     auto cell = CellIdComponent{message.CellId, {}, {}};
+     if (HomeRegistry::Scoped(message.CellId.ModId))
+         cell.Estate=HomeVisit::EstateFor(*pPlayer,message.CellId.ModId,message.CellId.BaseId);
+diff --git a/Code/server/Services/CharacterService.cpp b/Code/server/Services/CharacterService.cpp
+--- a/Code/server/Services/CharacterService.cpp
++++ b/Code/server/Services/CharacterService.cpp
+@@ -426,5 +426,6 @@
+     OwnerView<MovementComponent, CellIdComponent, CharacterComponent> view(m_world, acMessage.GetSender());
+ 
+     auto& message = acMessage.Packet;
++    if (message.SpatialEpoch!=acMessage.pPlayer->LocationEpoch()) return;
+ 
+     // Relayed as soon as it arrives, with the owner's capture tick, so receivers can schedule it on the owner's timeline.
+@@ -441,5 +442,8 @@
+         auto& cellIdComponent = view.get<CellIdComponent>(*itor);
+         const auto& characterComponent = view.get<CharacterComponent>(*itor);
++        const auto& owner=m_world.get<OwnerComponent>(*itor);
++        if (!owner.IsCurrentOwner(acMessage.pPlayer,movement.OwnershipEpoch)||
++            !SpatialEpoch::Finite(movement.Position.x,movement.Position.y,movement.Position.z)) continue;
+ 
+         const auto& senderLocation=acMessage.pPlayer->GetCellComponent();
+         if (senderLocation.HasExteriorEstate()||cellIdComponent.HasExteriorEstate()) continue;
+@@ -467,11 +471,22 @@
+-        movementComponent.Tick = message.Tick;
+-        movementComponent.Position = movement.Position;
+-        movementComponent.Rotation = glm::vec3(movement.Rotation.x, 0.f, movement.Rotation.y);
+-        movementComponent.Variables = movement.Variables;
+-        movementComponent.Direction = movement.Direction;
+-
+-        cellIdComponent.Cell = movement.CellId;
+-        cellIdComponent.WorldSpaceId = movement.WorldSpaceId;
+-        cellIdComponent.CenterCoords = GridCellCoords::CalculateGridCellCoords(movement.Position.x, movement.Position.y);
++        const auto order=movementComponent.LastMovement.Observe(movement.OwnershipEpoch,message.SpatialEpoch,message.Tick);
++        if (order==SpatialEpoch::Order::Duplicate) continue;
++        // Keep historical interpolation points only in the same physical cell;
++        // never let a delayed packet change the authoritative pose or routing.
++        if (order==SpatialEpoch::Order::Historical)
++        {
++            if (cellIdComponent.Cell!=movement.CellId||cellIdComponent.WorldSpaceId!=movement.WorldSpaceId) continue;
++        }
++        else
++        {
++            movementComponent.Tick = message.Tick;
++            movementComponent.Position = movement.Position;
++            movementComponent.Rotation = glm::vec3(movement.Rotation.x, 0.f, movement.Rotation.y);
++            movementComponent.Variables = movement.Variables;
++            movementComponent.Direction = movement.Direction;
++
++            cellIdComponent.Cell = movement.CellId;
++            cellIdComponent.WorldSpaceId = movement.WorldSpaceId;
++            cellIdComponent.CenterCoords = GridCellCoords::CalculateGridCellCoords(movement.Position.x, movement.Position.y);
++        }
+ 
+         for (auto pPlayer : m_world.GetPlayerManager())
+@@ -485,3 +500,4 @@
+             auto& relay = messages[pPlayer];
++            relay.SpatialEpoch=pPlayer->LocationEpoch();
+             relay.Tick = message.Tick;
+             relay.Updates[id] = movement;
+diff --git a/Code/client/Services/Generic/CharacterService.cpp b/Code/client/Services/Generic/CharacterService.cpp
+--- a/Code/client/Services/Generic/CharacterService.cpp
++++ b/Code/client/Services/Generic/CharacterService.cpp
+@@ -1050,7 +1050,8 @@
+         if (itor == std::end(view))
+             continue;
++        if (!movement.OwnershipEpoch||view.get<RemoteComponent>(*itor).OwnershipEpoch!=movement.OwnershipEpoch) continue;
+ 
+         auto& interpolationComponent = view.get<InterpolationComponent>(*itor);
+ 
+         InterpolationComponent::TimePoint point;
+         point.Tick = acMessage.Tick;
+@@ -1700,4 +1701,6 @@
+-        AnimationSystem::SerializeMovement(m_world, pActor, movementMessage.Updates[localComponent.Id]);
++        auto& movement=movementMessage.Updates[localComponent.Id];
++        AnimationSystem::SerializeMovement(m_world, pActor, movement);
++        movement.OwnershipEpoch=localComponent.OwnershipEpoch;
+     }
+ 
+     if (!actionsMessage.Actions.empty())
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign44"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign45"
