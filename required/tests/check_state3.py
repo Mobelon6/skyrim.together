@@ -152,22 +152,23 @@ int main(){
 }
 ''')
 
-server=extract('server/Services/QuestService.cpp','    auto& run =','    RecordQuest(pPlayer, notify);')
-run('party quest lifecycle with two senders',headers+'''
-struct RequestQuestUpdate{enum {StageUpdate,Started,Stopped};int Id;int Stage;int Status;};
-using NotifyQuestUpdate=RequestQuestUpdate;
-struct Run{unsigned Generation{1};std::set<uint16_t> Stages; bool Stopped=false;bool Started=false;};
-struct Party{std::map<int,Run> QuestRuns;};
-struct Sim{Party party; std::vector<int> sent;
-void receive(const RequestQuestUpdate& message){auto* pParty=&party;auto notify=message;
-'''+server+'''sent.push_back(notify.Status*1000+notify.Stage);}
-};
+server=extract('server/Services/QuestService.cpp','bool AdvanceQuestRun(', 'std::string QuestKey(')
+run('party quest lifecycle and ordered catch-up history',headers+'''
+struct NotifyQuestUpdate{enum {StageUpdate,Started,Stopped};uint16_t Stage;uint8_t Status;};
+struct QuestRun{unsigned Generation{1};std::set<uint16_t> Stages;std::vector<uint16_t> OrderedStages; bool Stopped=false;bool Started=false;};
+'''+server+'''
 int main(){
-    Sim s;
-    s.receive({2,10,1});s.receive({2,10,1});s.receive({2,100,0});s.receive({2,10,1});s.receive({2,100,0});
-    s.receive({2,20,0});s.receive({2,20,2});s.receive({2,20,2});s.receive({2,90,0});
-    s.receive({2,10,1});s.receive({2,100,0});s.receive({3,100,0});
-    assert((s.sent==std::vector<int>{1010,100,20,2020,1010,100,100}));
+    QuestRun run;
+    auto receive=[&](uint16_t stage,uint8_t status){NotifyQuestUpdate event{stage,status};return AdvanceQuestRun(run,event);};
+    assert(receive(10,1));assert(!receive(10,1));assert(receive(100,0));
+    assert(!receive(10,1));assert(!receive(100,0));assert(receive(20,0));
+    assert((run.OrderedStages==std::vector<uint16_t>{100,20}));
+    assert(receive(20,2));assert(!receive(20,2));assert(!receive(90,0));
+    assert(run.OrderedStages.empty());assert(receive(10,1));assert(receive(100,0));
+    assert(run.Generation==2&&(run.OrderedStages==std::vector<uint16_t>{100}));
+    QuestRun partial;NotifyQuestUpdate stage{80,0};assert(AdvanceQuestRun(partial,stage));
+    NotifyQuestUpdate start{10,1};assert(AdvanceQuestRun(partial,start));
+    assert((partial.OrderedStages==std::vector<uint16_t>{80}));
 }
 ''')
 

@@ -1617,3 +1617,254 @@ diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
  #define BUILD_BRANCH "${GIT_BRANCH}"
 -#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign2"
 +#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign4"
+diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestService.cpp
+--- a/Code/server/Services/QuestService.cpp
++++ b/Code/server/Services/QuestService.cpp
+@@ -4,4 +4,7 @@
+ #include <World.h>
+ #include <Services/QuestService.h>
++#include <Services/CampaignAccess.h>
++#include <TradeProperties.h>
++#include <sstream>
+ 
+ #include <Messages/RequestQuestUpdate.h>
+@@ -15,5 +18,120 @@
+ Console::Setting bEnableMiscQuestSync{"Gameplay:bEnableMiscQuestSync", "(Experimental) Syncs miscellaneous quests when possible", false};
+ 
++using QuestRun = PartyService::Party::QuestRun;
++
++bool AdvanceQuestRun(QuestRun& run, NotifyQuestUpdate& notify)
++{
++    switch (notify.Status)
++    {
++    case NotifyQuestUpdate::Started:
++        if (run.Started && !run.Stopped)
++            return false;
++        if (run.Stopped)
++        {
++            if (run.Generation == UINT32_MAX) return false;
++            ++run.Generation;
++        }
++        run.Started = true;
++        run.Stopped = false;
++        return true;
++    case NotifyQuestUpdate::StageUpdate:
++        if (run.Stopped || !run.Stages.insert(notify.Stage).second)
++            return false;
++        run.OrderedStages.push_back(notify.Stage);
++        return true;
++    case NotifyQuestUpdate::Stopped:
++        if (run.Stopped) return false;
++        run.Stopped = true;
++        run.Started = false;
++        run.Stages.clear();
++        run.OrderedStages.clear();
++        return true;
++    default:
++        return false;
++    }
++}
++
++std::string QuestKey(World& world, const GameId& id)
++{
++    const auto& mods = world.ctx().at<ModsComponent>();
++    for (const auto* list : {&mods.GetStandardMods(), &mods.GetLiteMods()})
++        for (const auto& [name, entry] : *list)
++            if (entry.id == id.ModId)
++            {
++                std::string plugin(name.begin(), name.end());
++                for (auto& c : plugin)
++                    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
++                const TradeProperties::FormKey key{plugin, id.BaseId};
++                return key.Valid() ? key.Encode() : std::string{};
++            }
++    return {};
++}
++
++bool RestoreQuestRun(const CampaignJournal::Journal& journal, const std::string& key, QuestRun& run)
++{
++    if (key.empty() || !journal.Ready()) return false;
++    QuestRun restored;
++    for (const auto& op : journal.Operations())
++    {
++        if (op.Kind != "quest-progress-v1") continue;
++        std::istringstream row(op.Payload);
++        std::string form, extra;
++        if (!(row >> form)) return false;
++        if (form != key) continue;
++        uint32_t generation{}, status{}, stage{}, type{};
++        uint64_t character{};
++        if (!(row >> generation >> status >> stage >> type >> character) || row >> extra ||
++            !character || status > NotifyQuestUpdate::Stopped || stage > UINT16_MAX || type > UINT8_MAX)
++            return false;
++        NotifyQuestUpdate event{};
++        event.Status = static_cast<uint8_t>(status);
++        event.Stage = static_cast<uint16_t>(stage);
++        event.ClientQuestType = static_cast<uint8_t>(type);
++        if (!AdvanceQuestRun(restored, event) || restored.Generation != generation)
++            return false;
++    }
++    run = std::move(restored);
++    return true;
++}
++
++bool StoreQuestRun(CampaignJournal::Journal& journal, const std::string& key,
++                   uint64_t character, const QuestRun& run, const NotifyQuestUpdate& event)
++{
++    if (!character || key.empty()) return false;
++    const auto head = journal.Current();
++    const auto payload = key + " " + std::to_string(run.Generation) + " " +
++        std::to_string(event.Status) + " " + std::to_string(event.Stage) + " " +
++        std::to_string(event.ClientQuestType) + " " + std::to_string(character);
++    return journal.Append(head, {"quest-progress-" + std::to_string(head.Revision + 1),
++        "quest-progress-v1", payload}) == CampaignJournal::Result::Committed;
++}
++
++// A player who has independently accepted this quest may have missed earlier
++// shared stages (e.g. because the unique pickup happened before acceptance).
++// Offer them through the existing consent path; never replay another run or
++// force a completed quest to start on the basis of old history alone.
++void OfferKnownStages(Player& player, const PartyService::Party& party,
++                      const QuestRun& run, const NotifyQuestUpdate& notice)
++{
++    if (run.Stopped || run.OrderedStages.empty()) return;
++    auto speaker = party.LeaderPlayerId;
++    if (speaker == player.GetId())
++        for (auto* member : party.Members)
++            if (member != &player) { speaker = member->GetId(); break; }
++    if (speaker == player.GetId()) return;
++    NotifyQuestUpdate update{};
++    update.Id = notice.Id;
++    update.ClientQuestType = notice.ClientQuestType;
++    update.Status = NotifyQuestUpdate::StageUpdate;
++    update.Speaker = speaker;
++    update.SharedRun = run.Generation;
++    for (auto stage : run.OrderedStages)
++    {
++        update.Stage = stage;
++        player.Send(update);
++    }
++}
++
+ }
+ 
+ QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
+@@ -44,3 +162,27 @@
+     PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
+     const PartyService::Party::Conversation* participants = nullptr;
++    if (pParty && message.JournalObjective &&
++        (message.Status == RequestQuestUpdate::Started || message.Status == RequestQuestUpdate::StageUpdate))
++    {
++        try
++        {
++            auto& authority = CampaignAccess::Authority();
++            using Mode = CampaignReplication::Link::Mode;
++            QuestRun run;
++            bool known = false;
++            if (authority.State() == Mode::Ready && CampaignAccess::Character(*pPlayer))
++                known = RestoreQuestRun(authority.Journal, QuestKey(m_world, message.Id), run);
++            else if (authority.State() == Mode::Disabled)
++            {
++                const auto found = pParty->QuestRuns.find(message.Id);
++                if (found != pParty->QuestRuns.end()) { run = found.value(); known = true; }
++            }
++            if (known && (message.Status == RequestQuestUpdate::Started || run.Stages.contains(message.Stage)))
++                OfferKnownStages(*pPlayer, *pParty, run, notify);
++        }
++        catch (const std::exception& error)
++        {
++            spdlog::error("STM quest catch-up: {}", error.what());
++        }
++    }
+     if (!pParty) return;
+@@ -115,38 +257,41 @@
+-    auto& run = pParty->QuestRuns[message.Id];
+-    // The sender's local quest log and the party's shared lifecycle are independent.
+-    // A late start from a second client must not clear stages the first client sent.
+-    switch (message.Status)
+-    {
+-    case RequestQuestUpdate::Started:
+-        if (run.Started && !run.Stopped)
+-            return;
+-        if (run.Stopped) ++run.Generation;
+-        run.Started = true;
+-        run.Stopped = false;
+-        notify.Status = NotifyQuestUpdate::Started;
+-        break;
+-    case RequestQuestUpdate::StageUpdate:
+-        // A party may form partway through a quest, so a stage can be its first event.
+-        // Once a stop is observed, only an explicit new start opens the next run.
+-        if (run.Stopped || !run.Stages.insert(message.Stage).second)
+-            return;
+-        break;
+-    case RequestQuestUpdate::Stopped:
+-        if (run.Stopped)
+-            return;
+-        run.Stopped = true;
+-        run.Started = false;
+-        run.Stages.clear();
+-        break;
+-    default:
+-        return;
+-    }
+-
+-    RecordQuest(pPlayer, notify);
+-    notify.Speaker = pPlayer->GetId();
+-    if (notify.Speaker == pParty->LeaderPlayerId)
+-        notify.SharedRun = run.Generation;
+-    for (auto* guest : pParty->Members)
+-        if (guest != pPlayer && PartyService::WithinSyncRange(m_world, *pPlayer, *guest) &&
+-            (!participants || participants->ChoiceListeners.count(guest->GetId())))
+-            guest->Send(notify);
++    try
++    {
++        auto& run = pParty->QuestRuns[message.Id];
++        auto& authority = CampaignAccess::Authority();
++        using Mode = CampaignReplication::Link::Mode;
++        const bool durable = authority.State() == Mode::Ready;
++        const auto character = durable ? CampaignAccess::Character(*pPlayer) : uint64_t{};
++        std::string key;
++        if (durable)
++        {
++            key = QuestKey(m_world, message.Id);
++            if (!character || !RestoreQuestRun(authority.Journal, key, run)) return;
++        }
++        else if (authority.State() != Mode::Disabled)
++            return;
++
++        // Keep the accepted run unchanged until its authoritative record is stored.
++        auto next = run;
++        notify.Status = message.Status;
++        if (!AdvanceQuestRun(next, notify))
++            return;
++        if (durable && !StoreQuestRun(authority.Journal, key, character, next, notify))
++        {
++            spdlog::error("STM could not persist quest progress {:X}", message.Id.LogFormat());
++            return;
++        }
++        run = std::move(next);
++        if (!durable)
++            RecordQuest(pPlayer, notify);
++        notify.Speaker = pPlayer->GetId();
++        if (notify.Speaker == pParty->LeaderPlayerId)
++            notify.SharedRun = run.Generation;
++        for (auto* guest : pParty->Members)
++            if (guest != pPlayer && PartyService::WithinSyncRange(m_world, *pPlayer, *guest) &&
++                (!participants || participants->ChoiceListeners.count(guest->GetId())))
++                guest->Send(notify);
++    }
++    catch (const std::exception& error)
++    {
++        spdlog::error("STM quest progression: {}", error.what());
++    }
+diff --git a/Code/server/Services/PartyService.h b/Code/server/Services/PartyService.h
+--- a/Code/server/Services/PartyService.h
++++ b/Code/server/Services/PartyService.h
+@@ -31,6 +31,7 @@
+         struct QuestRun
+         {
+             TiltedPhoques::Set<uint16_t> Stages;
++            Vector<uint16_t> OrderedStages;
+             uint32_t Generation{1};
+             bool Stopped = false;
+             bool Started = false;
