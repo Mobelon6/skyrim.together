@@ -1,0 +1,220 @@
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -24,3 +24,5 @@
+ #include <Forms/TESObjectCELL.h>
+ #include <Forms/BGSEncounterZone.h>
++#include <ExtraData/ExtraDataList.h>
++#include <cstring>
+ #include <Messages/NotifyPartyHome.h>
+@@ -95,9 +97,67 @@
+ const HomeCatalog::Cell* CatalogEntrance(uint32_t id)
+ {
+     if (!LoadProjectionCatalog()) return nullptr;
+     for (const auto& [_,cell]:*projectionCatalog)
+         for (const auto& entry:cell.Entrances)
+             if (CatalogForm(entry.Door)==id) return &cell;
+     return nullptr;
+ }
++// Native ExtraTeleport layout (CommonLibSSE-NG ExtraTeleport.h):
++// BSExtraData at 0x00, DoorTeleportData* at 0x10; linked handle at 0x00.
++// Do not retain a handle or raw object pointer in the durable home key.
++TESObjectREFR* NativeLinkedDoor(TESObjectREFR* source)
++{
++    if (!source || !source->baseForm || source->baseForm->formType!=FormType::Door ||
++        source->IsTemporary() || source->IsDeleted() || HomeInstance::ProjectionForm(source->formID)) return nullptr;
++    auto* extra=source->GetExtraDataList();
++    const auto* teleport=extra?extra->GetByType(ExtraDataType::Teleport):nullptr;
++    if (!teleport) return nullptr;
++    const void* data{};
++    std::memcpy(&data,reinterpret_cast<const unsigned char*>(teleport)+0x10,sizeof(data));
++    if (!data) return nullptr;
++    uint32_t handle{};
++    std::memcpy(&handle,data,sizeof(handle));
++    if (!handle) return nullptr;
++    auto* target=TESObjectREFR::GetByHandle(handle);
++    if (!target || target==source || !target->baseForm || target->baseForm->formType!=FormType::Door ||
++        target->IsTemporary() || target->IsDeleted() || HomeInstance::ProjectionForm(target->formID)) return nullptr;
++    return target;
++}
++TESObjectCELL* NativeDoorDestination(TESObjectREFR* source)
++{
++    auto* target=NativeLinkedDoor(source);
++    if (!target || NativeLinkedDoor(target)!=source) return nullptr;
++    auto* outside=source->GetParentCellEx();
++    auto* cell=target->GetParentCellEx();
++    if (!outside || !cell || cell==outside || !(cell->cellFlags&1) ||
++        cell->worldspace || cell->IsTemporary() || HomeInstance::ProjectionForm(cell->formID)) return nullptr;
++    return cell;
++}
++std::optional<TradeProperties::FormKey> NativeEntranceRoot(uint32_t form)
++{
++    auto* ref=Cast<TESObjectREFR>(TESForm::GetById(form));
++    auto* cell=NativeDoorDestination(ref);
++    if (!cell) return {};
++    std::vector<InventoryEvidence::PluginSlot> slots;
++    if (auto* mods=ModManager::Get())
++        for (const auto* mod:mods->mods)
++        {
++            if (!mod || !mod->IsLoaded()) continue;
++            const auto* end=std::find(mod->filename,mod->filename+sizeof(mod->filename),'\0');
++            if (end!=mod->filename+sizeof(mod->filename))
++                slots.push_back({mod->GetId(),mod->IsLite(),std::string(mod->filename,end)});
++        }
++    const auto key=InventoryEvidence::Resolve(cell->formID,slots);
++    if (!key) return {};
++    TradeProperties::FormKey root{key->Plugin,key->Local};
++    return root.Valid()?std::optional<TradeProperties::FormKey>(std::move(root)):std::nullopt;
++}
++// Prefer the engine's original door. The legacy catalog remains a fallback
++// for its existing projection route when a linked reference is unloaded.
++std::optional<TradeProperties::FormKey> EntranceRoot(uint32_t form,const HomeCatalog::Cell* catalog)
++{
++    if (auto root=NativeEntranceRoot(form)) return root;
++    if (catalog) return catalog->Root;
++    return {};
++}
+ struct CandidateVisit {uint32_t Slot{};uint64_t Owner{};};
+@@ -601,3 +661,3 @@
+ void SyncObjects(World& world,TESObjectCELL& cell,const CampaignAccess::Identity& identity,
+-                 uint32_t slot,const std::string& root)
++                 uint32_t slot,const std::string& root,const HomeSnapshot::State& baseline)
+ {
+@@ -618,21 +678,41 @@
+     ctx.Next=now+1s;
+     const auto* catalog=CatalogCell(cell.formID);
+-    if (!catalog || catalog->Refs.empty()) return;
+-    const auto view=CampaignAccess::HomeObjectView(ctx.Campaign,slot);
+-    if (!view) {ctx.Tracks.clear();return;}
+-    const auto& refs=catalog->Refs;
+-    unsigned sent=0;
+-    for (size_t i=0;i<std::min<size_t>(refs.size(),128) && sent<8;++i)
+-    {
+-        const auto& binding=refs[ctx.NextRef++%refs.size()];
+-        if (IsExit(*catalog,binding)) continue;
+-        const auto key=binding.Source.Encode();
+-        const auto it=view->find(key);
+-        if (it==view->end()) continue;
+-        const auto& old=it->second;
+-        auto* object=Cast<TESObjectREFR>(TESForm::GetById(CatalogForm(binding.Source)));
+-        if (!object || object->IsTemporary() || object->IsDeleted() || !object->baseForm ||
+-            object->GetParentCellEx()!=&cell || object->baseForm->formID!=CatalogForm(binding.Base) ||
+-            static_cast<uint32_t>(object->baseForm->formType)!=old.Type || Cast<Actor>(object) ||
+-            (old.Inventory==3 && object->IsDisabled())) {ctx.Tracks.erase(key);continue;}
++    const auto view=CampaignAccess::HomeObjectView(ctx.Campaign,slot);
++    if (!view) {ctx.Tracks.clear();return;}
++    // Original reference keys already exist in the authoritative baseline.
++    // Preserve the legacy catalog's filtering when present, otherwise use
++    // those keys directly. No generated forms or map are needed for owners.
++    const size_t count=catalog?catalog->Refs.size():baseline.Refs.size();
++    if (!count) return;
++    unsigned sent=0;
++    for (size_t i=0;i<std::min<size_t>(count,128) && sent<8;++i)
++    {
++        const auto index=ctx.NextRef++%count;
++        if (catalog && IsExit(*catalog,catalog->Refs[index])) continue;
++        const auto& source=catalog?catalog->Refs[index].Source:baseline.Refs[index].Key;
++        const auto& base=catalog?catalog->Refs[index].Base:baseline.Refs[index].Base;
++        const auto key=source.Encode();
++        const auto it=view->find(key);
++        if (it==view->end()) continue;
++        const auto& old=it->second;
++        auto* object=Cast<TESObjectREFR>(TESForm::GetById(CatalogForm(source)));
++        if (!object || object->IsTemporary() || object->IsDeleted() || !object->baseForm ||
++            object->GetParentCellEx()!=&cell || object->baseForm->formID!=CatalogForm(base) ||
++            static_cast<uint32_t>(object->baseForm->formType)!=old.Type || Cast<Actor>(object) ||
++            (old.Inventory==3 && object->IsDisabled())) {ctx.Tracks.erase(key);continue;}
++        bool parentControlled=false;
++        if (!catalog)
++        {
++            auto* extra=object->GetExtraDataList();
++            // Do not treat a transition door or quest alias as ordinary
++            // furniture. Unknown form types stay outside the fallback.
++            if (!extra || extra->HasQuestObjectAlias() || extra->Contains(ExtraDataType::Teleport) ||
++                !(old.Type==28 || old.Type==29 || old.Type==34 || old.Type==35 ||
++                  old.Type==36 || old.Type==40 || old.Inventory==3))
++            {ctx.Tracks.erase(key);continue;}
++            // CommonLibSSE-NG ExtraDataTypes.h: kEnableStateParent = 0x36.
++            // The parent's state controls visibility; never force a child
++            // against its enable parent during owner recovery.
++            parentControlled=extra->Contains(static_cast<ExtraDataType>(0x36));
++        }
+         auto tracked=ctx.Tracks.find(key);
+@@ -640,3 +720,5 @@
+                tracked->second.Pending->Encode()==old.Value.Encode()))))
+         {
++            if (parentControlled && object->IsDisabled()!=(old.Value.Disabled!=0))
++            {ctx.Tracks.erase(key);continue;}
+             const auto result=RestoreObject(world,cell,*object,old.Type,old.Value.Disabled!=0,old.Value);
+@@ -660,4 +742,6 @@
+             open=n;
+         }
+-        auto state=ObjectPose(*object,open,open && catalog->GuestDoors.count(key)?1u:0u);
++        // A native fallback can observe an ordinary door but cannot invent
++        // the old generator's verified guest-door capability.
++        auto state=ObjectPose(*object,open,open && (catalog?catalog->GuestDoors.count(key):old.Value.GuestDoor)?1u:0u);
+         if (state.Disabled) state.Transform=old.Value.Transform;
+@@ -680,6 +764,7 @@
+         if (ctx.SaveRevision<old.SaveRevision)
+         {
+             // An older authenticated checkpoint cannot replace newer state.
+-            RestoreObject(world,cell,*object,old.Type,old.Value.Disabled!=0,old.Value);
++            if (!parentControlled || object->IsDisabled()==(old.Value.Disabled!=0))
++                RestoreObject(world,cell,*object,old.Type,old.Value.Disabled!=0,old.Value);
+             continue;
+         }
+@@ -950,3 +1035,6 @@
+             if (!input.eof()) {accessMenu={};return;}
+-            if (const auto* cell=CatalogEntrance(door)) AddVisits(*identity,*cell,labels);
++            const auto* catalog=CatalogEntrance(door);
++            const auto actual=EntranceRoot(door,catalog);
++            if (!actual || actual->Encode()!=accessMenu.Root) {accessMenu={};return;}
++            if (catalog && catalog->Root.Encode()==accessMenu.Root) AddVisits(*identity,*catalog,labels);
+             selection=true;
+@@ -1043,7 +1131,8 @@
+         const auto* cell=CatalogEntrance(form);
+         const auto identity=CampaignAccess::Current(m_world);
+-        if (!cell || !identity) return false;
+-        const auto root=cell->Root.Encode();
+-        const auto slot=CampaignAccess::HomeScope(identity->Save.Campaign,identity->Save.Character,root);
+-        auto* p=PlayerCharacter::Get();
+-        auto* original=Cast<TESObjectCELL>(TESForm::GetById(CatalogForm(cell->Root)));
++        const auto destination=EntranceRoot(form,cell);
++        if (!destination || !identity) return false;
++        const auto root=destination->Encode();
++        const auto slot=CampaignAccess::HomeScope(identity->Save.Campaign,identity->Save.Character,root);
++        auto* p=PlayerCharacter::Get();
++        auto* original=Cast<TESObjectCELL>(TESForm::GetById(CatalogForm(*destination)));
+@@ -1061,2 +1150,4 @@
+-        std::string labels;AddVisits(*identity,*cell,labels);accessMenu.Nonce=0;
++        std::string labels;
++        if (cell && cell->Root.Encode()==root) AddVisits(*identity,*cell,labels);
++        accessMenu.Nonce=0;
+         if (accessMenu.Visits.empty()) {accessMenu={};return false;}
+@@ -1099,4 +1190,6 @@
+         const auto menu=std::move(accessMenu);accessMenu={};
+         auto identity=CampaignAccess::Current(m_world);
+-        if (!identity || identity->Save.Campaign!=menu.Campaign || identity->Save.Character!=menu.Character ||
++        const auto destination=EntranceRoot(door,CatalogEntrance(door));
++        if (!identity || !destination || destination->Encode()!=menu.Root ||
++            identity->Save.Campaign!=menu.Campaign || identity->Save.Character!=menu.Character ||
+             static_cast<size_t>(choice)>menu.Choices.size()+menu.Visits.size()) return;
+@@ -1394,4 +1487,7 @@
+                 const auto bytes=CampaignAccess::HomeBaseline(identity->Save.Campaign,slot);
+                 const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
+-                if (state) ApplyLoose(*cell,*state,nullptr);
+-                SyncObjects(world,*cell,*identity,slot,encoded);
++                if (state)
++                {
++                    ApplyLoose(*cell,*state,nullptr);
++                    SyncObjects(world,*cell,*identity,slot,encoded,*state);
++                }
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign26"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign27"
