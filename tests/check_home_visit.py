@@ -7,6 +7,9 @@ client=(r/"Code/client/Services/Generic/PartyHome.cpp").read_text()
 player=(r/"Code/server/Services/PlayerService.cpp").read_text()
 trade=(r/"Code/client/Services/Generic/PartyTrade.cpp").read_text()
 assert "found->second.Character==character" in server
+assert "found->second.Connection==uint64_t(player.GetConnectionId())" in server
+assert "uint64_t(owner->GetConnectionId()),e.House" in server
+assert "HomeEstateCatalog::Identity(*catalog,link.Journal,link.Campaign,*room)" in server
 assert "found->second.Slot==slot && Clock::now()<found->second.Until" in server
 assert "HomePermissions::Effective(link.Journal,slot,character)!=HomePermissions::Right::None" in server
 assert "if (e.AccessOp==3)" in server and "if (e.AccessOp==3)" in client

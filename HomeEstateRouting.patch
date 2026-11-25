@@ -1,0 +1,319 @@
+diff --git a/Code/server/Components/CellIdComponent.h b/Code/server/Components/CellIdComponent.h
+--- a/Code/server/Components/CellIdComponent.h
++++ b/Code/server/Components/CellIdComponent.h
+@@ -33,9 +33,21 @@
+     bool IsInInteriorCell() const noexcept { return !WorldSpaceId; }
+-
+-    bool IsInRange(const CellIdComponent& acRhs, bool aIsDragon) const noexcept
+-    {
+-        if (!HomeScope::EstateCompatible(Estate,acRhs.Estate)) return false;
+-        if (HomeScope::Private(Cell.ModId) || HomeScope::Private(acRhs.Cell.ModId))
+-            return !WorldSpaceId && !acRhs.WorldSpaceId && Cell==acRhs.Cell;
++
++    bool HasExteriorEstate() const noexcept
++    {return bool(WorldSpaceId)&&!(Estate==HomeScope::EstateContext{});}
++
++    bool SamePresence(const CellIdComponent& rhs) const noexcept
++    {
++        // Interior slots already isolate exact rooms. The estate association
++        // is informational there, so a newly registered main room does not
++        // invalidate an already admitted basement actor.
++        if (HomeScope::Private(Cell.ModId)||HomeScope::Private(rhs.Cell.ModId))
++            return !WorldSpaceId&&!rhs.WorldSpaceId&&Cell==rhs.Cell;
++        return HomeScope::EstateCompatible(Estate,rhs.Estate);
++    }
++
++    bool IsInRange(const CellIdComponent& acRhs, bool aIsDragon) const noexcept
++    {
++        if (!SamePresence(acRhs)) return false;
++        if (HomeScope::Private(Cell.ModId)) return true;
+         if (IsInInteriorCell())
+             return Cell == acRhs.Cell;
+diff --git a/Code/server/Services/HomeVisit.h b/Code/server/Services/HomeVisit.h
+--- a/Code/server/Services/HomeVisit.h
++++ b/Code/server/Services/HomeVisit.h
+@@ -1,5 +1,6 @@
+ #pragma once
+-#include <cstdint>
++#include <cstdint>
++#include <HomeScope.h>
+ struct Player;
+ namespace HomeVisit
+ {
+@@ -6,3 +7,5 @@
+ // Owner or currently authorized visitor, never merely a matching FormID.
+ bool CanEnter(Player&,uint32_t mod,uint32_t base);
++// Derive a logical estate from an admitted original interior; no new rights.
++HomeScope::EstateContext EstateFor(Player&,uint32_t mod,uint32_t base) noexcept;
+ }
+diff --git a/Code/server/Services/PartyHome.cpp b/Code/server/Services/PartyHome.cpp
+--- a/Code/server/Services/PartyHome.cpp
++++ b/Code/server/Services/PartyHome.cpp
+@@ -8,4 +8,5 @@
+ #include <HomePermissions.h>
+ #include <HomeLinkedAccess.h>
++#include <HomeEstateCatalog.h>
+ #include <HomeLocks.h>
+ #include <HomeResidents.h>
+@@ -30,4 +31,4 @@
+ std::map<uint32_t,PendingSnapshot> pendingSnapshots;
+-struct Lease {uint64_t Campaign{},Character{};uint32_t Slot{};Clock::time_point Until;};
++struct Lease {uint64_t Campaign{},Character{},Connection{};uint32_t Slot{};Clock::time_point Until;};
+ std::map<uint32_t,Lease> visits;
+ }
+@@ -44,8 +45,22 @@
+     const auto found=visits.find(player.GetId());
+     return home && home->Root.Local==base && found!=visits.end() &&
+         found->second.Campaign==link.Campaign && found->second.Character==character &&
+-        found->second.Slot==slot && Clock::now()<found->second.Until &&
+-        HomePermissions::Effective(link.Journal,slot,character)!=HomePermissions::Right::None;
+-}
++        found->second.Connection==uint64_t(player.GetConnectionId()) &&
++        found->second.Slot==slot && Clock::now()<found->second.Until &&
++        HomePermissions::Effective(link.Journal,slot,character)!=HomePermissions::Right::None;
++}
++HomeScope::EstateContext HomeVisit::EstateFor(Player& player,uint32_t mod,uint32_t base) noexcept
++{
++    try
++    {
++        if (!CanEnter(player,mod,base)) return {};
++        auto& link=CampaignAccess::Authority();
++        const auto& catalog=HomeEstateCatalog::Host();
++        const auto room=HomeRegistry::BySlot(link.Journal,mod&HomeRegistry::MaxSlot);
++        if (!catalog||!room) return {};
++        return HomeEstateCatalog::Identity(*catalog,link.Journal,link.Campaign,*room).value_or(HomeScope::EstateContext{});
++    }
++    catch (...) {return {};}
++}
+ void OverlayService::OnHome(const PacketEvent<RequestPartyHome>& packet) noexcept
+ {
+@@ -250,5 +265,5 @@
+                 std::erase_if(visits,[&](const auto& row){return row.second.Until<=now;});
+                 if (right==HomePermissions::Right::None) visits.erase(owner->GetId());
+-                else visits[owner->GetId()]={link.Campaign,character,e.House,now+std::chrono::seconds(30)};
++                else visits[owner->GetId()]={link.Campaign,character,uint64_t(owner->GetConnectionId()),e.House,now+std::chrono::seconds(30)};
+                 NotifyPartyHome result;auto& r=result.Event;
+                 r.Campaign=link.Campaign;r.Character=character;r.Owner=owner->GetId();r.House=e.House;
+diff --git a/Code/server/Services/PlayerService.cpp b/Code/server/Services/PlayerService.cpp
+--- a/Code/server/Services/PlayerService.cpp
++++ b/Code/server/Services/PlayerService.cpp
+@@ -130,6 +130,8 @@
+     if (HomeRegistry::Pending(message.CellId.ModId) &&
+         (pPlayer->GetId()>0xFFFFu || (message.CellId.ModId&0xFFFFu)!=pPlayer->GetId())) return;
+-    auto cell = CellIdComponent{message.CellId, {}, {}};
++    auto cell = CellIdComponent{message.CellId, {}, {}};
++    if (HomeRegistry::Scoped(message.CellId.ModId))
++        cell.Estate=HomeVisit::EstateFor(*pPlayer,message.CellId.ModId,message.CellId.BaseId);
+     pPlayer->SetCellComponent(cell);
+ 
+     m_world.GetDispatcher().trigger(PlayerLeaveCellEvent(oldCell));
+diff --git a/Code/server/Services/CharacterService.cpp b/Code/server/Services/CharacterService.cpp
+--- a/Code/server/Services/CharacterService.cpp
++++ b/Code/server/Services/CharacterService.cpp
+@@ -154,13 +154,10 @@
+         if (acEvent.Owner == pPlayer)
+             continue;
+ 
+-        if (pPlayer->GetCellComponent().WorldSpaceId != acEvent.WorldSpaceId || pPlayer->GetCellComponent().WorldSpaceId == acEvent.WorldSpaceId && !GridCellCoords::IsCellInGridCell(acEvent.CurrentCoords, pPlayer->GetCellComponent().CenterCoords, false))
+-        {
+-            pPlayer->Send(removeMessage);
+-        }
+-        else if (pPlayer->GetCellComponent().WorldSpaceId == acEvent.WorldSpaceId && GridCellCoords::IsCellInGridCell(acEvent.CurrentCoords, pPlayer->GetCellComponent().CenterCoords, false))
+-        {
+-            pPlayer->Send(spawnMessage);
+-        }
++        const auto* location=m_world.try_get<CellIdComponent>(acEvent.Entity);
++        if (location&&location->WorldSpaceId&&location->IsInRange(pPlayer->GetCellComponent(),false))
++            pPlayer->Send(spawnMessage);
++        else
++            pPlayer->Send(removeMessage);
+     }
+ }
+@@ -181,4 +178,5 @@
+-        if (acEvent.NewCell == pPlayer->GetCellComponent().Cell)
++        const auto* location=m_world.try_get<CellIdComponent>(acEvent.Entity);
++        if (location&&!location->WorldSpaceId&&location->IsInRange(pPlayer->GetCellComponent(),false))
+             pPlayer->Send(spawnMessage);
+         else
+             pPlayer->Send(removeMessage);
+@@ -195,4 +193,7 @@
+     const auto isPlayer = (refId.ModId == 0 && refId.BaseId == 0x14);
+     const auto isCustom = isPlayer || refId.ModId == std::numeric_limits<uint32_t>::max();
++    // The legacy assignment packet has no exterior estate/transition identity.
++    // Refuse rather than treat a private exterior as the ordinary world.
++    if (acMessage.pPlayer->GetCellComponent().HasExteriorEstate()) return;
+     if (!HomeScope::AdmittedCell(acMessage.pPlayer->GetCellComponent().Cell,message.CellId,message.WorldSpaceId)) return;
+     if (!isPlayer && HomeRegistry::Scoped(message.CellId.ModId))
+@@ -215,7 +216,8 @@
+             std::begin(view), std::end(view),
+-            [view, refId, cell=message.CellId](auto entity)
+-            {
+-                const auto& formIdComponent = view.get<FormIdComponent>(entity);
+-                const auto& location=view.get<CellIdComponent>(entity);
+-                return HomeScope::ReferenceMatches(formIdComponent.Id,location.Cell,refId,cell);
++            [view, refId, cell=message.CellId,sender=acMessage.pPlayer](auto entity)
++            {
++                const auto& formIdComponent = view.get<FormIdComponent>(entity);
++                const auto& location=view.get<CellIdComponent>(entity);
++                return sender->GetCellComponent().SamePresence(location)&&
++                    HomeScope::ReferenceMatches(formIdComponent.Id,location.Cell,refId,cell);
+             });
+@@ -302,4 +304,5 @@
+     // Scoped actors keep their namespace until an explicit reassignment.
+     if (message.Reason == OwnershipReleaseReason::Relinquish && (message.WorldSpaceId || message.CellId) &&
++        !view.get<CellIdComponent>(*it).HasExteriorEstate() &&
+         !HomeScope::Private(view.get<CellIdComponent>(*it).Cell.ModId) && !HomeScope::Private(message.CellId.ModId))
+     {
+@@ -380,3 +383,4 @@
+         const auto* cell=m_world.try_get<CellIdComponent>(cEntity);
+         if (cell && !HomeScope::Compatible(acMessage.pPlayer->GetCellComponent().Cell,cell->Cell)) return;
++        if (cell&&!acMessage.pPlayer->GetCellComponent().SamePresence(*cell)) return;
+         const auto& ownerComponent = view.get<OwnerComponent>(*it);
+@@ -440,4 +444,6 @@
+-        const auto& senderCell=acMessage.pPlayer->GetCellComponent().Cell;
++        const auto& senderLocation=acMessage.pPlayer->GetCellComponent();
++        if (senderLocation.HasExteriorEstate()||cellIdComponent.HasExteriorEstate()) continue;
++        const auto& senderCell=senderLocation.Cell;
+         const bool scoped=HomeScope::Private(senderCell.ModId) || HomeScope::Private(cellIdComponent.Cell.ModId) || HomeScope::Private(movement.CellId.ModId);
+         if (scoped)
+         {
+@@ -610,3 +616,4 @@
+     const auto* cell=m_world.try_get<CellIdComponent>(*it);
+     if (cell && !HomeScope::Compatible(acMessage.pPlayer->GetCellComponent().Cell,cell->Cell)) return;
++    if (cell&&!acMessage.pPlayer->GetCellComponent().SamePresence(*cell)) return;
+     // Replay cache needs to be cleared when a character respawns
+@@ -709,3 +716,5 @@
+-    auto& cellIdComponent = m_world.emplace<CellIdComponent>(cEntity, message.CellId);
++    auto& cellIdComponent = m_world.emplace<CellIdComponent>(cEntity, message.CellId);
++    if (HomeScope::Private(message.CellId.ModId)&&acMessage.pPlayer->GetCellComponent().Cell==message.CellId)
++        cellIdComponent.Estate=acMessage.pPlayer->GetCellComponent().Estate;
+     if (message.WorldSpaceId != GameId{})
+     {
+@@ -950,3 +959,4 @@
+     const auto& cell=view.get<CellIdComponent>(*it).Cell;
++    if (!apPlayer->GetCellComponent().SamePresence(view.get<CellIdComponent>(*it))) return false;
+     if (!view.get<CharacterComponent>(*it).IsPlayer() && HomeRegistry::Scoped(cell.ModId))
+     {
+diff --git a/Code/server/Services/ObjectService.cpp b/Code/server/Services/ObjectService.cpp
+--- a/Code/server/Services/ObjectService.cpp
++++ b/Code/server/Services/ObjectService.cpp
+@@ -66,4 +66,5 @@
+     for (const ObjectData& object : acMessage.Packet.Objects)
+     {
++        if (acMessage.pPlayer->GetCellComponent().HasExteriorEstate()) continue;
+         if (!HomeScope::AdmittedCell(acMessage.pPlayer->GetCellComponent().Cell,object.CellId,object.WorldSpaceId)) continue;
+         const auto iter = std::find_if(
+@@ -71,7 +72,8 @@
+         const auto iter = std::find_if(
+             std::begin(view), std::end(view),
+-            [view, id = object.Id, cell=object.CellId](auto entity)
+-            {
+-                const auto& formIdComponent = view.get<FormIdComponent>(entity);
+-                return HomeScope::ReferenceMatches(formIdComponent.Id,view.get<CellIdComponent>(entity).Cell,id,cell);
++            [view, id = object.Id, cell=object.CellId,sender=acMessage.pPlayer](auto entity)
++            {
++                const auto& formIdComponent = view.get<FormIdComponent>(entity);
++                return sender->GetCellComponent().SamePresence(view.get<CellIdComponent>(entity))&&
++                    HomeScope::ReferenceMatches(formIdComponent.Id,view.get<CellIdComponent>(entity).Cell,id,cell);
+             });
+@@ -105,5 +107,7 @@
+             objectComponent.CurrentLockData = object.CurrentLockData;
+ 
+-            m_world.emplace<CellIdComponent>(cEntity, object.CellId, object.WorldSpaceId, object.CurrentCoords);
++            auto& location=m_world.emplace<CellIdComponent>(cEntity, object.CellId, object.WorldSpaceId, object.CurrentCoords);
++            if (HomeScope::Private(object.CellId.ModId)&&acMessage.pPlayer->GetCellComponent().Cell==object.CellId)
++                location.Estate=acMessage.pPlayer->GetCellComponent().Estate;
+             auto& inventoryComp = m_world.emplace<InventoryComponent>(cEntity);
+             inventoryComp.Content = object.CurrentInventory;
+@@ -123,4 +127,5 @@
+     // for homes until scoped object application is implemented.
+     if (HomeScope::Private(acMessage.Packet.CellId.ModId) ||
++        acMessage.pPlayer->GetCellComponent().HasExteriorEstate() ||
+         HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)) return;
+     NotifyActivate notifyActivate;
+@@ -135,5 +140,6 @@
+     for (auto pPlayer : m_world.GetPlayerManager())
+     {
+-        if (pPlayer != acMessage.pPlayer && pPlayer->GetCellComponent().Cell == acMessage.Packet.CellId)
++        if (pPlayer != acMessage.pPlayer && !pPlayer->GetCellComponent().HasExteriorEstate() &&
++            pPlayer->GetCellComponent().Cell == acMessage.Packet.CellId)
+         {
+             pPlayer->Send(notifyActivate);
+@@ -145,5 +151,6 @@
+ void ObjectService::OnLockChange(const PacketEvent<LockChangeRequest>& acMessage) const noexcept
+ {
+     if (HomeScope::Private(acMessage.Packet.CellId.ModId) ||
++        acMessage.pPlayer->GetCellComponent().HasExteriorEstate() ||
+         HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)) return;
+     NotifyLockChange notifyLockChange;
+@@ -157,7 +164,8 @@
+     const auto iter = std::find_if(
+         std::begin(objectView), std::end(objectView),
+-        [objectView, id = acMessage.Packet.Id, cell=acMessage.Packet.CellId](auto entity)
+-        {
+-            const auto& formIdComponent = objectView.get<FormIdComponent>(entity);
+-            return HomeScope::ReferenceMatches(formIdComponent.Id,objectView.get<CellIdComponent>(entity).Cell,id,cell);
++        [objectView, id = acMessage.Packet.Id, cell=acMessage.Packet.CellId,sender=acMessage.pPlayer](auto entity)
++        {
++            const auto& formIdComponent = objectView.get<FormIdComponent>(entity);
++            return sender->GetCellComponent().SamePresence(objectView.get<CellIdComponent>(entity))&&
++                HomeScope::ReferenceMatches(formIdComponent.Id,objectView.get<CellIdComponent>(entity).Cell,id,cell);
+         });
+@@ -181,6 +189,6 @@
+         if (pPlayer == acMessage.pPlayer)
+             continue;
+ 
+-        if (pPlayer->GetCellComponent().Cell == acMessage.Packet.CellId)
++        if (!pPlayer->GetCellComponent().HasExteriorEstate()&&pPlayer->GetCellComponent().Cell == acMessage.Packet.CellId)
+             pPlayer->Send(notifyLockChange);
+     }
+@@ -194,7 +202,9 @@
+     // ScriptAnimation carries a raw local FormID and no target cell.
+-    if (HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)) return;
+-    for (Player* pPlayer : m_world.GetPlayerManager())
+-    {
+-        if (!HomeScope::Private(pPlayer->GetCellComponent().Cell.ModId)) pPlayer->Send(message);
++    if (HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)||
++        acMessage.pPlayer->GetCellComponent().HasExteriorEstate()) return;
++    for (Player* pPlayer : m_world.GetPlayerManager())
++    {
++        if (!HomeScope::Private(pPlayer->GetCellComponent().Cell.ModId)&&
++            !pPlayer->GetCellComponent().HasExteriorEstate()) pPlayer->Send(message);
+     }
+ }
+diff --git a/Code/server/Services/InventoryService.cpp b/Code/server/Services/InventoryService.cpp
+--- a/Code/server/Services/InventoryService.cpp
++++ b/Code/server/Services/InventoryService.cpp
+@@ -43,4 +43,7 @@
+     if (const auto* cell=m_world.try_get<CellIdComponent>(*it);
+         cell && !HomeScope::Compatible(acMessage.pPlayer->GetCellComponent().Cell,cell->Cell)) return;
++    if (const auto* cell=m_world.try_get<CellIdComponent>(*it);
++        cell && (!acMessage.pPlayer->GetCellComponent().SamePresence(*cell)||
++            cell->HasExteriorEstate()||acMessage.pPlayer->GetCellComponent().HasExteriorEstate())) return;
+ 
+     bool isRemoteNpcInteraction = false;
+@@ -110,4 +113,7 @@
+     if (const auto* cell=m_world.try_get<CellIdComponent>(*it);
+         cell && !HomeScope::Compatible(acMessage.pPlayer->GetCellComponent().Cell,cell->Cell)) return;
++    if (const auto* cell=m_world.try_get<CellIdComponent>(*it);
++        cell && (!acMessage.pPlayer->GetCellComponent().SamePresence(*cell)||
++            cell->HasExteriorEstate()||acMessage.pPlayer->GetCellComponent().HasExteriorEstate())) return;
+ 
+     const auto& ownerComponent = view.get<OwnerComponent>(*it);
+@@ -146,4 +152,7 @@
+     if (const auto* cell=m_world.try_get<CellIdComponent>(*it);
+         cell && !HomeScope::Compatible(acMessage.pPlayer->GetCellComponent().Cell,cell->Cell)) return;
++    if (const auto* cell=m_world.try_get<CellIdComponent>(*it);
++        cell && (!acMessage.pPlayer->GetCellComponent().SamePresence(*cell)||
++            cell->HasExteriorEstate()||acMessage.pPlayer->GetCellComponent().HasExteriorEstate())) return;
+ 
+     const auto* pOwnerComponent = m_world.try_get<OwnerComponent>(*it);
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign41"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign42"

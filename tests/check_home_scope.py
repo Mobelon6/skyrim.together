@@ -65,6 +65,14 @@ int main(){
     guest.Estate={0,1};assert(!guest.IsInRange(guest,false));
     guest.Estate={71,1};guest.CenterCoords={1,0};
     assert(!estateA.IsInRange(guest,false)); // physical range is still required
+    assert(estateA.HasExteriorEstate()&&!cx.HasExteriorEstate());
+    assert(!estateA.SamePresence(estateB)&&!estateA.SamePresence(cx));
+    CellIdComponent ca2(a);
+    ca.Estate={71,1};
+    assert(ca.SamePresence(ca2)&&ca.IsInRange(ca2,false));
+    assert(!ca.HasExteriorEstate()&&!ca.SamePresence(estateA));
+    assert(!ca.SamePresence(cb)); // distinct physical interior slot
+    assert(!estateA.SamePresence(ca));
 }
 '''
 with tempfile.TemporaryDirectory() as tmp:
@@ -94,4 +102,11 @@ assert "m_world.emplace_or_replace<HomeProjectedActor>" in client
 assert "if (isLocalOwner && m_world.all_of<HomeProjectedActor>" in client
 assert "HomeRegistry::OwnsCell(link.Journal,CampaignAccess::Character(*acMessage.pPlayer)" in actor
 assert "HomeRegistry::OwnsCell(link.Journal,CampaignAccess::Character(*apPlayer)" in actor
+assert "location->IsInRange(pPlayer->GetCellComponent(),false)" in actor
+assert "senderLocation.HasExteriorEstate()||cellIdComponent.HasExteriorEstate()" in actor
+assert "cell.Estate=HomeVisit::EstateFor" in player
+assert "cellIdComponent.Estate=acMessage.pPlayer->GetCellComponent().Estate" in actor
+assert "location.Estate=acMessage.pPlayer->GetCellComponent().Estate" in objects
+assert "sender->GetCellComponent().SamePresence" in objects
+assert inventory.count("cell->HasExteriorEstate()||acMessage.pPlayer->GetCellComponent().HasExteriorEstate()")==3
 print("PASS scoped reference matching, private admission, spawn routing and simulation gates")

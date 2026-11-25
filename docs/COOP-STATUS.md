@@ -1,6 +1,11 @@
 # Текущее состояние STM — Interaction07-dev
 
-## Актуальная точка продолжения — после Campaign39 (25.11.2026)
+## Актуальная точка продолжения — после Campaign41 (25.11.2026)
+
+### Campaign42 — подключение серверного контекста к действующим посещениям и маршрутизации
+
+Campaign41 [45642125978](https://github.com/Mobelon6/skyrim.together/actions/runs/45642125978) Linux/Windows success, packaged-ui skipped. HomeVisit::EstateFor выводит контекст из уже допущенного интерьерного слота и доверенного CoopEstateIndex.txt, не из заявления гостя. PlayerService сохраняет его при надёжном входе, CharacterService/ObjectService наследуют при назначении оригинальной приватной CELL. Точное разделение интерьерных слотов сохраняется независимо от наличия main-room metadata/регистрации; поздняя регистрация основного дома не делает существующий подвал недоступным. Lease гостя дополнительно привязан к GetConnectionId, не только player ID/character. Прямые interior/exterior spawn/remove теперь используют CellIdComponent::IsInRange; SamePresence применяется также к сопоставлению оригинальных NPC/объектов, передаче AI, восстановлению и инвентарю. Legacy raw activation/lock/animation, assignment/movement/inventory fail closed для будущего nonzero exterior estate: без полноценной wire identity нельзя принимать их как публичные. Приватный экстерьер ещё не активируется, новый wire формат не вводился. Проверены на историческом evidence min/max anchor coordinates (Lakeview x[-10657,-8480],y[-70681,-67556]; Windstad x[-24664,-22412],y[97355,101810]; Heljarchen x[29957,33258],y[36690,40397]); это не границы геометрии, не safe points, не основание допуска. Следующий функциональный блок: явный проверяемый spatial каталог и авторитетный exterior переход (lease/epoch/overlay-readback), затем scope-bearing сообщения для движения, spawn и object/actor ownership; не включать преждевременно. Сборка/игра Campaign42 ещё не подтверждены. 
+
 
 Кодовая ревизия [75b2a33](https://github.com/Mobelon6/skyrim.together/commit/75b2a33fd5f9baf04466b0c1aa72c4b9bdfbf22d): [CI 45616396577](https://github.com/Mobelon6/skyrim.together/actions/runs/45616396577) check success, Windows build success, packaged-ui skipped. Campaign38 также success/success. Interaction07 не установлен и не принят в игре; последний пользовательский базовый комплект Interaction06. Ниже ранние «последние» статусы являются историческими.
 
