@@ -359,7 +359,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -9,5 +9,13 @@
+@@ -9,5 +9,18 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
@@ -372,8 +372,13 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +#include <algorithm>
 +#include <mutex>
 +#include <map>
++#include <Forms/TESQuest.h>
++#include <Services/OverlayService.h>
++#include <TradeProperties.h>
++#include <set>
++#include <sstream>
  #include <HomeRegistry.h>
-@@ -26,6 +34,15 @@
+@@ -26,6 +39,15 @@
  namespace
  {
  CampaignReplication::Link campaignLink;
@@ -389,7 +394,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +238,110 @@
+@@ -221,6 +243,202 @@
      return 2;
  }
  
@@ -497,10 +502,102 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return {};
 +}
 +
++namespace
++{
++struct QuestCatchup
++{
++    uint32_t Generation{1};
++    bool Stopped{};
++    std::vector<std::pair<uint16_t,uint8_t>> Stages;
++};
++
++// Read the existing authoritative history, not the numeric maximum stage.
++// Do not assume that a local radiant quest belongs to a later shared run.
++std::optional<std::map<std::string,QuestCatchup>> ActiveQuestHistory(
++    const std::vector<CampaignJournal::Operation>& ops)
++{
++    std::map<std::string,QuestCatchup> quests;
++    for (const auto& op:ops)
++    {
++        if (op.Kind!="quest-progress-v1") continue;
++        std::istringstream in(op.Payload);
++        std::string key,extra;
++        uint32_t run{},status{},stage{},type{};
++        uint64_t character{};
++        if (!(in>>key>>run>>status>>stage>>type>>character)||in>>extra||
++            !run||!character||status>NotifyQuestUpdate::Stopped||stage>UINT16_MAX||type>UINT8_MAX)
++            return {};
++        auto& quest=quests[key];
++        if (run!=quest.Generation)
++        {
++            if (!quest.Stopped||status!=NotifyQuestUpdate::Started||
++                quest.Generation==UINT32_MAX||run!=quest.Generation+1) return {};
++            quest={};quest.Generation=run;
++        }
++        if (status==NotifyQuestUpdate::Stopped)
++        {
++            quest.Stopped=true;
++            quest.Stages.clear();
++        }
++        else if (status==NotifyQuestUpdate::StageUpdate)
++        {
++            if (quest.Stopped) return {};
++            quest.Stages.emplace_back(static_cast<uint16_t>(stage),static_cast<uint8_t>(type));
++        }
++    }
++    return quests;
++}
++
++// Session-local suppression of repeated offers. ESS remains the source of
++// applied stages; no receipt or save cursor is advanced here.
++std::set<std::pair<uint32_t,uint16_t>> offeredQuestStages;
++std::vector<NotifyQuestUpdate> MissingActiveQuestStages(World& world,
++    const CampaignJournal::Journal& journal)
++{
++    std::vector<NotifyQuestUpdate> updates;
++    if (!world.GetPartyService().IsInParty()||!SaveWorldReady()) return updates;
++    auto* player=PlayerCharacter::Get();
++    std::set<uint32_t> localQuests;
++    for (const auto& objective:player->objectives)
++        if (objective.instance&&objective.instance->quest)
++            localQuests.insert(objective.instance->quest->formID);
++    const auto history=ActiveQuestHistory(journal.Operations());
++    if (!history) return updates;
++    for (const auto& [key,state]:*history)
++    {
++        if (state.Stopped||state.Generation!=1||state.Stages.empty()) continue;
++        const auto form=TradeProperties::DecodeForm(key);
++        if (!form||!form->Valid()) continue;
++        auto* mod=ModManager::Get()->GetByName(form->Plugin.c_str());
++        if (!mod||!mod->IsLoaded()) continue;
++        const auto id=mod->GetFormId(form->Local);
++        if (!localQuests.contains(id)) continue;
++        auto* quest=Cast<TESQuest>(TESForm::GetById(id));
++        if (!quest||quest->IsStopped()||QuestService::IsNonSyncableQuest(quest)||
++            world.GetOverlayService().IsPersonalQuest(id)) continue;
++        GameId gameId{};
++        if (!world.GetModSystem().GetServerModId(id,gameId)) continue;
++        for (const auto& [stage,type]:state.Stages)
++        {
++            if (quest->IsStageReached(stage)||!offeredQuestStages.emplace(id,stage).second) continue;
++            NotifyQuestUpdate update{};
++            update.Id=gameId;update.Stage=stage;update.ClientQuestType=type;
++            update.Status=NotifyQuestUpdate::StageUpdate;
++            update.SharedRun=state.Generation;
++            update.Speaker=world.GetPartyService().GetLeaderPlayerId();
++            updates.push_back(update);
++        }
++    }
++    return updates;
++}
++}
++
  void QuestService::PollCampaign(const UpdateEvent&) noexcept
  {
++    if (!m_world.GetTransport().IsOnline()||!m_world.GetPartyService().IsInParty())
++        offeredQuestStages.clear();
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +371,7 @@
+@@ -250,6 +468,7 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -508,6 +605,26 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
          request.Credential=credential->Secret.c_str();
 +        request.Checkpoint=NextCheckpoint(*stamp).c_str();
          m_world.GetTransport().Send(request);
+@@ -275,8 +499,19 @@
+         else if (result!=CampaignJournal::Result::Duplicate)
+         {
+             campaignLink.Fail();
+             spdlog::error("Campaign replica refused server history; restart after resolving configuration/history");
+         }
++        if ((result==CampaignJournal::Result::Committed||result==CampaignJournal::Result::Duplicate)&&
++            campaignLink.Journal.Current().Revision==reply.Total)
++        {
++            // Only after the server confirmed the complete prefix for this save.
++            try
++            {
++                for (const auto& update:MissingActiveQuestStages(m_world,campaignLink.Journal))
++                    ReceiveQuestProgress(update);
++            }
++            catch (...) {spdlog::warn("STM active quest catch-up failed");}
++        }
+     }
+     catch (...) {campaignLink.Fail();spdlog::error("Campaign replica import failed");}
+ }
 diff --git a/Code/client/World.h b/Code/client/World.h
 --- a/Code/client/World.h
 +++ b/Code/client/World.h

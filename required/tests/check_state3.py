@@ -172,6 +172,33 @@ int main(){
 }
 ''')
 
+history=extract('client/Services/Generic/QuestJournal.cpp','struct QuestCatchup','// Session-local suppression')
+run('active quest catch-up from existing campaign history',headers+'''
+#include <sstream>
+namespace CampaignJournal {struct Operation{std::string Id,Kind,Payload;};}
+struct NotifyQuestUpdate{enum {StageUpdate,Started,Stopped};};
+'''+history+'''
+int main(){
+    using CampaignJournal::Operation;
+    std::vector<Operation> ops={{"1","quest-progress-v1","q 1 1 10 6 101"},
+        {"2","quest-progress-v1","q 1 0 100 6 101"},
+        {"3","quest-progress-v1","q 1 0 20 6 202"},
+        {"4","unrelated","data"}};
+    auto history=ActiveQuestHistory(ops);
+    assert(history&&history->at("q").Generation==1&&!history->at("q").Stopped);
+    assert((history->at("q").Stages==std::vector<std::pair<uint16_t,uint8_t>>{{100,6},{20,6}}));
+    ops.push_back({"5","quest-progress-v1","q 1 2 20 6 202"});
+    history=ActiveQuestHistory(ops);
+    assert(history&&history->at("q").Stopped&&history->at("q").Stages.empty());
+    ops.push_back({"6","quest-progress-v1","q 2 1 10 6 101"});
+    ops.push_back({"7","quest-progress-v1","q 2 0 100 6 101"});
+    history=ActiveQuestHistory(ops);
+    assert(history&&history->at("q").Generation==2&&!history->at("q").Stopped);
+    ops.push_back({"8","quest-progress-v1","q 4 0 90 6 101"});
+    assert(!ActiveQuestHistory(ops));
+}
+''')
+
 hp=extract('server/Services/ActorValueService.cpp','void ActorValueService::OnHealthChangeBroadcast(','void ActorValueService::OnDeathStateChange')
 run('actual server health relay over an actor ownership transfer',headers+'''
 #include <cmath>
