@@ -21,6 +21,24 @@ int main(int argc,char** argv)
     assert(a&&b);
     State s;s.Reference={"house.esp",201};s.Base={"skyrim.esm",101};s.Scale=100;
     assert(Decode(s.Encode()));
+    assert(RecoveryPlan(s,s)==Recovery::Matched);
+    auto altered=s;altered.Transform[0]=std::bit_cast<uint32_t>(128.f);
+    assert(RecoveryPlan(s,altered)==Recovery::Restore);
+    altered=s;altered.Flags=1;
+    assert(RecoveryPlan(s,altered)==Recovery::Restore);
+    auto hidden=altered;altered.Transform[0]=std::bit_cast<uint32_t>(128.f);
+    assert(RecoveryPlan(hidden,altered)==Recovery::Matched);
+    altered=s;altered.Flags=2;
+    assert(RecoveryPlan(s,altered)==Recovery::Conflict);
+    altered=s;altered.Flags=4;
+    assert(RecoveryPlan(s,altered)==Recovery::Conflict);
+    assert(RecoveryPlan(altered,altered)==Recovery::Matched);
+    altered=s;altered.Scale=101;
+    assert(RecoveryPlan(s,altered)==Recovery::Conflict);
+    altered=s;altered.Base.Local++;
+    assert(RecoveryPlan(s,altered)==Recovery::Conflict);
+    altered=s;altered.Reference.Local++;
+    assert(RecoveryPlan(s,altered)==Recovery::Conflict);
     auto bad=s;bad.Transform[0]=0x7f800000;assert(!Decode(bad.Encode()));
     bad=s;bad.Flags=8;assert(!Decode(bad.Encode()));
     assert(!Decode(s.Encode()+" "));
@@ -67,7 +85,13 @@ client=(root/"Code/client/Services/Generic/PartyHome.cpp").read_text()
 server=(root/"Code/server/Services/PartyHome.cpp").read_text()
 assert "SyncResidents(world,*cell,*identity,slot,encoded,slots)" in client
 assert "e.AccessOp=5;e.AccessRevision=t.Revision" in client
-assert "HomeResidents::CanResume(*old,ctx.SaveRevision,*state)" in client
+assert "RestoreResident(cell,old->Value,*state,slots)" in client
+assert "HomeResidents::RecoveryPlan(committed,observed)" in client
+assert "ctx.SaveRevision<old->SaveRevision" in client
+assert "ctx.Tracks.insert_or_assign(key,ResidentTrack{revision,{},{}})" in client
+restore=client.split("HomeResidents::Recovery RestoreResident(",1)[1].split("void SyncResidents(",1)[0]
+assert "actor->MoveTo(&cell" in restore and "actor->Enable()" in restore and "actor->Disable()" in restore
+assert all(x not in restore for x in ("->Kill(", "->Respawn(", "->RestoreRemoteLife(", "->Reset(", "->Delete("))
 assert "if (e.AccessOp==5)" in server
 assert "HomeResidents::Set(link.Journal,character,e.House,e.AccessRevision,e.SaveRevision,*resident)" in server
 print("PASS resident state, scoped authority, revisions, restart, replica, catalog candidates and fail-closed visits")

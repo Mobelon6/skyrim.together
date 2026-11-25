@@ -45,6 +45,7 @@ on:
       - HomePlacementClient.patch
       - HomeOwnerRecovery.patch
       - HomeLegacyPlacement.patch
+      - HomeResidentRecovery.patch
       - TiltedConnectLifecycle.patch
       - .github/workflows/build.yml
       - check*.py
@@ -116,6 +117,7 @@ jobs:
       - run: git -C upstream apply ../HomePlacementClient.patch
       - run: git -C upstream apply ../HomeOwnerRecovery.patch
       - run: git -C upstream apply ../HomeLegacyPlacement.patch
+      - run: git -C upstream apply ../HomeResidentRecovery.patch
       - uses: actions/checkout@v4
         with:
           repository: tiltedphoques/TiltedConnect
@@ -248,6 +250,7 @@ jobs:
           git apply ../HomePlacementClient.patch
           git apply ../HomeOwnerRecovery.patch
           git apply ../HomeLegacyPlacement.patch
+          git apply ../HomeResidentRecovery.patch
           git -C Libraries/TiltedConnect apply ../../../TiltedConnectLifecycle.patch
           git -C Libraries/TiltedUI apply ../../../OverlayProcess.patch
       - name: Cache compiled xmake packages

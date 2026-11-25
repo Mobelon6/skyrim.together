@@ -1,0 +1,119 @@
+diff --git a/Code/common/HomeResidents.h b/Code/common/HomeResidents.h
+--- a/Code/common/HomeResidents.h
++++ b/Code/common/HomeResidents.h
+@@ -118,6 +118,21 @@
+     return journal.Append(journal.Current(),{"home-resident-"+std::to_string(journal.Current().Revision+1),
+         "home-resident-v1",Payload(slot,{expected+1,saveRevision,state})})==CampaignJournal::Result::Committed;
+ }
++// Reconciliation of a stable original must not create an actor, replay a
++// death/resurrection, reset an outfit, or mutate an unrelated leveled base.
++enum class Recovery { Matched, Restore, Conflict };
++inline Recovery RecoveryPlan(const State& committed,const State& observed)
++{
++    if (!committed.Valid() || !observed.Valid() ||
++        committed.Reference.Encode()!=observed.Reference.Encode() ||
++        committed.Base.Encode()!=observed.Base.Encode() ||
++        committed.Scale!=observed.Scale || ((committed.Flags^observed.Flags)&6u))
++        return Recovery::Conflict;
++    if (committed.Flags&4u) return Recovery::Matched;
++    if ((committed.Flags^observed.Flags)&1u) return Recovery::Restore;
++    if (committed.Flags&1u) return Recovery::Matched;
++    return committed.Significant(observed)?Recovery::Restore:Recovery::Matched;
++}
+ // A fresh observation session cannot overwrite a conflicting life state.
+ inline bool CanResume(const Record& old,uint32_t saveRevision,const State& observed)
+ {
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -432,6 +432,7 @@
+     uint64_t SaveTag{};
+     Clock::time_point Next{};
+     std::map<std::string,ResidentTrack> Tracks;
++    std::set<std::string> RecoveryConflicts;
+     std::string LastKey;
+ };
+ ResidentContext residentContext;
+@@ -460,6 +461,29 @@
+     return s;
+ }
+ 
++HomeResidents::Recovery RestoreResident(TESObjectCELL& cell,const HomeResidents::State& committed,
++    const HomeResidents::State& observed,const std::vector<InventoryEvidence::PluginSlot>& slots)
++{
++    using HomeResidents::Recovery;
++    const auto plan=HomeResidents::RecoveryPlan(committed,observed);
++    if (plan!=Recovery::Restore) return plan;
++    auto* actor=Cast<Actor>(TESForm::GetById(CatalogForm(committed.Reference)));
++    if (!actor || actor->formID==0x14 || actor->IsTemporary() || actor->IsDeleted() ||
++        actor->GetParentCellEx()!=&cell || actor->IsStillLoading() ||
++        !actor->GetExtension() || actor->GetExtension()->IsRemote()) return Recovery::Conflict;
++    const bool disabled=(committed.Flags&1u)!=0;
++    if (actor->IsDisabled()!=disabled)
++    {if (disabled) actor->Disable();else actor->Enable();}
++    if (actor->IsDisabled()!=disabled) return Recovery::Restore;
++    if (!disabled)
++    {
++        const auto v=[&](size_t n){return std::bit_cast<float>(committed.Transform[n]);};
++        actor->SetRotation(v(3),v(4),v(5));
++        actor->MoveTo(&cell,glm::vec3{v(0),v(1),v(2)});
++    }
++    const auto actual=ObserveResident(committed.Reference.Encode(),cell,slots);
++    return actual?HomeResidents::RecoveryPlan(committed,*actual):Recovery::Restore;
++}
+ void SyncResidents(World& world,TESObjectCELL& cell,const CampaignAccess::Identity& identity,
+                    uint32_t slot,const std::string& root,const std::vector<InventoryEvidence::PluginSlot>& slots)
+ {
+@@ -492,26 +516,40 @@
+         const auto found=view->find(key);
+         const auto* old=found==view->end()?nullptr:&found->second;
+         auto tracked=ctx.Tracks.find(key);
+-        if (tracked==ctx.Tracks.end())
+-        {
+-            if (old && !HomeResidents::CanResume(*old,ctx.SaveRevision,*state)) continue;
+-            tracked=ctx.Tracks.emplace(key,ResidentTrack{old?old->Revision:0,{},{}}).first;
+-        }
+-        auto& t=tracked->second;
+         const auto revision=old?old->Revision:0;
+-        if (t.Pending && old && t.Revision!=UINT32_MAX && revision==t.Revision+1 &&
+-            old->Value.Encode()==t.Pending->Encode())
++        // Recognize our acknowledged observation before deciding whether a
++        // revision mismatch needs restoration. An ACK is not a new save.
++        if (tracked!=ctx.Tracks.end() && tracked->second.Pending && old &&
++            tracked->second.Revision!=UINT32_MAX && revision==tracked->second.Revision+1 &&
++            old->Value.Encode()==tracked->second.Pending->Encode())
+         {
+-            t.Revision=revision;t.Pending.reset();t.Retry=now+15s;
++            tracked->second.Revision=revision;tracked->second.Pending.reset();
++            tracked->second.Retry=now+15s;
+         }
+-        if (revision!=t.Revision)
++        if (old && (tracked==ctx.Tracks.end() || tracked->second.Revision!=revision))
+         {
+-            ctx.Tracks.erase(tracked);continue;
++            const auto result=RestoreResident(cell,old->Value,*state,slots);
++            if (result==HomeResidents::Recovery::Conflict)
++            {
++                if (ctx.RecoveryConflicts.insert(key).second)
++                    spdlog::warn("STM: residential NPC recovery conflict (slot {}, reference {})",slot,key);
++                ctx.Tracks.erase(key);continue;
++            }
++            if (result!=HomeResidents::Recovery::Matched)
++            {ctx.Tracks.erase(key);continue;}
++            ctx.RecoveryConflicts.erase(key);
++            ctx.Tracks.insert_or_assign(key,ResidentTrack{revision,{},{}});
++            // Never publish a value in the same tick that restores it.
++            continue;
+         }
++        if (tracked==ctx.Tracks.end())
++            tracked=ctx.Tracks.emplace(key,ResidentTrack{revision,{},{}}).first;
++        auto& t=tracked->second;
+         if (now<t.Retry) continue;
+         t.Pending.reset();
+         if (old && (ctx.SaveRevision<old->SaveRevision || old->Value.Base.Encode()!=state->Base.Encode()))
+-        {ctx.Tracks.erase(tracked);continue;}
++            continue;
++        if (old && (state->Flags&1u)) state->Transform=old->Value.Transform;
+         if (old && !state->Significant(old->Value)) continue;
+         RequestPartyHome req;auto& e=req.Event;
+         e.House=slot;e.Campaign=ctx.Campaign;e.Character=ctx.Character;
