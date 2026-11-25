@@ -15,6 +15,7 @@
 | [HOME-CONCEPT-RU.md](docs/HOME-CONCEPT-RU.md) | Общая недвижимость без инстансов |
 | [Party-Dialogue-and-Recovery-RU.md](docs/Party-Dialogue-and-Recovery-RU.md) | Диалоги, лидерство, сцены, восстановление |
 | [COOP-HISTORY.md](docs/COOP-HISTORY.md) | История предыдущих этапов, не текущий план |
+| [COOP-AUDIT-2026-11-25.md](docs/COOP-AUDIT-2026-11-25.md) | Срез инвентаризации 67 патчей и найденные дефекты |
 | [build.yml](.github/workflows/build.yml), [Actions](https://github.com/Mobelon6/skyrim.together/actions) | Фактический порядок патчей, сборка и проверки |
 | [LICENSING.md](LICENSING.md) | Условия распространения |
 
