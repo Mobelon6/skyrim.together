@@ -76,6 +76,28 @@ int main(int argc,char** argv)
     assert(CampaignCheckpoint::Find(server,71,6,foreign.Digest)->Observed==historical);
     auto wrong=foreign;wrong.Digest=std::string(64,'f');wrong.Cell.Local++;
     assert(CampaignCheckpoint::Publish(server,71,6,wrong)==Result::Invalid);
+    auto room=HomeRegistry::Register(server,5,{"skyrim.esm",0x1235});assert(room);
+    auto linked=foreign;linked.Digest=std::string(64,'1');linked.Cell=room->Root;linked.HomeSlot=room->Slot;
+    linked.EntrySlot=home->Slot;linked.ArrivalPose[0]=std::bit_cast<uint32_t>(12.5f);
+    linked.Observed=server.Current();
+    assert(linked.Valid()&&!CampaignCheckpoint::HadHomeAccess(server,linked));
+    assert(HomePermissions::SetGroup(server,5,{home->Slot,room->Slot},6,HomePermissions::Right::Visit,3));
+    linked.Observed=server.Current();
+    assert(CampaignCheckpoint::CanResume(server,71,linked));
+    auto parsed=CampaignCheckpoint::Decode(linked.Encode());assert(parsed&&parsed->Encode()==linked.Encode());
+    assert(CampaignCheckpoint::Publish(server,71,6,linked)==Result::Committed);
+    assert(CampaignCheckpoint::Find(server,71,6,linked.Digest)->EntrySlot==home->Slot);
+    assert(!CampaignCheckpoint::Decode(linked.Encode()+" 1"));
+    auto malformed=linked;malformed.EntrySlot=room->Slot;assert(!malformed.Valid());
+    malformed=linked;malformed.ArrivalPose[0]=std::bit_cast<uint32_t>(std::numeric_limits<float>::infinity());assert(!malformed.Valid());
+    malformed=linked;malformed.EntrySlot=0;assert(!malformed.Valid());
+    auto other=HomeRegistry::Register(server,9,{"skyrim.esm",0x1234});assert(other);
+    assert(HomePermissions::Set(server,9,other->Slot,6,HomePermissions::Right::Visit,4));
+    malformed=linked;malformed.EntrySlot=other->Slot;malformed.Observed=server.Current();
+    assert(!CampaignCheckpoint::HadHomeAccess(server,malformed));
+    assert(HomePermissions::Set(server,5,home->Slot,6,HomePermissions::Right::None,5));
+    assert(CampaignCheckpoint::Find(server,71,6,linked.Digest));
+    assert(!CampaignCheckpoint::CanResume(server,71,linked));
 }
 """
 with tempfile.TemporaryDirectory() as tmp:

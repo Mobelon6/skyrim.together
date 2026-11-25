@@ -26,5 +26,11 @@ assert "candidate!=owner||slot==visit.Slot" in src
 assert "HomeOriginalOverlay::Release()" in src
 assert src.index("if (!HomeOriginalOverlay::Release())")<src.index("SendAccess(m_world,*identity,3,next.Slot")
 assert "previousGuestCell.store(visit.Copy);originalGuestCell.store(moved.Copy)" in src
-assert "visit.Copy!=visit.EntryCell" in src
+assert "record->EntrySlot=visit.EntrySlot" in src
+assert "next.EntrySlot=visit.EntrySlot" in src
+assert "HomeLinkedAccess::Connected(*graph,root->Encode()).count(v.Root)" in src
+assert "HomeSnapshot::Digest(*shape)!=v.ResumeShape" in src
+assert "record->Entrance=*entrance" in src
+assert "NativeFormKey(visit.EntryDoor)" in src
+assert "!PrepareNativeEntry(*p,next)||!SendAccess" in src
 print("PASS reciprocal linked-room metadata, location boundary, winning overrides and source transition guards")
