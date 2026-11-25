@@ -67,7 +67,8 @@ uint64_t readyStream{};
 uint32_t readyCursor{},lastConflict{};
 std::chrono::steady_clock::time_point pollAt{},cleanupRetry{};
 bool shadowCleanupPending{};
-int nativeResets{};
+int nativeResets{},placementForgets{};
+namespace HomePlacementClient { void Forget() noexcept {++placementForgets;} }
 void ResetNativeIntents(){++nativeResets;}
 struct OverlayService { void RecheckTradeAfterLoad() noexcept; };
 struct Transport {
@@ -114,10 +115,10 @@ int main(){
     receiptFailure=receiptFailureCampaign=walletReady=true;readyStream=7;readyCursor=9;
     overlay.RecheckTradeAfterLoad();
     assert(!receiptFailure&&!receiptFailureCampaign&&!walletReady&&!readyStream&&!readyCursor);
-    assert(shadowCleanupPending && nativeResets==1);
+    assert(shadowCleanupPending && nativeResets==1 && placementForgets==1);
     receiptFailure=true;receiptFailureCampaign=false;walletReady=true;
     overlay.RecheckTradeAfterLoad();
-    assert(receiptFailure&&!walletReady);
+    assert(receiptFailure&&!walletReady && placementForgets==2);
     World active;active.m_transport.session=true;
     std::thread wrong([&]{threadId=2;assert(!active.BeginSaveLoad());});
     wrong.join();assert(active.m_disconnectBeforeLoad&&!active.IsLoadingSave()&&active.m_transport.session&&active.resets==0);

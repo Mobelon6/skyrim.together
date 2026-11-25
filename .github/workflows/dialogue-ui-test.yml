@@ -1,8 +1,5 @@
 name: Packaged dialogue interface
 on:
-  push:
-    paths:
-      - tools/verify_travel_settings.py
   workflow_call:
     inputs:
       run_id:
