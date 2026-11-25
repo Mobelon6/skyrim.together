@@ -1,0 +1,274 @@
+diff --git a/Code/client/Services/HomeOriginalOverlay.h b/Code/client/Services/HomeOriginalOverlay.h
+--- a/Code/client/Services/HomeOriginalOverlay.h
++++ b/Code/client/Services/HomeOriginalOverlay.h
+@@ -42,7 +42,7 @@
+ {
+     uint32_t Ref{},Base{},Type{},Scale{};
+     Fields Personal,Guest;
+-    bool ParentDriven{};
++    bool ParentDriven{},Loose{},LiveLoose{};
+ };
+ // Retain the personal copy until readback proves restoration.
+ // A pending native operation is never submitted again on each frame.
+@@ -54,7 +54,7 @@
+         if (m_staged) return false;
+         for (const auto& row:rows)
+             if (!row.Ref||!row.Base||!row.Personal.Valid()||!row.Guest.Valid()||
+-                row.Personal.Same(row.Guest)) return false;
++                (row.Personal.Same(row.Guest)&&!row.Loose) || (row.LiveLoose&&!row.Loose)) return false;
+         m_rows=std::move(rows);m_staged=true;return true;
+     }
+     bool Dirty() const noexcept {return m_dirty.load(std::memory_order_acquire);}
+@@ -63,7 +63,11 @@
+     Result Switch(bool guest,Read&& read,Write&& write)
+     {
+         if (!m_staged||m_failed) return Result::Unavailable;
+-        if (m_pending&&m_target!=guest) return Result::Pending;
++        if (m_pending&&m_target!=guest)
++        {
++            const auto result=Switch(m_target,read,write);
++            return result==Result::Ready?Result::Pending:result;
++        }
+         const auto fields=[](const Delta& row,bool target)->const Fields&
+         {return target?row.Guest:row.Personal;};
+         if (!m_pending&&m_guest!=guest)
+@@ -76,7 +80,7 @@
+             }
+             m_target=guest;m_pending=true;m_dirty.store(true,std::memory_order_release);
+             for (const auto& row:m_rows)
+-                if (!write(row,fields(row,guest)))
++                if (!row.Personal.Same(row.Guest)&&!write(row,fields(row,guest)))
+                 {m_failed=true;return Result::Unavailable;}
+         }
+         bool complete=true;
+@@ -97,6 +101,43 @@
+         m_dirty.store(guest,std::memory_order_release);
+         return Result::Ready;
+     }
++    // Stable original loose references are retained even when both worlds
++    // initially agree. Only confirmed, irreversible ledger consumption may
++    // change their guest target. Personal fields remain untouched.
++    bool CanTake(uint32_t ref) const noexcept
++    {
++        if (!m_staged||!m_guest||m_pending||m_failed) return false;
++        for (const auto& row:m_rows)
++            if (row.Ref==ref) return row.LiveLoose&&!row.Guest.Disabled;
++        return false;
++    }
++    template<class Read,class Write>
++    Result RefreshHidden(const std::vector<std::pair<uint32_t,bool>>& balances,Read&& read,Write&& write)
++    {
++        if (!m_staged||!m_guest||m_failed||m_pending) return Result::Unavailable;
++        std::vector<Delta*> changes;
++        size_t looseCount=0;
++        for (const auto& row:m_rows) if (row.Loose) ++looseCount;
++        if (looseCount!=balances.size()) return Result::Unavailable;
++        for (const auto& [ref,hidden]:balances)
++        {
++            Delta* row=nullptr;
++            for (auto& item:m_rows) if (item.Ref==ref&&item.Loose) {row=&item;break;}
++            if (!row) return Result::Unavailable;
++            if (row->Guest.Disabled==hidden) continue;
++            if (!hidden||!row->LiveLoose) return Result::Unavailable;
++            const auto current=read(*row);
++            if (!current||!current->Valid()||!current->Same(row->Guest)) return Result::Unavailable;
++            for (auto* existing:changes) if (existing==row) return Result::Unavailable;
++            changes.push_back(row);
++        }
++        if (changes.empty()) return Result::Ready;
++        m_target=true;m_pending=true;
++        for (auto* row:changes) row->Guest.Disabled=true;
++        for (auto* row:changes)
++            if (!write(*row,row->Guest)) {m_failed=true;return Result::Unavailable;}
++        return Switch(true,read,write);
++    }
+     bool Release() noexcept
+     {
+         if (Dirty()||m_pending||m_failed||m_guest) return false;
+@@ -115,6 +156,8 @@
+ // Game thread; attached original interior, before publishing guest scope.
+ bool Prepare(World&,TESObjectCELL&,uint64_t campaign,uint32_t slot) noexcept;
+ Result Switch(World&,bool guest) noexcept;
++Result RefreshLoose(World&,uint64_t campaign,uint32_t slot) noexcept;
++bool CanTake(uint32_t ref) noexcept;
+ bool Dirty() noexcept;
+ bool Release() noexcept;
+ void ForgetReplacedWorld() noexcept;
+diff --git a/Code/client/Services/Generic/HomeOriginalOverlay.cpp b/Code/client/Services/Generic/HomeOriginalOverlay.cpp
+--- a/Code/client/Services/Generic/HomeOriginalOverlay.cpp
++++ b/Code/client/Services/Generic/HomeOriginalOverlay.cpp
+@@ -151,6 +151,7 @@
+         {
+             Delta d;d.Ref=Local(r.Key);d.Base=Local(r.Base);d.Type=r.Type;d.Scale=r.Scale;
+             if (!d.Ref||!d.Base||(r.Flags&2)||!Resolve(d)) return false;
++            d.Loose=r.Inventory==3;
+             d.Guest.Disabled=(r.Flags&1)!=0;d.Guest.Pose=r.Transform;
+             d.Guest.LockState=r.LockState;d.Guest.LockLevel=r.LockLevel;
+             const auto found=objects->find(r.Key.Encode());
+@@ -217,7 +218,15 @@
+         for (auto& [id,d]:rows)
+         {
+             (void)id;
+-            if (d.Personal.Same(d.Guest)) continue;
++            if (d.Loose)
++            {
++                auto* object=Resolve(d);
++                const auto parent=object?Parent(*object):std::nullopt;
++                const auto children=object?Children(*object):std::nullopt;
++                d.LiveLoose=object&&CanChange(*object,d)&&parent&&!*parent&&children&&children->empty()&&
++                    vm.Get("ObjectReference","Enable")&&vm.Get("ObjectReference","Disable");
++            }
++            if (d.Personal.Same(d.Guest)&&!d.Loose) continue;
+             if (!std::equal(d.Personal.Pose.begin(),d.Personal.Pose.begin()+3,d.Guest.Pose.begin())&&
+                 !vm.Get("ObjectReference","SetPosition")) return false;
+             if (toggles(d)&&!d.ParentDriven&&(!vm.Get("ObjectReference","Enable")||
+@@ -238,6 +247,28 @@
+     }
+     catch (...) {return Result::Unavailable;}
+ }
++Result RefreshLoose(World& world,uint64_t campaign,uint32_t slot) noexcept
++{
++    try
++    {
++        if (!CampaignAccess::GameReady()) return Result::Pending;
++        const auto bytes=CampaignAccess::HomeBaseline(campaign,slot);
++        const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
++        if (!state) return Result::Unavailable;
++        std::vector<std::pair<uint32_t,bool>> balances;
++        for (const auto& row:state->Refs)
++            if (row.Inventory==3)
++            {
++                const auto ref=Local(row.Key);
++                if (!ref) return Result::Unavailable;
++                balances.emplace_back(ref,(row.Flags&1u)!=0||row.Items.empty());
++            }
++        return overlay.RefreshHidden(balances,[&](const Delta& row){return Observe(world,row);},
++            [&](const Delta& row,const Fields& f){return Write(world,row,f);});
++    }
++    catch (...) {return Result::Unavailable;}
++}
++bool CanTake(uint32_t ref) noexcept {return overlay.CanTake(ref);}
+ bool Dirty() noexcept {return overlay.Dirty();}
+ bool Release() noexcept
+ {
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -171,6 +171,6 @@
+     Clock::time_point Until{},Next{};
+     bool Granted{},Moved{},Ready{};
+-    bool Native{},Prepared{},Applied{},Leaving{},Closing{},ExitIssued{},Warned{};
++    bool Native{},Prepared{},Applied{},Leaving{},Closing{},ExitIssued{},Warned{},Refreshing{};
+     uint32_t ReturnCell{},ExitDoor{};
+     std::array<uint32_t,12> Pose{};
+     Clock::time_point MoveUntil{},ShapeAt{};
+@@ -410,7 +410,12 @@
+     if (!state || state->Omitted || !state->ResidentKeys.empty() || !state->Legacy.empty() ||
+         !residents || !residents->empty() || !objects) return {};
+     for (auto& r:state->Refs)
+-        if (r.Inventory==1) r.Items.clear(); // contents have their own ledger
++    {
++        if (r.Inventory==1 || r.Inventory==3) r.Items.clear();
++        // Stable loose stacks can disappear through the property ledger.
++        // Their visibility is refreshed separately, not a structural change.
++        if (r.Inventory==3) r.Flags&=~1u;
++    }
+     auto shape=state->Encode();
+     for (const auto& [key,record]:*objects)
+         shape+=" "+key+":"+std::to_string(record.Value.Open);
+@@ -1133,11 +1138,15 @@
+-        if (!cell || !HomeInstance::NativeGuestCell(cell->formID) || !visit.Ready || visit.Leaving) return true;
+-        if (form==visit.ExitDoor && NearDoor(*player,form))
+-        {visit.Leaving=true;visit.Ready=false;return true;}
+-        auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
+-        if (auto* actor=Cast<Actor>(object);actor && actor->GetExtension() && actor->GetExtension()->IsPlayer()) return false;
+-        if (object && object->baseForm && object->GetParentCellEx()==cell &&
+-            object->baseForm->formType==FormType::Container && !object->IsDisabled() && !object->IsDeleted())
+-            TryTrade(form);
++        if (!cell || !HomeInstance::NativeGuestCell(cell->formID) || !visit.Ready || visit.Leaving || visit.Refreshing) return true;
++        if (form==visit.ExitDoor && NearDoor(*player,form))
++        {visit.Leaving=true;visit.Ready=false;return true;}
++        auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
++        if (auto* actor=Cast<Actor>(object);actor && actor->GetExtension() && actor->GetExtension()->IsPlayer()) return false;
++        if (object && object->baseForm && object->GetParentCellEx()==cell && !object->IsDisabled() && !object->IsDeleted())
++        {
++            const auto type=object->baseForm->formType;
++            if (type==FormType::Container ||
++                (visit.Right==2 && HomeSnapshot::LooseType(static_cast<uint32_t>(type)) && HomeOriginalOverlay::CanTake(form)))
++                TryTrade(form);
++        }
+         return true;
+     }
+     if (CampaignAccess::Mode()!=CampaignReplication::Link::Mode::Disabled)
+@@ -1346,15 +1355,25 @@
+             visit.Leaving=true;visit.Ready=false;
+         }
+-        if (!visit.Leaving && visit.Ready && now>=visit.ShapeAt)
+-        {
+-            visit.ShapeAt=now+2s;
+-            const auto shape=NativeVisitShape(visit.Campaign,visit.Slot);
+-            if (!shape || *shape!=visit.Shape)
++        if (visit.Refreshing)
++        {
++            const auto result=HomeOriginalOverlay::Switch(m_world,true);
++            if (result==HomeOriginalOverlay::Result::Pending) return;
++            visit.Refreshing=false;
++            if (result!=HomeOriginalOverlay::Result::Ready) {visit.Leaving=true;visit.Ready=false;}
++        }
++        if (!visit.Leaving && visit.Ready && now>=visit.ShapeAt)
++        {
++            visit.ShapeAt=now+1s;
++            const auto shape=NativeVisitShape(visit.Campaign,visit.Slot);
++            const auto result=shape&&*shape==visit.Shape?
++                HomeOriginalOverlay::RefreshLoose(m_world,visit.Campaign,visit.Slot):HomeOriginalOverlay::Result::Unavailable;
++            if (result==HomeOriginalOverlay::Result::Pending) {visit.Refreshing=true;return;}
++            if (result!=HomeOriginalOverlay::Result::Ready)
+             {
+                 visit.Leaving=true;visit.Ready=false;
+                 Utils::ShowHudMessage("Состояние жилья изменилось. Войдите повторно.");
+             }
+         }
+         if (!visit.Leaving && !visit.Prepared)
+         {
+             if (!current->IsAttached()) return;
+@@ -1546,7 +1565,10 @@
+         auto* object=Cast<TESObjectREFR>(TESForm::GetById(local));
+         auto* parent=object?object->GetParentCellEx():nullptr;
+         if (!parent || !NativeGuestCell(parent->formID) || object->IsTemporary() || object->IsDeleted() ||
+-            object->IsDisabled() || !object->baseForm || object->baseForm->formType!=FormType::Container) return 0;
++            object->IsDisabled() || !object->baseForm || visit.Refreshing) return 0;
++        const auto type=object->baseForm->formType;
++        if (type!=FormType::Container &&
++            !(visit.Right==2 && HomeSnapshot::LooseType(static_cast<uint32_t>(type)) && HomeOriginalOverlay::CanTake(local))) return 0;
+         source=local;return visit.Slot;
+     }
+     const auto* cell=CopyCell(visit.Copy);
+@@ -1579,7 +1601,7 @@
+         auto* p=PlayerCharacter::Get();
+         auto* cell=p?p->GetParentCellEx():nullptr;
+         if (!p||!cell||!cell->IsAttached()||!visit.Native||!visit.Ready||!visit.Applied||
+-            visit.Leaving||!visit.Granted||Clock::now()>=visit.Until||cell->formID!=visit.Copy||
++            visit.Leaving||visit.Refreshing||!visit.Granted||Clock::now()>=visit.Until||cell->formID!=visit.Copy||
+             !InventoryReady(world)) return {};
+         const auto shape=NativeVisitShape(visit.Campaign,visit.Slot);
+         const auto entrance=NativeFormKey(visit.Door);
+diff --git a/Code/client/Services/Generic/PartyTrade.cpp b/Code/client/Services/Generic/PartyTrade.cpp
+--- a/Code/client/Services/Generic/PartyTrade.cpp
++++ b/Code/client/Services/Generic/PartyTrade.cpp
+@@ -1401,7 +1401,6 @@
+     auto* cell=const_cast<TESObjectREFR*>(object)->GetParentCellEx();
+     if (!cell || cell->worldspace) return {};
+     auto& world=World::Get();
+-    if (HomeInstance::NativeGuestCell(cell->formID) && loose) return {};
+     if (HomeInstance::ProjectionForm(object->formID) || HomeInstance::NativeGuestCell(cell->formID))
+     {
+         uint32_t source{};
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign30"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign31"

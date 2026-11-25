@@ -81,6 +81,7 @@ jobs:
       - run: git -C upstream apply ../HomeOriginalOverlay.patch
       - run: git -C upstream apply ../HomeOriginalVisit.patch
       - run: git -C upstream apply ../HomeGuestSave.patch
+      - run: git -C upstream apply ../HomeNativeLoose.patch
       - uses: actions/checkout@v4
         with:
           repository: tiltedphoques/TiltedConnect
@@ -226,6 +227,7 @@ jobs:
           git apply ../HomeOriginalOverlay.patch
           git apply ../HomeOriginalVisit.patch
           git apply ../HomeGuestSave.patch
+          git apply ../HomeNativeLoose.patch
           git -C Libraries/TiltedConnect apply ../../../TiltedConnectLifecycle.patch
           git -C Libraries/TiltedUI apply ../../../OverlayProcess.patch
       - name: Cache compiled xmake packages

@@ -54,6 +54,7 @@ code=r"""
 #include <chrono>
 namespace spdlog { template<class... T> void info(const char*,T...){} template<class... T> void warn(const char*,T...){} }
 namespace CampaignCheckpointClient { void ForgetLoaded() noexcept {} }
+namespace HomeGuestSave { int cancels{}; void Cancel() noexcept {++cancels;} }
 thread_local uint32_t threadId=1;
 uint32_t GetCurrentThreadId(){return threadId;}
 struct DisconnectedEvent{};
@@ -103,6 +104,7 @@ int main(){
     assert(!calendar.s_gameClockLocked&&!calendar.m_lastTick&&!calendar.m_lastLogTick&&calendar.m_fadeTimer==0.f);
     World w;w.m_transport.session=true;
     assert(w.BeginSaveLoad());
+    assert(HomeGuestSave::cancels==1);
     assert(w.IsLoadingSave()&&w.m_transport.closes==1&&w.resets==1);
     std::thread worker([&]{threadId=2;assert(w.BeginSaveLoad());w.EndSaveLoad(true,true);});
     worker.join();assert(w.IsLoadingSave()&&w.resets==1);

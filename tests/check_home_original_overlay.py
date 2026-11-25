@@ -44,6 +44,29 @@ int main()
     assert(t.Stage({}));
     assert(t.Switch(true,read,write)==Result::Ready&&t.Dirty());
     assert(t.Switch(false,read,write)==Result::Ready&&t.Release());
+    // Identical personal/guest loose shell must still be tracked; pickup
+    // changes only its confirmed guest target, never the personal backup.
+    Delta loose{3,5,41,100,a,a,false,true,true};
+    current={{3,a}};queued.clear();
+    assert(t.Stage({loose}));
+    assert(t.Switch(true,read,write)==Result::Ready&&t.CanTake(3));
+    auto before=writes;
+    assert(t.RefreshHidden({{3,true}},read,write)==Result::Pending&&!t.CanTake(3));
+    assert(writes==before+1);
+    assert(t.Switch(true,read,write)==Result::Pending&&writes==before+1);
+    current=queued;
+    assert(t.Switch(true,read,write)==Result::Ready&&!t.CanTake(3));
+    assert(t.RefreshHidden({{3,true}},read,write)==Result::Ready&&writes==before+1);
+    assert(t.RefreshHidden({{3,false}},read,write)==Result::Unavailable);
+    assert(t.Switch(false,read,write)==Result::Pending);
+    current=queued;
+    assert(t.Switch(false,read,write)==Result::Ready&&t.Release()&&current[3].Same(a));
+    // A parent-controlled loose shell cannot be independently hidden.
+    loose.LiveLoose=false;
+    assert(t.Stage({loose})&&t.Switch(true,read,write)==Result::Ready&&!t.CanTake(3));
+    before=writes;
+    assert(t.RefreshHidden({{3,true}},read,write)==Result::Unavailable&&writes==before);
+    assert(t.Switch(false,read,write)==Result::Ready&&t.Release());
 }
 """
 with tempfile.TemporaryDirectory() as tmp:
@@ -61,4 +84,10 @@ assert 'Get("ObjectReference","SetPosition")' in native and "object->MoveTo(" no
 assert "SetInventory(" not in native and "CreateLock(" not in native
 assert "HomeOriginalOverlay::Dirty()" in save
 assert "HomeOriginalOverlay::ForgetReplacedWorld();" in world
+home=(root/"Code/client/Services/Generic/PartyHome.cpp").read_text()
+trade=(root/"Code/client/Services/Generic/PartyTrade.cpp").read_text()
+assert "HomeOriginalOverlay::CanTake(local)" in home
+assert "HomeOriginalOverlay::RefreshLoose(m_world,visit.Campaign,visit.Slot)" in home
+assert "if (HomeInstance::NativeGuestCell(cell->formID) && loose) return {};" not in trade
+assert "d.LiveLoose=object&&CanChange" in native
 print("PASS real overlay transaction: readback, pending transition, failed mutation guard, restore")
