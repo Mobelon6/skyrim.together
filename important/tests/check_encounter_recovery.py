@@ -98,7 +98,7 @@ unsigned LeaderPlayerId=1;
 std::map<unsigned,Conversation> Talks,Brawls;
 } data;
 struct Player {unsigned id=1;unsigned GetId(){return id;}} owner;
-struct RequestQuestUpdate {enum {StageUpdate,Started,Stopped};unsigned Id{}, Status{};bool JournalObjective{};};
+struct RequestQuestUpdate {enum {StageUpdate,Started,Stopped};unsigned Id{}, Status{};bool JournalObjective{},CompletedRunOnce{};};
 struct Notice {unsigned ClientQuestType{},Subject{},Encounter{};};
 bool bEnableMiscQuestSync=false;
 void route(Party* pParty, Player* pPlayer, RequestQuestUpdate message, Notice& notify, int& sent,bool knownSharedQuest=false){
@@ -118,9 +118,10 @@ int main(){
  data.Brawls.clear();assert(sends(200,0,true,e)==1 && !e);assert(!sends(200,0,false,e));
  assert(!sends(200,1,true,e)&&!sends(200,2,true,e));
  owner.id=2;
- auto guest=[&](unsigned status,bool inJournal,bool known){Notice n{6};int sent=0;route(&data,&owner,{200,status,inJournal},n,sent,known);return sent;};
+ auto guest=[&](unsigned status,bool inJournal,bool known,bool completed=false){Notice n{6};int sent=0;route(&data,&owner,{200,status,inJournal,completed},n,sent,known);return sent;};
  assert(!guest(0,true,false));assert(guest(0,true,true));assert(!guest(0,false,true));
  assert(!guest(1,true,true)&&!guest(2,true,true));
+ assert(guest(2,false,true,true)&&!guest(2,false,false,true));
  data.Brawls[2]=talk;assert(!guest(0,true,true));
 }
 """

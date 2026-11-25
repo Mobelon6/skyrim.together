@@ -396,7 +396,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +245,307 @@
+@@ -221,6 +245,315 @@
      return 2;
  }
  
@@ -510,6 +510,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +{
 +    uint32_t Generation{1};
 +    bool Stopped{};
++    bool CompletedRunOnce{};
 +    std::vector<std::pair<uint16_t,uint8_t>> Stages;
 +};
 +
@@ -521,7 +522,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    std::map<std::string,QuestCatchup> quests;
 +    for (const auto& op:ops)
 +    {
-+        if (op.Kind!="quest-progress-v1") continue;
++        const bool completed=op.Kind=="quest-completed-v1";
++        if (!completed && op.Kind!="quest-progress-v1") continue;
 +        std::istringstream in(op.Payload);
 +        std::string key,extra;
 +        uint32_t run{},status{},stage{},type{};
@@ -530,6 +532,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            !run||!character||status>NotifyQuestUpdate::Stopped||stage>UINT16_MAX||type>UINT8_MAX)
 +            return {};
 +        auto& quest=quests[key];
++        if (quest.CompletedRunOnce || (completed&&(status!=NotifyQuestUpdate::Stopped||run!=1||quest.Stopped))) return {};
 +        if (run!=quest.Generation)
 +        {
 +            if (!quest.Stopped||status!=NotifyQuestUpdate::Started||
@@ -539,7 +542,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        if (status==NotifyQuestUpdate::Stopped)
 +        {
 +            quest.Stopped=true;
-+            quest.Stages.clear();
++            quest.CompletedRunOnce=completed;
++            if (!completed) quest.Stages.clear();
 +        }
 +        else if (status==NotifyQuestUpdate::StageUpdate)
 +        {
@@ -669,7 +673,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    if (!history) return updates;
 +    for (const auto& [key,state]:*history)
 +    {
-+        if (state.Stopped||state.Generation!=1||state.Stages.empty()) continue;
++        if ((state.Stopped&&!state.CompletedRunOnce)||state.Generation!=1||state.Stages.empty()) continue;
 +        const auto form=TradeProperties::DecodeForm(key);
 +        if (!form||!form->Valid()) continue;
 +        auto* mod=ModManager::Get()->GetByName(form->Plugin.c_str());
@@ -679,6 +683,10 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        auto* quest=Cast<TESQuest>(TESForm::GetById(id));
 +        if (!quest||quest->IsStopped()||QuestService::IsNonSyncableQuest(quest)||
 +            world.GetOverlayService().IsPersonalQuest(id)) continue;
++        if (state.CompletedRunOnce && (!(quest->flags & TESQuest::RunOnce) ||
++            (quest->flags & (TESQuest::Completed|TESQuest::Failed|TESQuest::AllowRepeatStages)))) continue;
++        // Replay only recorded native stages. Do not synthesize a stop, reward,
++        // completed flag or inventory grant from a completion record.
 +        GameId gameId{};
 +        if (!world.GetModSystem().GetServerModId(id,gameId)) continue;
 +        for (const auto& [stage,type]:state.Stages)
@@ -704,7 +712,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        attemptedQuestPickups.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +575,7 @@
+@@ -250,6 +583,7 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -712,7 +720,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
          request.Credential=credential->Secret.c_str();
 +        request.Checkpoint=NextCheckpoint(*stamp).c_str();
          m_world.GetTransport().Send(request);
-@@ -275,8 +601,20 @@
+@@ -275,8 +609,20 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();

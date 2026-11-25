@@ -155,7 +155,7 @@ int main(){
 server=extract('server/Services/QuestService.cpp','bool AdvanceQuestRun(', 'std::string QuestKey(')
 run('party quest lifecycle and ordered catch-up history',headers+'''
 struct NotifyQuestUpdate{enum {StageUpdate,Started,Stopped};uint16_t Stage;uint8_t Status;};
-struct QuestRun{unsigned Generation{1};std::set<uint16_t> Stages;std::vector<uint16_t> OrderedStages; bool Stopped=false;bool Started=false;};
+struct QuestRun{unsigned Generation{1};std::set<uint16_t> Stages;std::vector<uint16_t> OrderedStages; bool Stopped=false;bool Started=false;bool CompletedRunOnce=false;};
 '''+server+'''
 int main(){
     QuestRun run;
@@ -169,6 +169,11 @@ int main(){
     QuestRun partial;NotifyQuestUpdate stage{80,0};assert(AdvanceQuestRun(partial,stage));
     NotifyQuestUpdate start{10,1};assert(AdvanceQuestRun(partial,start));
     assert((partial.OrderedStages==std::vector<uint16_t>{80}));
+    QuestRun finished;assert(AdvanceQuestRun(finished,start));assert(AdvanceQuestRun(finished,stage));
+    NotifyQuestUpdate stop{80,2};assert(AdvanceQuestRun(finished,stop,true));
+    assert(finished.CompletedRunOnce&&finished.Stopped&&finished.OrderedStages==std::vector<uint16_t>{80});
+    assert(!AdvanceQuestRun(finished,start)&&!AdvanceQuestRun(finished,stage)&&!AdvanceQuestRun(finished,stop,true));
+    QuestRun unknown;assert(!AdvanceQuestRun(unknown,stop,true));
 }
 ''')
 
@@ -196,6 +201,10 @@ int main(){
     assert(history&&history->at("q").Generation==2&&!history->at("q").Stopped);
     ops.push_back({"8","quest-progress-v1","q 4 0 90 6 101"});
     assert(!ActiveQuestHistory(ops));
+    ops={{"1","quest-progress-v1","q 1 1 10 6 101"},{"2","quest-progress-v1","q 1 0 80 6 101"},{"3","quest-completed-v1","q 1 2 80 6 101"}};
+    history=ActiveQuestHistory(ops);assert(history&&history->at("q").Stopped&&history->at("q").CompletedRunOnce);
+    assert(history->at("q").Stages.size()==1&&history->at("q").Stages[0].first==80);
+    ops.push_back({"4","quest-progress-v1","q 2 1 10 6 202"});assert(!ActiveQuestHistory(ops));
 }
 ''')
 
