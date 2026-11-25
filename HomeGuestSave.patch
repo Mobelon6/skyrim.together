@@ -309,7 +309,8 @@ new file mode 100644
 diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
 --- a/Code/client/Services/Generic/PartyHome.cpp
 +++ b/Code/client/Services/Generic/PartyHome.cpp
-@@ -3,4 +3,7 @@
+@@ -2,6 +2,9 @@
+ #include <World.h>
  #include <Services/HomeInstance.h>
  #include <Services/HomeOriginalOverlay.h>
 +#include <Services/HomeGuestSave.h>
@@ -317,7 +318,9 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +#include <Services/PapyrusService.h>
  #include <cstdlib>
  #include <Services/HomePlacementClient.h>
-@@ -134,23 +137,25 @@
+ #include <Services/CampaignAccess.h>
+@@ -136,24 +139,26 @@
+         cell->worldspace || cell->IsTemporary() || HomeInstance::ProjectionForm(cell->formID)) return nullptr;
      return cell;
  }
 -std::optional<TradeProperties::FormKey> NativeEntranceRoot(uint32_t form)
@@ -361,7 +364,7 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
  }
  // Prefer the engine's original door. The legacy catalog remains a fallback
  // for its existing projection route when a linked reference is unloaded.
-@@ -175,5 +180,10 @@
+@@ -175,8 +180,13 @@
      std::array<uint32_t,12> Pose{};
      Clock::time_point MoveUntil{},ShapeAt{};
      std::string Shape;
@@ -374,7 +377,10 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +VisitState visit;
 +std::string lastResumeDigest;
 +Clock::time_point resumePoll{};
-@@ -399,6 +409,6 @@
+ struct PendingLock {uint32_t Revision{};Clock::time_point Until;};
+ struct LockContext
+ {
+@@ -399,7 +409,7 @@
  bool NativeVisitsEnabled()
  {
      const auto* flag=std::getenv("STM_NATIVE_HOME_VISITS");
@@ -382,12 +388,17 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +    return HomeGuestSave::HooksReady() && flag && std::string_view(flag)=="1";
  }
  std::optional<std::string> NativeVisitShape(uint64_t campaign,uint32_t slot)
-@@ -1127,3 +1137,4 @@
+ {
+@@ -1126,6 +1136,7 @@
+ }
  bool OverlayService::TryHouseDoor(uint32_t form) noexcept
  {
 +    if (HomeGuestSave::Busy()) return true;
      if (originalGuestCell.load())
-@@ -1303,4 +1314,15 @@
+     {
+         auto* player=PlayerCharacter::Get();
+@@ -1302,6 +1313,17 @@
+ {
      if (auto* p=PlayerCharacter::Get();!p || !p->GetParentCellEx() || p->GetParentCellEx()->formID!=lockContext.Cell ||
          !CampaignAccess::GameReady() || !m_transport.IsOnline()) lockContext={};
 +    if (!visit.Nonce && !HomeGuestSave::Busy() && NativeVisitsEnabled() &&
@@ -403,7 +414,11 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +    }
      if (visit.Native)
      {
-@@ -1398,3 +1420,32 @@
+         if (!CampaignAccess::GameReady()) return;
+@@ -1395,6 +1417,35 @@
+             visit.ExitIssued=true;visit.MoveUntil=now+15s;
+             MoveAt(*p,*out,visit.Pose,6);return;
+         }
 +        if (visit.Applied && visit.ResumePose)
 +        {
 +            const auto& pose=*visit.ResumePose;
@@ -436,7 +451,10 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
          if (visit.Applied) visit.Ready=true;
          if (valid && visit.Nonce && now>=visit.Next)
          {
-@@ -1524,2 +1575,71 @@
+@@ -1521,6 +1572,75 @@
+ // Run before cell discovery so the first cell announcement has the right
+ // namespace. Until the replicated registration exists, use a private
+ // connection-local quarantine. No guest projection is enabled in this mode.
 +std::optional<HomeGuestSave::Context> HomeGuestSave::CaptureAndLeave(World& world) noexcept
 +{
 +    try
@@ -508,13 +526,16 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +}
  bool HomeInstance::NativeGuestCell(uint32_t form) noexcept
  {return form && form==originalGuestCell.load();}
-@@ -1528,5 +1648,5 @@
+ bool HomeInstance::NativeGuestActive() noexcept
+@@ -1528,7 +1648,7 @@
  void HomeInstance::ForgetOriginalVisit() noexcept
  {
      if (visit.Native) {visit={};activeHomeRoute.store(0);projectedRoot.store(0);}
 -    originalGuestCell.store(0);
 +    originalGuestCell.store(0);lastResumeDigest.clear();resumePoll={};
  }
+ bool HomeInstance::ProjectionForm(uint32_t form) noexcept
+ {
 diff --git a/Code/client/Services/Generic/PartyTrade.cpp b/Code/client/Services/Generic/PartyTrade.cpp
 --- a/Code/client/Services/Generic/PartyTrade.cpp
 +++ b/Code/client/Services/Generic/PartyTrade.cpp
