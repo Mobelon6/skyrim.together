@@ -1952,7 +1952,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 diff --git a/Code/server/Services/PartyService.h b/Code/server/Services/PartyService.h
 --- a/Code/server/Services/PartyService.h
 +++ b/Code/server/Services/PartyService.h
-@@ -31,6 +31,8 @@
+@@ -31,9 +31,11 @@
          struct QuestRun
          {
              TiltedPhoques::Set<uint16_t> Stages;
@@ -1961,3 +1961,6 @@ diff --git a/Code/server/Services/PartyService.h b/Code/server/Services/PartySer
              bool Stopped = false;
              bool Started = false;
 +            bool CompletedRunOnce = false;
+         };
+ 
+         struct Conversation
