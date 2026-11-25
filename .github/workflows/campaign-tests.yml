@@ -1,0 +1,17 @@
+name: Co-op campaign rules
+on:
+  push:
+    paths:
+      - 'campaign/**'
+      - '.github/workflows/campaign-tests.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s campaign -v

@@ -1,0 +1,3721 @@
+diff --git a/Code/client/Components/RemoteComponent.h b/Code/client/Components/RemoteComponent.h
+index 28eee6f..d65fc16 100644
+--- a/Code/client/Components/RemoteComponent.h
++++ b/Code/client/Components/RemoteComponent.h
+@@ -5,6 +5,7 @@
+ #endif
+ 
+ #include <Structs/Inventory.h>
++#include <chrono>
+ 
+ struct RemoteComponent
+ {
+@@ -17,6 +18,8 @@ struct RemoteComponent
+ 
+     uint32_t Id;
+     uint32_t CachedRefId;
++    uint32_t ConfirmedCorpseEpoch{};
++    std::chrono::steady_clock::time_point NextLifeCheck{};
+     bool ObservedDead{};
+     bool ObservedBleedout{};
+     uint32_t OwnershipEpoch;
+diff --git a/Code/client/Events/PlayerDialogueEvent.h b/Code/client/Events/PlayerDialogueEvent.h
+index bcaddce..e38f0ca 100644
+--- a/Code/client/Events/PlayerDialogueEvent.h
++++ b/Code/client/Events/PlayerDialogueEvent.h
+@@ -2,11 +2,13 @@
+ 
+ struct PlayerDialogueEvent
+ {
+-    PlayerDialogueEvent(String aText, uint32_t aSpeakerHandle)
+-        : Text(std::move(aText)), SpeakerHandle(aSpeakerHandle)
++    PlayerDialogueEvent(String aText, uint32_t aSpeakerHandle, uint32_t aInfo, uint32_t aQuest)
++        : Text(std::move(aText)), SpeakerHandle(aSpeakerHandle), Info(aInfo), Quest(aQuest)
+     {
+     }
+ 
+     String Text;
+     uint32_t SpeakerHandle;
++    uint32_t Info;
++    uint32_t Quest;
+ };
+diff --git a/Code/client/Games/Misc/MenuTopicManager.cpp b/Code/client/Games/Misc/MenuTopicManager.cpp
+index deb39a1..1d12185 100644
+--- a/Code/client/Games/Misc/MenuTopicManager.cpp
++++ b/Code/client/Games/Misc/MenuTopicManager.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include <Events/PlayerDialogueEvent.h>
+ #include <TESObjectREFR.h>
++#include <Forms/TESTopicInfo.h>
++#include <World.h>
+ 
+ TP_THIS_FUNCTION(TPlayDialogueOption, bool, MenuTopicManager, int32_t aIndex);
+ static TPlayDialogueOption* RealPlayDialogueOption = nullptr;
+@@ -23,34 +25,112 @@ bool MenuTopicManager::IsPlayerDialogueSpeaker(const TESObjectREFR* apSpeaker) n
+     return pManager && pManager->IsCurrentSpeaker(apSpeaker->GetHandle());
+ }
+ 
++namespace
++{
++bool IsHireOption(const TESTopicInfo* info)
++{
++    if (!info)
++        return false;
++    bool requiresFreeSlot = false;
++    bool requiresPotentialFollower = false;
++    for (const auto* c = info->conditions.pHead; c; c = c->pNext)
++    {
++        if ((c->function != 74 && c->function != 71) || !c->params[0] || (c->flags & 0x1E) ||
++            c->object != 0 || c->GetOpCode() != TESConditionItem::OpCode::kEqualTo)
++            continue;
++        const auto form = static_cast<const TESForm*>(c->params[0])->formID;
++        if (c->function == 74 && form == 0xBCC98 && c->comparisonValue == 0.f)
++            requiresFreeSlot = true;
++        if (c->function == 71 && form == 0x5C84D && c->comparisonValue == 1.f)
++            requiresPotentialFollower = true;
++    }
++    // Generic recruitment plus standard paid hire / re-hire dialogues. A quest requiring
++    // the player to arrive alone can also test PlayerFollowerCount, without recruiting anyone.
++    const auto topic = info->parentTopic ? info->parentTopic->formID : 0;
++    return requiresFreeSlot && (requiresPotentialFollower || topic == 0xB0EE6 ||
++        topic == 0xBCC84 || topic == 0x104F1B || topic == 0x9BE49);
++}
++}
++
++bool MenuTopicManager::ResumeHire(int32_t index, uint32_t target, uint32_t info) noexcept
++{
++    const auto* npc = TESObjectREFR::GetByHandle(speaker.handle.iBits);
++    if (!menuOpen || !pOptions || !npc || npc->formID != target)
++        return false;
++    int i{};
++    for (auto* opt : *pOptions)
++        if (i++ == index && opt && opt->info && opt->info->formID == info && opt->text)
++        {
++            World::Get().GetRunner().Trigger(PlayerDialogueEvent(opt->text, speaker.handle.iBits, info, opt->quest ? opt->quest->formID : 0));
++            return TiltedPhoques::ThisCall(RealPlayDialogueOption, this, index);
++        }
++    return false;
++}
++
+ bool TP_MAKE_THISCALL(HookPlayDialogueOption, MenuTopicManager, int32_t aIndex)
+ {
+     if (apThis->pOptions)
+     {
+         int i = 0;
+         const char* pText = nullptr;
++        uint32_t info{}, quest{};
+         for (auto option : *apThis->pOptions)
+         {
+             if (i == aIndex)
+             {
++                if (!option)
++                    break;
++                if (IsHireOption(option->info))
++                    if (const auto* npc = TESObjectREFR::GetByHandle(apThis->speaker.handle.iBits))
++                        if (World::Get().GetOverlayService().BeginHire(npc->formID, option->info->formID, aIndex))
++                            return true;
+                 pText = option->text;
++                info = option->info ? option->info->formID : 0;
++                quest = option->quest ? option->quest->formID : 0;
+                 break;
+             }
+             i++;
+         }
+ 
+         if (pText != nullptr)
+-            World::Get().GetRunner().Trigger(PlayerDialogueEvent(pText, apThis->speaker.handle.iBits));
++            World::Get().GetRunner().Trigger(PlayerDialogueEvent(pText, apThis->speaker.handle.iBits, info, quest));
+     }
+ 
+     return TiltedPhoques::ThisCall(RealPlayDialogueOption, apThis, aIndex);
+ }
+ 
++namespace
++{
++// CommonLibSSE-NG: TESConditionItem::IsTrue(ConditionCheckParams&), AE 29924.
++// Read only the first two references from the solution. Never change the global or the NPC faction.
++struct ConditionContext { TESObjectREFR* action; TESObjectREFR* target; };
++TP_THIS_FUNCTION(TCheckCondition, bool, TESConditionItem, ConditionContext&);
++TCheckCondition* nextCondition{};
++bool TP_MAKE_THISCALL(CheckFollowerCondition, TESConditionItem, ConditionContext& context)
++{
++    const auto fn = apThis->function;
++    const auto* param = static_cast<const TESForm*>(apThis->params[0]);
++    // Alias and package-data operands can be numeric slots instead of TESForm pointers.
++    if ((fn == 74 || fn == 71) && param && !(apThis->flags & 0x1E) && apThis->object == 0 &&
++        apThis->GetOpCode() == TESConditionItem::OpCode::kEqualTo && context.action &&
++        OverlayService::FollowerBusy(context.action->formID) &&
++        ((fn == 74 && param->formID == 0xBCC98) || (fn == 71 && param->formID == 0x5C84E)))
++    {
++        const auto* menu = MenuTopicManager::Get();
++        if (menu && menu->speaker && context.action->GetHandle().handle.iBits == menu->speaker.handle.iBits)
++            return apThis->comparisonValue == (fn == 74 ? 1.f : 0.f);
++    }
++    return TiltedPhoques::ThisCall(nextCondition, apThis, context);
++}
++}
+ static TiltedPhoques::Initializer s_menuTopicHooks(
+     []()
+     {
+         POINTER_SKYRIMSE(TPlayDialogueOption, s_playDialogueOption, 35269);
+ 
++        POINTER_SKYRIMSE(TCheckCondition, checkCondition, 29924);
++        nextCondition = checkCondition.Get();
++        TP_HOOK(&nextCondition, CheckFollowerCondition);
+         RealPlayDialogueOption = s_playDialogueOption.Get();
+ 
+         TP_HOOK(&RealPlayDialogueOption, HookPlayDialogueOption);
+diff --git a/Code/client/Games/Misc/MenuTopicManager.h b/Code/client/Games/Misc/MenuTopicManager.h
+index f4b845b..e014669 100644
+--- a/Code/client/Games/Misc/MenuTopicManager.h
++++ b/Code/client/Games/Misc/MenuTopicManager.h
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
+ struct TESObjectREFR;
++struct TESForm;
++struct TESTopicInfo;
+ 
+ struct MenuTopicManager
+ {
+@@ -15,8 +17,15 @@ struct MenuTopicManager
+     struct DialogueOption
+     {
+         const char* text;
++        uint8_t padding[0x28 - sizeof(text)];
++        TESForm* quest; // MenuTopicManager::Dialogue::parentQuest
++        TESTopicInfo* info; // CommonLibSSE MenuTopicManager::Dialogue::parentTopicInfo
++
+     };
+ 
++    static_assert(offsetof(DialogueOption, info) == 0x30);
++    bool ResumeHire(int32_t index, uint32_t target, uint32_t info) noexcept;
++
+     uint8_t pad0[0x20];
+     GameList<DialogueOption>* pOptions;
+ 
+diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor.cpp
+index 70def70..ebab166 100644
+--- a/Code/client/Games/Skyrim/Actor.cpp
++++ b/Code/client/Games/Skyrim/Actor.cpp
+@@ -722,7 +722,13 @@ void Actor::SetActorValues(const ActorValues& acActorValues) noexcept
+         ForceActorValue(ActorValueOwner::ForceMode::PERMANENT, value.first, value.second);
+ 
+     for (auto& value : acActorValues.ActorValuesList)
++    {
++        // Death is applied from the ownership-checked life state immediately after a snapshot.
++        if (value.first == ActorValueInfo::kHealth && GetExtension() && !GetExtension()->IsPlayer() &&
++            (!std::isfinite(value.second) || value.second <= 0.f))
++            continue;
+         ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, value.first, value.second);
++    }
+ }
+ 
+ void Actor::SetFactions(const Factions& acFactions) noexcept
+@@ -749,7 +755,11 @@ void Actor::SetFactions(const Factions& acFactions) noexcept
+         const int8_t oldRank = it == current.end() ? -1 : it->second;
+         if (oldRank == rank)
+             continue;
+-        if (auto* pFaction = Cast<TESFaction>(GetById(modSystem.GetGameId(id))))
++        const auto local = modSystem.GetGameId(id);
++        // CurrentFollowerFaction belongs to the local player's follower quest. Other NPC factions still replicate.
++        if (local == 0x5C84E && World::Get().GetPartyService().IsInParty())
++            continue;
++        if (auto* pFaction = Cast<TESFaction>(GetById(local)))
+             SetFactionRank(pFaction, rank);
+     }
+ }
+@@ -830,7 +840,7 @@ void Actor::Kill() noexcept
+     // Network reconciliation can see a death from an older or different
+     // actor configuration. Preserve Essential on both the reference and base.
+     const TESNPC* pBase = Cast<TESNPC>(baseForm);
+-    if (IsEssential() || (pBase && pBase->actorData.IsEssential()))
++    if (OverlayService::NonlethalOpponent(formID) || IsEssential() || (pBase && pBase->actorData.IsEssential()))
+     {
+         spdlog::warn("Refusing to force death of essential actor {:X}", formID);
+         return;
+@@ -861,6 +871,19 @@ bool Actor::PlayIdle(TESIdleForm* apIdle) noexcept
+     return s_pPlayIdle(this, apIdle);
+ }
+ 
++void Actor::RestoreRemoteLife() noexcept
++{
++    if (GetExtension() && GetExtension()->IsPlayer())
++    {
++        Respawn();
++        return;
++    }
++    // Reset() also resets reference data. A remote visual correction must preserve inventory, outfit and packages.
++    Resurrect(false);
++    if (GetNiNode() && !IsDead())
++        Update3DPosition(true);
++}
++
+ void Actor::Respawn() noexcept
+ {
+     Resurrect(false);
+diff --git a/Code/client/Games/Skyrim/Actor.h b/Code/client/Games/Skyrim/Actor.h
+index f82b411..48562a6 100644
+--- a/Code/client/Games/Skyrim/Actor.h
++++ b/Code/client/Games/Skyrim/Actor.h
+@@ -240,6 +240,7 @@ struct Actor : TESObjectREFR
+     void DispelAllSpells(bool aNow = false) noexcept;
+     void Reset() noexcept;
+     void Kill() noexcept;
++    void RestoreRemoteLife() noexcept;
+     void Respawn() noexcept;
+     void PickUpObject(TESObjectREFR* apObject, int32_t aCount, bool aUnk1, float aUnk2) noexcept;
+     void DropObject(TESBoundObject* apObject, ExtraDataList* apExtraData, int32_t aCount, NiPoint3* apLocation, NiPoint3* apRotation) noexcept;
+diff --git a/Code/client/Games/Skyrim/Camera/PlayerCamera.cpp b/Code/client/Games/Skyrim/Camera/PlayerCamera.cpp
+index 534d294..e516e6c 100644
+--- a/Code/client/Games/Skyrim/Camera/PlayerCamera.cpp
++++ b/Code/client/Games/Skyrim/Camera/PlayerCamera.cpp
+@@ -36,6 +36,14 @@ bool PlayerCamera::WorldPtToScreenPt3(const NiPoint3& in, NiPoint3& out, float z
+     return false;
+ }
+ 
++void PlayerCamera::ToggleFreeCameraWithoutPause() noexcept
++{
++    // CommonLibSSE-NG PlayerCamera::ToggleFreeCameraMode, AE address-library ID.
++    TP_THIS_FUNCTION(TToggleFreeCamera, void, PlayerCamera, bool);
++    POINTER_SKYRIMSE(TToggleFreeCamera, toggleFreeCamera, 50809);
++    TiltedPhoques::ThisCall(toggleFreeCamera, this, false);
++}
++
+ void PlayerCamera::ForceFirstPerson() noexcept
+ {
+     TP_THIS_FUNCTION(TForceFirstPerson, void, PlayerCamera);
+diff --git a/Code/client/Games/Skyrim/Camera/PlayerCamera.h b/Code/client/Games/Skyrim/Camera/PlayerCamera.h
+index 098682f..c3dbaed 100644
+--- a/Code/client/Games/Skyrim/Camera/PlayerCamera.h
++++ b/Code/client/Games/Skyrim/Camera/PlayerCamera.h
+@@ -11,6 +11,7 @@ struct PlayerCamera : public TESCamera
+ 
+     bool WorldPtToScreenPt3(const NiPoint3& in, NiPoint3& out, float zeroTolerance = 1e-5f);
+ 
++    void ToggleFreeCameraWithoutPause() noexcept;
+     void ForceFirstPerson() noexcept;
+     void ForceThirdPerson() noexcept;
+ 
+diff --git a/Code/client/Games/Skyrim/Forms/TESTopicInfo.h b/Code/client/Games/Skyrim/Forms/TESTopicInfo.h
+index 49475d0..3f2b760 100644
+--- a/Code/client/Games/Skyrim/Forms/TESTopicInfo.h
++++ b/Code/client/Games/Skyrim/Forms/TESTopicInfo.h
+@@ -1,7 +1,12 @@
+ #pragma once
+ 
+ #include "TESForm.h"
++#include <Components/TESCondition.h>
+ 
+ struct TESTopicInfo : TESForm
+ {
++    TESForm* parentTopic; // TESTopic, CommonLibSSE-NG offset 0x20
++    uint8_t padding[8];
++    TESCondition conditions;
+ };
++static_assert(offsetof(TESTopicInfo, conditions) == 0x30);
+diff --git a/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.cpp b/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.cpp
+index 6684682..106cace 100644
+--- a/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.cpp
++++ b/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.cpp
+@@ -11,6 +11,12 @@ bool WorldPtToScreenPt3(const NiPoint3& aWorldPt, NiPoint3& aScreenPt)
+ {
+     return NiCamera::WorldPtToScreenPt3(reinterpret_cast<float*>(CameraWorldToCam), CameraPort, &aWorldPt, &aScreenPt.x, &aScreenPt.y, &aScreenPt.z, 1e-5f);
+ }
++bool ProjectForOverlay(const NiPoint3& point, NiPoint3& uv)
++{
++    // Project into the normalized output rectangle. The HUD camera port may be render-scaled.
++    static constexpr NiRect<float> output{0.f, 1.f, 1.f, 0.f};
++    return NiCamera::WorldPtToScreenPt3(reinterpret_cast<float*>(CameraWorldToCam), &output, &point, &uv.x, &uv.y, &uv.z);
++}
+ } // namespace HUDMenuUtils
+ 
+ static TiltedPhoques::Initializer s_Init(
+diff --git a/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.h b/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.h
+index 9db706f..85b09cd 100644
+--- a/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.h
++++ b/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.h
+@@ -2,5 +2,6 @@
+ 
+ namespace HUDMenuUtils
+ {
++bool ProjectForOverlay(const NiPoint3& point, NiPoint3& uv);
+ bool WorldPtToScreenPt3(const NiPoint3& aWorldPt, NiPoint3& aScreenPt);
+ }
+diff --git a/Code/client/Games/Skyrim/Interface/UI.cpp b/Code/client/Games/Skyrim/Interface/UI.cpp
+index a41d1ce..38f0f11 100644
+--- a/Code/client/Games/Skyrim/Interface/UI.cpp
++++ b/Code/client/Games/Skyrim/Interface/UI.cpp
+@@ -25,6 +25,20 @@ bool UI::GetMenuOpen(const BSFixedString& acName) const
+     return TiltedPhoques::ThisCall(s_isMenuOpen.Get(), this, acName);
+ }
+ 
++bool UI::BlocksPartyHud() const
++{
++    if (!menuSystemVisible || numPausesGame || numItemMenus || modal)
++        return true;
++    // Some menu mods deliberately clear the pause bit.
++    static const BSFixedString menus[] = {"Journal Menu", "MapMenu", "Loading Menu", "Main Menu",
++        "Dialogue Menu", "BarterMenu", "Crafting Menu", "Lockpicking Menu", "Book Menu",
++        "GiftMenu", "RaceSex Menu", "Sleep/Wait Menu", "Training Menu"};
++    for (const auto& menu : menus)
++        if (GetMenuOpen(menu))
++            return true;
++    return IsUnpausedMenuOpen();
++}
++
+ void UI::CloseAllMenus()
+ {
+     TP_THIS_FUNCTION(TUI_CloseAll, void, const UI);
+diff --git a/Code/client/Games/Skyrim/Interface/UI.h b/Code/client/Games/Skyrim/Interface/UI.h
+index 1fc0dc6..788d58d 100644
+--- a/Code/client/Games/Skyrim/Interface/UI.h
++++ b/Code/client/Games/Skyrim/Interface/UI.h
+@@ -42,6 +42,7 @@ public:
+     static bool ShouldUnpauseMenus();
+ 
+     bool GetMenuOpen(const BSFixedString& acName) const;
++    bool BlocksPartyHud() const;
+     bool IsUnpausedMenuOpen() const;
+     void CloseAllMenus();
+     void DebugLogAllMenus();
+diff --git a/Code/client/Games/Skyrim/Misc/BSString.h b/Code/client/Games/Skyrim/Misc/BSString.h
+index 9fc1f88..46dc8fa 100644
+--- a/Code/client/Games/Skyrim/Misc/BSString.h
++++ b/Code/client/Games/Skyrim/Misc/BSString.h
+@@ -9,6 +9,7 @@ struct BSString
+     {
+     }
+     ~BSString();
++    bool Assign(const char* text) noexcept;
+ 
+     [[nodiscard]] const char* AsAscii() { return data; }
+ 
+diff --git a/Code/client/Games/Skyrim/NetImmerse/NiAVObject.h b/Code/client/Games/Skyrim/NetImmerse/NiAVObject.h
+index 9dcbd4f..c9ee546 100644
+--- a/Code/client/Games/Skyrim/NetImmerse/NiAVObject.h
++++ b/Code/client/Games/Skyrim/NetImmerse/NiAVObject.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <NetImmerse/NiObjectNET.h>
++#include <Games/Primitives.h>
+ 
+ struct BSFixedString;
+ 
+@@ -14,7 +15,11 @@ struct NiAVObject : NiObjectNET
+     virtual void sub_29();
+     virtual NiAVObject* GetByName(BSFixedString& aName);
+ 
+-    uint8_t pad30[0x110 - 0x30];
++    // Skyrim SE/AE NiAVObject::world (0x7C), NiTransform::translate (+0x24).
++    uint8_t pad30[0xA0 - 0x30];
++    NiPoint3 worldPosition;
++    uint8_t padAC[0x110 - 0xAC];
+ };
+ 
++static_assert(offsetof(NiAVObject, worldPosition) == 0xA0);
+ static_assert(sizeof(NiAVObject) == 0x110);
+diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyrim/TESObjectREFR.cpp
+index fd80a79..dd40225 100644
+--- a/Code/client/Games/Skyrim/TESObjectREFR.cpp
++++ b/Code/client/Games/Skyrim/TESObjectREFR.cpp
+@@ -1019,6 +1019,13 @@ bool TP_MAKE_THISCALL(HookPlayAnimation, void, uint32_t auiStackID, TESObjectREF
+ 
+ bool TP_MAKE_THISCALL(HookActivate, TESObjectREFR, TESObjectREFR* apActivator, uint8_t aUnk1, TESBoundObject* apObjectToGet, int32_t aCount, char aDefaultProcessing)
+ {
++    if (apActivator && apActivator == PlayerCharacter::Get() && apThis)
++    {
++        auto& service = World::Get().GetOverlayService();
++        if (service.TryJoinConversation(apThis->formID))
++            return true;
++        service.NoteActivation(apThis->formID);
++    }
+     Actor* pActivator = Cast<Actor>(apActivator);
+ 
+     // Exclude books from activation since only reading them removes them from the cell
+diff --git a/Code/client/Services/ActorValueService.h b/Code/client/Services/ActorValueService.h
+index 6040a08..6bb871a 100644
+--- a/Code/client/Services/ActorValueService.h
++++ b/Code/client/Services/ActorValueService.h
+@@ -16,6 +16,7 @@ struct NotifyActorValueChanges;
+ struct NotifyActorMaxValueChanges;
+ struct NotifyHealthChangeBroadcast;
+ struct NotifyDeathStateChange;
++struct NotifyNpcLifeCheck;
+ 
+ struct Actor;
+ 
+@@ -84,6 +85,8 @@ private:
+     /**
+      * @brief Receives death state changes and applies them locally.
+      */
++    entt::scoped_connection m_lifeCheck;
++    void OnLifeCheck(const NotifyNpcLifeCheck& packet) const noexcept;
+     void OnDeathStateChange(const NotifyDeathStateChange& acEvent) const noexcept;
+ 
+     /**
+diff --git a/Code/client/Services/Generic/ActorValueService.cpp b/Code/client/Services/Generic/ActorValueService.cpp
+index 559bcc6..7bfef3d 100644
+--- a/Code/client/Services/Generic/ActorValueService.cpp
++++ b/Code/client/Services/Generic/ActorValueService.cpp
+@@ -21,6 +21,8 @@
+ #include <Messages/RequestHealthChangeBroadcast.h>
+ #include <Messages/NotifyDeathStateChange.h>
+ #include <Messages/RequestDeathStateChange.h>
++#include <Messages/RequestNpcLifeCheck.h>
++#include <Messages/NotifyNpcLifeCheck.h>
+ 
+ #include <misc/ActorValueOwner.h>
+ #include <cmath>
+@@ -39,6 +41,7 @@ ActorValueService::ActorValueService(World& aWorld, entt::dispatcher& aDispatche
+     m_dispatcher.sink<NotifyActorMaxValueChanges>().connect<&ActorValueService::OnActorMaxValueChanges>(this);
+     m_dispatcher.sink<HealthChangeEvent>().connect<&ActorValueService::OnHealthChange>(this);
+     m_dispatcher.sink<NotifyHealthChangeBroadcast>().connect<&ActorValueService::OnHealthChangeBroadcast>(this);
++    m_lifeCheck = m_dispatcher.sink<NotifyNpcLifeCheck>().connect<&ActorValueService::OnLifeCheck>(this);
+     m_dispatcher.sink<NotifyDeathStateChange>().connect<&ActorValueService::OnDeathStateChange>(this);
+ }
+ 
+@@ -298,6 +301,24 @@ void ActorValueService::RunDeathStateUpdates() noexcept
+         auto& remote = remotes.get<RemoteComponent>(entity);
+         const bool dead = pActor->IsDead();
+         const bool bleedingOut = pActor->actorState.IsBleedingOut();
++        if (!dead)
++        {
++            remote.ConfirmedCorpseEpoch = 0;
++            remote.NextLifeCheck = {};
++        }
++        else if (remote.ConfirmedCorpseEpoch != remote.OwnershipEpoch && !m_world.any_of<WaitingFor3D, PlayerComponent>(entity))
++        {
++            if (remote.NextLifeCheck == std::chrono::steady_clock::time_point{})
++                remote.NextLifeCheck = now + 1s;
++            else if (now >= remote.NextLifeCheck)
++            {
++                RequestNpcLifeCheck check;
++                check.Id = remote.Id;
++                check.OwnershipEpoch = remote.OwnershipEpoch;
++                m_transport.Send(check);
++                remote.NextLifeCheck = now + 8s;
++            }
++        }
+         if (dead != remote.ObservedDead || bleedingOut != remote.ObservedBleedout)
+         {
+             spdlog::info("Remote life state actor {:X}, server {:X}, epoch {}, dead {}, bleedout {}, health {}, essential {}, combat {}",
+@@ -367,7 +388,8 @@ void ActorValueService::OnHealthChangeBroadcast(const NotifyHealthChangeBroadcas
+     const bool isRemote = pExtension->IsRemote();
+     const float currentHealth = pActor->GetActorValue(ActorValueInfo::kHealth);
+     float newHealth = currentHealth + acMessage.DeltaHealth;
+-    if (!isPlayer && acMessage.KeepAlive)
++    const bool keepAlive = acMessage.KeepAlive || (!isPlayer && OverlayService::NonlethalOpponent(pActor->formID));
++    if (!isPlayer && keepAlive)
+     {
+         if (currentHealth <= 0.f || pActor->IsDead())
+             return;
+@@ -381,7 +403,7 @@ void ActorValueService::OnHealthChangeBroadcast(const NotifyHealthChangeBroadcas
+ 
+     pActor->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, newHealth);
+ 
+-    if (!isRemote && !isPlayer && !acMessage.KeepAlive && acMessage.DeltaHealth < 0.f)
++    if (!isRemote && !isPlayer && !keepAlive && acMessage.DeltaHealth < 0.f)
+     {
+         const float health = pActor->GetActorValue(ActorValueInfo::kHealth);
+         if (!pActor->IsDead() && health <= 0.f)
+@@ -457,6 +479,8 @@ void ActorValueService::OnActorMaxValueChanges(const NotifyActorMaxValueChanges&
+ void ActorValueService::OnDeathStateChange(const NotifyDeathStateChange& acMessage) const noexcept
+ {
+     const auto entity = OwnershipSystem::AcceptRemoteUpdate(m_world, acMessage.Id, acMessage.OwnershipEpoch);
++    if (entity)
++        m_world.get<RemoteComponent>(*entity).ConfirmedCorpseEpoch = acMessage.IsDead ? acMessage.OwnershipEpoch : 0;
+     if (auto* pWaitingFor3D = entity ? m_world.try_get<WaitingFor3D>(*entity) : nullptr)
+     {
+         pWaitingFor3D->PendingDeathState = acMessage;
+@@ -486,6 +510,20 @@ void ActorValueService::OnDeathStateChange(const NotifyDeathStateChange& acMessa
+     if (pActor->IsDead() != acMessage.IsDead)
+     {
+         spdlog::info("Applying death state {} to remote actor {:X}, server id: {:X}", acMessage.IsDead, pActor->formID, acMessage.Id);
+-        acMessage.IsDead ? pActor->Kill() : pActor->Respawn();
++        acMessage.IsDead ? pActor->Kill() : pActor->RestoreRemoteLife();
+     }
+ }
++
++void ActorValueService::OnLifeCheck(const NotifyNpcLifeCheck& packet) const noexcept
++{
++    const auto entity = OwnershipSystem::AcceptOwnerUpdate(m_world, packet.Id, packet.OwnershipEpoch);
++    const auto* form = entity ? m_world.try_get<FormIdComponent>(*entity) : nullptr;
++    auto* actor = form ? Cast<Actor>(TESForm::GetById(form->Id)) : nullptr;
++    if (!actor || !actor->GetNiNode() || !actor->GetExtension() || actor->GetExtension()->IsPlayer())
++        return;
++    RequestDeathStateChange answer;
++    answer.Id = packet.Id;
++    answer.OwnershipEpoch = packet.OwnershipEpoch;
++    answer.IsDead = actor->IsDead();
++    m_transport.Send(answer);
++}
+diff --git a/Code/client/Services/Generic/CharacterService.cpp b/Code/client/Services/Generic/CharacterService.cpp
+index 312a0d6..ccea155 100644
+--- a/Code/client/Services/Generic/CharacterService.cpp
++++ b/Code/client/Services/Generic/CharacterService.cpp
+@@ -173,7 +173,7 @@ void CharacterService::ReconcileActorData(
+         else
+         {
+             spdlog::info("Respawning actor {:X} to match server state", apActor->formID);
+-            apActor->Respawn();
++            apActor->RestoreRemoteLife();
+         }
+     }
+ 
+@@ -557,7 +557,7 @@ void CharacterService::OnCharacterSpawn(const CharacterSpawnRequest& acMessage)
+             {
+                 pActor->SetActorValues(acMessage.InitialActorValues);
+                 if (!acMessage.IsPlayer && pActor->IsDead() != acMessage.IsDead)
+-                    acMessage.IsDead ? pActor->Kill() : pActor->Respawn();
++                    acMessage.IsDead ? pActor->Kill() : pActor->RestoreRemoteLife();
+             }
+         }
+ 
+@@ -671,7 +671,7 @@ void CharacterService::OnCharacterSpawn(const CharacterSpawnRequest& acMessage)
+     }
+ 
+     if (pActor->IsDead() != acMessage.IsDead)
+-        acMessage.IsDead ? pActor->Kill() : pActor->Respawn();
++        acMessage.IsDead ? pActor->Kill() : pActor->RestoreRemoteLife();
+ 
+     spdlog::info("Spawn Request Is summon {}", acMessage.IsPlayerSummon);
+ 
+@@ -1732,7 +1732,7 @@ Actor* CharacterService::CreateCharacterForEntity(entt::entity aEntity) const no
+     }
+ 
+     if (pActor->IsDead() != acMessage.IsDead)
+-        acMessage.IsDead ? pActor->Kill() : pActor->Respawn();
++        acMessage.IsDead ? pActor->Kill() : pActor->RestoreRemoteLife();
+ 
+     spdlog::info("Spawned character for entity, server id: {:X}", remoteComponent.Id);
+ 
+@@ -2061,7 +2061,7 @@ void CharacterService::RunRemoteUpdates() noexcept
+ 
+         const uint32_t ownershipEpoch = OwnershipSystem::GetOwnershipEpoch(m_world, entity);
+         if (const auto isDead = waitingFor3D.GetDeathState(ownershipEpoch); isDead && pActor->IsDead() != *isDead)
+-            *isDead ? pActor->Kill() : pActor->Respawn();
++            *isDead ? pActor->Kill() : pActor->RestoreRemoteLife();
+ 
+         if (pActor->IsVampireLord())
+             pActor->FixVampireLordModel();
+diff --git a/Code/client/Services/Generic/CoopInteraction.cpp b/Code/client/Services/Generic/CoopInteraction.cpp
+new file mode 100644
+index 0000000..80df01f
+--- /dev/null
++++ b/Code/client/Services/Generic/CoopInteraction.cpp
+@@ -0,0 +1,314 @@
++#include <TiltedOnlinePCH.h>
++#include <World.h>
++#include <Services/PapyrusService.h>
++#include <Services/PlayerService.h>
++#include <Forms/TESQuest.h>
++#include <Forms/TESFaction.h>
++#include <Games/Misc/MenuTopicManager.h>
++#include <PlayerCharacter.h>
++#include <Utils.h>
++#include <Messages/RequestCoopInteraction.h>
++#include <Messages/NotifyCoopInteraction.h>
++#include <Components.h>
++#include <atomic>
++#include <map>
++#include <mutex>
++
++namespace
++{
++using Clock = std::chrono::steady_clock;
++using namespace std::chrono_literals;
++std::mutex rightsMutex;
++std::map<uint32_t, Clock::time_point> occupied;
++std::atomic_uint32_t occupiedCount{};
++uint32_t opponent{}, lastPose{UINT32_MAX};
++Clock::time_point opponentExpires{};
++std::atomic_uint32_t confirmedOpponent{}, localOpponent{};
++std::atomic_int64_t confirmedUntil{}, localUntil{};
++void PublishAlive(std::atomic_uint32_t& slot, std::atomic_int64_t& until, uint32_t npc)
++{
++    until.store((Clock::now() + 4s).time_since_epoch().count());
++    slot.store(npc);
++}
++
++void Transmit(Interaction kind, uint32_t speaker, uint32_t session, GameId npc = {}, uint32_t value = 0)
++{
++    RequestCoopInteraction message;
++    message.Event = {kind, speaker, session, value, npc};
++    World::Get().GetTransport().Send(message);
++}
++GameId NetworkForm(uint32_t id)
++{
++    GameId result{};
++    if (id && (id >> 24) != 0xFF)
++        World::Get().GetModSystem().GetServerModId(id, result);
++    return result;
++}
++TESObjectREFR* Alias(uint32_t questId)
++{
++    auto* quest = Cast<TESQuest>(TESForm::GetById(questId));
++    return quest && !quest->IsStopped() ? quest->GetAliasedRef(0) : nullptr;
++}
++std::optional<int32_t> Relationship(Actor* npc)
++{
++    auto* method = World::Get().ctx().at<PapyrusService>().Get("Actor", "GetRelationshipRank");
++    if (!method || !npc || !PlayerCharacter::Get())
++        return {};
++    PapyrusFunction<int32_t, Actor, Actor*> get(method);
++    return get(npc, PlayerCharacter::Get());
++}
++}
++
++void OverlayService::LeaveConversation(uint64_t key) noexcept
++{
++    if (key && m_transport.IsConnected())
++        Transmit(Interaction::Leave, static_cast<uint32_t>(key >> 32), static_cast<uint32_t>(key));
++}
++void OverlayService::NoteActivation(uint32_t form) noexcept
++{
++    m_activated = form;
++    m_activatedUntil = Clock::now() + 4s;
++}
++bool OverlayService::WasActivated(uint32_t form) const noexcept
++{
++    return form && m_activated == form && Clock::now() < m_activatedUntil;
++}
++
++bool OverlayService::FollowerBusy(uint32_t npc) noexcept
++{
++    if (!occupiedCount.load(std::memory_order_relaxed))
++        return false;
++    std::lock_guard guard(rightsMutex);
++    const auto i = occupied.find(npc);
++    return i != occupied.end() && i->second > Clock::now();
++}
++bool OverlayService::NonlethalOpponent(uint32_t npc) noexcept
++{
++    const auto now = Clock::now().time_since_epoch().count();
++    return npc && ((confirmedOpponent.load() == npc && now < confirmedUntil.load()) ||
++        (localOpponent.load() == npc && now < localUntil.load()));
++}
++
++bool OverlayService::BeginHire(uint32_t npc, uint32_t info, int32_t index) noexcept
++{
++    if (!m_world.GetPartyService().IsInParty())
++        return false;
++    const GameId key = NetworkForm(npc);
++    if (!key)
++        return false;
++    if (m_pendingForm && Clock::now() < m_pendingUntil)
++        return true;
++    m_pendingSession = m_world.ctx().at<PlayerService>().ActiveDialogueSession(npc);
++    if (!m_pendingSession)
++        return true;
++    m_pendingForm = npc;
++    m_pendingInfo = info;
++    m_pendingIndex = index;
++    m_pendingNonce = ++m_nonce;
++    m_pendingUntil = Clock::now() + 4s;
++    Transmit(Interaction::Hire, 0, m_nonce, key, m_pendingSession);
++    return true;
++}
++
++void OverlayService::ClearInteraction() noexcept
++{
++    { std::lock_guard guard(rightsMutex); occupied.clear(); occupiedCount.store(0); }
++    m_activated = m_pendingForm = opponent = 0;
++    confirmedOpponent.store(0);
++    localOpponent.store(0);
++    m_pendingJoin = m_requestedTalk = 0;
++    m_watch = {};
++    lastPose = UINT32_MAX;
++    m_pollAt = {};
++}
++
++void OverlayService::OnInteraction(const NotifyCoopInteraction& packet) noexcept
++{
++    if (!m_world.GetPartyService().IsInParty())
++        return;
++    const auto& e = packet.Event;
++    const auto now = Clock::now();
++    uint32_t form = e.Npc ? m_world.GetModSystem().GetGameId(e.Npc) : 0;
++    const uint64_t key = (uint64_t(e.Speaker) << 32) | e.Session;
++    if (e.Kind == Interaction::Joined || e.Kind == Interaction::Rejoin)
++    {
++        if ((e.Kind == Interaction::Joined && m_pendingJoin != key) ||
++            (!m_conversations.count(e.Speaker)) || m_conversations.at(e.Speaker).Last.Anchor.Session != e.Session)
++            return;
++        if (m_dismissedTalk == key && e.Kind == Interaction::Rejoin)
++            return;
++        m_pendingJoin = 0;
++        m_requestedTalk = key;
++        m_dismissedTalk = 0;
++        return;
++    }
++    if (!form)
++        return;
++    if (e.Kind == Interaction::FollowerReserved || e.Kind == Interaction::FollowerReleased)
++    {
++        bool newlyReserved = false;
++        {
++            std::lock_guard guard(rightsMutex);
++            if (e.Kind == Interaction::FollowerReserved)
++            {
++                auto& until = occupied[form];
++                newlyReserved = until <= now;
++                until = now + 10s;
++            }
++            else
++                occupied.erase(form);
++            occupiedCount.store(static_cast<uint32_t>(occupied.size()), std::memory_order_relaxed);
++        }
++        if (newlyReserved)
++        {
++            // Repair a rank copied by previous STR builds, while preserving a pre-existing personal follower.
++            auto* quest = Cast<TESQuest>(TESForm::GetById(0x750BA));
++            auto* actor = Cast<Actor>(TESForm::GetById(form));
++            auto* faction = Cast<TESFaction>(TESForm::GetById(0x5C84E));
++            auto* method = m_world.ctx().at<PapyrusService>().Get("Actor", "GetFactionRank");
++            if (actor && quest && quest->GetAliasedRef(0) != actor && faction && method)
++            {
++                PapyrusFunction<int32_t, Actor, TESFaction*> rank(method);
++                if (rank(actor, faction) >= 0)
++                    actor->SetFactionRank(faction, -1);
++            }
++        }
++        return;
++    }
++    if (e.Kind == Interaction::Granted || e.Kind == Interaction::Denied)
++    {
++        if (form != m_pendingForm || e.Session != m_pendingNonce || now >= m_pendingUntil)
++            return;
++        m_pendingForm = 0;
++        if (e.Kind == Interaction::Granted)
++        {
++            if (m_world.ctx().at<PlayerService>().ActiveDialogueSession(form) != m_pendingSession)
++                return;
++            if (auto* menu = MenuTopicManager::Get())
++                menu->ResumeHire(m_pendingIndex, form, m_pendingInfo);
++        }
++        else
++            Utils::ShowHudMessage("Нанять спутника сейчас не удалось.");
++        return;
++    }
++    auto* actor = Cast<Actor>(TESForm::GetById(form));
++    if (!actor)
++        return;
++    if (e.Kind == Interaction::WatchOutcomes)
++    {
++        if (m_watch.Npc == form && m_watch.Session == e.Session)
++            return;
++        auto rank = Relationship(actor);
++        m_watch = {};
++        m_watch.Npc = form;
++        m_watch.Session = e.Session;
++        m_watch.Rank = rank ? static_cast<uint32_t>(*rank + 4) : UINT32_MAX;
++        m_watch.Expires = now + 6s;
++    }
++    else if (e.Kind == Interaction::Outcome && e.Value >= 1 && e.Value <= 4)
++    {
++        const auto current = Relationship(actor);
++        auto* method = m_world.ctx().at<PapyrusService>().Get("Actor", "SetRelationshipRank");
++        if (current && *current < static_cast<int32_t>(e.Value) && method)
++        {
++            PapyrusFunction<void, Actor, Actor*, int32_t> set(method);
++            set(actor, PlayerCharacter::Get(), static_cast<int32_t>(e.Value));
++        }
++    }
++    else if (e.Kind == Interaction::OpponentState && e.Value <= 2)
++    {
++        if (e.Value == 2)
++        {
++            if (opponent == form)
++            {
++                opponent = 0;
++                confirmedOpponent.store(0);
++                lastPose = UINT32_MAX;
++            }
++            return;
++        }
++        if (opponent != form || opponentExpires < now)
++            lastPose = UINT32_MAX;
++        opponent = form;
++        PublishAlive(confirmedOpponent, confirmedUntil, form);
++        opponentExpires = now + 4s;
++        if (!actor->GetNiNode())
++            return;
++        if (actor->IsDead())
++            actor->RestoreRemoteLife();
++        if (actor->IsDead())
++            return;
++        if (e.Value != lastPose)
++        {
++            static BSFixedString down("BleedoutStart"), up("BleedoutStop");
++            if (e.Value == 1 || lastPose == 1 || actor->actorState.IsBleedingOut())
++                actor->SendAnimationEvent(e.Value == 1 ? &down : &up);
++            lastPose = e.Value;
++        }
++        if (actor->GetCombatTarget() == PlayerCharacter::Get())
++        {
++            auto players = m_world.view<PlayerComponent, FormIdComponent>();
++            for (auto entity : players)
++                if (players.get<PlayerComponent>(entity).Id == e.Speaker)
++                    if (auto* challenger = Cast<Actor>(TESForm::GetById(players.get<FormIdComponent>(entity).Id)))
++                        actor->SetCombatTargetEx(challenger);
++        }
++    }
++}
++
++void OverlayService::UpdateInteraction() noexcept
++{
++    if (!m_world.GetPartyService().IsInParty() || !m_transport.IsConnected())
++        return;
++    const auto now = Clock::now();
++    if (now < m_pollAt)
++        return;
++    m_pollAt = now + 500ms;
++    auto* local = PlayerCharacter::Get();
++    if (!local || !local->parentCell || !local->GetNiNode())
++        return; // a load screen cannot confirm dismissal
++    auto* followerQuest = Cast<TESQuest>(TESForm::GetById(0x750BA)); // DialogueFollower, human follower alias
++    if (followerQuest)
++    {
++        auto* follower = followerQuest->GetAliasedRef(0);
++        Transmit(Interaction::FollowerReport, 0, 0, follower ? NetworkForm(follower->formID) : GameId{});
++    }
++    if (!m_watch.Npc)
++        return;
++    auto* actor = Cast<Actor>(TESForm::GetById(m_watch.Npc));
++    const auto* menu = MenuTopicManager::Get();
++    if (actor && menu && menu->IsCurrentSpeaker(actor->GetHandle()))
++        m_watch.Expires = now + 6s;
++    if (!actor || now >= m_watch.Expires)
++    {
++        m_watch = {};
++        return;
++    }
++    auto key = NetworkForm(m_watch.Npc);
++    if (!key)
++        return;
++    const bool fighting = Alias(0x47AE6) == actor; // DGIntimidateQuest's current opponent, irrespective of NPC
++    PublishAlive(localOpponent, localUntil, fighting && !actor->IsDead() ? m_watch.Npc : 0);
++    if (fighting && !m_watch.Brawl)
++    {
++        Transmit(Interaction::Brawl, 0, m_watch.Session, key);
++        m_watch.Brawl = true;
++    }
++    if (m_watch.Brawl)
++    {
++        if (fighting)
++            m_watch.Expires = now + 15s;
++        const uint32_t pose = !fighting || actor->IsDead() ? 2u : actor->actorState.IsBleedingOut() ? 1u : 0u;
++        if (pose != 2 || m_watch.State != pose)
++            Transmit(Interaction::OpponentState, 0, m_watch.Session, key, pose);
++        m_watch.State = pose;
++    }
++    const auto rank = Relationship(actor);
++    if (rank && *rank >= -4 && *rank <= 4)
++    {
++        const auto observed = static_cast<uint32_t>(*rank + 4);
++        if (m_watch.Rank != UINT32_MAX && observed > m_watch.Rank && *rank > 0)
++            Transmit(Interaction::Outcome, 0, m_watch.Session, key, static_cast<uint32_t>(*rank));
++        m_watch.Rank = observed;
++    }
++}
+diff --git a/Code/client/Services/Generic/DialogueInvitation.cpp b/Code/client/Services/Generic/DialogueInvitation.cpp
+new file mode 100644
+index 0000000..22b4403
+--- /dev/null
++++ b/Code/client/Services/Generic/DialogueInvitation.cpp
+@@ -0,0 +1,106 @@
++#include <TiltedOnlinePCH.h>
++#include <World.h>
++#include <PlayerCharacter.h>
++#include <Misc/BSString.h>
++#include <Games/Memory.h>
++#include <Games/Misc/MenuTopicManager.h>
++#include <Forms/TESNPC.h>
++#include <Windows.h>
++#include <Messages/RequestCoopInteraction.h>
++#include <atomic>
++#include <cstring>
++
++namespace
++{
++// CrosshairPickData::target, AE address library and TESNPC::GetActivateText (CommonLibSSE-NG).
++struct PickData { uint32_t padding, target; };
++TESObjectREFR* Picked()
++{
++    POINTER_SKYRIMSE(PickData*, singleton, 401585);
++    const auto* pick = *singleton.Get();
++    return pick && pick->target ? TESObjectREFR::GetByHandle(pick->target) : nullptr;
++}
++using ActivateText = bool (*)(TESNPC*, TESObjectREFR*, BSString&);
++ActivateText nextText{};
++std::atomic_uint32_t invitedNpc{}, invitedSpeaker{};
++bool JoinText(TESNPC* base, TESObjectREFR* ref, BSString& destination)
++{
++    const bool result = nextText(base, ref, destination);
++    if (invitedNpc.load() == 0)
++        return result;
++    const auto* pick = Picked();
++    if (!pick || pick->baseForm != base || (pick->formID != invitedNpc.load() && pick->formID != invitedSpeaker.load()))
++        return result;
++    // Vanilla HUD accepts "verb\\nname". Preserve the name supplied by Skyrim or other UI mods.
++    const char* text = destination.AsAscii();
++    const char* name = text ? std::strchr(text, '\n') : nullptr;
++    std::string replacement = "Присоединиться";
++    if (name)
++        replacement += name;
++    return destination.Assign(replacement.c_str()) || result;
++}
++void Install(TESNPC* base)
++{
++    if (nextText || !base)
++        return;
++    auto** slot = *reinterpret_cast<void***>(base) + 0x4C;
++    DWORD old{};
++    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &old))
++        return;
++    nextText = reinterpret_cast<ActivateText>(*slot);
++    InterlockedExchangePointer(slot, reinterpret_cast<void*>(&JoinText));
++    DWORD ignored{};
++    VirtualProtect(slot, sizeof(*slot), old, &ignored);
++}
++}
++
++bool BSString::Assign(const char* text) noexcept
++{
++    const auto bytes = std::strlen(text) + 1;
++    if (bytes > UINT16_MAX)
++        return false;
++    if (!data || bytes > capacity)
++    {
++        auto* buffer = static_cast<char*>(Memory::Allocate(bytes));
++        if (!buffer)
++            return false;
++        if (data)
++            Memory::Free(const_cast<char*>(data));
++        data = buffer;
++        capacity = static_cast<uint16_t>(bytes);
++    }
++    std::memcpy(const_cast<char*>(data), text, bytes);
++    length = static_cast<uint16_t>(bytes - 1);
++    return true;
++}
++
++void OverlayService::PublishInvitation(uint32_t speaker, uint32_t session, uint32_t npcForm, uint32_t speakerForm) noexcept
++{
++    m_invitedTalk = session ? (uint64_t(speaker) << 32) | session : 0;
++    m_invitedSpeaker = speakerForm;
++    m_invitedNpc = npcForm;
++    if (npcForm && !nextText)
++        if (auto* actor = Cast<Actor>(TESForm::GetById(npcForm)))
++            Install(Cast<TESNPC>(actor->baseForm));
++    invitedSpeaker.store(speakerForm);
++    invitedNpc.store(npcForm);
++}
++
++bool OverlayService::TryJoinConversation(uint32_t form) noexcept
++{
++    if (!form || !m_invitedTalk || (form != m_invitedNpc && form != m_invitedSpeaker))
++        return false;
++    auto* pick = Picked();
++    auto* player = PlayerCharacter::Get();
++    const auto* topicMenu = MenuTopicManager::Get();
++    if (!pick || pick->formID != form || !player || player->IsDead() || player->IsInCombat() ||
++        m_active || !m_world.GetPartyService().IsInParty() || (topicMenu && topicMenu->menuOpen))
++        return false;
++    RequestCoopInteraction request;
++    request.Event.Kind = Interaction::Join;
++    request.Event.Speaker = static_cast<uint32_t>(m_invitedTalk >> 32);
++    request.Event.Session = static_cast<uint32_t>(m_invitedTalk);
++    m_pendingJoin = m_invitedTalk;
++    m_transport.Send(request);
++    return true;
++}
+diff --git a/Code/client/Services/Generic/DialogueMarker.cpp b/Code/client/Services/Generic/DialogueMarker.cpp
+index ca9ff1e..0b0f7b0 100644
+--- a/Code/client/Services/Generic/DialogueMarker.cpp
++++ b/Code/client/Services/Generic/DialogueMarker.cpp
+@@ -3,6 +3,7 @@
+ #include <Services/DialogueMarkerLayout.h>
+ #include <Interface/Menus/HUDMenuUtils.h>
+ #include <imgui.h>
++#include <Interface/UI.h>
+ 
+ void OverlayService::DrawDialogueMarker() noexcept
+ {
+@@ -13,18 +14,21 @@ void OverlayService::DrawDialogueMarker() noexcept
+             return;
+         frame = m_marker;
+     }
++    const auto* ui = UI::Get();
++    if (!ui || ui->BlocksPartyHud())
++        return;
+     const auto screen = ImGui::GetIO().DisplaySize;
+     if (screen.x < 4.f || screen.y < 4.f)
+         return;
+     using namespace DialogueMarkerLayout;
+     const auto project = [screen, &frame](glm::vec3 position, bool mirrorBehind = false) -> Projection {
+         NiPoint3 uv{};
+-        bool front = HUDMenuUtils::WorldPtToScreenPt3(position, uv) && uv.z >= 0.f;
++        bool front = HUDMenuUtils::ProjectForOverlay(position, uv) && uv.z >= 0.f;
+         if (!front)
+         {
+             if (!mirrorBehind)
+                 return {};
+-            if (HUDMenuUtils::WorldPtToScreenPt3(frame.Eye + (frame.Eye - position), uv))
++            if (HUDMenuUtils::ProjectForOverlay(frame.Eye + (frame.Eye - position), uv))
+             {
+                 uv.x = 1.f - uv.x;
+                 uv.y = 1.f - uv.y;
+diff --git a/Code/client/Services/Generic/DialogueObserver.cpp b/Code/client/Services/Generic/DialogueObserver.cpp
+new file mode 100644
+index 0000000..b6d3573
+--- /dev/null
++++ b/Code/client/Services/Generic/DialogueObserver.cpp
+@@ -0,0 +1,119 @@
++#include <TiltedOnlinePCH.h>
++#include <Services/OverlayService.h>
++#include <AI/Movement/PlayerControls.h>
++#include <BSGraphics/BSGraphicsRenderer.h>
++#include <Camera/PlayerCamera.h>
++#include <NetImmerse/NiCamera.h>
++#include <PlayerCharacter.h>
++#include <Utils.h>
++#include <cmath>
++
++namespace
++{
++// CommonLibSSE-NG RE/F/FreeCameraState.h. Only accessed while this exact camera state is active.
++struct FreeView : TESCameraState
++{
++    uint8_t inputHandlerAndPadding[0x30 - sizeof(TESCameraState)];
++    NiPoint3 translation;
++    NiPoint2 rotation; // pitch, yaw in radians
++};
++static_assert(offsetof(FreeView, translation) == 0x30);
++static_assert(offsetof(FreeView, rotation) == 0x3C);
++
++float AngleDelta(float a, float b)
++{
++    return std::remainder(a - b, 6.28318530718f);
++}
++}
++
++void OverlayService::EndObserver() noexcept
++{
++    if (!m_observerCamera)
++        return;
++    auto* camera = PlayerCamera::Get();
++    auto* owned = m_observerCamera;
++    m_observerCamera = nullptr;
++    m_observedTalk = 0;
++    if (camera && camera->currentState == owned && owned->id == TESCameraState::kFree)
++        camera->ToggleFreeCameraWithoutPause();
++}
++
++void OverlayService::UpdateObserver(const DialogueMarker& frame, uint32_t speaker, uint32_t session, float distance) noexcept
++{
++    const uint64_t key = (uint64_t(speaker) << 32) | session;
++    auto* player = PlayerCharacter::Get();
++    auto* camera = PlayerCamera::Get();
++    auto* window = BSGraphics::GetMainWindow();
++    if (m_requestedTalk != key || !frame.HasNpc || !frame.HasSpeaker || !player || !camera || !window || !window->IsForeground() ||
++        distance > (m_observerCamera ? 400.f : 300.f) || player->IsDead() || player->IsInCombat())
++    {
++        m_requestedTalk = 0;
++        EndObserver();
++        return;
++    }
++    if (m_observerCamera && (m_observedTalk != key || camera->currentState != m_observerCamera))
++    {
++        // A quest, another camera mod, or the player may have taken over the camera.
++        m_dismissedTalk = m_observedTalk;
++        EndObserver();
++    }
++    if (GetAsyncKeyState(VK_BACK) & 0x8000)
++    {
++        LeaveConversation(key);
++        m_requestedTalk = 0;
++        m_dismissedTalk = key;
++        EndObserver();
++        return;
++    }
++    if (m_dismissedTalk == key)
++    {
++        m_requestedTalk = 0;
++        return;
++    }
++
++    if (!m_observerCamera)
++    {
++        const auto* state = camera->currentState;
++        if (!state || (state->id != TESCameraState::kFirstPerson && state->id != TESCameraState::kThirdPerson)
++            || !camera->cameraRoot || !BSInputEnableManager::IsMovementControlsEnabled())
++            return;
++        const auto* eye = camera->GetNiCamera();
++        if (!eye || glm::distance(static_cast<const glm::vec3&>(eye->worldPosition), frame.Eye) > 850.f)
++            return;
++        m_observerEye = eye->worldPosition;
++        camera->ToggleFreeCameraWithoutPause();
++        if (!camera->currentState || camera->currentState->id != TESCameraState::kFree)
++        {
++            m_dismissedTalk = key;
++            return;
++        }
++        m_observerCamera = camera->currentState;
++        m_observedTalk = key;
++        const auto* view = static_cast<const FreeView*>(m_observerCamera);
++        m_appliedPitch = view->rotation.x;
++        m_appliedYaw = view->rotation.y;
++        m_offsetPitch = m_offsetYaw = 0.f;
++        Utils::ShowHudMessage("Совместный диалог. Backspace — выйти из наблюдения.");
++    }
++
++    // Keep the game's last collision-resolved eye position. Moving the free camera through a wall
++    // to obtain a wider shot would reveal another room. The game routes WASD to free camera;
++    // fixing its position leaves only the observer's adjustments to the viewing angle.
++    const glm::vec3 target = (frame.Speaker + frame.Npc) * .5f - glm::vec3{0.f, 0.f, 10.f};
++    const auto direction = target - m_observerEye;
++    const float horizontal = std::hypot(direction.x, direction.y);
++    if (horizontal < 1.f)
++    {
++        EndObserver();
++        m_dismissedTalk = key;
++        return;
++    }
++    auto* view = static_cast<FreeView*>(m_observerCamera);
++    m_offsetPitch = std::clamp(m_offsetPitch + AngleDelta(view->rotation.x, m_appliedPitch), -.35f, .35f);
++    m_offsetYaw = std::clamp(m_offsetYaw + AngleDelta(view->rotation.y, m_appliedYaw), -.55f, .55f);
++    m_appliedPitch = std::clamp(-std::atan2(direction.z, horizontal) + m_offsetPitch, -1.52f, 1.52f);
++    m_appliedYaw = std::atan2(direction.x, direction.y) + m_offsetYaw;
++    view->translation = m_observerEye;
++    view->rotation.x = m_appliedPitch;
++    view->rotation.y = m_appliedYaw;
++}
+diff --git a/Code/client/Services/Generic/ImguiService.cpp b/Code/client/Services/Generic/ImguiService.cpp
+index 8faba9c..1c663e4 100644
+--- a/Code/client/Services/Generic/ImguiService.cpp
++++ b/Code/client/Services/Generic/ImguiService.cpp
+@@ -3,6 +3,8 @@
+ #include <Services/ImguiService.h>
+ #include <Systems/RenderSystemD3D11.h>
+ #include <d3d11.h>
++#include <BSGraphics/BSGraphicsRenderer.h>
++#include <cfloat>
+ #include <imgui/imgui_impl_dx11.h>
+ #include <imgui/imgui_impl_win32.h>
+ #include <imgui.h>
+@@ -35,6 +37,20 @@ void ImguiService::Render() const
+     ImGui_ImplDX11_NewFrame();
+ 
+     ImGui_ImplWin32_NewFrame();
++    auto& io = ImGui::GetIO();
++    const auto* window = BSGraphics::GetMainWindow();
++    if (window && window->SwapChainRenderTarget.pTexture && io.DisplaySize.x > 0 && io.DisplaySize.y > 0)
++    {
++        D3D11_TEXTURE2D_DESC desc{};
++        window->SwapChainRenderTarget.pTexture->GetDesc(&desc);
++        if (desc.Width && desc.Height)
++        {
++            const ImVec2 pixels{static_cast<float>(desc.Width), static_cast<float>(desc.Height)};
++            if (io.MousePos.x > -FLT_MAX && io.MousePos.y > -FLT_MAX)
++                io.MousePos = {io.MousePos.x * pixels.x / io.DisplaySize.x, io.MousePos.y * pixels.y / io.DisplaySize.y};
++            io.DisplaySize = pixels;
++        }
++    }
+     ImGui::NewFrame();
+ 
+     m_drawSignal.publish();
+diff --git a/Code/client/Services/Generic/OverlayClient.cpp b/Code/client/Services/Generic/OverlayClient.cpp
+index d8a9f30..d64eca9 100644
+--- a/Code/client/Services/Generic/OverlayClient.cpp
++++ b/Code/client/Services/Generic/OverlayClient.cpp
+@@ -76,6 +76,12 @@ bool OverlayClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefR
+             uint32_t aPlayerId = eventArgs->GetInt(0);
+             World::Get().GetRunner().Queue([aPlayerId]() { World::Get().GetPartyService().ChangePartyLeader(aPlayerId); });
+         }
++        else if (eventName == "answerCarriage")
++        {
++            const uint32_t rider = eventArgs->GetInt(0), trip = eventArgs->GetInt(1);
++            const bool yes = eventArgs->GetInt(2) == 1;
++            World::Get().GetRunner().Queue([rider, trip, yes]() { World::Get().GetOverlayService().AnswerCarriage(rider, trip, yes); });
++        }
+         else if (eventName == "teleportToPlayer")
+             ProcessTeleportMessage(eventArgs);
+         else if (eventName == "toggleDebugUI")
+diff --git a/Code/client/Services/Generic/OverlayService.cpp b/Code/client/Services/Generic/OverlayService.cpp
+index 430bcee..b9dcf92 100644
+--- a/Code/client/Services/Generic/OverlayService.cpp
++++ b/Code/client/Services/Generic/OverlayService.cpp
+@@ -3,6 +3,7 @@
+ #include <Services/OverlayService.h>
+ 
+ #include <OverlayApp.hpp>
++#include <Messages/NotifyCoopInteraction.h>
+ 
+ #include <D3D11Hook.hpp>
+ #include <OverlayRenderHandlerD3D11.hpp>
+@@ -35,11 +36,13 @@
+ #include <Events/PartyLeftEvent.h>
+ 
+ #include <PlayerCharacter.h>
++#include <Events/ActivateEvent.h>
+ #include <Services/PartyService.h>
+ #include <Games/Misc/MenuTopicManager.h>
+ #include <Interface/Menus/HUDMenuUtils.h>
+ #include <Services/ImguiService.h>
+ #include <Interface/UI.h>
++#include <NetImmerse/NiNode.h>
+ #include <Utils.h>
+ #include <cmath>
+ #include <limits>
+@@ -140,6 +143,9 @@ OverlayService::OverlayService(World& aWorld, TransportService& transport, entt:
+     : m_world(aWorld)
+     , m_transport(transport)
+ {
++    m_interactionConnection = aDispatcher.sink<NotifyCoopInteraction>().connect<&OverlayService::OnInteraction>(this);
++    m_boardConnection = aDispatcher.sink<ActivateEvent>().connect<&OverlayService::OnBoardCarriage>(this);
++    m_noticeConnection = aDispatcher.sink<NotifyPartyTravel>().connect<&OverlayService::OnTravelNotice>(this);
+     m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&OverlayService::OnUpdate>(this);
+     m_connectedConnection = aDispatcher.sink<ConnectedEvent>().connect<&OverlayService::OnConnectedEvent>(this);
+     m_disconnectedConnection = aDispatcher.sink<DisconnectedEvent>().connect<&OverlayService::OnDisconnectedEvent>(this);
+@@ -166,7 +172,8 @@ OverlayService::~OverlayService() noexcept
+ void OverlayService::Create(RenderSystemD3D11* apRenderSystem) noexcept
+ {
+     m_pProvider = TiltedPhoques::MakeUnique<D3D11RenderProvider>(apRenderSystem);
+-    m_pOverlay = new CpuRenderedOverlayApp(m_pProvider.get(), new ::OverlayClient(m_transport, m_pProvider->Create()));
++    m_gameOverlayClient = new ::OverlayClient(m_transport, m_pProvider->Create());
++    m_pOverlay = new CpuRenderedOverlayApp(m_pProvider.get(), m_gameOverlayClient);
+ 
+     if (!m_pOverlay->Initialize())
+     {
+@@ -189,6 +196,22 @@ void OverlayService::Render() noexcept
+     else if (!inGame && m_inGame)
+         SetInGame(false);
+ 
++    // Game-update callbacks can stop during the system menu. Its UI keeps rendering.
++    if (inGame)
++    {
++        const auto* ui = UI::Get();
++        const bool open = !ui || ui->BlocksPartyHud();
++        if (m_gameMenuOpen != open)
++        {
++            auto args = CefListValue::Create();
++            args->SetBool(0, open);
++            m_pOverlay->ExecuteAsync("openingMenu", args);
++            m_gameMenuOpen = open;
++        }
++    }
++    else
++        m_gameMenuOpen.reset();
++
+     m_pOverlay->GetClient()->Render();
+ }
+ 
+@@ -210,6 +233,7 @@ void OverlayService::Reload() noexcept
+ 
+ void OverlayService::Initialize() noexcept
+ {
++    m_gameMenuOpen.reset();
+     m_pOverlay->ExecuteAsync("init");
+ }
+ 
+@@ -234,6 +258,8 @@ void OverlayService::SetInGame(bool aInGame) noexcept
+ {
+     if (m_inGame == aInGame)
+         return;
++    if (!aInGame && m_active && m_gameOverlayClient)
++        m_gameOverlayClient->SetUIVisible(false);
+     m_inGame = aInGame;
+ 
+     if (m_inGame)
+@@ -244,8 +270,6 @@ void OverlayService::SetInGame(bool aInGame) noexcept
+     else
+     {
+         m_pOverlay->ExecuteAsync("exitGame");
+-        // TODO: this does nothing, since m_inGame is false
+-        SetActive(false);
+     }
+ }
+ 
+@@ -309,7 +333,9 @@ void OverlayService::OnUpdate(const UpdateEvent&) noexcept
+ {
+     RunDebugDataUpdates();
+     RunPlayerHealthUpdates();
++    UpdateInteraction();
+     UpdateDialogueHud();
++    UpdateCarriage();
+ }
+ 
+ void OverlayService::OnConnectedEvent(const ConnectedEvent& acEvent) noexcept
+@@ -323,6 +349,9 @@ void OverlayService::OnConnectedEvent(const ConnectedEvent& acEvent) noexcept
+ 
+ void OverlayService::OnDisconnectedEvent(const DisconnectedEvent&) noexcept
+ {
++    ClearInteraction();
++    ClearCarriage();
++    m_dismissedTalk = 0;
+     m_conversations.clear();
+     ClearDialogueHud();
+     m_pOverlay->ExecuteAsync("disconnect");
+@@ -396,6 +425,9 @@ void OverlayService::OnPlayerDialogue(const NotifyPlayerDialogue& acMessage) noe
+ 
+ void OverlayService::ClearDialogueHud() noexcept
+ {
++    PublishInvitation(0, 0, 0, 0);
++    m_requestedTalk = 0;
++    EndObserver();
+     { std::lock_guard guard(m_markerMutex); m_marker.Active = false; }
+     HideDialogueText();
+ }
+@@ -419,7 +451,7 @@ void OverlayService::UpdateDialogueHud() noexcept
+     const auto* pMenu = MenuTopicManager::Get();
+     const auto& party = m_world.GetPartyService();
+     const auto* ui = UI::Get();
+-    if (!ui || !ui->menuSystemVisible || ui->numPausesGame || ui->IsUnpausedMenuOpen() || !pPlayer || !pPlayer->parentCell || !party.IsInParty() || !m_pOverlay || m_active ||
++    if (!ui || ui->BlocksPartyHud() || !pPlayer || !pPlayer->parentCell || !party.IsInParty() || !m_pOverlay || m_active ||
+         !m_inGame || (pMenu && pMenu->menuOpen))
+     {
+         ClearDialogueHud();
+@@ -462,6 +494,7 @@ void OverlayService::UpdateDialogueHud() noexcept
+     }
+ 
+     DialogueMarker marker{};
++    uint32_t speakerForm{};
+     marker.Active = sameSpace;
+     if (sameSpace)
+     {
+@@ -472,6 +505,12 @@ void OverlayService::UpdateDialogueHud() noexcept
+             if (!actor || !actor->GetNiNode() || actor->IsDisabled() ||
+                 actor->GetWorldSpace() != pWorld || (!pWorld && actor->GetParentCellEx() != pCell))
+                 return false;
++            static BSFixedString head("NPC Head [Head]");
++            if (auto* node = actor->GetNiNode()->GetByName(head))
++            {
++                out = static_cast<const glm::vec3&>(node->worldPosition) + glm::vec3{0, 0, 8};
++                return true;
++            }
+             out = static_cast<const glm::vec3&>(actor->position) + glm::vec3{0, 0, actor->GetHeight()};
+             return true;
+         };
+@@ -483,15 +522,21 @@ void OverlayService::UpdateDialogueHud() noexcept
+         {
+             if (players.get<PlayerComponent>(entity).Id == pSelected->SpeakerId)
+             {
+-                marker.HasSpeaker = getHead(players.get<FormIdComponent>(entity).Id, marker.Speaker);
++                speakerForm = players.get<FormIdComponent>(entity).Id;
++                marker.HasSpeaker = getHead(speakerForm, marker.Speaker);
+                 break;
+             }
+         }
+     }
++    if (marker.HasSpeaker && marker.HasNpc && nearest <= 300.f && !pPlayer->IsInCombat() && !pPlayer->IsDead())
++        PublishInvitation(pSelected->SpeakerId, pSelected->Anchor.Session, m_conversations.at(pSelected->SpeakerId).LocalNpcForm, speakerForm);
++    else
++        PublishInvitation(0, 0, 0, 0);
++    UpdateObserver(marker, pSelected->SpeakerId, pSelected->Anchor.Session, nearest);
+     { std::lock_guard guard(m_markerMutex); m_marker = marker; }
+ 
+     const int mode = sameSpace ? 3 : 0;
+-    if (sameSpace && (nearest > 350.f || pPlayer->IsInCombat() || pSelected->Text.empty()))
++    if (sameSpace && (!m_observerCamera || nearest > 400.f || pPlayer->IsInCombat() || pSelected->Text.empty()))
+     {
+         HideDialogueText();
+         return;
+@@ -610,6 +655,8 @@ void OverlayService::OnPartyJoinedEvent(const PartyJoinedEvent& acEvent) noexcep
+ 
+ void OverlayService::OnPartyLeftEvent(const PartyLeftEvent& acEvent) noexcept
+ {
++    ClearInteraction();
++    ClearCarriage();
+     m_conversations.clear();
+     ClearDialogueHud();
+     m_world.GetOverlayService().GetOverlayApp()->ExecuteAsync("partyLeft");
+diff --git a/Code/client/Services/Generic/PartyTravel.cpp b/Code/client/Services/Generic/PartyTravel.cpp
+new file mode 100644
+index 0000000..ef5f01b
+--- /dev/null
++++ b/Code/client/Services/Generic/PartyTravel.cpp
+@@ -0,0 +1,205 @@
++#include <TiltedOnlinePCH.h>
++#include <World.h>
++#include <OverlayApp.hpp>
++#include <Services/OverlayClient.h>
++#include <Services/OverlayService.h>
++#include <Services/PartyService.h>
++#include <Services/TransportService.h>
++#include <Events/ActivateEvent.h>
++#include <Messages/PartyTravelRequest.h>
++#include <Messages/NotifyTeleport.h>
++#include <PlayerCharacter.h>
++#include <Forms/TESObjectCELL.h>
++#include <Forms/TESWorldSpace.h>
++#include <Forms/TESQuest.h>
++#include <Interface/UI.h>
++
++namespace
++{
++using Clock = std::chrono::steady_clock;
++
++bool IsPassengerSeat(TESObjectREFR* seat)
++{
++    if (!seat)
++        return false;
++    // Skyrim.esm DialogueCarriageSystem, CurrentSeat alias. The five linked
++    // passenger references also work if the quest has already cleared its alias.
++    auto* quest = Cast<TESQuest>(TESForm::GetById(0x17F01));
++    if (quest && quest->GetAliasedRef(14) == seat)
++        return true;
++    constexpr uint32_t seats[] = {0x1070F0, 0x1070ED, 0x1070E4, 0x1070E3, 0x1070E7};
++    return std::find(std::begin(seats), std::end(seats), seat->formID) != std::end(seats);
++}
++
++bool NearDestination(PlayerCharacter* player)
++{
++    // ObjectReference properties on CarriageSystemScript from Skyrim.esm.
++    constexpr uint32_t stops[] = {0x108D8D, 0xB0EF6, 0xB0A00, 0xB09FF, 0xB09FE, 0x162A4,
++        0x177EF, 0x177E4, 0x177D7, 0x177CC, 0x177C3, 0x177B0, 0x177A1, 0x1779A, 0x17791,
++        0x17760, 0x17753, 0x1773A, 0x17732};
++    auto* world = player->GetWorldSpace();
++    if (!world)
++        return false;
++    for (uint32_t id : stops)
++    {
++        auto* marker = Cast<TESObjectREFR>(TESForm::GetById(id));
++        if (marker && marker->GetWorldSpace() == world &&
++            glm::distance(static_cast<const glm::vec3&>(marker->position), static_cast<const glm::vec3&>(player->position)) <= 2400.f)
++            return true;
++    }
++    return false;
++}
++}
++
++void OverlayService::OnBoardCarriage(const ActivateEvent& event) noexcept
++{
++    auto* player = PlayerCharacter::Get();
++    if (!player || event.pActivator != player || m_boardedTrip || !m_transport.IsConnected() ||
++        !m_world.GetPartyService().IsInParty() || !IsPassengerSeat(event.pObject))
++        return;
++    if (++m_tripCounter == 0)
++        ++m_tripCounter;
++    m_boardedTrip = m_tripCounter;
++    m_departure = player->position;
++    m_boardDeadline = Clock::now() + std::chrono::minutes(3);
++    PartyTravelRequest board;
++    board.Action = BoardCarriage;
++    board.Trip = m_boardedTrip;
++    m_transport.Send(board);
++}
++
++void OverlayService::CloseTravelPrompt() noexcept
++{
++    if (m_promptOpen && m_pOverlay)
++        m_pOverlay->ExecuteAsync("hideCarriage");
++    if (m_ownsTravelOverlay && m_gameOverlayClient && GetActive())
++        m_gameOverlayClient->SetUIVisible(false);
++    m_promptOpen = m_ownsTravelOverlay = false;
++}
++
++void OverlayService::ClearCarriage() noexcept
++{
++    CloseTravelPrompt();
++    m_boardedTrip = 0;
++    m_offer.reset();
++    m_acceptedRide = false;
++}
++
++void OverlayService::AnswerCarriage(uint32_t rider, uint32_t trip, bool yes) noexcept
++{
++    if (!m_offer || m_offer->Rider != rider || m_offer->Trip != trip || m_acceptedRide)
++        return;
++    PartyTravelRequest response;
++    response.Action = yes ? AcceptCarriage : DeclineCarriage;
++    response.Rider = rider;
++    response.Trip = trip;
++    m_transport.Send(response);
++    CloseTravelPrompt();
++    m_acceptedRide = yes;
++    if (!yes)
++        m_offer.reset();
++}
++
++void OverlayService::OnTravelNotice(const NotifyPartyTravel& notice) noexcept
++{
++    if (!m_world.GetPartyService().IsInParty())
++        return;
++    const bool matches = m_offer && m_offer->Rider == notice.Rider && m_offer->Trip == notice.Trip;
++    if (notice.Kind == InvitePassenger)
++    {
++        if (matches)
++            return;
++        if (m_offer)
++        {
++            PartyTravelRequest busy;
++            busy.Action = DeclineCarriage;
++            busy.Rider = notice.Rider;
++            busy.Trip = notice.Trip;
++            m_transport.Send(busy);
++            return;
++        }
++        m_offer = notice;
++        m_acceptedRide = false;
++        m_offerDeadline = Clock::now() + std::chrono::minutes(3);
++    }
++    else if (matches && notice.Kind == CancelPassenger)
++    {
++        CloseTravelPrompt();
++        m_offer.reset();
++        m_acceptedRide = false;
++    }
++    else if (matches && m_acceptedRide && notice.Kind == TransportPassenger && notice.Cell)
++        m_offer = notice;
++}
++
++void OverlayService::UpdateCarriage() noexcept
++{
++    if (!m_boardedTrip && !m_offer)
++        return;
++    auto* player = PlayerCharacter::Get();
++    const auto now = Clock::now();
++    auto* ui = UI::Get();
++    if (!m_world.GetPartyService().IsInParty() || !m_transport.IsConnected())
++    {
++        ClearCarriage();
++        return;
++    }
++    if (m_boardedTrip && player && player->parentCell)
++    {
++        PartyTravelRequest result;
++        result.Action = CancelCarriage;
++        result.Rider = m_transport.GetLocalPlayerId();
++        result.Trip = m_boardedTrip;
++        const float moved = glm::distance(m_departure, static_cast<const glm::vec3&>(player->position));
++        if (now < m_boardDeadline && moved > 4096.f && player->GetWorldSpace() && NearDestination(player) &&
++            m_world.GetModSystem().GetServerModId(player->GetParentCellEx()->formID, result.Cell) &&
++            m_world.GetModSystem().GetServerModId(player->GetWorldSpace()->formID, result.World))
++        {
++            result.Action = ArriveByCarriage;
++            result.Position = static_cast<const glm::vec3&>(player->position);
++        }
++        if (result.Action == ArriveByCarriage || now >= m_boardDeadline || (moved > 900.f && moved < 4096.f))
++        {
++            m_transport.Send(result);
++            m_boardedTrip = 0;
++        }
++    }
++    if (!m_offer)
++        return;
++    if (now >= m_offerDeadline)
++    {
++        CloseTravelPrompt();
++        m_offer.reset();
++        m_acceptedRide = false;
++        return;
++    }
++    if (m_promptOpen && !GetActive())
++    {
++        AnswerCarriage(m_offer->Rider, m_offer->Trip, false);
++        return;
++    }
++    if (!GetInGame() || !player || !player->parentCell || !ui || ui->BlocksPartyHud() || player->IsInCombat())
++        return;
++    if (m_offer->Kind == TransportPassenger && m_acceptedRide)
++    {
++        NotifyTeleport destination;
++        destination.CellId = m_offer->Cell;
++        destination.WorldSpaceId = m_offer->World;
++        destination.Position = m_offer->Position;
++        m_offer.reset();
++        m_acceptedRide = false;
++        OnNotifyTeleport(destination);
++    }
++    else if (!m_acceptedRide && !m_promptOpen && m_gameOverlayClient && m_pOverlay)
++    {
++        auto args = CefListValue::Create();
++        args->SetInt(0, m_offer->Rider);
++        args->SetInt(1, m_offer->Trip);
++        args->SetString(2, m_offer->Name.c_str());
++        m_promptOpen = true;
++        m_ownsTravelOverlay = !GetActive();
++        m_pOverlay->ExecuteAsync("offerCarriage", args);
++        if (m_ownsTravelOverlay)
++            m_gameOverlayClient->SetUIVisible(true);
++    }
++}
+diff --git a/Code/client/Services/Generic/PlayerService.cpp b/Code/client/Services/Generic/PlayerService.cpp
+index 00749d3..00759a5 100644
+--- a/Code/client/Services/Generic/PlayerService.cpp
++++ b/Code/client/Services/Generic/PlayerService.cpp
+@@ -151,6 +151,16 @@ void PlayerService::OnCellChangeEvent(const CellChangeEvent& acEvent) const noex
+     }
+ }
+ 
++uint32_t PlayerService::ActiveDialogueSession(uint32_t form) noexcept
++{
++    const auto* menu = MenuTopicManager::Get();
++    const auto* actor = menu && menu->menuOpen ? TESObjectREFR::GetByHandle(menu->speaker.handle.iBits) : nullptr;
++    if (!actor || actor->formID != form)
++        return 0;
++    UpdateDialogue();
++    return menu->speaker.handle.iBits == m_dialogueHandle ? m_dialogueSession : 0;
++}
++
+ void PlayerService::OnPlayerDialogueEvent(const PlayerDialogueEvent& acEvent) noexcept
+ {
+     UpdateDialogue(&acEvent);
+@@ -160,15 +170,36 @@ void PlayerService::UpdateDialogue(const PlayerDialogueEvent* apChoice) noexcept
+ {
+     if (!m_transport.IsConnected() || !m_world.GetPartyService().IsInParty())
+     {
+-        m_dialogueHandle = 0;
++        m_dialogueHandle = m_closedSpeaker = 0;
+         m_dialogueText.clear();
+         return;
+     }
+     const auto* pMenu = MenuTopicManager::Get();
+     const uint32_t handle = pMenu && pMenu->menuOpen && pMenu->speaker ? pMenu->speaker.handle.iBits : 0;
+-    if (apChoice && (!handle || apChoice->SpeakerHandle != handle))
+-        return;
+     const auto now = std::chrono::steady_clock::now();
++    if (apChoice && !handle)
++    {
++        // A goodbye, quest offer or brawl can close the vanilla menu before the game-thread callback runs.
++        // Complete the known session without briefly reopening the observer camera.
++        const bool closing = m_dialogueHandle && apChoice->SpeakerHandle == m_dialogueHandle;
++        if (!closing && (!m_closedSpeaker || m_closedSpeaker != apChoice->SpeakerHandle || now >= m_closedUntil))
++            return;
++        PlayerDialogueRequest last;
++        last.Anchor.Session = m_dialogueSession;
++        last.Anchor.Choice = ++m_dialogueChoice;
++        if (apChoice->Info)
++            m_world.GetModSystem().GetServerModId(apChoice->Info, last.Anchor.TopicInfo);
++        if (apChoice->Quest)
++            m_world.GetModSystem().GetServerModId(apChoice->Quest, last.Anchor.TopicQuest);
++        last.Text = apChoice->Text;
++        m_transport.Send(last);
++        m_closedSpeaker = apChoice->SpeakerHandle;
++        m_closedUntil = now + 1s;
++        m_dialogueHandle = 0;
++        return;
++    }
++    if (apChoice && apChoice->SpeakerHandle != handle)
++        return;
+     if (handle == m_dialogueHandle && (!handle || (now < m_nextDialogueUpdate && !apChoice)))
+         return;
+ 
+@@ -196,22 +227,35 @@ void PlayerService::UpdateDialogue(const PlayerDialogueEvent* apChoice) noexcept
+         }
+         if (handle != m_dialogueHandle)
+         {
++            m_gameInitiated = !m_world.GetOverlayService().WasActivated(pTarget->formID);
+             ++m_dialogueSession;
+             m_dialogueChoice = 0;
++            m_dialogueInfo = m_dialogueQuest = m_closedSpeaker = 0;
+             m_dialogueText.clear();
+         }
+         if (apChoice)
+         {
+             ++m_dialogueChoice;
++            m_dialogueInfo = apChoice->Info;
++            m_dialogueQuest = apChoice->Quest;
+             m_dialogueText = apChoice->Text;
+             m_dialogueTextUntil = now + 5s;
+         }
++        if (m_dialogueQuest)
++            m_world.GetModSystem().GetServerModId(m_dialogueQuest, request.Anchor.TopicQuest);
++        if (m_dialogueInfo)
++            m_world.GetModSystem().GetServerModId(m_dialogueInfo, request.Anchor.TopicInfo);
+         if (now < m_dialogueTextUntil)
+             request.Text = m_dialogueText;
+     }
+     else
++    {
++        m_closedSpeaker = m_dialogueHandle;
++        m_closedUntil = now + 1s;
+         m_dialogueText.clear();
++    }
+ 
++    request.Anchor.GameInitiated = m_gameInitiated;
+     request.Anchor.Session = m_dialogueSession;
+     request.Anchor.Choice = m_dialogueChoice;
+     m_transport.Send(request);
+diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
+new file mode 100644
+index 0000000..f95b999
+--- /dev/null
++++ b/Code/client/Services/Generic/QuestJournal.cpp
+@@ -0,0 +1,69 @@
++#include <TiltedOnlinePCH.h>
++#include <World.h>
++#include <Services/QuestService.h>
++#include <Services/PartyService.h>
++#include <Services/TransportService.h>
++#include <Messages/RequestQuestJournal.h>
++#include <Messages/NotifyQuestJournal.h>
++#include <Events/UpdateEvent.h>
++#include <QuestJournalDisk.h>
++
++namespace
++{
++std::filesystem::path Mirror()
++{
++    auto* local = _wgetenv(L"LOCALAPPDATA");
++    if (!local || !*local)
++        throw std::runtime_error("LOCALAPPDATA is unavailable");
++    return std::filesystem::path(local) / "SkyrimTogetherReborn" / "CoopJournal";
++}
++}
++
++void QuestService::PollJournal(const UpdateEvent&) noexcept
++{
++    if (!m_world.GetPartyService().IsInParty() || !m_world.GetTransport().IsConnected())
++    {
++        m_journalStream = 0;
++        m_journalConfirmed = 0;
++        m_nextJournalPoll = {};
++        return;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (now < m_nextJournalPoll)
++        return;
++    m_nextJournalPoll = now + std::chrono::seconds(4);
++    RequestQuestJournal pull;
++    pull.Stream = m_journalStream;
++    pull.Sequence = m_journalConfirmed;
++    m_world.GetTransport().Send(pull);
++}
++
++void QuestService::OnJournalRecord(const NotifyQuestJournal& record) noexcept
++{
++    if (!record.Stream || !m_world.GetPartyService().IsInParty() || record.Sequence > record.Total)
++        return;
++    try
++    {
++        if (!record.Sequence)
++        {
++            const auto localCount = QuestJournalDisk::Contiguous(Mirror(), record.Stream);
++            if (localCount > record.Total)
++                return;
++            m_journalStream = record.Stream;
++            m_journalConfirmed = localCount;
++            m_nextJournalPoll = {};
++            return;
++        }
++        if (record.Stream != m_journalStream || record.Sequence != m_journalConfirmed + 1)
++            return;
++        if (!QuestJournalDisk::Store(Mirror(), record.Stream, record.Sequence, {record.Row.data(), record.Row.size()}))
++        {
++            spdlog::error("Cannot store co-op quest journal record {}", record.Sequence);
++            return;
++        }
++        ++m_journalConfirmed;
++        if (record.Sequence < record.Total && record.Sequence % 8 == 0)
++            m_nextJournalPoll = {};
++    }
++    catch (const std::exception& e) { spdlog::error("Mirroring co-op quest journal: {}", e.what()); }
++}
+diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Services/Generic/QuestService.cpp
+index ea8a488..69dd328 100644
+--- a/Code/client/Services/Generic/QuestService.cpp
++++ b/Code/client/Services/Generic/QuestService.cpp
+@@ -22,6 +22,7 @@
+ 
+ #include <Messages/RequestQuestUpdate.h>
+ #include <Messages/NotifyQuestUpdate.h>
++#include <Messages/NotifyQuestJournal.h>
+ 
+ static TESQuest* FindQuestByNameId(const String& name)
+ {
+@@ -39,6 +40,8 @@ static void ReleaseUncheckedStages(TESQuest* apQuest, HeldStages& aHeld) noexcep
+ QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
+     : m_world(aWorld)
+ {
++    m_journalClock = aDispatcher.sink<UpdateEvent>().connect<&QuestService::PollJournal>(this);
++    m_journalRecords = aDispatcher.sink<NotifyQuestJournal>().connect<&QuestService::OnJournalRecord>(this);
+     m_joinedConnection = aDispatcher.sink<ConnectedEvent>().connect<&QuestService::OnConnected>(this);
+     m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&QuestService::OnUpdate>(this);
+     m_disconnectedConnection = aDispatcher.sink<DisconnectedEvent>().connect<&QuestService::OnDisconnected>(this);
+@@ -671,6 +674,10 @@ static constexpr std::array kNonSyncableQuestIds = std::to_array<uint32_t>({
+ 
+ bool QuestService::IsNonSyncableQuest(TESQuest* apQuest)
+ {
++    // These framework quests own local-player and follower aliases. Replaying their fragments
++    // would give a listener a second follower or make the listener the brawl challenger.
++    if (apQuest && (apQuest->formID == 0x750BA || apQuest->formID == 0x47AE6))
++        return true;
+     // Quests with no quest stages are never synced. Most TESQues::Type:: quests should
+     // be synced, including Type::None and Type::Miscellaneous, but there are a few
+     // known exceptions that should be excluded that are in the table.
+diff --git a/Code/client/Services/OverlayClient.h b/Code/client/Services/OverlayClient.h
+index 0c71ac8..076bd59 100644
+--- a/Code/client/Services/OverlayClient.h
++++ b/Code/client/Services/OverlayClient.h
+@@ -19,6 +19,7 @@ struct OverlayClient : TiltedPhoques::OverlayClient
+ 
+     bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source_process, CefRefPtr<CefProcessMessage> message) override;
+ 
++    void SetUIVisible(bool aVisible) noexcept;
+     TP_NOCOPYMOVE(OverlayClient);
+ 
+ private:
+@@ -30,7 +31,6 @@ private:
+     void ProcessTeleportMessage(CefRefPtr<CefListValue> aEventArgs);
+     void ProcessToggleDebugUI();
+     void ProcessOpenPlayGuide();
+-    void SetUIVisible(bool aVisible) noexcept;
+ 
+     TransportService& m_transport;
+ };
+diff --git a/Code/client/Services/OverlayService.h b/Code/client/Services/OverlayService.h
+index 326f51c..0d99b60 100644
+--- a/Code/client/Services/OverlayService.h
++++ b/Code/client/Services/OverlayService.h
+@@ -2,6 +2,7 @@
+ 
+ #include <include/internal/cef_ptr.h>
+ #include <mutex>
++#include <Messages/NotifyPartyTravel.h>
+ #include <Messages/NotifyPlayerDialogue.h>
+ 
+ namespace TiltedPhoques
+@@ -9,6 +10,8 @@ namespace TiltedPhoques
+ struct OverlayApp;
+ }
+ 
++struct TESCameraState;
++struct OverlayClient;
+ struct RenderSystemD3D11;
+ struct D3D11RenderProvider;
+ struct FormIdComponent;
+@@ -27,6 +30,7 @@ struct ConnectionErrorEvent;
+ struct NotifyPlayerLevel;
+ struct NotifyPlayerCellChanged;
+ struct NotifyTeleport;
++struct ActivateEvent;
+ struct NotifyPlayerHealthUpdate;
+ enum ChatMessageTypes;
+ struct PartyJoinedEvent;
+@@ -64,6 +68,13 @@ struct OverlayService
+ 
+     void SendSystemMessage(const std::string& acMessage);
+ 
++    void NoteActivation(uint32_t form) noexcept;
++    bool WasActivated(uint32_t form) const noexcept;
++    bool BeginHire(uint32_t npc, uint32_t info, int32_t index) noexcept;
++    static bool FollowerBusy(uint32_t npc) noexcept;
++    static bool NonlethalOpponent(uint32_t npc) noexcept;
++    bool TryJoinConversation(uint32_t form) noexcept;
++    void AnswerCarriage(uint32_t rider, uint32_t trip, bool yes) noexcept;
+     void SetPlayerHealthPercentage(uint32_t aFormId) const noexcept;
+ 
+ protected:
+@@ -85,6 +96,33 @@ protected:
+     void OnPartyLeftEvent(const PartyLeftEvent& acEvent) noexcept;
+ 
+ private:
++    void OnInteraction(const struct NotifyCoopInteraction&) noexcept;
++    void UpdateInteraction() noexcept;
++    void ClearInteraction() noexcept;
++    entt::scoped_connection m_interactionConnection;
++    uint32_t m_activated{}, m_pendingForm{}, m_pendingInfo{}, m_nonce{}, m_pendingNonce{}, m_pendingSession{};
++    int32_t m_pendingIndex{};
++    uint64_t m_pendingJoin{};
++    std::chrono::steady_clock::time_point m_activatedUntil{}, m_pollAt{}, m_pendingUntil{};
++    struct OutcomeWatch
++    {
++        uint32_t Npc{}, Session{}, Rank{}, State{UINT32_MAX};
++        bool Brawl{};
++        std::chrono::steady_clock::time_point Expires{};
++    } m_watch;
++    void LeaveConversation(uint64_t key) noexcept;
++    void OnBoardCarriage(const ActivateEvent&) noexcept;
++    void OnTravelNotice(const NotifyPartyTravel&) noexcept;
++    void UpdateCarriage() noexcept;
++    void ClearCarriage() noexcept;
++    void CloseTravelPrompt() noexcept;
++    uint32_t m_tripCounter{}, m_boardedTrip{};
++    glm::vec3 m_departure{};
++    std::chrono::steady_clock::time_point m_boardDeadline{}, m_offerDeadline{};
++    std::optional<NotifyPartyTravel> m_offer;
++    ::OverlayClient* m_gameOverlayClient{}; // owned by m_pOverlay
++    bool m_promptOpen{}, m_ownsTravelOverlay{}, m_acceptedRide{};
++    entt::scoped_connection m_boardConnection, m_noticeConnection;
+     void RunDebugDataUpdates() noexcept;
+     void UpdateDialogueHud() noexcept;
+     void ClearDialogueHud() noexcept;
+@@ -95,6 +133,14 @@ private:
+         glm::vec3 Anchor{}, Eye{}, Npc{}, Speaker{};
+         bool Active{}, HasNpc{}, HasSpeaker{};
+     };
++    void UpdateObserver(const DialogueMarker&, uint32_t speaker, uint32_t session, float distance) noexcept;
++    void EndObserver() noexcept;
++    uint64_t m_observedTalk{}, m_dismissedTalk{}, m_requestedTalk{}, m_invitedTalk{};
++    uint32_t m_invitedNpc{}, m_invitedSpeaker{};
++    void PublishInvitation(uint32_t speaker, uint32_t session, uint32_t npcForm, uint32_t speakerForm) noexcept;
++    TESCameraState* m_observerCamera{};
++    glm::vec3 m_observerEye{};
++    float m_appliedPitch{}, m_appliedYaw{}, m_offsetPitch{}, m_offsetYaw{};
+     // Publish plain world coordinates from the game update. Only the render thread reads the live camera.
+     std::mutex m_markerMutex;
+     DialogueMarker m_marker{};
+@@ -119,6 +165,7 @@ private:
+     World& m_world;
+     TransportService& m_transport;
+ 
++    std::optional<bool> m_gameMenuOpen;
+     bool m_active = false;
+     bool m_inGame = false;
+ 
+diff --git a/Code/client/Services/PlayerService.h b/Code/client/Services/PlayerService.h
+index 0c10173..55b6fe1 100644
+--- a/Code/client/Services/PlayerService.h
++++ b/Code/client/Services/PlayerService.h
+@@ -25,6 +25,7 @@ struct PlayerService
+     ~PlayerService() noexcept = default;
+ 
+     TP_NOCOPYMOVE(PlayerService);
++    uint32_t ActiveDialogueSession(uint32_t form) noexcept;
+ 
+ protected:
+     void OnUpdate(const UpdateEvent& acEvent) noexcept;
+@@ -41,6 +42,9 @@ protected:
+     void OnPartyLeftEvent(const PartyLeftEvent& acEvent) noexcept;
+ 
+ private:
++    uint32_t m_dialogueInfo{}, m_dialogueQuest{}, m_closedSpeaker{};
++    std::chrono::steady_clock::time_point m_closedUntil{};
++    bool m_gameInitiated{};
+     uint32_t m_dialogueHandle{};
+     uint32_t m_dialogueSession{};
+     uint32_t m_dialogueChoice{};
+diff --git a/Code/client/Services/QuestService.h b/Code/client/Services/QuestService.h
+index f8b26cd..49c4c56 100644
+--- a/Code/client/Services/QuestService.h
++++ b/Code/client/Services/QuestService.h
+@@ -1,4 +1,6 @@
+ #pragma once
++#include <chrono>
++struct NotifyQuestJournal;
+ 
+ #include <World.h>
+ #include <Events/EventDispatcher.h>
+@@ -56,6 +58,12 @@ public:
+     };
+ 
+ private:
++    void PollJournal(const UpdateEvent&) noexcept;
++    void OnJournalRecord(const NotifyQuestJournal&) noexcept;
++    uint64_t m_journalStream{};
++    uint32_t m_journalConfirmed{};
++    std::chrono::steady_clock::time_point m_nextJournalPoll{};
++    entt::scoped_connection m_journalClock, m_journalRecords;
+     void OnConnected(const ConnectedEvent&) noexcept;
+     void OnUpdate(const UpdateEvent&) noexcept;
+     void OnDisconnected(const DisconnectedEvent&) noexcept;
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+index 951e3f9..0e7c6e8 100644
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-dialogue2"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction1"
+diff --git a/Code/common/QuestJournalDisk.cpp b/Code/common/QuestJournalDisk.cpp
+new file mode 100644
+index 0000000..f03f656
+--- /dev/null
++++ b/Code/common/QuestJournalDisk.cpp
+@@ -0,0 +1,115 @@
++#include "QuestJournalDisk.h"
++#include <atomic>
++#include <cstdio>
++#include <fstream>
++#include <random>
++#include <iterator>
++#ifdef _WIN32
++#include <windows.h>
++#include <io.h>
++#else
++#include <unistd.h>
++#include <fcntl.h>
++#endif
++
++namespace QuestJournalDisk
++{
++namespace fs = std::filesystem;
++namespace
++{
++fs::path Directory(const fs::path& root, uint64_t stream)
++{
++    return root / std::to_string(stream);
++}
++
++fs::path Record(const fs::path& directory, uint32_t sequence)
++{
++    return directory / (std::to_string(sequence) + ".tsv");
++}
++
++bool Same(const fs::path& path, const std::string& data)
++{
++    std::ifstream file(path, std::ios::binary);
++    if (!file || fs::file_size(path) != data.size())
++        return false;
++    return data == std::string(std::istreambuf_iterator<char>(file), {});
++}
++}
++
++uint64_t CreateStream(const fs::path& root)
++{
++    fs::create_directories(root);
++    std::random_device random;
++    for (int attempt = 0; attempt < 16; ++attempt)
++    {
++        uint64_t id = (uint64_t(random()) << 32) | random();
++        if (id && fs::create_directory(Directory(root, id)))
++            return id;
++    }
++    return 0;
++}
++
++uint32_t Contiguous(const fs::path& root, uint64_t stream)
++{
++    const auto dir = Directory(root, stream);
++    uint32_t last{};
++    while (last < UINT32_MAX && fs::is_regular_file(Record(dir, last + 1)))
++        ++last;
++    return last;
++}
++
++bool Store(const fs::path& root, uint64_t stream, uint32_t sequence, std::string_view row)
++{
++    if (!stream || !sequence || row.empty() || row.size() > 4096 || row.find_first_of("\r\n") != std::string_view::npos)
++        return false;
++    const auto dir = Directory(root, stream);
++    fs::create_directories(dir);
++    const auto dest = Record(dir, sequence);
++    const auto data = std::to_string(sequence) + "\t" + std::string(row) + "\n";
++    if (fs::exists(dest))
++        return Same(dest, data);
++#ifdef _WIN32
++    auto pid = GetCurrentProcessId();
++#else
++    auto pid = getpid();
++#endif
++    static std::atomic_uint64_t counter{0};
++    fs::path temp = dest;
++    temp += "." + std::to_string(pid) + "." + std::to_string(++counter) + ".tmp";
++#ifdef _WIN32
++    FILE* file = _wfopen(temp.c_str(), L"wb");
++#else
++    FILE* file = std::fopen(temp.c_str(), "wb");
++#endif
++    if (!file)
++        return false;
++    bool ok = std::fwrite(data.data(), 1, data.size(), file) == data.size() && !std::fflush(file);
++#ifdef _WIN32
++    ok = ok && !_commit(_fileno(file));
++#else
++    ok = ok && !fsync(fileno(file));
++#endif
++    if (std::fclose(file) != 0)
++        ok = false;
++    if (ok)
++    {
++#ifdef _WIN32
++        ok = MoveFileExW(temp.c_str(), dest.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
++#else
++        ok = link(temp.c_str(), dest.c_str()) == 0;
++        if (ok)
++        {
++            const int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY);
++            ok = fd >= 0 && fsync(fd) == 0;
++            if (fd >= 0)
++                close(fd);
++        }
++#endif
++        if (!ok && fs::exists(dest))
++            ok = Same(dest, data);
++    }
++    std::error_code ignored;
++    fs::remove(temp, ignored);
++    return ok;
++}
++}
+diff --git a/Code/common/QuestJournalDisk.h b/Code/common/QuestJournalDisk.h
+new file mode 100644
+index 0000000..fa6f2ad
+--- /dev/null
++++ b/Code/common/QuestJournalDisk.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include <cstdint>
++#include <filesystem>
++#include <string>
++#include <string_view>
++
++namespace QuestJournalDisk
++{
++// Each party session gets an immutable stream. A record is published only after flushing its contents.
++uint64_t CreateStream(const std::filesystem::path& root);
++uint32_t Contiguous(const std::filesystem::path& root, uint64_t stream);
++bool Store(const std::filesystem::path& root, uint64_t stream, uint32_t sequence, std::string_view row);
++}
+diff --git a/Code/encoding/Messages/ClientMessageFactory.h b/Code/encoding/Messages/ClientMessageFactory.h
+index 3170dce..1a59183 100644
+--- a/Code/encoding/Messages/ClientMessageFactory.h
++++ b/Code/encoding/Messages/ClientMessageFactory.h
+@@ -2,6 +2,10 @@
+ 
+ #include <Messages/Message.h>
+ #include <MetaMessage.h>
++#include <Messages/RequestQuestJournal.h>
++#include <Messages/RequestCoopInteraction.h>
++#include <Messages/RequestNpcLifeCheck.h>
++#include <Messages/PartyTravelRequest.h>
+ 
+ #include <Messages/AuthenticationRequest.h>
+ #include <Messages/AssignCharacterRequest.h>
+@@ -71,7 +75,7 @@ struct ClientMessageFactory
+             PartyChangeLeaderRequest, PartyKickRequest, RequestActorValueChanges, RequestActorMaxValueChanges, EnterExteriorCellRequest, RequestHealthChangeBroadcast, ActivateRequest, LockChangeRequest, AssignObjectsRequest, RequestDeathStateChange, ShiftGridCellRequest,
+             RequestOwnershipTransfer, RequestOwnershipClaim, RequestObjectInventoryChanges, SpellCastRequest, ProjectileLaunchRequest, InterruptCastRequest, AddTargetRequest, ScriptAnimationRequest, DrawWeaponRequest, MountRequest, NewPackageRequest, RequestRespawn, SyncExperienceRequest,
+             RequestEquipmentChanges, SendChatMessageRequest, TeleportCommandRequest, PlayerRespawnRequest, DialogueRequest, SubtitleRequest, PlayerDialogueRequest, PlayerLevelRequest, TeleportRequest, RequestPlayerHealthUpdate, RequestWeatherChange, RequestCurrentWeather, RequestSetWaypoint,
+-            RequestRemoveWaypoint, RemoveSpellRequest, SetTimeCommandRequest, RequestActionEvents>;
++            RequestRemoveWaypoint, RemoveSpellRequest, SetTimeCommandRequest, RequestActionEvents, PartyTravelRequest, RequestNpcLifeCheck, RequestQuestJournal, RequestCoopInteraction>;
+ 
+         return s_visitor(std::forward<T>(func));
+     }
+diff --git a/Code/encoding/Messages/NotifyCoopInteraction.h b/Code/encoding/Messages/NotifyCoopInteraction.h
+new file mode 100644
+index 0000000..ce34adb
+--- /dev/null
++++ b/Code/encoding/Messages/NotifyCoopInteraction.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include "Message.h"
++#include <Structs/CoopInteraction.h>
++struct NotifyCoopInteraction final : ServerMessage
++{
++    static constexpr ServerOpcode Opcode = kNotifyCoopInteraction;
++    NotifyCoopInteraction() : ServerMessage(Opcode) {}
++    CoopInteraction Event{};
++    void SerializeRaw(TiltedPhoques::Buffer::Writer& w) const noexcept override { Event.Serialize(w); }
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept override { ServerMessage::DeserializeRaw(r); Event.Deserialize(r); }
++    bool operator==(const NotifyCoopInteraction& other) const noexcept { return Event == other.Event; }
++};
+diff --git a/Code/encoding/Messages/NotifyNpcLifeCheck.cpp b/Code/encoding/Messages/NotifyNpcLifeCheck.cpp
+new file mode 100644
+index 0000000..92de069
+--- /dev/null
++++ b/Code/encoding/Messages/NotifyNpcLifeCheck.cpp
+@@ -0,0 +1,15 @@
++#include <Messages/NotifyNpcLifeCheck.h>
++
++void NotifyNpcLifeCheck::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
++{
++    Serialization::WriteVarInt(aWriter, Id);
++    Serialization::WriteVarInt(aWriter, OwnershipEpoch);
++}
++
++void NotifyNpcLifeCheck::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept
++{
++    ServerMessage::DeserializeRaw(aReader);
++
++    Id = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
++    OwnershipEpoch = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
++}
+diff --git a/Code/encoding/Messages/NotifyNpcLifeCheck.h b/Code/encoding/Messages/NotifyNpcLifeCheck.h
+new file mode 100644
+index 0000000..b09381d
+--- /dev/null
++++ b/Code/encoding/Messages/NotifyNpcLifeCheck.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include "Message.h"
++
++struct NotifyNpcLifeCheck final : ServerMessage
++{
++    static constexpr ServerOpcode Opcode = kNotifyNpcLifeCheck;
++
++    NotifyNpcLifeCheck()
++        : ServerMessage(Opcode)
++    {
++    }
++
++    void SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept override;
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
++
++    bool operator==(const NotifyNpcLifeCheck& acRhs) const noexcept { return Id == acRhs.Id && OwnershipEpoch == acRhs.OwnershipEpoch && GetOpcode() == acRhs.GetOpcode(); }
++
++    uint32_t Id;
++    uint32_t OwnershipEpoch{};
++};
+diff --git a/Code/encoding/Messages/NotifyPartyTravel.cpp b/Code/encoding/Messages/NotifyPartyTravel.cpp
+new file mode 100644
+index 0000000..ce06f97
+--- /dev/null
++++ b/Code/encoding/Messages/NotifyPartyTravel.cpp
+@@ -0,0 +1,30 @@
++#include <Messages/NotifyPartyTravel.h>
++
++void NotifyPartyTravel::SerializeRaw(TiltedPhoques::Buffer::Writer& writer) const noexcept
++{
++    Serialization::WriteVarInt(writer, Rider);
++    Serialization::WriteVarInt(writer, Trip);
++    Serialization::WriteVarInt(writer, Kind);
++    if (Kind == TransportPassenger)
++    {
++        Cell.Serialize(writer);
++        World.Serialize(writer);
++        Position.Serialize(writer);
++    }
++    Serialization::WriteString(writer, Name);
++}
++
++void NotifyPartyTravel::DeserializeRaw(TiltedPhoques::Buffer::Reader& reader) noexcept
++{
++    ServerMessage::DeserializeRaw(reader);
++    Rider = Serialization::ReadVarInt(reader);
++    Trip = Serialization::ReadVarInt(reader);
++    Kind = Serialization::ReadVarInt(reader);
++    if (Kind == TransportPassenger)
++    {
++        Cell.Deserialize(reader);
++        World.Deserialize(reader);
++        Position.Deserialize(reader);
++    }
++    Name = Serialization::ReadString(reader);
++}
+diff --git a/Code/encoding/Messages/NotifyPartyTravel.h b/Code/encoding/Messages/NotifyPartyTravel.h
+new file mode 100644
+index 0000000..d6bf0a0
+--- /dev/null
++++ b/Code/encoding/Messages/NotifyPartyTravel.h
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include "Message.h"
++#include <Structs/GameId.h>
++#include <Structs/Vector3_NetQuantize.h>
++
++enum TravelNotice : uint32_t { InvitePassenger, CancelPassenger, TransportPassenger };
++
++struct NotifyPartyTravel final : ServerMessage
++{
++    static constexpr ServerOpcode Opcode = kNotifyPartyTravel;
++    NotifyPartyTravel() : ServerMessage(Opcode) {}
++    void SerializeRaw(TiltedPhoques::Buffer::Writer& writer) const noexcept override;
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader& reader) noexcept override;
++    bool operator==(const NotifyPartyTravel& other) const noexcept { return Rider == other.Rider && Trip == other.Trip && Kind == other.Kind && Cell == other.Cell && World == other.World && Position == other.Position && Name == other.Name; }
++
++    uint32_t Rider{};
++    uint32_t Trip{};
++    uint32_t Kind{};
++    GameId Cell{}, World{};
++    Vector3_NetQuantize Position{};
++    String Name{};
++};
+diff --git a/Code/encoding/Messages/NotifyQuestJournal.cpp b/Code/encoding/Messages/NotifyQuestJournal.cpp
+new file mode 100644
+index 0000000..5b4b0b3
+--- /dev/null
++++ b/Code/encoding/Messages/NotifyQuestJournal.cpp
+@@ -0,0 +1,18 @@
++#include <Messages/NotifyQuestJournal.h>
++
++void NotifyQuestJournal::SerializeRaw(TiltedPhoques::Buffer::Writer& w) const noexcept
++{
++    Serialization::WriteVarInt(w, Stream);
++    Serialization::WriteVarInt(w, Sequence);
++    Serialization::WriteVarInt(w, Total);
++    Serialization::WriteString(w, Row);
++}
++
++void NotifyQuestJournal::DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept
++{
++    ServerMessage::DeserializeRaw(r);
++    Stream = Serialization::ReadVarInt(r);
++    Sequence = Serialization::ReadVarInt(r) & 0xFFFFFFFF;
++    Total = Serialization::ReadVarInt(r) & 0xFFFFFFFF;
++    Row = Serialization::ReadString(r);
++}
+diff --git a/Code/encoding/Messages/NotifyQuestJournal.h b/Code/encoding/Messages/NotifyQuestJournal.h
+new file mode 100644
+index 0000000..0e08078
+--- /dev/null
++++ b/Code/encoding/Messages/NotifyQuestJournal.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include "Message.h"
++
++struct NotifyQuestJournal final : ServerMessage
++{
++    static constexpr ServerOpcode Opcode = kNotifyQuestJournal;
++    NotifyQuestJournal() : ServerMessage(Opcode) {}
++    void SerializeRaw(TiltedPhoques::Buffer::Writer& writer) const noexcept override;
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader& reader) noexcept override;
++    bool operator==(const NotifyQuestJournal& other) const noexcept { return Stream == other.Stream && Sequence == other.Sequence && Total == other.Total && Row == other.Row; }
++    uint64_t Stream{};
++    uint32_t Sequence{};
++    uint32_t Total{};
++    String Row{};
++};
+diff --git a/Code/encoding/Messages/PartyTravelRequest.cpp b/Code/encoding/Messages/PartyTravelRequest.cpp
+new file mode 100644
+index 0000000..d3642d0
+--- /dev/null
++++ b/Code/encoding/Messages/PartyTravelRequest.cpp
+@@ -0,0 +1,22 @@
++#include <Messages/PartyTravelRequest.h>
++
++void PartyTravelRequest::SerializeRaw(TiltedPhoques::Buffer::Writer& writer) const noexcept
++{
++    Serialization::WriteVarInt(writer, Action);
++    Serialization::WriteVarInt(writer, Rider);
++    Serialization::WriteVarInt(writer, Trip);
++    Cell.Serialize(writer);
++    World.Serialize(writer);
++    Position.Serialize(writer);
++}
++
++void PartyTravelRequest::DeserializeRaw(TiltedPhoques::Buffer::Reader& reader) noexcept
++{
++    ClientMessage::DeserializeRaw(reader);
++    Action = Serialization::ReadVarInt(reader);
++    Rider = Serialization::ReadVarInt(reader);
++    Trip = Serialization::ReadVarInt(reader);
++    Cell.Deserialize(reader);
++    World.Deserialize(reader);
++    Position.Deserialize(reader);
++}
+diff --git a/Code/encoding/Messages/PartyTravelRequest.h b/Code/encoding/Messages/PartyTravelRequest.h
+new file mode 100644
+index 0000000..d79c440
+--- /dev/null
++++ b/Code/encoding/Messages/PartyTravelRequest.h
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include "Message.h"
++#include <Structs/GameId.h>
++#include <Structs/Vector3_NetQuantize.h>
++
++enum TravelAction : uint32_t { BoardCarriage, ArriveByCarriage, AcceptCarriage, DeclineCarriage, CancelCarriage };
++
++struct PartyTravelRequest final : ClientMessage
++{
++    static constexpr ClientOpcode Opcode = kPartyTravelRequest;
++    PartyTravelRequest() : ClientMessage(Opcode) {}
++    void SerializeRaw(TiltedPhoques::Buffer::Writer& writer) const noexcept override;
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader& reader) noexcept override;
++    bool operator==(const PartyTravelRequest& other) const noexcept { return Action == other.Action && Rider == other.Rider && Trip == other.Trip && Cell == other.Cell && World == other.World && Position == other.Position; }
++
++    uint32_t Action{};
++    uint32_t Rider{};
++    uint32_t Trip{};
++    GameId Cell{};
++    GameId World{};
++    Vector3_NetQuantize Position{};
++};
+diff --git a/Code/encoding/Messages/RequestCoopInteraction.h b/Code/encoding/Messages/RequestCoopInteraction.h
+new file mode 100644
+index 0000000..0f5bd80
+--- /dev/null
++++ b/Code/encoding/Messages/RequestCoopInteraction.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include "Message.h"
++#include <Structs/CoopInteraction.h>
++struct RequestCoopInteraction final : ClientMessage
++{
++    static constexpr ClientOpcode Opcode = kRequestCoopInteraction;
++    RequestCoopInteraction() : ClientMessage(Opcode) {}
++    CoopInteraction Event{};
++    void SerializeRaw(TiltedPhoques::Buffer::Writer& w) const noexcept override { Event.Serialize(w); }
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept override { ClientMessage::DeserializeRaw(r); Event.Deserialize(r); }
++    bool operator==(const RequestCoopInteraction& other) const noexcept { return Event == other.Event; }
++};
+diff --git a/Code/encoding/Messages/RequestNpcLifeCheck.cpp b/Code/encoding/Messages/RequestNpcLifeCheck.cpp
+new file mode 100644
+index 0000000..f4626df
+--- /dev/null
++++ b/Code/encoding/Messages/RequestNpcLifeCheck.cpp
+@@ -0,0 +1,15 @@
++#include <Messages/RequestNpcLifeCheck.h>
++
++void RequestNpcLifeCheck::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
++{
++    Serialization::WriteVarInt(aWriter, Id);
++    Serialization::WriteVarInt(aWriter, OwnershipEpoch);
++}
++
++void RequestNpcLifeCheck::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept
++{
++    ClientMessage::DeserializeRaw(aReader);
++
++    Id = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
++    OwnershipEpoch = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
++}
+diff --git a/Code/encoding/Messages/RequestNpcLifeCheck.h b/Code/encoding/Messages/RequestNpcLifeCheck.h
+new file mode 100644
+index 0000000..123051a
+--- /dev/null
++++ b/Code/encoding/Messages/RequestNpcLifeCheck.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include "Message.h"
++
++struct RequestNpcLifeCheck final : ClientMessage
++{
++    static constexpr ClientOpcode Opcode = kRequestNpcLifeCheck;
++
++    RequestNpcLifeCheck()
++        : ClientMessage(Opcode)
++    {
++    }
++
++    void SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept override;
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
++
++    bool operator==(const RequestNpcLifeCheck& acRhs) const noexcept { return Id == acRhs.Id && OwnershipEpoch == acRhs.OwnershipEpoch && GetOpcode() == acRhs.GetOpcode(); }
++
++    uint32_t Id;
++    uint32_t OwnershipEpoch{};
++};
+diff --git a/Code/encoding/Messages/RequestQuestJournal.cpp b/Code/encoding/Messages/RequestQuestJournal.cpp
+new file mode 100644
+index 0000000..38f99fb
+--- /dev/null
++++ b/Code/encoding/Messages/RequestQuestJournal.cpp
+@@ -0,0 +1,14 @@
++#include <Messages/RequestQuestJournal.h>
++
++void RequestQuestJournal::SerializeRaw(TiltedPhoques::Buffer::Writer& w) const noexcept
++{
++    Serialization::WriteVarInt(w, Stream);
++    Serialization::WriteVarInt(w, Sequence);
++}
++
++void RequestQuestJournal::DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept
++{
++    ClientMessage::DeserializeRaw(r);
++    Stream = Serialization::ReadVarInt(r);
++    Sequence = Serialization::ReadVarInt(r) & 0xFFFFFFFF;
++}
+diff --git a/Code/encoding/Messages/RequestQuestJournal.h b/Code/encoding/Messages/RequestQuestJournal.h
+new file mode 100644
+index 0000000..d647028
+--- /dev/null
++++ b/Code/encoding/Messages/RequestQuestJournal.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include "Message.h"
++
++struct RequestQuestJournal final : ClientMessage
++{
++    static constexpr ClientOpcode Opcode = kRequestQuestJournal;
++    RequestQuestJournal() : ClientMessage(Opcode) {}
++    void SerializeRaw(TiltedPhoques::Buffer::Writer& writer) const noexcept override;
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader& reader) noexcept override;
++    bool operator==(const RequestQuestJournal& other) const noexcept { return Stream == other.Stream && Sequence == other.Sequence; }
++    uint64_t Stream{};
++    uint32_t Sequence{};
++};
+diff --git a/Code/encoding/Messages/ServerMessageFactory.h b/Code/encoding/Messages/ServerMessageFactory.h
+index 183da57..207736a 100644
+--- a/Code/encoding/Messages/ServerMessageFactory.h
++++ b/Code/encoding/Messages/ServerMessageFactory.h
+@@ -3,6 +3,10 @@
+ #include <TiltedCore/Stl.hpp>
+ #include <Messages/Message.h>
+ #include <MetaMessage.h>
++#include <Messages/NotifyQuestJournal.h>
++#include <Messages/NotifyCoopInteraction.h>
++#include <Messages/NotifyNpcLifeCheck.h>
++#include <Messages/NotifyPartyTravel.h>
+ 
+ #include <Messages/AuthenticationResponse.h>
+ #include <Messages/AssignCharacterResponse.h>
+@@ -74,7 +78,7 @@ struct ServerMessageFactory
+             NotifyActorValueChanges, NotifyPartyJoined, NotifyPartyLeft, NotifyActorMaxValueChanges, NotifyHealthChangeBroadcast, NotifyActivate, NotifyLockChange, AssignObjectsResponse, NotifyDeathStateChange, NotifyOwnershipTransfer, NotifyObjectInventoryChanges, NotifySpellCast,
+             NotifyProjectileLaunch, NotifyInterruptCast, NotifyAddTarget, NotifyScriptAnimation, NotifyDrawWeapon, NotifyMount, NotifyNewPackage, NotifyRespawn, NotifySyncExperience, NotifyEquipmentChanges, NotifyChatMessageBroadcast, TeleportCommandResponse, NotifyPlayerRespawn, NotifyDialogue,
+             NotifySubtitle, NotifyPlayerDialogue, NotifyActorTeleport, NotifyPlayerLeft, NotifyPlayerJoined, NotifyDialogue, NotifySubtitle, NotifyPlayerDialogue, NotifyPlayerLevel, NotifyPlayerCellChanged, NotifyTeleport, NotifyPlayerHealthUpdate, NotifySettingsChange,
+-            NotifyWeatherChange, NotifySetWaypoint, NotifyRemoveWaypoint, NotifySetTimeResult, NotifyRemoveSpell, NotifyActionEvents>;
++            NotifyWeatherChange, NotifySetWaypoint, NotifyRemoveWaypoint, NotifySetTimeResult, NotifyRemoveSpell, NotifyActionEvents, NotifyPartyTravel, NotifyNpcLifeCheck, NotifyQuestJournal, NotifyCoopInteraction>;
+ 
+         return s_visitor(std::forward<T>(func));
+     }
+diff --git a/Code/encoding/Opcodes.h b/Code/encoding/Opcodes.h
+index d7edb33..1888495 100644
+--- a/Code/encoding/Opcodes.h
++++ b/Code/encoding/Opcodes.h
+@@ -55,6 +55,10 @@ enum ClientOpcode : unsigned char
+     kRequestRemoveWaypoint,
+     kSetTimeCommandRequest,
+     kRequestActionEvents,
++    kPartyTravelRequest,
++    kRequestNpcLifeCheck,
++    kRequestQuestJournal,
++    kRequestCoopInteraction,
+     kClientOpcodeMax
+ };
+ 
+@@ -116,5 +120,9 @@ enum ServerOpcode : unsigned char
+     kNotifyRemoveWaypoint,
+     kNotifySetTimeResult,
+     kNotifyActionEvents,
++    kNotifyPartyTravel,
++    kNotifyNpcLifeCheck,
++    kNotifyQuestJournal,
++    kNotifyCoopInteraction,
+     kServerOpcodeMax
+ };
+diff --git a/Code/encoding/Structs/CoopInteraction.h b/Code/encoding/Structs/CoopInteraction.h
+new file mode 100644
+index 0000000..5568392
+--- /dev/null
++++ b/Code/encoding/Structs/CoopInteraction.h
+@@ -0,0 +1,33 @@
++#pragma once
++#include <Structs/GameId.h>
++#include <TiltedCore/Serialization.hpp>
++enum class Interaction : uint32_t
++{
++    Join, Leave, Joined, WatchOutcomes, FollowerReport, FollowerReserved, FollowerReleased,
++    Hire, Granted, Denied, Brawl, OpponentState, Outcome, Rejoin
++};
++struct CoopInteraction
++{
++    Interaction Kind{};
++    uint32_t Speaker{}, Session{}, Value{};
++    GameId Npc{};
++    void Serialize(TiltedPhoques::Buffer::Writer& w) const noexcept
++    {
++        using TiltedPhoques::Serialization;
++        Serialization::WriteVarInt(w, static_cast<uint32_t>(Kind));
++        Serialization::WriteVarInt(w, Speaker);
++        Serialization::WriteVarInt(w, Session);
++        Serialization::WriteVarInt(w, Value);
++        Npc.Serialize(w);
++    }
++    void Deserialize(TiltedPhoques::Buffer::Reader& r) noexcept
++    {
++        using TiltedPhoques::Serialization;
++        Kind = static_cast<Interaction>(Serialization::ReadVarInt(r));
++        Speaker = static_cast<uint32_t>(Serialization::ReadVarInt(r));
++        Session = static_cast<uint32_t>(Serialization::ReadVarInt(r));
++        Value = static_cast<uint32_t>(Serialization::ReadVarInt(r));
++        Npc.Deserialize(r);
++    }
++    bool operator==(const CoopInteraction&) const noexcept = default;
++};
+diff --git a/Code/encoding/Structs/DialogueAnchor.h b/Code/encoding/Structs/DialogueAnchor.h
+index 5a17570..27c4076 100644
+--- a/Code/encoding/Structs/DialogueAnchor.h
++++ b/Code/encoding/Structs/DialogueAnchor.h
+@@ -8,11 +8,14 @@
+ // An empty Cell closes the current session. Heartbeats allow late joiners to see it.
+ struct DialogueAnchor
+ {
++    bool GameInitiated{};
+     uint32_t Session{};
+     uint32_t Choice{};
+     // Runtime-created references use the shared entity ID. Placed references also carry a plugin-relative ID.
+     uint32_t TargetEntity{UINT32_MAX};
+     GameId TargetForm{};
++    GameId TopicInfo{}; // selected INFO record in the speaker's load order
++    GameId TopicQuest{};
+     GameId Cell{};
+     GameId WorldSpace{};
+     Vector3_NetQuantize Position{};
+@@ -24,7 +27,10 @@ struct DialogueAnchor
+         TiltedPhoques::Serialization::WriteVarInt(aWriter, Session);
+         TiltedPhoques::Serialization::WriteVarInt(aWriter, Choice);
+         TiltedPhoques::Serialization::WriteVarInt(aWriter, TargetEntity);
++        TiltedPhoques::Serialization::WriteBool(aWriter, GameInitiated);
+         TargetForm.Serialize(aWriter);
++        TopicInfo.Serialize(aWriter);
++        TopicQuest.Serialize(aWriter);
+         Cell.Serialize(aWriter);
+         WorldSpace.Serialize(aWriter);
+         Position.Serialize(aWriter);
+@@ -35,7 +41,10 @@ struct DialogueAnchor
+         Session = TiltedPhoques::Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+         Choice = TiltedPhoques::Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+         TargetEntity = TiltedPhoques::Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
++        GameInitiated = TiltedPhoques::Serialization::ReadBool(aReader);
+         TargetForm.Deserialize(aReader);
++        TopicInfo.Deserialize(aReader);
++        TopicQuest.Deserialize(aReader);
+         Cell.Deserialize(aReader);
+         WorldSpace.Deserialize(aReader);
+         Position.Deserialize(aReader);
+diff --git a/Code/server/Services/ActorValueService.cpp b/Code/server/Services/ActorValueService.cpp
+index 1667eea..83d8aaa 100644
+--- a/Code/server/Services/ActorValueService.cpp
++++ b/Code/server/Services/ActorValueService.cpp
+@@ -3,6 +3,9 @@
+ #include <Messages/RequestActorMaxValueChanges.h>
+ #include <Messages/RequestHealthChangeBroadcast.h>
+ #include <Messages/RequestDeathStateChange.h>
++#include <Messages/RequestNpcLifeCheck.h>
++#include <Messages/NotifyNpcLifeCheck.h>
++#include <Game/Player.h>
+ #include <Services/ActorValueService.h>
+ #include <cmath>
+ #include <World.h>
+@@ -18,6 +21,7 @@ ActorValueService::ActorValueService(World& aWorld, entt::dispatcher& aDispatche
+     m_updateHealthConnection = aDispatcher.sink<PacketEvent<RequestActorValueChanges>>().connect<&ActorValueService::OnActorValueChanges>(this);
+     m_updateMaxValueConnection = aDispatcher.sink<PacketEvent<RequestActorMaxValueChanges>>().connect<&ActorValueService::OnActorMaxValueChanges>(this);
+     m_updateDeltaHealthConnection = aDispatcher.sink<PacketEvent<RequestHealthChangeBroadcast>>().connect<&ActorValueService::OnHealthChangeBroadcast>(this);
++    m_lifeCheck = aDispatcher.sink<PacketEvent<RequestNpcLifeCheck>>().connect<&ActorValueService::OnLifeCheck>(this);
+     m_deathStateConnection = aDispatcher.sink<PacketEvent<RequestDeathStateChange>>().connect<&ActorValueService::OnDeathStateChange>(this);
+ }
+ 
+@@ -128,3 +132,20 @@ void ActorValueService::OnDeathStateChange(const PacketEvent<RequestDeathStateCh
+     if (!GameServer::Get()->SendToPlayersInRange(notify, cEntity, acMessage.pPlayer))
+         spdlog::error("{}: SendToPlayersInRange failed", __FUNCTION__);
+ }
++
++void ActorValueService::OnLifeCheck(const PacketEvent<RequestNpcLifeCheck>& event) const noexcept
++{
++    const auto& packet = event.Packet;
++    const auto entity = static_cast<entt::entity>(packet.Id);
++    if (!m_world.valid(entity))
++        return;
++    const auto* owner = m_world.try_get<OwnerComponent>(entity);
++    const auto* cell = m_world.try_get<CellIdComponent>(entity);
++    if (!owner || !cell || !packet.OwnershipEpoch || owner->OwnershipEpoch != packet.OwnershipEpoch ||
++        !owner->GetOwner() || owner->GetOwner() == event.pPlayer || !cell->IsInRange(event.pPlayer->GetCellComponent(), false))
++        return;
++    NotifyNpcLifeCheck query;
++    query.Id = packet.Id;
++    query.OwnershipEpoch = packet.OwnershipEpoch;
++    owner->GetOwner()->Send(query);
++}
+diff --git a/Code/server/Services/ActorValueService.h b/Code/server/Services/ActorValueService.h
+index 8825334..f4431cc 100644
+--- a/Code/server/Services/ActorValueService.h
++++ b/Code/server/Services/ActorValueService.h
+@@ -9,6 +9,7 @@ struct RequestActorValueChanges;
+ struct RequestActorMaxValueChanges;
+ struct RequestHealthChangeBroadcast;
+ struct RequestDeathStateChange;
++struct RequestNpcLifeCheck;
+ 
+ /**
+  * @brief Broadcasts changes in (max) actor values and updates them server side.
+@@ -26,6 +27,8 @@ private:
+     void OnActorValueChanges(const PacketEvent<RequestActorValueChanges>& acMessage) const noexcept;
+     void OnActorMaxValueChanges(const PacketEvent<RequestActorMaxValueChanges>& acMessage) const noexcept;
+     void OnHealthChangeBroadcast(const PacketEvent<RequestHealthChangeBroadcast>& acMessage) const noexcept;
++    entt::scoped_connection m_lifeCheck;
++    void OnLifeCheck(const PacketEvent<RequestNpcLifeCheck>& event) const noexcept;
+     void OnDeathStateChange(const PacketEvent<RequestDeathStateChange>& acMessage) const noexcept;
+ 
+     entt::scoped_connection m_updateHealthConnection;
+diff --git a/Code/server/Services/CharacterService.cpp b/Code/server/Services/CharacterService.cpp
+index b61112c..9abf4f5 100644
+--- a/Code/server/Services/CharacterService.cpp
++++ b/Code/server/Services/CharacterService.cpp
+@@ -782,6 +782,8 @@ const char* CharacterService::GetOwnershipTransferReasonName(const OwnershipTran
+ {
+     switch (aReason)
+     {
++    case OwnershipTransferReason::PartyInteraction:
++        return "party interaction";
+     case OwnershipTransferReason::LeaderAssignment:
+         return "party leader assignment";
+     case OwnershipTransferReason::LeaderClaim:
+@@ -836,14 +838,45 @@ bool CharacterService::CanClaimOwnership(Player* apPlayer, const entt::entity aE
+         return reject("the actor is out of range");
+ 
+     auto& partyService = m_world.GetPartyService();
+-    if (!partyService.IsPlayerInParty(apPlayer) || !partyService.IsPlayerLeader(apPlayer))
++    if (!partyService.IsPlayerInParty(apPlayer))
+         return reject("the player is not the party leader");
+ 
+     PartyService::Party* const pParty = partyService.GetPlayerParty(apPlayer);
+     if (!pParty || std::find(pParty->Members.begin(), pParty->Members.end(), pCurrentOwner) == pParty->Members.end())
+         return reject("the current owner is not in the party");
+ 
+-    return true;
++    const auto key = view.get<FormIdComponent>(*it).Id.LogFormat();
++    std::optional<uint32_t> preferredOwner;
++    const auto follower = pParty->Followers.find(key);
++    if (follower != pParty->Followers.end() &&
++        (follower->second.Confirmed || follower->second.Expires > std::chrono::steady_clock::now()))
++        preferredOwner = follower->second.Owner;
++    if (!preferredOwner)
++        for (const auto& [challenger, fight] : pParty->Brawls)
++            if (fight.Anchor.TargetForm.LogFormat() == key && fight.Expires > std::chrono::steady_clock::now())
++                preferredOwner = challenger;
++    if (preferredOwner)
++        return *preferredOwner == apPlayer->GetId();
++    return aReason != OwnershipTransferReason::PartyInteraction && partyService.IsPlayerLeader(apPlayer);
++}
++
++void CharacterService::AssignInteractionOwner(Player* player, const GameId& npc) const noexcept
++{
++    if (!player || !npc)
++        return;
++    auto view = m_world.view<FormIdComponent, OwnerComponent>();
++    for (auto entity : view)
++    {
++        if (view.get<FormIdComponent>(entity).Id != npc)
++            continue;
++        const auto& owner = view.get<OwnerComponent>(entity);
++        // A deliberately relinquished, unloaded actor must not bounce between clients.
++        if (owner.GetOwner() != player &&
++            std::find(owner.InvalidOwners.begin(), owner.InvalidOwners.end(), player) == owner.InvalidOwners.end() &&
++            CanClaimOwnership(player, entity, owner.OwnershipEpoch, OwnershipTransferReason::PartyInteraction))
++            TransferOwnership(player, entity, OwnershipTransferReason::PartyInteraction);
++        break;
++    }
+ }
+ 
+ bool CharacterService::TransferOwnership(Player* apPlayer, const entt::entity aEntity, const OwnershipTransferReason aReason, const bool aResetInvalidOwners) const noexcept
+diff --git a/Code/server/Services/CharacterService.h b/Code/server/Services/CharacterService.h
+index 78b2cc9..fffa56b 100644
+--- a/Code/server/Services/CharacterService.h
++++ b/Code/server/Services/CharacterService.h
+@@ -37,11 +37,13 @@ struct CharacterService
+ 
+     TP_NOCOPYMOVE(CharacterService);
+ 
++    void AssignInteractionOwner(Player* player, const GameId& npc) const noexcept;
+     static void Serialize(World& aRegistry, entt::entity aEntity, CharacterSpawnRequest* apSpawnRequest) noexcept;
+ 
+ protected:
+     enum class OwnershipTransferReason : uint8_t
+     {
++        PartyInteraction,
+         LeaderAssignment,
+         LeaderClaim,
+         Mount,
+diff --git a/Code/server/Services/CoopInteraction.cpp b/Code/server/Services/CoopInteraction.cpp
+new file mode 100644
+index 0000000..7fb5a4a
+--- /dev/null
++++ b/Code/server/Services/CoopInteraction.cpp
+@@ -0,0 +1,167 @@
++#include <GameServer.h>
++#include <World.h>
++#include <Game/Player.h>
++#include <Services/OverlayService.h>
++#include <Messages/RequestCoopInteraction.h>
++#include <Messages/NotifyCoopInteraction.h>
++
++namespace
++{
++using Clock = std::chrono::steady_clock;
++using namespace std::chrono_literals;
++void Send(Player& player, Interaction kind, uint32_t speaker, uint32_t session, GameId npc = {}, uint32_t value = 0)
++{
++    NotifyCoopInteraction message;
++    message.Event = {kind, speaker, session, value, npc};
++    player.Send(message);
++}
++bool InScene(World& world, Player& player, const DialogueAnchor& anchor)
++{
++    if (!player.GetCharacter())
++        return false;
++    const auto& cell = player.GetCellComponent();
++    if (cell.WorldSpaceId != anchor.WorldSpace || (!anchor.WorldSpace && cell.Cell != anchor.Cell))
++        return false;
++    const auto* movement = world.try_get<MovementComponent>(*player.GetCharacter());
++    return movement && glm::distance(movement->Position, static_cast<const glm::vec3&>(anchor.Position)) <= 420.f;
++}
++}
++
++void OverlayService::OnInteraction(const PacketEvent<RequestCoopInteraction>& packet) noexcept
++{
++    using namespace std::chrono_literals;
++    const auto& e = packet.Packet.Event;
++    auto& player = *packet.pPlayer;
++    auto* party = m_world.GetPartyService().GetPlayerParty(&player);
++    if (!party)
++        return;
++    const auto now = Clock::now();
++    const auto id = player.GetId();
++    const auto member = [&](uint32_t candidate) -> Player* {
++        auto* p = m_world.GetPlayerManager().GetById(candidate);
++        return p && p->GetParty().JoinedPartyId == player.GetParty().JoinedPartyId ? p : nullptr;
++    };
++    const auto announce = [&](Interaction k, uint32_t holder, GameId npc) {
++        for (auto* peer : party->Members)
++            if (peer->GetId() != holder)
++                Send(*peer, k, holder, 0, npc);
++    };
++    if (e.Kind == Interaction::FollowerReport || e.Kind == Interaction::Hire)
++    {
++        for (auto i = party->Followers.begin(); i != party->Followers.end(); )
++        {
++            const auto& f = i->second;
++            if (!member(f.Owner) || (!f.Confirmed && now >= f.Expires) ||
++                (e.Kind == Interaction::FollowerReport && f.Owner == id && f.Confirmed && e.Npc != f.Npc))
++            {
++                announce(Interaction::FollowerReleased, f.Owner, f.Npc);
++                i = party->Followers.erase(i);
++            }
++            else
++                ++i;
++        }
++        if (e.Npc)
++        {
++            auto i = party->Followers.find(e.Npc.LogFormat());
++            bool free = i == party->Followers.end();
++            if (e.Kind == Interaction::Hire)
++            {
++                // Only a player in their own live dialogue can reserve, irrespective of party leadership.
++                const auto scene = party->Talks.find(id);
++                if (scene == party->Talks.end() || scene->second.Closed || scene->second.Expires <= now ||
++                    scene->second.Anchor.Session != e.Value || scene->second.Anchor.TargetForm != e.Npc || !InScene(m_world, player, scene->second.Anchor))
++                    free = false;
++                if (free)
++                    for (const auto& entry : party->Followers)
++                        if (entry.second.Owner == id)
++                            free = false;
++                if (free)
++                {
++                    party->Followers[e.Npc.LogFormat()] = {e.Npc, id, now + 15s, false};
++                    announce(Interaction::FollowerReserved, id, e.Npc);
++                }
++                Send(player, free ? Interaction::Granted : Interaction::Denied, id, e.Session, e.Npc);
++                return;
++            }
++            if (free || i->second.Owner == id)
++            {
++                if (free)
++                    announce(Interaction::FollowerReserved, id, e.Npc);
++                auto& entry = party->Followers[e.Npc.LogFormat()];
++                const bool checkSimulation = !entry.Confirmed || now >= entry.Expires;
++                entry.Npc = e.Npc;
++                entry.Owner = id;
++                entry.Confirmed = true;
++                if (checkSimulation)
++                {
++                    entry.Expires = now + 4s;
++                    m_world.GetCharacterService().AssignInteractionOwner(&player, e.Npc);
++                }
++            }
++        }
++        for (const auto& [key, f] : party->Followers)
++            if (f.Owner != id)
++                Send(player, Interaction::FollowerReserved, f.Owner, 0, f.Npc);
++        return;
++    }
++    if (e.Kind == Interaction::Join || e.Kind == Interaction::Leave)
++    {
++        auto it = party->Talks.find(e.Speaker);
++        auto* speaker = member(e.Speaker);
++        if (!speaker || speaker == &player || it == party->Talks.end() || it->second.Anchor.Session != e.Session)
++            return;
++        auto& talk = it->second;
++        if (e.Kind == Interaction::Leave)
++        {
++            talk.Listeners.erase(id);
++            auto fight = party->Brawls.find(e.Speaker);
++            if (fight != party->Brawls.end() && fight->second.Anchor.Session == e.Session)
++                fight->second.Listeners.erase(id);
++            return;
++        }
++        if (talk.Closed || talk.Expires <= now || !InScene(m_world, player, talk.Anchor))
++            return;
++        talk.Listeners.insert(id);
++        Send(player, Interaction::Joined, e.Speaker, e.Session, talk.Anchor.TargetForm);
++        Send(*speaker, Interaction::WatchOutcomes, e.Speaker, e.Session, talk.Anchor.TargetForm);
++        return;
++    }
++    // Only the player conducting the original conversation can originate these outcomes.
++    auto it = party->Talks.find(id);
++    auto encounter = party->Brawls.find(id);
++    if (encounter != party->Brawls.end() && encounter->second.Expires <= now)
++    {
++        party->Brawls.erase(encounter);
++        encounter = party->Brawls.end();
++    }
++    if (e.Kind == Interaction::Brawl && it != party->Talks.end() && it->second.Expires > now &&
++        it->second.Anchor.Session == e.Session && e.Npc && it->second.Anchor.TargetForm == e.Npc)
++    {
++        auto& fight = party->Brawls[id] = it->second;
++        fight.Expires = now + 5min;
++        m_world.GetCharacterService().AssignInteractionOwner(&player, e.Npc);
++        return;
++    }
++    PartyService::Party::Conversation* source = nullptr;
++    if (encounter != party->Brawls.end() && encounter->second.Anchor.Session == e.Session && encounter->second.Anchor.TargetForm == e.Npc)
++        source = &encounter->second;
++    else if (it != party->Talks.end() && it->second.Anchor.Session == e.Session && it->second.Anchor.TargetForm == e.Npc && it->second.Expires > now)
++        source = &it->second;
++    if (!source || !e.Npc)
++        return;
++    if (e.Kind == Interaction::OpponentState && e.Value <= 2 && encounter != party->Brawls.end() && source == &encounter->second)
++    {
++        source->MayResume = source->MayResume || e.Value > 0;
++        source->Expires = now + (e.Value == 2 ? 20s : 5min);
++        // An NPC's life state is visible to bystanders. Eligibility is personal to the enrolled listeners.
++        for (auto* peer : party->Members)
++            if (peer != &player && InScene(m_world, *peer, source->Anchor))
++                Send(*peer, e.Kind, id, e.Session, e.Npc, e.Value);
++    }
++    else if (e.Kind == Interaction::Outcome && e.Value >= 1 && e.Value <= 4)
++    {
++        for (auto listener : source->Listeners)
++            if (auto* guest = member(listener))
++                Send(*guest, e.Kind, id, e.Session, e.Npc, e.Value);
++    }
++}
+diff --git a/Code/server/Services/OverlayService.cpp b/Code/server/Services/OverlayService.cpp
+index 4bda89e..5628eb4 100644
+--- a/Code/server/Services/OverlayService.cpp
++++ b/Code/server/Services/OverlayService.cpp
+@@ -17,11 +17,18 @@
+ #include "Game/Player.h"
+ 
+ #include <regex>
++#include <Messages/RequestCoopInteraction.h>
++#include <Messages/NotifyCoopInteraction.h>
++#include <Messages/PartyTravelRequest.h>
++#include <Events/UpdateEvent.h>
+ 
+ 
+ OverlayService::OverlayService(World& aWorld, entt::dispatcher& aDispatcher)
+     : m_world(aWorld)
+ {
++    m_interactionConnection = aDispatcher.sink<PacketEvent<RequestCoopInteraction>>().connect<&OverlayService::OnInteraction>(this);
++    m_rideConnection = aDispatcher.sink<PacketEvent<PartyTravelRequest>>().connect<&OverlayService::OnPartyTravel>(this);
++    m_tickRides = aDispatcher.sink<UpdateEvent>().connect<&OverlayService::UpdateRides>(this);
+     m_chatMessageConnection = aDispatcher.sink<PacketEvent<SendChatMessageRequest>>().connect<&OverlayService::HandleChatMessage>(this);
+     m_playerDialogueConnection = aDispatcher.sink<PacketEvent<PlayerDialogueRequest>>().connect<&OverlayService::OnPlayerDialogue>(this);
+     m_teleportConnection = aDispatcher.sink<PacketEvent<TeleportRequest>>().connect<&OverlayService::OnTeleport>(this);
+@@ -76,10 +83,72 @@ void OverlayService::OnPlayerDialogue(const PacketEvent<PlayerDialogueRequest>&
+         return;
+     NotifyPlayerDialogue message;
+     message.Anchor = acMessage.Packet.Anchor;
++    auto* party = m_world.GetPartyService().GetPlayerParty(pSpeaker);
++    if (!party || !message.Anchor.Session)
++        return;
++    auto& talk = party->Talks[pSpeaker->GetId()];
++    const uint32_t previousChoice = talk.Anchor.Session == message.Anchor.Session ? talk.Anchor.Choice : 0;
++    const bool opening = message.Anchor.Cell && talk.Anchor.Session != message.Anchor.Session;
++    if (!message.Anchor.Cell)
++    {
++        if (talk.Anchor.Session != message.Anchor.Session)
++            return;
++        if (message.Anchor.Choice > previousChoice)
++        {
++            talk.Anchor.Choice = message.Anchor.Choice;
++            talk.Anchor.TopicInfo = message.Anchor.TopicInfo;
++            talk.Anchor.TopicQuest = message.Anchor.TopicQuest;
++        }
++        talk.Closed = true;
++    }
++    else
++    {
++        if (talk.Anchor.Session != message.Anchor.Session || talk.Anchor.TargetForm != message.Anchor.TargetForm ||
++            talk.Anchor.TargetEntity != message.Anchor.TargetEntity)
++            talk = {};
++        talk.Anchor = message.Anchor;
++        talk.Closed = false;
++    }
++    if (message.Anchor.Choice > previousChoice)
++    {
++        talk.ChoiceListeners = talk.Listeners;
++        talk.ChoiceExpires = std::chrono::steady_clock::now() + std::chrono::seconds(8);
++    }
++    // A continuation can reuse the explicit participants once, only on a game-initiated
++    // conversation with the same opponent after the original conversation closed.
++    auto fight = party->Brawls.find(pSpeaker->GetId());
++    const bool followup = message.Anchor.Cell && message.Anchor.GameInitiated && fight != party->Brawls.end() &&
++        fight->second.MayResume && fight->second.Expires > std::chrono::steady_clock::now() && fight->second.Anchor.Session != talk.Anchor.Session &&
++        fight->second.Anchor.TargetForm == talk.Anchor.TargetForm;
++    talk.Expires = std::chrono::steady_clock::now() + std::chrono::seconds(talk.Closed ? 6 : 4);
+     message.Text = acMessage.Packet.Text;
+     message.SpeakerId = pSpeaker->GetId();
+     message.Name = pSpeaker->GetUsername();
+     GameServer::Get()->SendToParty(message, pSpeaker->GetParty(), pSpeaker);
++    if (followup)
++    {
++        for (auto* peer : party->Members)
++        {
++            if (!fight->second.Listeners.count(peer->GetId()) || !peer->GetCharacter())
++                continue;
++            const auto& cell = peer->GetCellComponent();
++            const auto* pos = m_world.try_get<MovementComponent>(*peer->GetCharacter());
++            if (cell.WorldSpaceId != talk.Anchor.WorldSpace || (!cell.WorldSpaceId && cell.Cell != talk.Anchor.Cell) ||
++                !pos || glm::distance(pos->Position, static_cast<const glm::vec3&>(talk.Anchor.Position)) > 300.f)
++                continue;
++            talk.Listeners.insert(peer->GetId());
++            NotifyCoopInteraction joined;
++            joined.Event = {Interaction::Rejoin, pSpeaker->GetId(), talk.Anchor.Session, 0, talk.Anchor.TargetForm};
++            peer->Send(joined);
++        }
++        party->Brawls.erase(fight);
++    }
++    if (opening && talk.Anchor.TargetForm)
++    {
++        NotifyCoopInteraction watch;
++        watch.Event = {Interaction::WatchOutcomes, pSpeaker->GetId(), talk.Anchor.Session, 0, talk.Anchor.TargetForm};
++        pSpeaker->Send(watch);
++    }
+ }
+ 
+ void OverlayService::OnTeleport(const PacketEvent<TeleportRequest>& acMessage) const noexcept
+diff --git a/Code/server/Services/OverlayService.h b/Code/server/Services/OverlayService.h
+index 29783a7..311140f 100644
+--- a/Code/server/Services/OverlayService.h
++++ b/Code/server/Services/OverlayService.h
+@@ -7,6 +7,13 @@
+ 
+ struct World;
+ 
++#include <Messages/NotifyPartyTravel.h>
++#include <chrono>
++#include <map>
++
++struct RequestCoopInteraction;
++struct PartyTravelRequest;
++struct UpdateEvent;
+ struct PlayerDialogueRequest;
+ struct TeleportRequest;
+ struct RequestPlayerHealthUpdate;
+@@ -30,6 +37,21 @@ protected:
+     void OnPlayerHealthUpdate(const PacketEvent<RequestPlayerHealthUpdate>& acMessage) const noexcept;
+ 
+ private:
++    void OnInteraction(const PacketEvent<RequestCoopInteraction>&) noexcept;
++    entt::scoped_connection m_interactionConnection;
++    struct Ride
++    {
++        uint32_t party{}, number{};
++        GameId originWorld{};
++        glm::vec3 origin{};
++        std::chrono::steady_clock::time_point expires{};
++        std::map<uint32_t, bool> passengers; // false: invited, true: accepted
++        NotifyPartyTravel destination{};
++    };
++    std::map<uint32_t, Ride> m_rides;
++    void OnPartyTravel(const PacketEvent<PartyTravelRequest>& request) noexcept;
++    void UpdateRides(const UpdateEvent&) noexcept;
++    entt::scoped_connection m_rideConnection, m_tickRides;
+     World& m_world;
+ 
+     entt::scoped_connection m_chatMessageConnection;
+diff --git a/Code/server/Services/PartyService.cpp b/Code/server/Services/PartyService.cpp
+index 5fc3577..1d1aa63 100644
+--- a/Code/server/Services/PartyService.cpp
++++ b/Code/server/Services/PartyService.cpp
+@@ -356,6 +356,17 @@ void PartyService::RemovePlayerFromParty(Player* apPlayer) noexcept
+         Party& party = m_parties[id];
+         auto& members = party.Members;
+ 
++        const auto departing = apPlayer->GetId();
++        party.Talks.erase(departing);
++        party.Brawls.erase(departing);
++        for (auto& [id, talk] : party.Talks)
++        {
++            talk.Listeners.erase(departing);
++            talk.ChoiceListeners.erase(departing);
++        }
++        for (auto& [id, fight] : party.Brawls)
++            fight.Listeners.erase(departing);
++        std::erase_if(party.Followers, [departing](const auto& row) { return row.second.Owner == departing; });
+         members.erase(std::find(std::begin(members), std::end(members), apPlayer));
+ 
+         if (members.empty())
+diff --git a/Code/server/Services/PartyService.h b/Code/server/Services/PartyService.h
+index 15319de..62487ea 100644
+--- a/Code/server/Services/PartyService.h
++++ b/Code/server/Services/PartyService.h
+@@ -2,6 +2,10 @@
+ 
+ #include <Events/PacketEvent.h>
+ 
++#include <Structs/DialogueAnchor.h>
++#include <chrono>
++#include <map>
++#include <set>
+ struct World;
+ struct UpdateEvent;
+ struct PlayerJoinEvent;
+@@ -31,7 +35,34 @@ struct PartyService
+             bool Started = false;
+         };
+ 
++        struct Conversation
++        {
++            DialogueAnchor Anchor{};
++            std::set<uint32_t> Listeners;
++            std::chrono::steady_clock::time_point Expires{};
++            bool Closed{}, MayResume{};
++            std::chrono::steady_clock::time_point ChoiceExpires{};
++            std::set<uint32_t> ChoiceListeners; // capture who had joined when that actual option was selected
++            bool SharesQuest(const GameId& quest, std::chrono::steady_clock::time_point now) const noexcept
++            {
++                return Anchor.Choice && Anchor.TopicInfo && Anchor.TopicQuest == quest &&
++                    now < ChoiceExpires && !ChoiceListeners.empty();
++            }
++        };
++        struct Follower
++        {
++            GameId Npc{};
++            uint32_t Owner{};
++            std::chrono::steady_clock::time_point Expires{};
++            bool Confirmed{};
++        };
++        std::map<uint32_t, Conversation> Talks;
++        std::map<uint32_t, Conversation> Brawls;
++        std::map<uint64_t, Follower> Followers;
+         Map<GameId, QuestRun> QuestRuns{};
++        uint64_t JournalStream{};
++        uint32_t JournalCommitted{};
++        Vector<String> JournalRows;
+     };
+ 
+     PartyService(World& aWorld, entt::dispatcher& aDispatcher) noexcept;
+diff --git a/Code/server/Services/PartyTravel.cpp b/Code/server/Services/PartyTravel.cpp
+new file mode 100644
+index 0000000..b23bbe2
+--- /dev/null
++++ b/Code/server/Services/PartyTravel.cpp
+@@ -0,0 +1,125 @@
++#include <GameServer.h>
++#include <Services/OverlayService.h>
++#include <Messages/PartyTravelRequest.h>
++#include <Events/UpdateEvent.h>
++#include <Game/Player.h>
++#include <cmath>
++
++namespace
++{
++using Clock = std::chrono::steady_clock;
++bool Within(const glm::vec3& a, const glm::vec3& b, float radius)
++{
++    const auto delta = a - b;
++    return glm::dot(delta, delta) <= radius * radius;
++}
++}
++
++void OverlayService::OnPartyTravel(const PacketEvent<PartyTravelRequest>& event) noexcept
++{
++    auto& sender = *event.pPlayer;
++    const auto& packet = event.Packet;
++    const auto party = sender.GetParty().JoinedPartyId;
++    if (!party || !packet.Trip || !sender.GetCharacter())
++        return;
++
++    if (packet.Action == BoardCarriage)
++    {
++        if (m_rides.count(sender.GetId()))
++            return;
++        const auto* origin = m_world.try_get<MovementComponent>(*sender.GetCharacter());
++        const auto& cell = sender.GetCellComponent();
++        if (!origin || !cell.WorldSpaceId)
++            return;
++        Ride ride;
++        ride.number = packet.Trip;
++        ride.party = *party;
++        ride.origin = origin->Position;
++        ride.originWorld = cell.WorldSpaceId;
++        ride.expires = Clock::now() + std::chrono::minutes(3);
++        NotifyPartyTravel invite;
++        invite.Rider = sender.GetId();
++        invite.Trip = packet.Trip;
++        invite.Name = sender.GetUsername();
++        invite.Kind = InvitePassenger;
++        for (auto* guest : m_world.GetPlayerManager())
++        {
++            if (guest == &sender || guest->GetParty().JoinedPartyId != party || !guest->GetCharacter()
++                || guest->GetCellComponent().WorldSpaceId != cell.WorldSpaceId)
++                continue;
++            auto* movement = m_world.try_get<MovementComponent>(*guest->GetCharacter());
++            if (movement && Within(ride.origin, movement->Position, 1200.f))
++            {
++                ride.passengers.emplace(guest->GetId(), false);
++                guest->Send(invite);
++            }
++        }
++        if (!ride.passengers.empty())
++            m_rides.emplace(sender.GetId(), std::move(ride));
++        return;
++    }
++    auto i = m_rides.find(packet.Rider);
++    if (i == m_rides.end() || i->second.party != *party || i->second.number != packet.Trip || Clock::now() >= i->second.expires)
++        return;
++    auto& ride = i->second;
++    if (sender.GetId() == packet.Rider)
++    {
++        if (packet.Action == CancelCarriage)
++            ride.expires = Clock::now();
++        else if (packet.Action == ArriveByCarriage && !ride.destination.Cell && packet.Cell && packet.World == ride.originWorld
++                 && std::isfinite(packet.Position.x) && std::isfinite(packet.Position.y) && std::isfinite(packet.Position.z)
++                 && !Within(packet.Position, ride.origin, 4096.f))
++        {
++            ride.destination.Kind = TransportPassenger;
++            ride.destination.Rider = packet.Rider;
++            ride.destination.Trip = packet.Trip;
++            ride.destination.Cell = packet.Cell;
++            ride.destination.World = packet.World;
++            ride.destination.Position = packet.Position;
++        }
++    }
++    else if (auto member = ride.passengers.find(sender.GetId()); member != ride.passengers.end())
++    {
++        if (packet.Action == AcceptCarriage)
++            member->second = true;
++        else if (packet.Action == DeclineCarriage)
++            ride.passengers.erase(member);
++    }
++}
++
++void OverlayService::UpdateRides(const UpdateEvent&) noexcept
++{
++    for (auto i = m_rides.begin(); i != m_rides.end(); )
++    {
++        auto& ride = i->second;
++        auto* rider = m_world.GetPlayerManager().GetById(i->first);
++        bool ended = Clock::now() >= ride.expires || !rider || rider->GetParty().JoinedPartyId != ride.party;
++        for (auto member = ride.passengers.begin(); member != ride.passengers.end(); )
++        {
++            auto* guest = m_world.GetPlayerManager().GetById(member->first);
++            if (!guest || guest->GetParty().JoinedPartyId != ride.party || ended)
++            {
++                if (guest)
++                {
++                    NotifyPartyTravel cancel;
++                    cancel.Kind = CancelPassenger;
++                    cancel.Rider = i->first;
++                    cancel.Trip = ride.number;
++                    guest->Send(cancel);
++                }
++            }
++            else if (member->second && ride.destination.Cell)
++                guest->Send(ride.destination);
++            else
++            {
++                ++member;
++                continue;
++            }
++            member = ride.passengers.erase(member);
++        }
++        if (ride.passengers.empty())
++            i = m_rides.erase(i);
++        else
++            ++i;
++    }
++}
+diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJournal.cpp
+new file mode 100644
+index 0000000..c4cd381
+--- /dev/null
++++ b/Code/server/Services/QuestJournal.cpp
+@@ -0,0 +1,96 @@
++#include <GameServer.h>
++#include <World.h>
++#include <Game/Player.h>
++#include <Services/QuestService.h>
++#include <Messages/RequestQuestJournal.h>
++#include <Messages/NotifyQuestJournal.h>
++#include <Messages/NotifyQuestUpdate.h>
++#include <QuestJournalDisk.h>
++#include <sstream>
++#include <iomanip>
++
++namespace
++{
++const std::filesystem::path kJournal{"config/CoopJournal"};
++
++std::string Field(const String& value)
++{
++    std::string out(value.begin(), value.end());
++    for (auto& c : out)
++        if (static_cast<unsigned char>(c) < 32)
++            c = ' ';
++    return out;
++}
++
++void Flush(PartyService::Party& party)
++{
++    if (!party.JournalStream)
++        party.JournalStream = QuestJournalDisk::CreateStream(kJournal);
++    if (!party.JournalStream)
++        return;
++    // Limit recovery work per request after a transient disk failure.
++    for (unsigned n = 0; n < 8 && party.JournalCommitted < party.JournalRows.size(); ++n)
++    {
++        const auto& row = party.JournalRows[party.JournalCommitted];
++        if (!QuestJournalDisk::Store(kJournal, party.JournalStream, party.JournalCommitted + 1, {row.data(), row.size()}))
++        {
++            spdlog::error("Cannot commit co-op journal stream {} record {}", party.JournalStream, party.JournalCommitted + 1);
++            break;
++        }
++        ++party.JournalCommitted;
++    }
++}
++}
++
++void QuestService::RecordQuest(Player* player, const NotifyQuestUpdate& event) noexcept
++{
++    auto* party = m_world.GetPartyService().GetPlayerParty(player);
++    if (!party)
++        return;
++    try
++    {
++        const auto& mods = m_world.ctx().at<ModsComponent>();
++        std::string plugin;
++        for (const auto* list : {&mods.GetStandardMods(), &mods.GetLiteMods()})
++            for (const auto& item : *list)
++                if (item.second.id == event.Id.ModId)
++                    plugin = Field(item.first);
++        const char* phase = event.Status == NotifyQuestUpdate::Started ? "start" :
++            event.Status == NotifyQuestUpdate::Stopped ? "stop" : "stage";
++        std::ostringstream row;
++        row << "quest-v1" << '	' << plugin << '	' << std::hex << event.Id.BaseId << std::dec << '	'
++            << phase << '	' << event.Stage << '	' << player->GetId() << '	' << Field(player->GetUsername());
++        const auto data = row.str();
++        party->JournalRows.emplace_back(data.c_str());
++        Flush(*party);
++    }
++    catch (const std::exception& e) { spdlog::error("Writing co-op quest journal: {}", e.what()); }
++}
++
++void QuestService::OnJournalRequest(const PacketEvent<RequestQuestJournal>& event) noexcept
++{
++    auto* party = m_world.GetPartyService().GetPlayerParty(event.pPlayer);
++    if (!party || party->JournalRows.empty())
++        return;
++    try
++    {
++        Flush(*party);
++        if (!party->JournalStream || !party->JournalCommitted)
++            return;
++        NotifyQuestJournal reply;
++        reply.Stream = party->JournalStream;
++        reply.Total = party->JournalCommitted;
++        if (event.Packet.Stream != reply.Stream)
++        {
++            event.pPlayer->Send(reply); // announce stream identity before the client reads its durable cursor
++            return;
++        }
++        for (uint32_t index = event.Packet.Sequence, n = 0; index < reply.Total && n < 8; ++index, ++n)
++        {
++            reply.Sequence = index + 1;
++            reply.Row = party->JournalRows[index];
++            event.pPlayer->Send(reply);
++        }
++    }
++    catch (const std::exception& e) { spdlog::error("Serving co-op quest journal: {}", e.what()); }
++}
+diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestService.cpp
+index f496759..57e40ae 100644
+--- a/Code/server/Services/QuestService.cpp
++++ b/Code/server/Services/QuestService.cpp
+@@ -5,6 +5,7 @@
+ #include <Services/QuestService.h>
+ 
+ #include <Messages/RequestQuestUpdate.h>
++#include <Messages/RequestQuestJournal.h>
+ #include <Messages/NotifyQuestUpdate.h>
+ 
+ #include <Setting.h>
+@@ -17,6 +18,7 @@ Console::Setting bEnableMiscQuestSync{"Gameplay:bEnableMiscQuestSync", "(Experim
+ QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
+     : m_world(aWorld)
+ {
++    m_journalRequests = aDispatcher.sink<PacketEvent<RequestQuestJournal>>().connect<&QuestService::OnJournalRequest>(this);
+     m_questUpdateConnection = aDispatcher.sink<PacketEvent<RequestQuestUpdate>>().connect<&QuestService::OnQuestChanges>(this);
+ }
+ 
+@@ -37,10 +39,19 @@ void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessa
+     notify.Status = message.Status;
+     notify.ClientQuestType = message.ClientQuestType;
+ 
++    PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
++    const PartyService::Party::Conversation* participants = nullptr;
+     if (notify.ClientQuestType == 0 ||  notify.ClientQuestType == 6) // Types None or Miscellaneous. Hard-coded to avoid client header file.
+     {
+         if (!bEnableMiscQuestSync)
+-            return;
++        {
++            if (!pParty)
++                return;
++            const auto talk = pParty->Talks.find(pPlayer->GetId());
++            if (talk == pParty->Talks.end() || !talk->second.SharesQuest(message.Id, std::chrono::steady_clock::now()))
++                return;
++            participants = &talk->second;
++        }
+         spdlog::debug("{}: syncing type none/misc quest to party, gameId {:X} questStage {} questStatus {} questType {}",
+                      __FUNCTION__, notify.Id.LogFormat(), notify.Stage, notify.Status, notify.ClientQuestType);
+     }
+@@ -91,7 +102,6 @@ void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessa
+     }
+ 
+     const auto& partyComponent = acMessage.pPlayer->GetParty();
+-    PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
+     if (!pParty)
+         return;
+ 
+@@ -124,5 +134,13 @@ void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessa
+         return;
+     }
+ 
+-    GameServer::Get()->SendToParty(notify, partyComponent, acMessage.GetSender());
++    RecordQuest(pPlayer, notify);
++    if (participants)
++    {
++        for (auto* member : pParty->Members)
++            if (participants->ChoiceListeners.count(member->GetId()))
++                member->Send(notify);
++    }
++    else
++        GameServer::Get()->SendToParty(notify, partyComponent, acMessage.GetSender());
+ }
+diff --git a/Code/server/Services/QuestService.h b/Code/server/Services/QuestService.h
+index 1e6a905..d025e44 100644
+--- a/Code/server/Services/QuestService.h
++++ b/Code/server/Services/QuestService.h
+@@ -6,6 +6,9 @@
+ struct World;
+ struct UpdateEvent;
+ struct RequestQuestUpdate;
++struct RequestQuestJournal;
++struct NotifyQuestUpdate;
++struct Player;
+ 
+ /**
+  * @brief Dispatch quest sync messages.
+@@ -18,6 +21,9 @@ public:
+     QuestService(World& aWorld, entt::dispatcher& aDispatcher);
+ 
+ private:
++    void RecordQuest(Player*, const NotifyQuestUpdate&) noexcept;
++    void OnJournalRequest(const PacketEvent<RequestQuestJournal>&) noexcept;
++    entt::scoped_connection m_journalRequests;
+     void OnQuestChanges(const PacketEvent<RequestQuestUpdate>& aChanges) noexcept;
+ 
+     World& m_world;
+diff --git a/Code/skyrim_ui/src/app/components/root/root.component.html b/Code/skyrim_ui/src/app/components/root/root.component.html
+index a2185f2..def6ebf 100644
+--- a/Code/skyrim_ui/src/app/components/root/root.component.html
++++ b/Code/skyrim_ui/src/app/components/root/root.component.html
+@@ -21,6 +21,17 @@
+       }
+     }
+   }
++  @if (carriage$ | async; as ride) {
++    @if (!(menuOpen$ | async)) {
++      <div class="carriage-shade">
++        <section class="carriage-offer" role="dialog" aria-modal="true" aria-labelledby="carriage-question">
++          <p id="carriage-question">{{ ride.name }} отправляется на повозке. Поехать вместе?</p>
++          <button (click)="answerCarriage(ride.rider, ride.trip, true)">Да</button>
++          <button (click)="answerCarriage(ride.rider, ride.trip, false)">Нет</button>
++        </section>
++      </div>
++    }
++  }
+   <app-notification-popup-container
+     class="app-notification-popup"
+   ></app-notification-popup-container>
+diff --git a/Code/skyrim_ui/src/app/components/root/root.component.scss b/Code/skyrim_ui/src/app/components/root/root.component.scss
+index 7660cf0..7b525a9 100644
+--- a/Code/skyrim_ui/src/app/components/root/root.component.scss
++++ b/Code/skyrim_ui/src/app/components/root/root.component.scss
+@@ -224,9 +224,40 @@
+   line-height: 1.3;
+   font-size: clamp(1.5rem, 2.65vh, 2.5rem);
+   overflow-wrap: anywhere;
++  isolation: isolate;
++
++  &::before {
++    content: '';
++    position: absolute;
++    z-index: -1;
++    inset: -.18em -.55em;
++    border-radius: .42em;
++    background: rgba(12, 12, 14, .70);
++    filter: blur(.22em);
++    pointer-events: none;
++  }
+   animation: conversation-reply-fade 5s both;
+ }
+ @keyframes conversation-reply-fade {
+   0%, 76% { opacity: 1; }
+   100% { opacity: 0; }
+ }
++
++.carriage-shade {
++  position: fixed;
++  inset: 0;
++  z-index: 50;
++  display: grid;
++  place-items: center;
++  background: rgba(0, 0, 0, .28);
++  pointer-events: auto;
++}
++.carriage-offer {
++  max-width: 28em;
++  padding: .9em 1.6em 1.25em;
++  text-align: center;
++  background: rgba(16, 17, 19, .94);
++  border: 1px solid rgba(240, 234, 214, .5);
++  color: white;
++  button { margin: 0 .65em; min-width: 3.5em; }
++}
+diff --git a/Code/skyrim_ui/src/app/components/root/root.component.ts b/Code/skyrim_ui/src/app/components/root/root.component.ts
+index f072255..d2b7e30 100644
+--- a/Code/skyrim_ui/src/app/components/root/root.component.ts
++++ b/Code/skyrim_ui/src/app/components/root/root.component.ts
+@@ -44,6 +44,12 @@ export class RootComponent implements OnInit {
+   /* ### ENUMS ### */
+   readonly RootView = View;
+ 
++  readonly carriage$ = this.client.carriageOffer.asObservable();
++  public answerCarriage(rider: number, trip: number, yes: boolean): void {
++    skyrimtogether.answerCarriage(rider, trip, yes ? 1 : 0);
++    this.client.carriageOffer.next(null);
++  }
++
+   view$ = this.uiRepository.view$;
+   readonly conversation$ = this.client.partyConversation.asObservable();
+ 
+@@ -97,7 +103,7 @@ export class RootComponent implements OnInit {
+           state &&
+           !this.uiRepository.isViewOpen()
+         ) {
+-          setTimeout(() => this.chatComp.focus(), 100);
++          setTimeout(() => { if (!this.client.carriageOffer.value) this.chatComp?.focus(); }, 100);
+         }
+         if (!state) {
+           this.closeView();
+diff --git a/Code/skyrim_ui/src/app/mock/skyrimtogether.mock.ts b/Code/skyrim_ui/src/app/mock/skyrimtogether.mock.ts
+index 9a2ec37..ea2f25e 100644
+--- a/Code/skyrim_ui/src/app/mock/skyrimtogether.mock.ts
++++ b/Code/skyrim_ui/src/app/mock/skyrimtogether.mock.ts
+@@ -123,6 +123,8 @@ export class SkyrimtogetherMock extends EventEmitter implements SkyrimTogether {
+     throw new Error('NOT YET IMPLEMENTED');
+   }
+ 
++  answerCarriage(_rider: number, _trip: number, _decision: number): void {}
++
+   teleportToPlayer(playerId: number): void {
+     if (this.connected) {
+       const player = playerStore.query(getEntity(playerId));
+diff --git a/Code/skyrim_ui/src/app/services/client.service.ts b/Code/skyrim_ui/src/app/services/client.service.ts
+index bbe4806..50f682b 100644
+--- a/Code/skyrim_ui/src/app/services/client.service.ts
++++ b/Code/skyrim_ui/src/app/services/client.service.ts
+@@ -36,6 +36,7 @@ export class ClientService implements OnDestroy {
+   public inGameStateChange = new BehaviorSubject(!environment.game);
+ 
+   /** Opening/close menu change. */
++  public carriageOffer = new BehaviorSubject<{rider: number; trip: number; name: string} | null>(null);
+   public openingMenuChange = new BehaviorSubject(false);
+ 
+   /** Connection state change. */
+@@ -135,6 +136,9 @@ export class ClientService implements OnDestroy {
+     skyrimtogether.on('deactivate', this.onDeactivate.bind(this));
+     skyrimtogether.on('enterGame', this.onEnterGame.bind(this));
+     skyrimtogether.on('exitGame', this.onExitGame.bind(this));
++    skyrimtogether.on('offerCarriage', (rider, trip, name) =>
++      this.zone.run(() => this.carriageOffer.next({rider, trip, name})));
++    skyrimtogether.on('hideCarriage', () => this.zone.run(() => this.carriageOffer.next(null)));
+     skyrimtogether.on('openingMenu', this.onOpeningMenu.bind(this));
+     skyrimtogether.on('connect', this.onConnect.bind(this));
+     skyrimtogether.on('disconnect', this.onDisconnect.bind(this));
+@@ -183,6 +187,8 @@ export class ClientService implements OnDestroy {
+     skyrimtogether.off('deactivate');
+     skyrimtogether.off('enterGame');
+     skyrimtogether.off('exitGame');
++    skyrimtogether.off('offerCarriage');
++    skyrimtogether.off('hideCarriage');
+     skyrimtogether.off('openingMenu');
+     skyrimtogether.off('connect');
+     skyrimtogether.off('disconnect');
+diff --git a/Code/skyrim_ui/src/typings.d.ts b/Code/skyrim_ui/src/typings.d.ts
+index 67ccfc0..bcfdc26 100644
+--- a/Code/skyrim_ui/src/typings.d.ts
++++ b/Code/skyrim_ui/src/typings.d.ts
+@@ -103,6 +103,10 @@ declare const skyrimtogether: SkyrimTogether;
+ 
+ /** Global Skyrim: Together object type. */
+ interface SkyrimTogether {
++  on(event: 'offerCarriage', callback: (rider: number, trip: number, name: string) => void): void;
++  on(event: 'hideCarriage', callback: () => void): void;
++  off(event: 'offerCarriage' | 'hideCarriage'): void;
++  answerCarriage(rider: number, trip: number, decision: number): void;
+   on(event: 'partyConversation', callback: (mode: number, x: number, y: number, speaker: string,
+     reply: string, speakerId: number, session: number, choice: number) => void): void;
+   on(event: 'hidePartyConversation', callback: () => void): void;
+diff --git a/Code/tests/encoding.cpp b/Code/tests/encoding.cpp
+index 21c0c9e..9472d45 100644
+--- a/Code/tests/encoding.cpp
++++ b/Code/tests/encoding.cpp
+@@ -720,6 +720,9 @@ TEST_CASE("Party dialogue anchors, replies and closure survive packet serializat
+         REQUIRE(last == 0xA3);
+     };
+     PlayerDialogueRequest request;
++    request.Anchor.GameInitiated = true;
++    request.Anchor.TopicInfo = GameId(17,0x982);
++    request.Anchor.TopicQuest = GameId(17,0x959);
+     request.Anchor.Session = 0x156;
+     request.Anchor.Choice = 3;
+     request.Anchor.TargetEntity = 0; // zero is a valid synchronized entity
+@@ -739,3 +742,37 @@ TEST_CASE("Party dialogue anchors, replies and closure survive packet serializat
+     incoming.Text.clear();
+     check(incoming);
+ }
++
++TEST_CASE("Co-op participation, follower decisions and durable journal stream survive transport", "[coop-gameplay]")
++{
++    const auto check = [](const auto& sent) {
++        Buffer buffer(4096);
++        Buffer::Writer writer(&buffer);
++        sent.SerializeRaw(writer);
++        writer.WriteBits(0x9D, 8);
++        Buffer::Reader reader(&buffer);
++        std::decay_t<decltype(sent)> received;
++        received.DeserializeRaw(reader);
++        REQUIRE(received == sent);
++        uint64_t end{};
++        reader.ReadBits(end, 8);
++        REQUIRE(end == 0x9D);
++    };
++    RequestCoopInteraction request;
++    request.Event = {Interaction::Hire, 0, 175, 4, GameId(13, 0x4982)};
++    check(request);
++    NotifyCoopInteraction reply;
++    reply.Event = request.Event;
++    reply.Event.Kind = Interaction::Granted;
++    check(reply);
++    RequestQuestJournal pull;
++    pull.Stream = 0xfedcba9812345678ULL;
++    pull.Sequence = 9100;
++    check(pull);
++    NotifyQuestJournal record;
++    record.Stream = pull.Stream;
++    record.Sequence = 9101;
++    record.Total = 9200;
++    record.Row = "quest-v1\tExample.esp\t4982\tstage\t20";
++    check(record);
++}
+diff --git a/Code/tp_process/ProcessHandler.cpp b/Code/tp_process/ProcessHandler.cpp
+index 9c67fd1..e938713 100644
+--- a/Code/tp_process/ProcessHandler.cpp
++++ b/Code/tp_process/ProcessHandler.cpp
+@@ -25,6 +25,7 @@ void ProcessHandler::OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<C
+     m_pCoreObject->SetValue("acceptPartyInvite", CefV8Value::CreateFunction("acceptPartyInvite", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);
+     m_pCoreObject->SetValue("kickPartyMember", CefV8Value::CreateFunction("kickPartyMember", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);
+     m_pCoreObject->SetValue("changePartyLeader", CefV8Value::CreateFunction("changePartyLeader", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);
++    m_pCoreObject->SetValue("answerCarriage", CefV8Value::CreateFunction("answerCarriage", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);
+     m_pCoreObject->SetValue("teleportToPlayer", CefV8Value::CreateFunction("teleportToPlayer", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);
+     m_pCoreObject->SetValue("toggleDebugUI", CefV8Value::CreateFunction("toggleDebugUI", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);
+     m_pCoreObject->SetValue("openPlayGuide", CefV8Value::CreateFunction("openPlayGuide", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);

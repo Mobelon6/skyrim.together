@@ -1,0 +1,240 @@
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -252,9 +252,10 @@
+         }
+         const bool hide=(row.Flags&3u)!=0 || row.Items.empty();
+         if (hide && !ref->IsDisabled()) ref->Disable();
+-        // A visitor shell is reusable across different owner instances.
+-        if (copy && !hide && ref->IsDisabled()) ref->Enable();
+-        if ((copy || hide) && ref->IsDisabled()!=hide) return false;
++        // The durable balance, not the loaded personal save, determines
++        // whether this stable stack still exists.
++        if (!hide && ref->IsDisabled()) ref->Enable();
++        if (ref->IsDisabled()!=hide) return false;
+     }
+     return true;
+ }
+@@ -270,55 +271,60 @@
+          std::bit_cast<uint32_t>(ref.position.z),std::bit_cast<uint32_t>(ref.rotation.x),
+          std::bit_cast<uint32_t>(ref.rotation.y),std::bit_cast<uint32_t>(ref.rotation.z)}};
+ }
+-bool ApplyObjectChanges(World& world,TESObjectCELL& cell,const HomeCatalog::Cell& copy,
+-                        const HomeSnapshot::State& state,uint64_t campaign,uint32_t slot)
+-{
+-    const auto view=CampaignAccess::HomeObjectView(campaign,slot);
+-    if (!view) return false;
+-    for (const auto& row:state.Refs)
+-    {
+-        const auto found=view->find(row.Key.Encode());
+-        if (found==view->end() || !found->second.Revision) continue;
+-        const auto binding=std::find_if(copy.Refs.begin(),copy.Refs.end(),
+-            [&](const auto& r){return r.Source.Encode()==row.Key.Encode();});
+-        if (binding==copy.Refs.end()) return false;
+-        if (IsExit(copy,*binding)) continue;
+-        auto* object=Cast<TESObjectREFR>(TESForm::GetById(CatalogForm(binding->Target)));
+-        if (!object || !object->baseForm || object->baseForm->formID!=CatalogForm(binding->TargetBase) ||
+-            object->GetParentCellEx()!=&cell || object->IsDeleted() || Cast<Actor>(object)) return false;
+-        const auto& v=found->second.Value;
+-        const bool disabled=(row.Flags&1u)!=0;
+-        if (object->IsDisabled()!=disabled)
+-        {if (disabled) object->Disable();else object->Enable();}
+-        if (object->IsDisabled()!=disabled) return false;
+-        if (disabled) continue;
+-        auto observed=ObjectPose(*object,v.Open);
+-        if (!observed.Valid()) return false;
+-        if (observed.Significant(v))
+-        {
+-            const auto pos=[&](size_t i){return std::bit_cast<float>(v.Transform[i]);};
+-            object->SetRotation(pos(3),pos(4),pos(5));
+-            object->MoveTo(&cell,glm::vec3{pos(0),pos(1),pos(2)});
+-            if (object->GetParentCellEx()!=&cell) return false;
+-        }
+-        if (row.Type==29 && v.Open)
+-        {
+-            auto& vm=world.ctx().at<PapyrusService>();
+-            const auto* get=vm.Get("ObjectReference","GetOpenState");
+-            const auto* set=vm.Get("ObjectReference","SetOpen");
+-            if (!get || !set) return false;
+-            const auto local=static_cast<uint32_t>(PapyrusFunction<TESObjectREFR::OpenState,TESObjectREFR>(get)(object));
+-            if (local==2 || local==4) continue; // animation in progress
+-            if (local!=1 && local!=3) return false;
+-            if (local!=v.Open)
+-            {
+-                const PapyrusFunction<void,TESObjectREFR,bool> setOpen{set};
+-                setOpen(object,v.Open==1);
+-            }
+-        }
+-    }
+-    return true;
+-}
++enum class RestoreResult { Ready,Pending,Unavailable };
++RestoreResult RestoreObject(World& world,TESObjectCELL& cell,TESObjectREFR& object,
++                            uint32_t type,bool disabled,const HomeObjects::State& wanted)
++{
++    if (!wanted.Valid() || object.IsDeleted() || object.GetParentCellEx()!=&cell) return RestoreResult::Unavailable;
++    if (object.IsDisabled()!=disabled)
++    {if (disabled) object.Disable();else object.Enable();}
++    if (object.IsDisabled()!=disabled) return RestoreResult::Pending;
++    if (disabled) return RestoreResult::Ready;
++    auto expected=wanted;expected.Disabled=0;
++    const auto observed=ObjectPose(object,wanted.Open);
++    if (!observed.Valid()) return RestoreResult::Unavailable;
++    if (observed.Significant(expected))
++    {
++        const auto pos=[&](size_t i){return std::bit_cast<float>(wanted.Transform[i]);};
++        object.SetRotation(pos(3),pos(4),pos(5));
++        object.MoveTo(&cell,glm::vec3{pos(0),pos(1),pos(2)});
++        if (object.GetParentCellEx()!=&cell) return RestoreResult::Unavailable;
++        if (ObjectPose(object,wanted.Open).Significant(expected)) return RestoreResult::Pending;
++    }
++    if (type!=29 || !wanted.Open) return RestoreResult::Ready;
++    auto& vm=world.ctx().at<PapyrusService>();
++    const auto* get=vm.Get("ObjectReference","GetOpenState");
++    const auto* set=vm.Get("ObjectReference","SetOpen");
++    if (!get || !set) return RestoreResult::Unavailable;
++    const auto local=static_cast<uint32_t>(PapyrusFunction<TESObjectREFR::OpenState,TESObjectREFR>(get)(&object));
++    if (local==2 || local==4) return RestoreResult::Pending;
++    if (local!=1 && local!=3) return RestoreResult::Unavailable;
++    if (local==wanted.Open) return RestoreResult::Ready;
++    const PapyrusFunction<void,TESObjectREFR,bool> setOpen{set};
++    setOpen(&object,wanted.Open==1);
++    return RestoreResult::Pending;
++}
++bool ApplyObjectChanges(World& world,TESObjectCELL& cell,const HomeCatalog::Cell& copy,
++                        const HomeSnapshot::State& state,uint64_t campaign,uint32_t slot)
++{
++    const auto view=CampaignAccess::HomeObjectView(campaign,slot);
++    if (!view) return false;
++    for (const auto& row:state.Refs)
++    {
++        const auto found=view->find(row.Key.Encode());
++        if (found==view->end() || !found->second.Revision) continue;
++        const auto binding=std::find_if(copy.Refs.begin(),copy.Refs.end(),
++            [&](const auto& r){return r.Source.Encode()==row.Key.Encode();});
++        if (binding==copy.Refs.end()) return false;
++        if (IsExit(copy,*binding)) continue;
++        auto* object=Cast<TESObjectREFR>(TESForm::GetById(CatalogForm(binding->Target)));
++        if (!object || !object->baseForm || object->baseForm->formID!=CatalogForm(binding->TargetBase) ||
++            object->GetParentCellEx()!=&cell || object->IsDeleted() || Cast<Actor>(object)) return false;
++        if (RestoreObject(world,cell,*object,row.Type,(row.Flags&1u)!=0,found->second.Value)==RestoreResult::Unavailable)
++            return false;
++    }
++    return true;
++}
+ Clock::time_point residentDisplayNext{};
+ void AddVisits(const CampaignAccess::Identity& id,const HomeCatalog::Cell& cell,std::string& labels)
+ {
+@@ -565,7 +571,22 @@
+             object->GetParentCellEx()!=&cell || object->baseForm->formID!=CatalogForm(binding.Base) ||
+             static_cast<uint32_t>(object->baseForm->formType)!=old.Type || Cast<Actor>(object) ||
+             (old.Inventory==3 && object->IsDisabled())) {ctx.Tracks.erase(key);continue;}
+-        uint32_t open=old.Value.Open;
++        auto tracked=ctx.Tracks.find(key);
++        // Restore committed state before admitting a new owner observation.
++        // A spent loose stack is still governed exclusively by ApplyLoose.
++        if (old.Revision && (tracked==ctx.Tracks.end() ||
++            (tracked->second.Revision!=old.Revision &&
++             !(tracked->second.Pending && tracked->second.Revision!=UINT32_MAX &&
++               old.Revision==tracked->second.Revision+1 &&
++               tracked->second.Pending->Encode()==old.Value.Encode()))))
++        {
++            const auto result=RestoreObject(world,cell,*object,old.Type,old.Value.Disabled!=0,old.Value);
++            if (result!=RestoreResult::Ready) {ctx.Tracks.erase(key);continue;}
++            ctx.Tracks.insert_or_assign(key,ObjectTrack{old.Revision,{},{}});
++            // Never publish a value in the same tick that restores it.
++            continue;
++        }
++        uint32_t open=old.Value.Open;
+         if (old.Type==29 && !object->IsDisabled())
+         {
+             auto& vm=world.ctx().at<PapyrusService>();
+@@ -575,20 +596,23 @@
+             if (n!=1 && n!=3) continue;
+             open=n;
+         }
+-        auto state=ObjectPose(*object,open);
+-        if (!HomeObjects::Allowed(old,state)) continue;
+-        auto tracked=ctx.Tracks.find(key);
+-        if (tracked==ctx.Tracks.end())
+-        {
+-            if (old.Revision && (ctx.SaveRevision<old.SaveRevision || state.Significant(old.Value))) continue;
+-            tracked=ctx.Tracks.emplace(key,ObjectTrack{old.Revision,{},{}}).first;
+-        }
++        auto state=ObjectPose(*object,open);
++        if (state.Disabled) state.Transform=old.Value.Transform;
++        if (!HomeObjects::Allowed(old,state)) continue;
++        if (tracked==ctx.Tracks.end())
++            tracked=ctx.Tracks.emplace(key,ObjectTrack{old.Revision,{},{}}).first;
+         auto& t=tracked->second;
+         if (t.Pending && t.Revision!=UINT32_MAX && old.Revision==t.Revision+1 &&
+             old.Value.Encode()==t.Pending->Encode())
+         {t.Revision=old.Revision;t.Pending.reset();}
+-        if (old.Revision!=t.Revision || ctx.SaveRevision<old.SaveRevision)
+-        {ctx.Tracks.erase(tracked);continue;}
++        if (old.Revision!=t.Revision)
++        {ctx.Tracks.erase(tracked);continue;}
++        if (ctx.SaveRevision<old.SaveRevision)
++        {
++            // An older authenticated checkpoint cannot replace newer state.
++            RestoreObject(world,cell,*object,old.Type,old.Value.Disabled!=0,old.Value);
++            continue;
++        }
+         if (now<t.Retry || old.Revision==UINT32_MAX || !state.Significant(old.Value)) continue;
+         HomeObjects::Change c{slot,old.Revision+1,ctx.SaveRevision,key,state};
+         RequestPartyHome req;auto& e=req.Event;
+@@ -1222,16 +1246,16 @@
+             UploadBaseline(world,*cell,*identity,slot,encoded,slots);
+             SyncLocks(*cell,*identity,slot,encoded,nullptr);
+             SyncResidents(world,*cell,*identity,slot,encoded,slots);
+-            SyncObjects(world,*cell,*identity,slot,encoded);
+-            static Clock::time_point looseNext{};
++            static Clock::time_point looseNext{};
+             if (Clock::now()>=looseNext && cell->IsAttached())
+             {
+                 looseNext=Clock::now()+1s;
+                 const auto bytes=CampaignAccess::HomeBaseline(identity->Save.Campaign,slot);
+                 const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
+-                if (state) ApplyLoose(*cell,*state,nullptr);
+-            }
+-            return;
++                if (state) ApplyLoose(*cell,*state,nullptr);
++                SyncObjects(world,*cell,*identity,slot,encoded);
++            }
++            return;
+         }
+         activeHomeRoute.store(quarantine);
+         RequestPartyHome request;
+diff --git a/Code/client/Services/Generic/InventoryService.cpp b/Code/client/Services/Generic/InventoryService.cpp
+--- a/Code/client/Services/Generic/InventoryService.cpp
++++ b/Code/client/Services/Generic/InventoryService.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include <World.h>
+ #include <Services/HomeActorProtection.h>
++#include <Services/HomePlacementClient.h>
+ #include <Systems/OwnershipSystem.h>
+ #include <Games/Skyrim/Interface/UI.h>
+ #include <PlayerCharacter.h>
+@@ -180,9 +181,10 @@
+ 
+         ScopedInventoryOverride _;
+ 
+-        // Do not create free loot from the visitor's display actor.
+-        if (acMessage.Drop && !HomeActorProtection::Resident(pActor))
++        // Journal projections own the world stack. Preserve the inventory
++        // delta even when native drop replication is suppressed.
++        if (acMessage.Drop && !HomeActorProtection::Resident(pActor) && !HomePlacementClient::Scoped(pActor))
+             pActor->DropOrPickUpObject(acMessage.Item, nullptr, nullptr);
+         else
+             pActor->AddOrRemoveItem(acMessage.Item);
+ 
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign21"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign22"

@@ -1,0 +1,348 @@
+diff --git a/Code/common/HomeScope.h b/Code/common/HomeScope.h
+--- a/Code/common/HomeScope.h
++++ b/Code/common/HomeScope.h
+@@ -17,6 +17,13 @@
+ {
+     return (!Private(a.ModId) && !Private(b.ModId)) || a==b;
+ }
++// Reject foreign and quarantined projections before resolving a local NPC.
++template<class Id>
++bool SpawnAllowed(const Id& current,const Id& incoming,bool projection) noexcept
++{
++    if (projection && ((current.ModId&0xFFFF0000u)!=Registered)) return false;
++    return Compatible(current,incoming);
++}
+ template<class Id>
+ bool ReferenceMatches(const Id& reference,const Id& cell,const Id& requested,const Id& requestedCell) noexcept
+ {
+diff --git a/Code/client/Services/Generic/CharacterService.cpp b/Code/client/Services/Generic/CharacterService.cpp
+--- a/Code/client/Services/Generic/CharacterService.cpp
++++ b/Code/client/Services/Generic/CharacterService.cpp
+@@ -49,6 +49,7 @@
+ #include <Messages/NotifyActionEvents.h>
+ #include <Messages/CharacterSpawnRequest.h>
+ #include <Services/HomeInstance.h>
++#include <HomeScope.h>
+ #include <Messages/RequestFactionsChanges.h>
+ #include <Messages/NotifyFactionsChanges.h>
+ #include <Messages/NotifyRemoveCharacter.h>
+@@ -73,6 +74,44 @@
+ #include <World.h>
+ #include <Games/TES.h>
+ 
++namespace
++{
++struct HomeProjectedActor
++{
++    GameId Cell;
++};
++TESObjectCELL* CurrentActorCell() noexcept
++{
++    auto* player=PlayerCharacter::Get();
++    return player?player->GetParentCellEx():nullptr;
++}
++bool AcceptHomeSpawn(World& world,const GameId& incoming) noexcept
++{
++    const auto* cell=CurrentActorCell();
++    if (!cell) return false;
++    const bool projection=HomeInstance::ProjectionForm(cell->formID);
++    GameId current{};
++    if (!world.GetModSystem().GetServerModId(cell->formID,current))
++        return !projection && !HomeInstance::PrivateCell(cell->formID) && !HomeScope::Private(incoming.ModId);
++    return HomeScope::SpawnAllowed(current,incoming,projection);
++}
++bool InHomeProjection() noexcept
++{
++    const auto* cell=CurrentActorCell();
++    return cell && HomeInstance::ProjectionForm(cell->formID);
++}
++// Use a static base supplied by the owner, never the visitor's placed actor.
++// Actor::Create marks the new reference remote and sets its skip-save flag.
++Actor* CreateProjectedActor(World& world,const CharacterSpawnRequest& spawn) noexcept
++{
++    const auto& base=spawn.LeveledNpcPickId!=GameId{}?spawn.LeveledNpcPickId:spawn.BaseId;
++    if (!base || HomeInstance::Tagged(base.ModId)) return nullptr;
++    auto* npc=Cast<TESNPC>(TESForm::GetById(world.GetModSystem().GetGameId(base)));
++    if (!npc || npc->IsTemporary()) return nullptr;
++    return Actor::Create(npc);
++}
++}
++
+ CharacterService::CharacterService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept
+     : m_world(aWorld)
+     , m_dispatcher(aDispatcher)
+@@ -120,7 +159,7 @@
+ 
+ void CharacterService::DeleteRemoteEntityComponents(entt::entity aEntity) const noexcept
+ {
+-    m_world.remove<FaceGenComponent, InterpolationComponent, RemoteAnimationComponent, RemoteComponent, CacheComponent, WaitingFor3D, PlayerComponent>(aEntity);
++    m_world.remove<FaceGenComponent, InterpolationComponent, RemoteAnimationComponent, RemoteComponent, CacheComponent, WaitingFor3D, PlayerComponent, HomeProjectedActor>(aEntity);
+ }
+ 
+ void CharacterService::DeclineOwnership(const uint32_t aServerId, const uint32_t aOwnershipEpoch) const noexcept
+@@ -340,6 +379,13 @@
+ 
+ void CharacterService::OnDisconnected(const DisconnectedEvent& acDisconnectedEvent) const noexcept
+ {
++    Vector<uint32_t> projected;
++    for (auto entity:m_world.view<HomeProjectedActor,RemoteComponent>())
++        projected.push_back(m_world.get<RemoteComponent>(entity).Id);
++    for (auto id:projected)
++    {
++        NotifyRemoveCharacter remove{};remove.ServerId=id;OnRemoveCharacter(remove);
++    }
+     auto remoteView = m_world.view<FormIdComponent, RemoteComponent>();
+     for (auto entity : remoteView)
+     {
+@@ -518,8 +564,10 @@
+ 
+ void CharacterService::OnCharacterSpawn(const CharacterSpawnRequest& acMessage) const noexcept
+ {
+-    // Visiting is read-only. Never move a persistent NPC from the visitor's personal save into a display cell.
+-    if (!acMessage.IsPlayer && HomeInstance::Foreign(acMessage.CellId.ModId)) return;
++    // Legacy home routing remains intact; campaign scopes also match the root.
++    if (!acMessage.IsPlayer && HomeInstance::Foreign(acMessage.CellId.ModId)) return;
++    if (!AcceptHomeSpawn(m_world,acMessage.CellId)) return;
++    const bool projectedNpc=!acMessage.IsPlayer && InHomeProjection();
+     if (acMessage.OwnershipEpoch == 0)
+     {
+         spdlog::warn("Ignored spawn for actor {:X} because the ownership epoch is invalid", acMessage.ServerId);
+@@ -531,6 +579,8 @@
+ 
+     if (remoteItor != std::end(remoteView))
+     {
++        const auto* projected=m_world.try_get<HomeProjectedActor>(*remoteItor);
++        if (projectedNpc != (projected!=nullptr) || (projected && projected->Cell!=acMessage.CellId)) return;
+         auto& remoteComponent = remoteView.get<RemoteComponent>(*remoteItor);
+         if (acMessage.OwnershipEpoch <= remoteComponent.OwnershipEpoch)
+         {
+@@ -571,8 +621,14 @@
+ 
+     std::optional<entt::entity> entity;
+ 
+-    // Custom forms
+-    if (acMessage.FormId == GameId{})
++    // A placed resident in another player's home must be a separate reference.
++    if (projectedNpc && acMessage.FormId!=GameId{})
++    {
++        pActor=CreateProjectedActor(m_world,acMessage);
++        if (!pActor) return;
++        entity=m_world.create();
++    }
++    else if (acMessage.FormId == GameId{})
+     {
+         TESNPC* pNpc = nullptr;
+ 
+@@ -593,7 +649,7 @@
+                 return;
+             }
+ 
+-            pNpc->Deserialize(acMessage.AppearanceBuffer, acMessage.ChangeFlags);
++            if (!projectedNpc) pNpc->Deserialize(acMessage.AppearanceBuffer, acMessage.ChangeFlags);
+         }
+         else
+         {
+@@ -627,6 +683,10 @@
+             return;
+         }
+ 
++        const auto* actorCell=pActor->GetParentCellEx();
++        if ((actorCell && HomeInstance::ProjectionForm(actorCell->formID)) ||
++            (HomeScope::Private(acMessage.CellId.ModId) && actorCell!=CurrentActorCell()) ||
++            (actorCell && HomeInstance::PrivateCell(actorCell->formID) && !HomeInstance::Tagged(acMessage.CellId.ModId))) return;
+         // Moving an uninitialized reference crashes (e.g. null race); discovery will request its assignment once it loads
+         if (pActor->IsStillLoading())
+         {
+@@ -648,6 +708,11 @@
+         spdlog::error("Actor object {:X} could not be created.", acMessage.ServerId);
+         return;
+     }
++    if (projectedNpc)
++    {
++        if (!pActor->IsTemporary()) return;
++        m_world.emplace_or_replace<HomeProjectedActor>(*entity,HomeProjectedActor{acMessage.CellId});
++    }
+ 
+     spdlog::info("CharacterSpawnRequest, server id: {:X}, form id: {:X}, dead: {}", acMessage.ServerId, pActor->formID, acMessage.IsDead);
+ 
+@@ -685,7 +750,7 @@
+     }
+ 
+     // Static references arrive with their own locally rolled leveled pick; conform to the owner's.
+-    if (acMessage.FormId != GameId{})
++    if (!projectedNpc && acMessage.FormId != GameId{})
+         ApplyLeveledNpcPick(pActor, acMessage.LeveledNpcPickId);
+ 
+     m_world.emplace_or_replace<RemoteComponent>(*entity, acMessage.ServerId, pActor->formID, acMessage.OwnershipEpoch);
+@@ -716,6 +781,7 @@
+ 
+     for (const auto& [serverId, movement] : acMessage.Updates)
+     {
++        if (!AcceptHomeSpawn(m_world,movement.CellId)) continue;
+         auto itor = std::find_if(std::begin(view), std::end(view), [serverId = serverId, view](entt::entity entity) { return view.get<RemoteComponent>(entity).Id == serverId; });
+ 
+         if (itor == std::end(view))
+@@ -862,6 +928,11 @@
+     }
+ 
+     const entt::entity cEntity = *entity;
++    if (isLocalOwner && m_world.all_of<HomeProjectedActor>(cEntity))
++    {
++        DeclineOwnership(acMessage.ServerId,acMessage.OwnershipEpoch);
++        return;
++    }
+     const auto* pFormIdComponent = m_world.try_get<FormIdComponent>(cEntity);
+     Actor* pActor = pFormIdComponent ? Cast<Actor>(TESForm::GetById(pFormIdComponent->Id)) : nullptr;
+ 
+@@ -941,7 +1012,7 @@
+ 
+     ApplyFactionSnapshot(cEntity, pActor, acMessage.FactionsContent);
+     ReconcileActorData(cEntity, pActor, acMessage.OwnershipEpoch, acMessage.CurrentActorData, pActor && pActor->GetNiNode(), false);
+-    if (pActor)
++    if (pActor && !m_world.all_of<HomeProjectedActor>(cEntity))
+         ApplyLeveledNpcPick(pActor, acMessage.LeveledNpcPickId);
+ 
+     spdlog::info("Actor {:X} is now owned by player {:X} at epoch {}", acMessage.ServerId, acMessage.OwnerPlayerId, acMessage.OwnershipEpoch);
+@@ -959,6 +1030,16 @@
+         return;
+ 
+     const entt::entity cEntity = *entity;
++    if (m_world.all_of<HomeProjectedActor>(cEntity))
++    {
++        const auto* remote=m_world.try_get<RemoteComponent>(cEntity);
++        const auto clone=remote?remote->CachedRefId:0;
++        // Clear network identity before deletion can deliver ActorRemoved.
++        DeleteRemoteEntityComponents(cEntity);
++        if (clone) CharacterService::DeleteTempActor(clone);
++        if (m_world.valid(cEntity) && m_world.orphan(cEntity)) m_world.destroy(cEntity);
++        return;
++    }
+     const auto* pFormIdComponent = m_world.try_get<FormIdComponent>(cEntity);
+     Actor* pActor = pFormIdComponent ? Cast<Actor>(TESForm::GetById(pFormIdComponent->Id)) : nullptr;
+ 
+@@ -1361,6 +1442,9 @@
+         return;
+     }
+ 
++    if (HomeScope::Private(acMessage.CellId.ModId)) return;
++    if (const auto* cell=pActor->GetParentCellEx();cell &&
++        (HomeInstance::PrivateCell(cell->formID) || HomeInstance::ProjectionForm(cell->formID))) return;
+     MoveActor(pActor, acMessage.WorldSpaceId, acMessage.CellId, acMessage.Position);
+ 
+     spdlog::info("Successfully teleported actor, form id: {:X}, world space: {:X}, cell: {:X}, position: ({}, {}, {})", pActor->formID, acMessage.WorldSpaceId.BaseId, acMessage.CellId.BaseId, acMessage.Position.x, acMessage.Position.y, acMessage.Position.z);
+@@ -1458,7 +1542,9 @@
+     const auto& formIdComponent = m_world.get<FormIdComponent>(aEntity);
+ 
+     auto* pActor = Cast<Actor>(TESForm::GetById(formIdComponent.Id));
+-    if (!pActor)
++    if (!pActor || !pActor->parentCell)
++        return;
++    if (formIdComponent.Id!=0x14 && HomeInstance::ProjectionForm(pActor->parentCell->formID))
+         return;
+ 
+     TESNPC* pNpc = Cast<TESNPC>(pActor->baseForm);
+@@ -1579,6 +1665,13 @@
+     if (pNpc->IsTemporary())
+         pNpc = pNpc->GetTemplateBase();
+ 
++    if (!isPlayer && !isTemporary && HomeScope::Private(message.CellId.ModId))
++    {
++        // Existing FormId field carries the NPC base, while ReferenceId
++        // continues to identify the placed actor on the server.
++        if (pNpc && !pNpc->IsTemporary())
++            m_world.GetModSystem().GetServerModId(pNpc->formID,message.FormId);
++    }
+     if (isTemporary)
+     {
+         if (pNpc && !m_world.GetModSystem().GetServerModId(pNpc->formID, message.FormId))
+@@ -1699,11 +1792,14 @@
+     }
+ 
+     auto& acMessage = pWaitingFor3D->SpawnRequest;
++    const bool projected=m_world.all_of<HomeProjectedActor>(aEntity);
++    if (projected && (!InHomeProjection() || !AcceptHomeSpawn(m_world,acMessage.CellId))) return nullptr;
+ 
+     Actor* pActor = nullptr;
+ 
+-    // Custom forms
+-    if (acMessage.FormId == GameId{})
++    if (projected && acMessage.FormId!=GameId{})
++        pActor=CreateProjectedActor(m_world,acMessage);
++    else if (acMessage.FormId == GameId{})
+     {
+         TESNPC* pNpc = nullptr;
+ 
+@@ -1722,7 +1818,7 @@
+                 return nullptr;
+             }
+ 
+-            pNpc->Deserialize(acMessage.AppearanceBuffer, acMessage.ChangeFlags);
++            if (!projected) pNpc->Deserialize(acMessage.AppearanceBuffer, acMessage.ChangeFlags);
+         }
+         else
+         {
+@@ -2001,6 +2097,16 @@
+ 
+ void CharacterService::RunRemoteUpdates() noexcept
+ {
++    // Lost remove packets and revoked visits cannot leave a network clone
++    // in another instance of the same root CELL.
++    Vector<uint32_t> staleProjected;
++    for (auto entity:m_world.view<HomeProjectedActor,RemoteComponent>())
++        if (!InHomeProjection() || !AcceptHomeSpawn(m_world,m_world.get<HomeProjectedActor>(entity).Cell))
++            staleProjected.push_back(m_world.get<RemoteComponent>(entity).Id);
++    for (auto id:staleProjected)
++    {
++        NotifyRemoveCharacter remove{};remove.ServerId=id;OnRemoveCharacter(remove);
++    }
+     // Each remote actor is played back on its owner's timeline, only as far behind as its snapshots need, see PlaybackClock.
+     // Playback can only rely on snapshots that have been handled, so it runs on the time they were last picked up at.
+     const double cNow = m_transport.GetLastPollTime();
+diff --git a/Code/server/Services/CharacterService.cpp b/Code/server/Services/CharacterService.cpp
+--- a/Code/server/Services/CharacterService.cpp
++++ b/Code/server/Services/CharacterService.cpp
+@@ -1,4 +1,6 @@
+ #include <Services/CharacterService.h>
++#include <Services/CampaignAccess.h>
++#include <HomeRegistry.h>
+ #include <Components.h>
+ #include <GameServer.h>
+ #include <World.h>
+@@ -193,6 +195,13 @@
+     const auto isPlayer = (refId.ModId == 0 && refId.BaseId == 0x14);
+     const auto isCustom = isPlayer || refId.ModId == std::numeric_limits<uint32_t>::max();
+     if (!HomeScope::AdmittedCell(acMessage.pPlayer->GetCellComponent().Cell,message.CellId,message.WorldSpaceId)) return;
++    if (!isPlayer && HomeRegistry::Scoped(message.CellId.ModId))
++    {
++        auto& link=CampaignAccess::Authority();
++        if (link.State()!=CampaignReplication::Link::Mode::Ready ||
++            !HomeRegistry::OwnsCell(link.Journal,CampaignAccess::Character(*acMessage.pPlayer),
++                message.CellId.ModId,message.CellId.BaseId)) return;
++    }
+ 
+     // Check if id is the player
+     if (!isCustom)
+@@ -920,6 +929,14 @@
+         return false;
+     }
+ 
++    const auto& cell=view.get<CellIdComponent>(*it).Cell;
++    if (!view.get<CharacterComponent>(*it).IsPlayer() && HomeRegistry::Scoped(cell.ModId))
++    {
++        // A guest's ephemeral actor is not an authoritative incarnation.
++        auto& link=CampaignAccess::Authority();
++        if (link.State()!=CampaignReplication::Link::Mode::Ready ||
++            !HomeRegistry::OwnsCell(link.Journal,CampaignAccess::Character(*apPlayer),cell.ModId,cell.BaseId)) return false;
++    }
+     auto& ownerComponent = view.get<OwnerComponent>(*it);
+     Player* const pOldOwner = ownerComponent.GetOwner();
+     if (pOldOwner == apPlayer)
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign14"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign15"

@@ -1,0 +1,559 @@
+diff --git a/Code/common/HomeSnapshot.h b/Code/common/HomeSnapshot.h
+--- a/Code/common/HomeSnapshot.h
++++ b/Code/common/HomeSnapshot.h
+@@ -33,108 +33,152 @@
+     uint32_t Count{};
+     std::string Variant;
+ };
+-struct Ref
+-{
+-    TradeProperties::FormKey Key,Base;
+-    uint32_t Type{},Flags{},Scale{},Inventory{},LockState{},LockLevel{};
+-    std::array<uint32_t,6> Transform{};
+-    std::vector<Item> Items;
+-};
+-struct State
+-{
+-    uint32_t Omitted{};
+-    std::vector<Ref> Refs;
+-    std::set<std::string> ResidentKeys;
+-    bool Valid() const
+-    {
+-        if (Refs.empty() || Refs.size()>16384 || ResidentKeys.size()>128) return false;
+-        for (const auto& key:ResidentKeys)
+-        {
+-            const auto form=TradeProperties::DecodeForm(key);
+-            if (!form || !form->Valid() || form->Encode()!=key || form->Plugin=="skyrimcoophomeinstances.esp") return false;
+-        }
+-        std::string prior;
+-        for (const auto& r:Refs)
+-        {
+-            if (!r.Key.Valid() || !r.Base.Valid() || r.Type>=0x87 ||
+-                r.Flags>3 || r.Scale>65535 || r.Inventory>3 || r.LockState>2 || r.LockLevel>255 ||
+-                (!r.LockState && r.LockLevel) ||
+-                (r.Type!=28 && r.Inventory!=0 && r.Inventory!=3) || (r.Type==28 && (r.Inventory==0 || r.Inventory==3)) ||
+-                (r.Inventory!=1 && r.Inventory!=3 && !r.Items.empty())) return false;
+-            if (r.Inventory==3 && (!LooseType(r.Type) || r.LockState ||
+-                ((r.Flags&3u)?!r.Items.empty():r.Items.size()!=1) ||
+-                (!r.Items.empty() && (r.Items.front().Base.Encode()!=r.Base.Encode() ||
+-                                      r.Items.front().Count>9999)))) return false;
+-            for (auto v:r.Transform) if (!std::isfinite(std::bit_cast<float>(v))) return false;
+-            const auto key=r.Key.Encode();
+-            if (ResidentKeys.count(key)) return false;
+-            if (!prior.empty() && key<=prior) return false;
+-            prior=key;
+-            std::pair<std::string,std::string> last;
+-            bool first=true;
+-            std::map<std::string,uint64_t> totals;
+-            for (const auto& item:r.Items)
+-            {
+-                if (!item.Base.Valid() || !item.Count || item.Count>INT32_MAX ||
+-                    !TradeProperties::Decode(item.Variant)) return false;
+-                const auto encoded=item.Base.Encode();
+-                auto order=std::pair{encoded,item.Variant};
+-                if (!first && order<=last) return false;
+-                first=false;last=std::move(order);
+-                if ((totals[encoded]+=item.Count)>INT32_MAX) return false;
+-            }
+-        }
+-        return true;
+-    }
+-    std::string Encode() const
+-    {
+-        bool loose=false;
+-        for (const auto& ref:Refs) if (ref.Inventory==3) {loose=true;break;}
+-        std::string out=std::string(loose?"static-v3 ":ResidentKeys.empty()?"static-v1 ":"static-v2 ")+std::to_string(Omitted)+"\n";
+-        for (const auto& key:ResidentKeys) out+="A "+key+"\n";
+-        for (const auto& r:Refs)
+-        {
+-            out+="R "+r.Key.Encode()+" "+r.Base.Encode()+" "+std::to_string(r.Type)+" "+
+-                std::to_string(r.Flags)+" "+std::to_string(r.Scale)+" "+std::to_string(r.Inventory)+" "+
+-                std::to_string(r.LockState)+" "+std::to_string(r.LockLevel);
+-            for (auto v:r.Transform) out+=" "+std::to_string(v);
+-            out+="\n";
+-            for (const auto& item:r.Items)
+-                out+="I "+item.Base.Encode()+" "+std::to_string(item.Count)+" "+
+-                    (item.Variant.empty()?"-":item.Variant)+"\n";
+-        }
+-        return out;
+-    }
+-};
+-inline std::optional<State> Decode(std::string_view bytes)
+-{
+-    if (bytes.empty() || bytes.size()>MaxBytes || bytes.back()!='\n') return {};
+-    State s;
+-    std::istringstream input{std::string(bytes)};
+-    std::string line,tag,key,base,variant,extra;
+-    if (!std::getline(input,line)) return {};
+-    std::istringstream header(line);
+-    if (!(header>>tag>>s.Omitted) || (tag!="static-v1" && tag!="static-v2" && tag!="static-v3") || header>>extra) return {};
+-    const bool withResidents=tag!="static-v1";
+-    while (std::getline(input,line))
+-    {
+-        std::istringstream row(line);
+-        if (!(row>>tag)) return {};
+-        if (tag=="A")
+-        {
+-            if (!withResidents || !s.Refs.empty() || !(row>>key) || row>>extra ||
+-                s.ResidentKeys.size()>=128 || !s.ResidentKeys.insert(key).second) return {};
+-        }
+-        else if (tag=="R")
+-        {
+-            Ref r;
+-            if (!(row>>key>>base>>r.Type>>r.Flags>>r.Scale>>r.Inventory>>r.LockState>>r.LockLevel)) return {};
+-            for (auto& v:r.Transform) if (!(row>>v)) return {};
+-            auto k=TradeProperties::DecodeForm(key),b=TradeProperties::DecodeForm(base);
+-            if (!k || !b || row>>extra || s.Refs.size()>=16384) return {};
+-            r.Key=*k;r.Base=*b;s.Refs.push_back(std::move(r));
+-        }
+-        else if (tag=="I" && !s.Refs.empty())
++// The source locator is scoped to the owner save, never a network FormID.
++struct LegacyStack
++{
++    uint32_t Source{};
++    Item Value;
++    std::array<uint32_t,6> Transform{};
++    bool Valid() const
++    {
++        if ((Source>>24)!=0xFF || !(Source&0xFFFFFFu) || !Value.Base.Valid() ||
++            !Value.Count || Value.Count>9999 || !TradeProperties::Decode(Value.Variant)) return false;
++        for (size_t i=0;i<Transform.size();++i)
++        {
++            const auto n=std::bit_cast<float>(Transform[i]);
++            if (!std::isfinite(n) || std::abs(n)>(i<3?10000000.f:1000.f)) return false;
++        }
++        return true;
++    }
++};
++struct Ref
++{
++    TradeProperties::FormKey Key,Base;
++    uint32_t Type{},Flags{},Scale{},Inventory{},LockState{},LockLevel{};
++    std::array<uint32_t,6> Transform{};
++    std::vector<Item> Items;
++};
++struct State
++{
++    uint32_t Omitted{};
++    std::vector<Ref> Refs;
++    std::set<std::string> ResidentKeys;
++    std::vector<LegacyStack> Legacy;
++    bool Valid() const
++    {
++        if (Refs.empty() || Refs.size()>16384 || ResidentKeys.size()>128 || Legacy.size()>2048) return false;
++        uint32_t priorSource{};
++        for (const auto& item:Legacy)
++        {
++            if (!item.Valid() || item.Source<=priorSource) return false;
++            priorSource=item.Source;
++        }
++        for (const auto& key:ResidentKeys)
++        {
++            const auto form=TradeProperties::DecodeForm(key);
++            if (!form || !form->Valid() || form->Encode()!=key || form->Plugin=="skyrimcoophomeinstances.esp") return false;
++        }
++        std::string prior;
++        for (const auto& r:Refs)
++        {
++            if (!r.Key.Valid() || !r.Base.Valid() || r.Type>=0x87 ||
++                r.Flags>3 || r.Scale>65535 || r.Inventory>3 || r.LockState>2 || r.LockLevel>255 ||
++                (!r.LockState && r.LockLevel) ||
++                (r.Type!=28 && r.Inventory!=0 && r.Inventory!=3) || (r.Type==28 && (r.Inventory==0 || r.Inventory==3)) ||
++                (r.Inventory!=1 && r.Inventory!=3 && !r.Items.empty())) return false;
++            if (r.Inventory==3 && (!LooseType(r.Type) || r.LockState ||
++                ((r.Flags&3u)?!r.Items.empty():r.Items.size()!=1) ||
++                (!r.Items.empty() && (r.Items.front().Base.Encode()!=r.Base.Encode() ||
++                                      r.Items.front().Count>9999)))) return false;
++            for (auto v:r.Transform) if (!std::isfinite(std::bit_cast<float>(v))) return false;
++            const auto key=r.Key.Encode();
++            if (ResidentKeys.count(key)) return false;
++            if (!prior.empty() && key<=prior) return false;
++            prior=key;
++            std::pair<std::string,std::string> last;
++            bool first=true;
++            std::map<std::string,uint64_t> totals;
++            for (const auto& item:r.Items)
++            {
++                if (!item.Base.Valid() || !item.Count || item.Count>INT32_MAX ||
++                    !TradeProperties::Decode(item.Variant)) return false;
++                const auto encoded=item.Base.Encode();
++                auto order=std::pair{encoded,item.Variant};
++                if (!first && order<=last) return false;
++                first=false;last=std::move(order);
++                if ((totals[encoded]+=item.Count)>INT32_MAX) return false;
++            }
++        }
++        return true;
++    }
++    std::string Encode() const
++    {
++        bool loose=false;
++        for (const auto& ref:Refs) if (ref.Inventory==3) {loose=true;break;}
++        std::string out=std::string(!Legacy.empty()?"static-v4 ":loose?"static-v3 ":ResidentKeys.empty()?"static-v1 ":"static-v2 ")+std::to_string(Omitted)+"\n";
++        for (const auto& key:ResidentKeys) out+="A "+key+"\n";
++        for (const auto& r:Refs)
++        {
++            out+="R "+r.Key.Encode()+" "+r.Base.Encode()+" "+std::to_string(r.Type)+" "+
++                std::to_string(r.Flags)+" "+std::to_string(r.Scale)+" "+std::to_string(r.Inventory)+" "+
++                std::to_string(r.LockState)+" "+std::to_string(r.LockLevel);
++            for (auto v:r.Transform) out+=" "+std::to_string(v);
++            out+="\n";
++            for (const auto& item:r.Items)
++                out+="I "+item.Base.Encode()+" "+std::to_string(item.Count)+" "+
++                    (item.Variant.empty()?"-":item.Variant)+"\n";
++        }
++        for (const auto& d:Legacy)
++        {
++            out+="D "+std::to_string(d.Source)+" "+d.Value.Base.Encode()+" "+std::to_string(d.Value.Count)+" "+
++                (d.Value.Variant.empty()?"-":d.Value.Variant);
++            for (auto n:d.Transform) out+=" "+std::to_string(n);
++            out+="\n";
++        }
++        return out;
++    }
++};
++inline std::optional<State> Decode(std::string_view bytes)
++{
++    if (bytes.empty() || bytes.size()>MaxBytes || bytes.back()!='\n') return {};
++    State s;
++    std::istringstream input{std::string(bytes)};
++    std::string line,tag,key,base,variant,extra;
++    if (!std::getline(input,line)) return {};
++    std::istringstream header(line);
++    if (!(header>>tag>>s.Omitted) || (tag!="static-v1" && tag!="static-v2" && tag!="static-v3" && tag!="static-v4") || header>>extra) return {};
++    const bool withResidents=tag!="static-v1";
++    const bool withLegacy=tag=="static-v4";
++    while (std::getline(input,line))
++    {
++        std::istringstream row(line);
++        if (!(row>>tag)) return {};
++        if (tag=="A")
++        {
++            if (!withResidents || !s.Refs.empty() || !(row>>key) || row>>extra ||
++                s.ResidentKeys.size()>=128 || !s.ResidentKeys.insert(key).second) return {};
++        }
++        else if (tag=="R")
++        {
++            Ref r;
++            if (!(row>>key>>base>>r.Type>>r.Flags>>r.Scale>>r.Inventory>>r.LockState>>r.LockLevel)) return {};
++            for (auto& v:r.Transform) if (!(row>>v)) return {};
++            auto k=TradeProperties::DecodeForm(key),b=TradeProperties::DecodeForm(base);
++            if (!k || !b || row>>extra || s.Refs.size()>=16384) return {};
++            r.Key=*k;r.Base=*b;s.Refs.push_back(std::move(r));
++        }
++        else if (tag=="D" && withLegacy)
++        {
++            LegacyStack d;
++            if (!(row>>d.Source>>base>>d.Value.Count>>variant) || s.Legacy.size()>=2048) return {};
++            for (auto& n:d.Transform) if (!(row>>n)) return {};
++            auto b=TradeProperties::DecodeForm(base);
++            if (!b || row>>extra) return {};
++            d.Value.Base=*b;d.Value.Variant=variant=="-"?"":variant;
++            if (!d.Valid()) return {};
++            s.Legacy.push_back(std::move(d));
++        }
++        else if (tag=="I" && !s.Refs.empty() && s.Legacy.empty())
+         {
+             Item item;
+             if (!(row>>base>>item.Count>>variant) || row>>extra) return {};
+diff --git a/Code/common/HomePlacement.h b/Code/common/HomePlacement.h
+--- a/Code/common/HomePlacement.h
++++ b/Code/common/HomePlacement.h
+@@ -51,33 +51,45 @@
+     uint64_t Creator{};
+     uint32_t Receipt{};
+     Pose Initial{};
+-    std::string Encode() const
+-    {
+-        return "home/"+std::to_string(Slot)+"/drop/"+std::to_string(Creator)+"/"+
+-            std::to_string(Receipt)+"/"+EncodePose(Initial);
+-    }
+-};
+-inline std::optional<Key> Decode(std::string_view s)
+-{
+-    if (!s.starts_with("home/") || s.size()>180) return {};
+-    const auto original=s;
+-    s.remove_prefix(5);
+-    auto sep=s.find('/');
+-    Key k;
+-    if (sep==std::string_view::npos || !TradeProperties::Number(s.substr(0,sep),k.Slot) ||
+-        !k.Slot || k.Slot>HomeRegistry::MaxSlot) return {};
+-    s.remove_prefix(sep+1);
+-    if (!s.starts_with("drop/")) return {};
+-    s.remove_prefix(5);
+-    sep=s.find('/');
+-    if (sep==std::string_view::npos) return {};
+-    const auto owner=s.substr(0,sep);
+-    const auto parsed=std::from_chars(owner.data(),owner.data()+owner.size(),k.Creator);
+-    if (!k.Creator || parsed.ec!=std::errc{} || parsed.ptr!=owner.data()+owner.size()) return {};
+-    s.remove_prefix(sep+1);
+-    sep=s.find('/');
+-    if (sep==std::string_view::npos || !TradeProperties::Number(s.substr(0,sep),k.Receipt) ||
+-        !k.Receipt || k.Receipt>0xFFFFFE) return {};
++    uint32_t LegacySource{};
++    std::string Encode() const
++    {
++        return "home/"+std::to_string(Slot)+(LegacySource?"/legacy/":"/drop/")+std::to_string(Creator)+"/"+
++            std::to_string(LegacySource?LegacySource:Receipt)+"/"+EncodePose(Initial);
++    }
++};
++inline std::optional<Key> Decode(std::string_view s)
++{
++    if (!s.starts_with("home/") || s.size()>180) return {};
++    const auto original=s;
++    s.remove_prefix(5);
++    auto sep=s.find('/');
++    Key k;
++    if (sep==std::string_view::npos || !TradeProperties::Number(s.substr(0,sep),k.Slot) ||
++        !k.Slot || k.Slot>HomeRegistry::MaxSlot) return {};
++    s.remove_prefix(sep+1);
++    const bool legacy=s.starts_with("legacy/");
++    if (!legacy && !s.starts_with("drop/")) return {};
++    s.remove_prefix(legacy?7:5);
++    sep=s.find('/');
++    if (sep==std::string_view::npos) return {};
++    const auto owner=s.substr(0,sep);
++    const auto parsed=std::from_chars(owner.data(),owner.data()+owner.size(),k.Creator);
++    if (!k.Creator || parsed.ec!=std::errc{} || parsed.ptr!=owner.data()+owner.size()) return {};
++    s.remove_prefix(sep+1);
++    sep=s.find('/');
++    uint32_t token{};
++    if (sep==std::string_view::npos || !TradeProperties::Number(s.substr(0,sep),token)) return {};
++    if (legacy)
++    {
++        if ((token>>24)!=0xFF || !(token&0xFFFFFFu)) return {};
++        k.LegacySource=token;
++    }
++    else
++    {
++        if (!token || token>0xFFFFFE) return {};
++        k.Receipt=token;
++    }
+     auto pose=DecodePose(s.substr(sep+1));
+     if (!pose) return {};
+     k.Initial=*pose;
+diff --git a/Code/common/TradeLedger.h b/Code/common/TradeLedger.h
+--- a/Code/common/TradeLedger.h
++++ b/Code/common/TradeLedger.h
+@@ -33,7 +33,24 @@
+     uint64_t Stream()
+     {
+         if (authority && !authority->Ready()) throw std::runtime_error("campaign trade authority unavailable");
+-        if (stream) return stream;
++        if (stream)
++        {
++            // The server ledger outlives publication of new home baselines.
++            // Import only newly committed baselines, without replaying existing receipts.
++            if (authority)
++            {
++                const auto& ops=authority->Operations();
++                if (legacyScanned>ops.size()) throw std::runtime_error("campaign journal truncated");
++                while (legacyScanned<ops.size())
++                {
++                    const auto& op=ops[legacyScanned];
++                    if (op.Kind=="home-static-v1" && !LoadLegacy(op.Id))
++                        throw std::runtime_error("invalid new legacy placement baseline");
++                    ++legacyScanned;
++                }
++            }
++            return stream;
++        }
+         if (authority)
+         {
+             if (!campaignId) throw std::runtime_error("invalid campaign trade stream");
+@@ -47,6 +64,10 @@
+                     if (op.Id!="trade-"+std::to_string(last+1)) throw std::runtime_error("invalid campaign trade sequence");
+                     Replay(op.Payload,position); ++last;
+                 }
++                else if (op.Kind=="home-static-v1")
++                {
++                    if (!LoadLegacy(op.Id)) throw std::runtime_error("invalid legacy placement baseline");
++                }
+                 else if (op.Kind=="home-placement-pose-v1")
+                 {
+                     const auto move=HomePlacement::DecodeMove(op.Payload);
+@@ -54,6 +75,7 @@
+                         throw std::runtime_error("invalid placement pose");
+                 }
+             }
++            legacyScanned=authority->Operations().size();
+             stream=campaignId; return stream;
+         }
+         uint64_t id{};
+@@ -296,6 +318,29 @@
+             if (ops[i].Id==marker && ops[i].Kind=="home-static-v1") return true;
+         return false;
+     }
++    bool LoadLegacy(const std::string& marker)
++    {
++        constexpr std::string_view prefix="home-static-";
++        uint32_t slot{};
++        if (!marker.starts_with(prefix) ||
++            !TradeProperties::Number(std::string_view(marker).substr(prefix.size()),slot) ||
++            HomeSnapshot::Marker(slot)!=marker) return false;
++        const auto home=HomeRegistry::BySlot(*authority,slot);
++        const auto baseline=HomeSnapshot::Read(*authority,slot);
++        const auto state=baseline.State==HomeSnapshot::Status::Ready?HomeSnapshot::Decode(baseline.Bytes):std::nullopt;
++        if (!home || !state) return false;
++        for (const auto& d:state->Legacy)
++        {
++            HomePlacement::Key key{slot,home->Owner,0,d.Transform,d.Source};
++            const auto account=key.Encode();
++            if (!HomePlacement::Decode(account) || placements.count(account) || homeStock.count(account)) return false;
++            Items items;
++            items.emplace(ItemKey{d.Value.Base.Plugin,d.Value.Base.Local,d.Value.Variant},d.Value.Count);
++            homeStock.emplace(account,std::move(items));
++            placements.emplace(account,HomePlacement::Stack{key,d.Value,d.Transform,0});
++        }
++        return true;
++    }
+     bool ApplyPlacementMove(const HomePlacement::Move& m)
+     {
+         const auto it=placements.find(m.Account);
+@@ -348,7 +393,7 @@
+             {
+                 // Only the creator's next backpack receipt may create this ID.
+                 // Neither an old save nor an ACK retry can create a second stack.
+-                if (placed->Creator!=character || placed->Receipt!=accounts[r.user].size()+1 ||
++                if (placed->LegacySource || placed->Creator!=character || placed->Receipt!=accounts[r.user].size()+1 ||
+                     placements.count(r.peer) || !BaselinePublished(placed->Slot,beforePosition)) return false;
+                 const auto baseline=HomeSnapshot::Read(*authority,placed->Slot);
+                 if (baseline.State!=HomeSnapshot::Status::Ready || !HomeSnapshot::Decode(baseline.Bytes)) return false;
+@@ -511,4 +556,5 @@
+     std::map<std::string,Items> homeStock;
+     std::set<std::string> looseAccounts;
+     std::map<std::string,HomePlacement::Stack> placements;
++    size_t legacyScanned{};
+ };
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -643,57 +643,68 @@
+     {
+         auto* ref=cell.refData.refArray[i].Get();
+         if (!ref) continue;
+-        if (ref->formID==0x14 || NativeTrade::IsProxy(ref)) continue;
+-        if (catalog && Cast<Actor>(ref) && !ref->IsTemporary())
+-        {
+-            const auto key=InventoryEvidence::Resolve(ref->formID,slots);
+-            if (key)
+-            {
+-                const auto encoded=TradeProperties::FormKey{key->Plugin,key->Local}.Encode();
+-                const auto known=catalog->ResidentBases.find(encoded);
+-                if (known!=catalog->ResidentBases.end())
+-                {
+-                    const auto observed=ObserveResident(encoded,cell,slots);
+-                    if (!observed || observed->Base.Encode()!=known->second.Encode()) return {};
+-                    state.ResidentKeys.insert(encoded);
+-                    continue;
+-                }
+-            }
+-        }
+-        if (!ref->baseForm || ref->IsTemporary() || ref->baseForm->IsTemporary() ||
+-            Cast<Actor>(ref) ||
+-            ref->GetParentCellEx()!=&cell)
+-        {++state.Omitted;continue;}
+-        auto key=InventoryEvidence::Resolve(ref->formID,slots);
+-        auto base=InventoryEvidence::Resolve(ref->baseForm->formID,slots);
+-        if (!key || !base) {++state.Omitted;continue;}
+-        HomeSnapshot::Ref row;
+-        row.Key={key->Plugin,key->Local};row.Base={base->Plugin,base->Local};
+-        row.Type=static_cast<uint32_t>(ref->baseForm->formType);
+-        row.Flags=(ref->IsDisabled()?1u:0u)|(ref->IsDeleted()?2u:0u);
+-        row.Scale=ref->scale;
+-        if (auto* lock=ref->GetLock())
+-        {row.LockState=lock->IsLocked()?2u:1u;row.LockLevel=static_cast<uint8_t>(lock->lockLevel);}
+-        row.Transform={std::bit_cast<uint32_t>(ref->position.x),std::bit_cast<uint32_t>(ref->position.y),
+-            std::bit_cast<uint32_t>(ref->position.z),std::bit_cast<uint32_t>(ref->rotation.x),
+-            std::bit_cast<uint32_t>(ref->rotation.y),std::bit_cast<uint32_t>(ref->rotation.z)};
+-        if (ref->baseForm->formType==FormType::Container)
+-        {
+-            auto items=HomeInventory::Capture(*ref);
+-            row.Inventory=items?1:2;
+-            if (items) row.Items=std::move(*items);
+-        }
+-        else if (HomeSnapshot::LooseType(row.Type))
+-        {
+-            auto items=HomeInventory::CaptureLoose(*ref);
+-            if (items) {row.Inventory=3;row.Items=std::move(*items);}
+-            else ++state.Omitted;
+-        }
+-        state.Refs.push_back(std::move(row));
+-        if (state.Refs.size()>16384) return {};
+-    }
+-    if (catalog && state.ResidentKeys.size()!=catalog->ResidentBases.size()) return {};
+-    std::sort(state.Refs.begin(),state.Refs.end(),[](const auto& a,const auto& b){return a.Key.Encode()<b.Key.Encode();});
++        if (ref->formID==0x14 || NativeTrade::IsProxy(ref) || HomePlacementClient::Tracked(ref)) continue;
++        if (ref->IsTemporary() && !Cast<Actor>(ref) && ref->GetParentCellEx()==&cell)
++        {
++            if (ref->IsDeleted() || ref->IsDisabled()) continue;
++            if (auto item=HomePlacementClient::CaptureLegacy(*ref))
++            {
++                state.Legacy.push_back(std::move(*item));
++                if (state.Legacy.size()>2048) return {};
++                continue;
++            }
++        }
++        if (catalog && Cast<Actor>(ref) && !ref->IsTemporary())
++        {
++            const auto key=InventoryEvidence::Resolve(ref->formID,slots);
++            if (key)
++            {
++                const auto encoded=TradeProperties::FormKey{key->Plugin,key->Local}.Encode();
++                const auto known=catalog->ResidentBases.find(encoded);
++                if (known!=catalog->ResidentBases.end())
++                {
++                    const auto observed=ObserveResident(encoded,cell,slots);
++                    if (!observed || observed->Base.Encode()!=known->second.Encode()) return {};
++                    state.ResidentKeys.insert(encoded);
++                    continue;
++                }
++            }
++        }
++        if (!ref->baseForm || ref->IsTemporary() || ref->baseForm->IsTemporary() ||
++            Cast<Actor>(ref) ||
++            ref->GetParentCellEx()!=&cell)
++        {++state.Omitted;continue;}
++        auto key=InventoryEvidence::Resolve(ref->formID,slots);
++        auto base=InventoryEvidence::Resolve(ref->baseForm->formID,slots);
++        if (!key || !base) {++state.Omitted;continue;}
++        HomeSnapshot::Ref row;
++        row.Key={key->Plugin,key->Local};row.Base={base->Plugin,base->Local};
++        row.Type=static_cast<uint32_t>(ref->baseForm->formType);
++        row.Flags=(ref->IsDisabled()?1u:0u)|(ref->IsDeleted()?2u:0u);
++        row.Scale=ref->scale;
++        if (auto* lock=ref->GetLock())
++        {row.LockState=lock->IsLocked()?2u:1u;row.LockLevel=static_cast<uint8_t>(lock->lockLevel);}
++        row.Transform={std::bit_cast<uint32_t>(ref->position.x),std::bit_cast<uint32_t>(ref->position.y),
++            std::bit_cast<uint32_t>(ref->position.z),std::bit_cast<uint32_t>(ref->rotation.x),
++            std::bit_cast<uint32_t>(ref->rotation.y),std::bit_cast<uint32_t>(ref->rotation.z)};
++        if (ref->baseForm->formType==FormType::Container)
++        {
++            auto items=HomeInventory::Capture(*ref);
++            row.Inventory=items?1:2;
++            if (items) row.Items=std::move(*items);
++        }
++        else if (HomeSnapshot::LooseType(row.Type))
++        {
++            auto items=HomeInventory::CaptureLoose(*ref);
++            if (items) {row.Inventory=3;row.Items=std::move(*items);}
++            else ++state.Omitted;
++        }
++        state.Refs.push_back(std::move(row));
++        if (state.Refs.size()>16384) return {};
++    }
++    if (catalog && state.ResidentKeys.size()!=catalog->ResidentBases.size()) return {};
++    std::sort(state.Refs.begin(),state.Refs.end(),[](const auto& a,const auto& b){return a.Key.Encode()<b.Key.Encode();});
++    std::sort(state.Legacy.begin(),state.Legacy.end(),[](const auto& a,const auto& b){return a.Source<b.Source;});
+     if (!state.Valid()) return {};
+     auto bytes=state.Encode();
+     if (bytes.size()>HomeSnapshot::MaxBytes) return {};
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign22"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign23"

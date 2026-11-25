@@ -1,0 +1,455 @@
+diff --git a/Code/common/HomePlacement.h b/Code/common/HomePlacement.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/HomePlacement.h
+@@ -0,0 +1,109 @@
++#pragma once
++#include "HomeSnapshot.h"
++#include <array>
++#include <charconv>
++#include <cmath>
++#include <bit>
++#include <sstream>
++
++namespace HomePlacement
++{
++// A placed stack has a receipt-derived identity, not a runtime FF form ID.
++// Its creation pose is immutable; later poses are separate CAS observations.
++using Pose=std::array<uint32_t,6>;
++inline bool Valid(const Pose& p)
++{
++    for (size_t i=0;i<p.size();++i)
++    {
++        const auto f=std::bit_cast<float>(p[i]);
++        if (!std::isfinite(f) || std::abs(f)>(i<3?10000000.f:1000.f)) return false;
++    }
++    return true;
++}
++inline bool Different(const Pose& a,const Pose& b)
++{
++    for (size_t i=0;i<a.size();++i)
++        if (std::abs(std::bit_cast<float>(a[i])-std::bit_cast<float>(b[i]))>(i<3?2.f:0.03f)) return true;
++    return false;
++}
++inline std::string EncodePose(const Pose& p)
++{
++    std::string s;
++    for (auto n:p) {if (!s.empty()) s+='/';s+=std::to_string(n);}
++    return s;
++}
++inline std::optional<Pose> DecodePose(std::string_view s)
++{
++    Pose p{};
++    for (size_t i=0;i<p.size();++i)
++    {
++        const auto sep=s.find('/');
++        if ((i+1==p.size())!=(sep==std::string_view::npos) ||
++            !TradeProperties::Number(s.substr(0,sep),p[i])) return {};
++        if (sep!=std::string_view::npos) s.remove_prefix(sep+1);
++    }
++    if (!Valid(p)) return {};
++    return p;
++}
++struct Key
++{
++    uint32_t Slot{};
++    uint64_t Creator{};
++    uint32_t Receipt{};
++    Pose Initial{};
++    std::string Encode() const
++    {
++        return "home/"+std::to_string(Slot)+"/drop/"+std::to_string(Creator)+"/"+
++            std::to_string(Receipt)+"/"+EncodePose(Initial);
++    }
++};
++inline std::optional<Key> Decode(std::string_view s)
++{
++    if (!s.starts_with("home/") || s.size()>180) return {};
++    const auto original=s;
++    s.remove_prefix(5);
++    auto sep=s.find('/');
++    Key k;
++    if (sep==std::string_view::npos || !TradeProperties::Number(s.substr(0,sep),k.Slot) ||
++        !k.Slot || k.Slot>HomeRegistry::MaxSlot) return {};
++    s.remove_prefix(sep+1);
++    if (!s.starts_with("drop/")) return {};
++    s.remove_prefix(5);
++    sep=s.find('/');
++    if (sep==std::string_view::npos) return {};
++    const auto owner=s.substr(0,sep);
++    const auto parsed=std::from_chars(owner.data(),owner.data()+owner.size(),k.Creator);
++    if (!k.Creator || parsed.ec!=std::errc{} || parsed.ptr!=owner.data()+owner.size()) return {};
++    s.remove_prefix(sep+1);
++    sep=s.find('/');
++    if (sep==std::string_view::npos || !TradeProperties::Number(s.substr(0,sep),k.Receipt) ||
++        !k.Receipt || k.Receipt>0xFFFFFE) return {};
++    auto pose=DecodePose(s.substr(sep+1));
++    if (!pose) return {};
++    k.Initial=*pose;
++    return k.Encode()==original?std::optional<Key>(k):std::nullopt;
++}
++struct Stack
++{
++    Key Id;
++    HomeSnapshot::Item Item;
++    Pose Position;
++    uint32_t Revision{};
++};
++struct Move
++{
++    std::string Account;
++    uint32_t Revision{};
++    Pose Position{};
++    std::string Encode() const {return Account+" "+std::to_string(Revision)+" "+EncodePose(Position);}
++};
++inline std::optional<Move> DecodeMove(std::string_view s)
++{
++    Move m;std::string pose,extra;
++    std::istringstream in{std::string(s)};
++    if (!(in>>m.Account>>m.Revision>>pose) || in>>extra || !m.Revision || !Decode(m.Account)) return {};
++    auto p=DecodePose(pose);if (!p) return {};
++    m.Position=*p;
++    return m.Encode()==s?std::optional<Move>(m):std::nullopt;
++}
++}
+diff --git a/Code/common/TradeLedger.h b/Code/common/TradeLedger.h
+--- a/Code/common/TradeLedger.h
++++ b/Code/common/TradeLedger.h
+@@ -5,6 +5,7 @@
+ #include "HomeSnapshot.h"
+ #include "HomeLocks.h"
+ #include "HomeObjects.h"
++#include "HomePlacement.h"
+ #include "HomePermissions.h"
+ #include <tuple>
+ #include <algorithm>
+@@ -36,7 +37,7 @@
+         if (authority)
+         {
+             if (!campaignId) throw std::runtime_error("invalid campaign trade stream");
+-            accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); looseAccounts.clear(); confirmed.clear(); last=0;
++            accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); looseAccounts.clear(); placements.clear(); confirmed.clear(); last=0;
+             size_t position=0;
+             for (const auto& op:authority->Operations())
+             {
+@@ -46,6 +47,12 @@
+                     if (op.Id!="trade-"+std::to_string(last+1)) throw std::runtime_error("invalid campaign trade sequence");
+                     Replay(op.Payload,position); ++last;
+                 }
++                else if (op.Kind=="home-placement-pose-v1")
++                {
++                    const auto move=HomePlacement::DecodeMove(op.Payload);
++                    if (!move || op.Id!="home-placement-"+std::to_string(position) || !ApplyPlacementMove(*move))
++                        throw std::runtime_error("invalid placement pose");
++                }
+             }
+             stream=campaignId; return stream;
+         }
+@@ -59,7 +66,7 @@
+                 }
+         if (!id) id = QuestJournalDisk::CreateStream(root);
+         if (!id) throw std::runtime_error("cannot initialize trade ledger");
+-        accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); looseAccounts.clear(); confirmed.clear(); last = 0;
++        accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); looseAccounts.clear(); placements.clear(); confirmed.clear(); last = 0;
+         const auto size = QuestJournalDisk::Contiguous(root,id);
+         const auto dir = root/std::to_string(id);
+         for (const auto& entry : std::filesystem::directory_iterator(dir))
+@@ -167,6 +174,60 @@
+             count,before,false,std::move(variant)};
+         return CommitRow(r,cursor,true);
+     }
++    // The same H receipt and ACK govern inventory and placed objects.
++    // A negative receipt creates a new empty account; ACK makes it visible.
++    bool CommitPlacement(uint64_t character,uint32_t slot,const TradeProperties::FormKey& item,
++                         std::string variant,uint32_t count,int64_t before,uint32_t cursor,
++                         const HomePlacement::Pose& pose)
++    {
++        if (!authority || !Stream() || !character || !slot || slot>HomeRegistry::MaxSlot ||
++            !count || count>9999 || cursor>=0xFFFFFE || !item.Valid() || !HomePlacement::Valid(pose) ||
++            HomePermissions::Effective(*authority,slot,character)!=HomePermissions::Right::Modify) return false;
++        HomePlacement::Key key{slot,character,cursor+1,pose};
++        Row r{std::to_string(character),key.Encode(),item.Plugin,item.Local,-int(count),before,false,std::move(variant)};
++        return CommitRow(r,cursor,true);
++    }
++    bool TakePlacement(uint64_t character,std::string_view account,const TradeProperties::FormKey& item,
++                       std::string variant,uint32_t count,int64_t before,uint32_t cursor)
++    {
++        const auto key=HomePlacement::Decode(account);
++        if (!authority || !Stream() || !character || !key || !item.Valid() || !count || count>9999 ||
++            HomePermissions::Effective(*authority,key->Slot,character)!=HomePermissions::Right::Modify) return false;
++        Row r{std::to_string(character),std::string(account),item.Plugin,item.Local,int(count),before,false,std::move(variant)};
++        return CommitRow(r,cursor,true);
++    }
++    std::optional<HomePlacement::Stack> PlacedStack(std::string_view account)
++    {
++        if (!authority || !Stream()) return {};
++        auto found=placements.find(std::string(account));
++        if (found==placements.end()) return {};
++        const auto& s=found->second;
++        const auto& items=homeStock.at(found->first);
++        const auto it=items.find({s.Item.Base.Plugin,s.Item.Base.Local,s.Item.Variant});
++        if (it==items.end() || it->second!=s.Item.Count) return {};
++        return s;
++    }
++    std::vector<HomePlacement::Stack> Placed(uint32_t slot)
++    {
++        std::vector<HomePlacement::Stack> out;
++        if (!authority || !Stream()) return out;
++        for (const auto& [key,s]:placements)
++            if (s.Id.Slot==slot)
++                if (auto active=PlacedStack(key)) out.push_back(std::move(*active));
++        return out;
++    }
++    bool MovePlacement(uint64_t character,const HomePlacement::Move& move)
++    {
++        const auto current=PlacedStack(move.Account);
++        if (!current || !character || current->Revision==UINT32_MAX ||
++            move.Revision!=current->Revision+1 || !HomePlacement::Valid(move.Position) ||
++            HomePermissions::Effective(*authority,current->Id.Slot,character)!=HomePermissions::Right::Modify ||
++            authority->Current().Revision==UINT32_MAX) return false;
++        if (!HomePlacement::Different(current->Position,move.Position)) return true;
++        if (authority->Append(authority->Current(),{"home-placement-"+std::to_string(authority->Current().Revision+1),
++            "home-placement-pose-v1",move.Encode()})!=CampaignJournal::Result::Committed) return false;
++        return ApplyPlacementMove(move);
++    }
+     std::optional<HomeSnapshot::State> HomeState(uint32_t slot)
+     {
+         if (!authority || !Stream()) return {};
+@@ -225,6 +286,29 @@
+         Append(r); return true;
+     }
+     static bool HomePeer(const Row& r) {return r.peer.starts_with("home/");}
++    bool BaselinePublished(uint32_t slot,size_t beforePosition) const
++    {
++        if (!authority || !beforePosition) return false;
++        const auto marker=HomeSnapshot::Marker(slot);
++        const auto& ops=authority->Operations();
++        const auto limit=std::min(ops.size(),beforePosition-1);
++        for (size_t i=0;i<limit;++i)
++            if (ops[i].Id==marker && ops[i].Kind=="home-static-v1") return true;
++        return false;
++    }
++    bool ApplyPlacementMove(const HomePlacement::Move& m)
++    {
++        const auto it=placements.find(m.Account);
++        if (it==placements.end() || it->second.Revision==UINT32_MAX ||
++            m.Revision!=it->second.Revision+1 || !HomePlacement::Valid(m.Position) ||
++            !HomePlacement::Different(it->second.Position,m.Position)) return false;
++        auto& s=it->second;
++        const auto& items=homeStock.at(m.Account);
++        const auto item=items.find({s.Item.Base.Plugin,s.Item.Base.Local,s.Item.Variant});
++        if (item==items.end() || item->second!=s.Item.Count) return false;
++        s.Position=m.Position;s.Revision=m.Revision;
++        return true;
++    }
+     Items* LoadHome(const std::string& account,size_t beforePosition)
+     {
+         if (!authority || !account.starts_with("home/")) return nullptr;
+@@ -235,13 +319,7 @@
+         auto key=TradeProperties::DecodeForm(std::string_view(account).substr(sep+1));
+         if (!key || !key->Valid() || HomeAccount(slot,*key)!=account) return nullptr;
+         // A historical operation cannot spend a baseline published later.
+-        const auto marker=HomeSnapshot::Marker(slot);
+-        const auto& ops=authority->Operations();
+-        const auto limit=std::min(ops.size(),beforePosition-1);
+-        bool published=false;
+-        for (size_t i=0;i<limit;++i)
+-            if (ops[i].Id==marker && ops[i].Kind=="home-static-v1") {published=true;break;}
+-        if (!published) return nullptr;
++        if (!BaselinePublished(slot,beforePosition)) return nullptr;
+         auto baseline=HomeSnapshot::Read(*authority,slot);
+         auto state=baseline.State==HomeSnapshot::Status::Ready?HomeSnapshot::Decode(baseline.Bytes):std::nullopt;
+         if (!state) return nullptr;
+@@ -264,6 +342,35 @@
+         if (!authority || !character || parsed.ec!=std::errc{} ||
+             parsed.ptr!=r.user.data()+r.user.size() || std::to_string(character)!=r.user ||
+             r.refund || r.before<0 || !TradeProperties::FormKey{r.plugin,r.base}.Valid()) return false;
++        if (const auto placed=HomePlacement::Decode(r.peer))
++        {
++            if (r.count<0)
++            {
++                // Only the creator's next backpack receipt may create this ID.
++                // Neither an old save nor an ACK retry can create a second stack.
++                if (placed->Creator!=character || placed->Receipt!=accounts[r.user].size()+1 ||
++                    placements.count(r.peer) || !BaselinePublished(placed->Slot,beforePosition)) return false;
++                const auto baseline=HomeSnapshot::Read(*authority,placed->Slot);
++                if (baseline.State!=HomeSnapshot::Status::Ready || !HomeSnapshot::Decode(baseline.Bytes)) return false;
++                size_t active=0;
++                for (const auto& [key,s]:placements)
++                    if (s.Id.Slot==placed->Slot)
++                    {
++                        const auto& stock=homeStock.at(key);
++                        const auto balance=stock.find({s.Item.Base.Plugin,s.Item.Base.Local,s.Item.Variant});
++                        if (balance==stock.end() || balance->second>0) ++active;
++                    }
++                return active<2048;
++            }
++            const auto found=placements.find(r.peer);
++            if (found==placements.end()) return false;
++            const auto& s=found->second;
++            const auto& stock=homeStock.at(r.peer);
++            const auto balance=stock.find({r.plugin,r.base,r.variant});
++            return s.Item.Base.Plugin==r.plugin && s.Item.Base.Local==r.base &&
++                s.Item.Variant==r.variant && s.Item.Count==static_cast<uint32_t>(r.count) &&
++                balance!=stock.end() && balance->second==r.count;
++        }
+         auto* items=LoadHome(r.peer,beforePosition);
+         if (!items) return false;
+         auto item=items->find({r.plugin,r.base,r.variant});
+@@ -355,6 +462,13 @@
+         accounts[r.user].push_back(r);
+         if (HomePeer(r))
+         {
++            if (r.count<0)
++                if (const auto key=HomePlacement::Decode(r.peer))
++                {
++                    homeStock.emplace(r.peer,Items{});
++                    placements.emplace(r.peer,HomePlacement::Stack{*key,
++                        {{r.plugin,r.base},static_cast<uint32_t>(-r.count),r.variant},key->Initial,0});
++                }
+             if (r.count>0) homeStock.at(r.peer)[{r.plugin,r.base,r.variant}]-=r.count;
+             return;
+         }
+@@ -396,4 +510,5 @@
+     std::map<std::pair<std::string,std::string>,Items> contributions;
+     std::map<std::string,Items> homeStock;
+     std::set<std::string> looseAccounts;
++    std::map<std::string,HomePlacement::Stack> placements;
+ };
+diff --git a/Code/server/Services/PartyTrade.cpp b/Code/server/Services/PartyTrade.cpp
+--- a/Code/server/Services/PartyTrade.cpp
++++ b/Code/server/Services/PartyTrade.cpp
+@@ -109,6 +109,18 @@
+         }
+     return {};
+ }
++bool PlacementNear(World& world,Player& player,uint32_t slot,const HomePlacement::Pose& pose)
++{
++    const auto& cell=player.GetCellComponent();
++    if (!slot || !HomeRegistry::Scoped(cell.Cell.ModId) ||
++        (cell.Cell.ModId&HomeRegistry::MaxSlot)!=slot ||
++        !HomeVisit::CanEnter(player,cell.Cell.ModId,cell.Cell.BaseId) ||
++        !player.GetCharacter() || !HomePlacement::Valid(pose)) return false;
++    const auto* movement=world.try_get<MovementComponent>(*player.GetCharacter());
++    if (!movement) return false;
++    const glm::vec3 position{std::bit_cast<float>(pose[0]),std::bit_cast<float>(pose[1]),std::bit_cast<float>(pose[2])};
++    return glm::distance(movement->Position,position)<=420.f;
++}
+ void ShowHomeStock(Player& p,uint32_t session,const HomeSnapshot::Ref& ref)
+ {
+     PartyTrade reset{TradeOp::Reset,0,session};
+@@ -222,6 +234,51 @@
+         }
+         // A zero-session Take is a direct pickup from a stable house ref.
+         // It never enters the ordinary trade or native container session.
++        if (e.Op==TradeOp::HomePlace || e.Op==TradeOp::HomeTake || e.Op==TradeOp::HomeMove)
++        {
++            // All placed stacks are scoped to the admitted home instance.
++            // Use the existing authenticated wallet cursor, not native drop replication.
++            if (!campaign || e.Session || !e.Peer || e.Peer>HomeRegistry::MaxSlot ||
++                e.Text.size()>320 || ActiveAccount(user) || ledger.HasOutstanding(user))
++            {Send(p,{TradeOp::Error,0,0});return;}
++            const auto character=CampaignAccess::Character(p);
++            const std::string_view payload(e.Text.data(),e.Text.size());
++            bool ok=false;
++            if (e.Op==TradeOp::HomeMove)
++            {
++                const auto move=HomePlacement::DecodeMove(payload);
++                const auto key=move?HomePlacement::Decode(move->Account):std::nullopt;
++                const auto stack=move?ledger.PlacedStack(move->Account):std::nullopt;
++                if (key && stack && key->Slot==e.Peer && !e.Count && !e.BeforePlusOne &&
++                    PlacementNear(m_world,p,e.Peer,stack->Position) &&
++                    PlacementNear(m_world,p,e.Peer,move->Position))
++                    ok=ledger.MovePlacement(character,*move);
++            }
++            else if (e.Count && e.Count<=9999 && e.BeforePlusOne && e.BeforePlusOne<=0x80000000u)
++            {
++                const TradeProperties::FormKey item{InventoryEvidence::CanonicalPlugin(Plugin(m_world,e.Item.ModId)),e.Item.BaseId};
++                const std::string variant(e.Variant.data(),e.Variant.size());
++                if (e.Op==TradeOp::HomePlace)
++                {
++                    const auto pose=HomePlacement::DecodePose(payload);
++                    if (pose && PlacementNear(m_world,p,e.Peer,*pose) && ledger.Ack(user,e.Cursor))
++                        ok=ledger.CommitPlacement(character,e.Peer,item,variant,e.Count,
++                            int64_t(e.BeforePlusOne)-1,e.Cursor,*pose);
++                }
++                else
++                {
++                    const auto key=HomePlacement::Decode(payload);
++                    const auto stack=ledger.PlacedStack(payload);
++                    if (key && stack && key->Slot==e.Peer && PlacementNear(m_world,p,e.Peer,stack->Position) &&
++                        ledger.Ack(user,e.Cursor))
++                        ok=ledger.TakePlacement(character,payload,item,variant,e.Count,
++                            int64_t(e.BeforePlusOne)-1,e.Cursor);
++                }
++            }
++            if (!ok) Send(p,{TradeOp::Error,0,0});
++            else if (e.Op!=TradeOp::HomeMove) next();
++            return;
++        }
+         if (e.Op==TradeOp::Take && !e.Session)
+         {
+             if (!campaign || !e.Peer || e.Peer>HomeRegistry::MaxSlot ||
+diff --git a/Code/encoding/Structs/PartyTrade.h b/Code/encoding/Structs/PartyTrade.h
+--- a/Code/encoding/Structs/PartyTrade.h
++++ b/Code/encoding/Structs/PartyTrade.h
+@@ -2,7 +2,7 @@
+ #include <Structs/GameId.h>
+ #include <TiltedCore/Serialization.hpp>
+ 
+-enum class TradeOp : uint8_t { Poll, Invite, Offer, Accept, Open, Close, Deposit, Take, Entry, Reset, Receipt, Error, Ready, RecoveryConflict, ReturnOffer, Return, HomeOpen };
++enum class TradeOp : uint8_t { Poll, Invite, Offer, Accept, Open, Close, Deposit, Take, Entry, Reset, Receipt, Error, Ready, RecoveryConflict, ReturnOffer, Return, HomeOpen, HomePlace, HomeTake, HomeMove };
+ struct PartyTrade
+ {
+     TradeOp Op{};
+diff --git a/Code/client/Services/CampaignAccess.h b/Code/client/Services/CampaignAccess.h
+--- a/Code/client/Services/CampaignAccess.h
++++ b/Code/client/Services/CampaignAccess.h
+@@ -3,6 +3,7 @@
+ #include <CampaignReplication.h>
+ #include <array>
+ #include <map>
+ #include <HomeResidents.h>
+ #include <HomeObjects.h>
++#include <HomePlacement.h>
+ struct World;
+@@ -29,6 +30,7 @@
+ // Canonical ref -> state, level and per-reference revision.
+ std::optional<std::map<std::string,std::array<uint32_t,3>>> HomeLockView(uint64_t campaign,uint32_t slot);
+ std::optional<HomeResidents::Residents> HomeResidentView(uint64_t campaign,uint32_t slot);
+ std::optional<HomeObjects::Records> HomeObjectView(uint64_t campaign,uint32_t slot);
++std::optional<std::vector<HomePlacement::Stack>> HomePlacements(uint64_t campaign,uint32_t slot);
+ bool ConfirmReceipt(World&, uint64_t stream, uint64_t savedStream, uint32_t cursor, uint32_t receipt,
+                     std::string_view plugin, uint32_t base, int count,int64_t before,std::string_view variant={});
+diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
+--- a/Code/client/Services/Generic/QuestJournal.cpp
++++ b/Code/client/Services/Generic/QuestJournal.cpp
+@@ -135,7 +135,19 @@
+     return {};
+ }
+ 
++std::optional<std::vector<HomePlacement::Stack>> CampaignAccess::HomePlacements(uint64_t campaign,uint32_t slot)
++{
++    if (Mode()!=CampaignReplication::Link::Mode::Ready || campaign!=campaignLink.Campaign ||
++        !slot || slot>HomeRegistry::MaxSlot) return {};
++    try
++    {
++        TradeLedger view(campaignLink.Journal,campaign);
++        if (!view.HomeState(slot)) return {};
++        return view.Placed(slot);
++    }
++    catch (...) {return {};}
++}
+ std::optional<HomeObjects::Records> CampaignAccess::HomeObjectView(uint64_t campaign,uint32_t slot)
+ {
+     if (Mode()!=CampaignReplication::Link::Mode::Ready || campaign!=campaignLink.Campaign) return {};
+     return HomeObjects::Read(campaignLink.Journal,slot);
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign19"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign20"

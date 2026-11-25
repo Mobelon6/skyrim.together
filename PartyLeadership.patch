@@ -1,0 +1,80 @@
+diff --git a/Code/client/Services/Generic/OverlayClient.cpp b/Code/client/Services/Generic/OverlayClient.cpp
+index a037861..d8a9f30 100644
+--- a/Code/client/Services/Generic/OverlayClient.cpp
++++ b/Code/client/Services/Generic/OverlayClient.cpp
+@@ -74,7 +74,7 @@ bool OverlayClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefR
+         else if (eventName == "changePartyLeader")
+         {
+             uint32_t aPlayerId = eventArgs->GetInt(0);
+-            World::Get().GetPartyService().ChangePartyLeader(aPlayerId);
++            World::Get().GetRunner().Queue([aPlayerId]() { World::Get().GetPartyService().ChangePartyLeader(aPlayerId); });
+         }
+         else if (eventName == "teleportToPlayer")
+             ProcessTeleportMessage(eventArgs);
+diff --git a/Code/client/Services/Generic/PartyService.cpp b/Code/client/Services/Generic/PartyService.cpp
+index 60d17fc..e448ea3 100644
+--- a/Code/client/Services/Generic/PartyService.cpp
++++ b/Code/client/Services/Generic/PartyService.cpp
+@@ -120,12 +120,9 @@ void PartyService::OnPartyInfo(const NotifyPartyInfo& acPartyInfo) noexcept
+         m_leaderPlayerId = acPartyInfo.LeaderPlayerId;
+         m_partyMembers = acPartyInfo.PlayerIds;
+ 
+-        // TODO: this can be done a bit prettier
+-        if (m_isLeader)
+-        {
+-            TESGlobal* pWorldEncountersEnabled = Cast<TESGlobal>(TESForm::GetById(0xB8EC1));
+-            pWorldEncountersEnabled->f = 1.f;
+-        }
++        // Both peers receive this packet on handoff, including the outgoing leader.
++        if (auto* pEncounters = Cast<TESGlobal>(TESForm::GetById(0xB8EC1)))
++            pEncounters->f = m_isLeader ? 1.f : 0.f;
+ 
+         auto pArguments = CefListValue::Create();
+ 
+diff --git a/Code/client/Services/Generic/PlayerService.cpp b/Code/client/Services/Generic/PlayerService.cpp
+index 6ced4d5..70f5dc1 100644
+--- a/Code/client/Services/Generic/PlayerService.cpp
++++ b/Code/client/Services/Generic/PlayerService.cpp
+@@ -175,12 +175,8 @@ void PlayerService::OnPlayerLevelEvent(const PlayerLevelEvent& acEvent) const no
+ 
+ void PlayerService::OnPartyJoinedEvent(const PartyJoinedEvent& acEvent) noexcept
+ {
+-    // TODO: this can be done a bit prettier
+-    if (acEvent.IsLeader)
+-    {
+-        TESGlobal* pWorldEncountersEnabled = Cast<TESGlobal>(TESForm::GetById(0xB8EC1));
+-        pWorldEncountersEnabled->f = 1.f;
+-    }
++    if (auto* pEncounters = Cast<TESGlobal>(TESForm::GetById(0xB8EC1)))
++        pEncounters->f = acEvent.IsLeader ? 1.f : 0.f;
+ }
+ 
+ void PlayerService::OnPartyLeftEvent(const PartyLeftEvent& acEvent) noexcept
+diff --git a/Code/skyrim_ui/src/app/components/party-menu/party-menu.component.html b/Code/skyrim_ui/src/app/components/party-menu/party-menu.component.html
+index 9fe85c9..a9678a2 100644
+--- a/Code/skyrim_ui/src/app/components/party-menu/party-menu.component.html
++++ b/Code/skyrim_ui/src/app/components/party-menu/party-menu.component.html
+@@ -96,16 +96,14 @@
+                 >
+                   {{ 'COMPONENT.PARTY_MENU.ACTIONS.KICK' | transloco }}
+                 </button>
+-                <!--
+-                <button
+-                  [disabled]="!isPartyLeader"
+-                  class="user-action-button"
+-                  [ngClass]="!isPartyLeader ? 'hidden' : ''"
+-                  (click)="changeLeader(player.id)"
++                @if ((isPartyLeader$ | async) && player.id !== (group$ | async)?.owner) {
++                  <button
++                    class="user-action-button"
++                    (click)="changeLeader(player.id)"
+                   >
+-                  {{ 'COMPONENT.PARTY_MENU.ACTIONS.MAKE_LEADER' | transloco }}
+-                </button>
+-                -->
++                    {{ 'COMPONENT.PARTY_MENU.ACTIONS.MAKE_LEADER' | transloco }}
++                  </button>
++                }
+               </td>
+             </tr>
+           }

@@ -1,0 +1,655 @@
+diff --git a/Code/common/CampaignIdentity.h b/Code/common/CampaignIdentity.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/CampaignIdentity.h
+@@ -0,0 +1,44 @@
++#pragma once
++#include "CampaignJournal.h"
++#include <array>
++#include <filesystem>
++#include <map>
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace CampaignIdentity
++{
++// Values are stored in nonconstant Skyrim GLOB records (exact 22-bit integer chunks).
++// A checkpoint represents APPLIED game effects, never merely a downloaded journal.
++inline constexpr unsigned FieldCount=12;
++using Fields=std::array<float,FieldCount>;
++struct Stamp
++{
++    uint64_t Campaign{}, Character{};
++    CampaignJournal::Head Applied{};
++    bool operator==(const Stamp&) const=default;
++};
++enum class SaveState { Empty, Valid, Invalid };
++SaveState Decode(const Fields&, Stamp&);
++std::optional<Fields> Encode(const Stamp&);
++bool Known(const CampaignJournal::Journal&, uint64_t campaign, const Stamp&);
++
++struct Credential
++{
++    uint64_t Character{};
++    std::string Secret;
++};
++std::optional<Credential> ReadCredential(const std::filesystem::path& root);
++class Admission
++{
++public:
++    bool Load(const std::filesystem::path& root);
++    bool Claim(uint32_t connection, const Credential&);
++    void Release(uint32_t connection);
++    const std::map<uint32_t,uint64_t>& Active() const {return m_active;}
++private:
++    std::map<uint64_t,std::string> m_credentials;
++    std::map<uint32_t,uint64_t> m_active;
++};
++}
+diff --git a/Code/common/CampaignIdentity.cpp b/Code/common/CampaignIdentity.cpp
+new file mode 100644
+--- /dev/null
++++ b/Code/common/CampaignIdentity.cpp
+@@ -0,0 +1,124 @@
++#include "CampaignIdentity.h"
++#include <cmath>
++#include <charconv>
++#include <fstream>
++#include <algorithm>
++#include <limits>
++
++namespace CampaignIdentity
++{
++namespace
++{
++constexpr uint32_t Mask=(1u<<22)-1;
++bool Part(float f,uint32_t limit,uint64_t& v)
++{
++    if (!std::isfinite(f)||f<0.f||f>static_cast<float>(limit)||std::floor(f)!=f) return false;
++    v=static_cast<uint64_t>(f);return true;
++}
++bool Read64(const Fields& f,unsigned offset,uint64_t& out)
++{
++    uint64_t a{},b{},c{};
++    if (!Part(f[offset],Mask,a)||!Part(f[offset+1],Mask,b)||!Part(f[offset+2],(1u<<20)-1,c)) return false;
++    out=a|(b<<22)|(c<<44);return true;
++}
++void Write64(Fields& f,unsigned offset,uint64_t value)
++{
++    for(unsigned i=0;i<3;++i) f[offset+i]=static_cast<float>((value>>(22*i))&Mask);
++}
++bool SecretValid(std::string_view value)
++{
++    return value.size()==64 && std::all_of(value.begin(),value.end(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');});
++}
++bool ParseId(std::string_view text,uint64_t& value)
++{
++    const auto r=std::from_chars(text.data(),text.data()+text.size(),value);
++    return r.ec==std::errc{} && r.ptr==text.data()+text.size() && value && text==std::to_string(value);
++}
++bool ReadEntry(std::istream& in,Credential& value)
++{
++    std::string id;
++    return (in>>id>>value.Secret) && ParseId(id,value.Character) && SecretValid(value.Secret);
++}
++bool EqualSecret(std::string_view a,std::string_view b)
++{
++    if(a.size()!=64||b.size()!=64) return false;
++    unsigned diff{};
++    for(unsigned i=0;i<64;++i) diff|=static_cast<unsigned char>(a[i])^static_cast<unsigned char>(b[i]);
++    return diff==0;
++}
++}
++SaveState Decode(const Fields& f, Stamp& out)
++{
++    out={};
++    if(std::all_of(f.begin(),f.end(),[](float x){return x==0.f;})) return SaveState::Empty;
++    Stamp value;
++    uint64_t low{},high{};
++    if(f[11]!=1.f||!Read64(f,0,value.Campaign)||!Read64(f,3,value.Character)||
++        !Part(f[6],Mask,low)||!Part(f[7],1023,high)||!Read64(f,8,value.Applied.Tag)||
++        !value.Campaign||!value.Character||!value.Applied.Tag) return SaveState::Invalid;
++    value.Applied.Revision=static_cast<uint32_t>(low|(high<<22));
++    if(value.Applied.Revision==UINT32_MAX) return SaveState::Invalid;
++    out=value;return SaveState::Valid;
++}
++std::optional<Fields> Encode(const Stamp& value)
++{
++    if(!value.Campaign||!value.Character||!value.Applied.Tag||value.Applied.Revision==UINT32_MAX) return {};
++    Fields f{};
++    Write64(f,0,value.Campaign);Write64(f,3,value.Character);
++    f[6]=static_cast<float>(value.Applied.Revision&Mask);f[7]=static_cast<float>(value.Applied.Revision>>22);
++    Write64(f,8,value.Applied.Tag);f[11]=1.f;
++    return f;
++}
++bool Known(const CampaignJournal::Journal& journal,uint64_t campaign,const Stamp& stamp)
++{
++    const auto head=journal.At(stamp.Applied.Revision);
++    return campaign && stamp.Campaign==campaign && stamp.Character && head && *head==stamp.Applied;
++}
++std::optional<Credential> ReadCredential(const std::filesystem::path& root)
++{
++    try
++    {
++        const auto path=root/"CharacterLink.txt";
++        if(!std::filesystem::is_regular_file(path)||std::filesystem::file_size(path)>512) return {};
++        std::ifstream in(path);
++        Credential value;
++        std::string extra;
++        if(!ReadEntry(in,value)||in>>extra||in.bad()) return {};
++        return value;
++    }
++    catch(...) {return {};}
++}
++bool Admission::Load(const std::filesystem::path& root)
++{
++    m_credentials.clear();m_active.clear();
++    try
++    {
++        const auto path=root/"Participants.txt";
++        if(!std::filesystem::is_regular_file(path)||std::filesystem::file_size(path)>8192) return false;
++        std::ifstream in(path);
++        std::map<uint64_t,std::string> next;
++        for(;;)
++        {
++            in>>std::ws;
++            if(in.eof()) break;
++            Credential c;
++            if(!ReadEntry(in,c)||next.size()>=32||next.contains(c.Character)) return false;
++            for(const auto& entry:next) if(EqualSecret(entry.second,c.Secret)) return false;
++            next.emplace(c.Character,std::move(c.Secret));
++        }
++        if(in.bad()||next.empty()) return false;
++        m_credentials=std::move(next);return true;
++    }
++    catch(...) {return false;}
++}
++bool Admission::Claim(uint32_t connection,const Credential& c)
++{
++    if(!connection) return false;
++    const auto entry=m_credentials.find(c.Character);
++    if(entry==m_credentials.end()||!EqualSecret(entry->second,c.Secret)) return false;
++    for(const auto& [who,character]:m_active)
++        if((who==connection&&character!=c.Character)||(who!=connection&&character==c.Character)) return false;
++    m_active.insert_or_assign(connection,c.Character);return true;
++}
++void Admission::Release(uint32_t connection){m_active.erase(connection);}
++}
+diff --git a/Code/common/CampaignReplication.h b/Code/common/CampaignReplication.h
+--- a/Code/common/CampaignReplication.h
++++ b/Code/common/CampaignReplication.h
+@@ -37,6 +37,7 @@
+     void Fail() { m_mode=Mode::Failed; }
+     uint64_t Campaign{};
+     std::string Profile;
++    std::filesystem::path Root;
+     CampaignJournal::Journal Journal;
+ private:
+     Mode m_mode{Mode::Disabled};
+diff --git a/Code/common/CampaignReplication.cpp b/Code/common/CampaignReplication.cpp
+--- a/Code/common/CampaignReplication.cpp
++++ b/Code/common/CampaignReplication.cpp
+@@ -63,6 +63,7 @@
+     {
+         const std::filesystem::path root(path);
+         if (!root.is_absolute()) return m_mode;
++        Root=root;
+         const auto config=root/"CampaignLink.txt";
+         if (!std::filesystem::is_regular_file(config) || std::filesystem::file_size(config)>512) return m_mode;
+         std::ifstream input(config);
+diff --git a/Code/encoding/Messages/RequestCampaignPull.h b/Code/encoding/Messages/RequestCampaignPull.h
+--- a/Code/encoding/Messages/RequestCampaignPull.h
++++ b/Code/encoding/Messages/RequestCampaignPull.h
+@@ -9,6 +9,9 @@
+     uint64_t Campaign{}, Nonce{}, Tag{};
+     uint32_t Revision{};
+     String Profile{};
+-    bool operator==(const RequestCampaignPull& o) const noexcept
+-    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile; }
++    uint64_t Character{}, SaveTag{};
++    uint32_t SaveRevision{};
++    String Credential{};
++    bool operator==(const RequestCampaignPull& o) const noexcept
++    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile && Character==o.Character && SaveTag==o.SaveTag && SaveRevision==o.SaveRevision && Credential==o.Credential; }
+ };
+diff --git a/Code/encoding/Messages/RequestCampaignPull.cpp b/Code/encoding/Messages/RequestCampaignPull.cpp
+--- a/Code/encoding/Messages/RequestCampaignPull.cpp
++++ b/Code/encoding/Messages/RequestCampaignPull.cpp
+@@ -4,11 +4,15 @@
+     Serialization::WriteVarInt(w,Campaign); Serialization::WriteVarInt(w,Nonce);
+     Serialization::WriteVarInt(w,Tag); Serialization::WriteVarInt(w,Revision);
+     Serialization::WriteString(w,Profile);
+-}
+-void RequestCampaignPull::DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept
+-{
+-    ClientMessage::DeserializeRaw(r);
+-    Campaign=Serialization::ReadVarInt(r);Nonce=Serialization::ReadVarInt(r);
+-    Tag=Serialization::ReadVarInt(r);Revision=Serialization::ReadVarInt(r)&0xffffffff;
+-    Profile=Serialization::ReadString(r);
++    Serialization::WriteVarInt(w,Character);Serialization::WriteVarInt(w,SaveTag);
++    Serialization::WriteVarInt(w,SaveRevision);Serialization::WriteString(w,Credential);
++}
++void RequestCampaignPull::DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept
++{
++    ClientMessage::DeserializeRaw(r);
++    Campaign=Serialization::ReadVarInt(r);Nonce=Serialization::ReadVarInt(r);
++    Tag=Serialization::ReadVarInt(r);Revision=Serialization::ReadVarInt(r)&0xffffffff;
++    Profile=Serialization::ReadString(r);
++    Character=Serialization::ReadVarInt(r);SaveTag=Serialization::ReadVarInt(r);
++    SaveRevision=Serialization::ReadVarInt(r)&0xffffffff;Credential=Serialization::ReadString(r);
+ }
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign1"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign2"
+diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
+--- a/Code/client/Services/Generic/QuestJournal.cpp
++++ b/Code/client/Services/Generic/QuestJournal.cpp
+@@ -8,52 +8,123 @@
+ #include <Events/UpdateEvent.h>
+ #include <QuestJournalDisk.h>
+ #include <CampaignReplication.h>
+-#include <Messages/RequestCampaignPull.h>
+-#include <Messages/NotifyCampaignRecord.h>
+-
+-namespace
+-{
+-CampaignReplication::Link campaignLink;
+-CampaignReplication::Pull pending;
+-uint64_t nonce{};
+-std::chrono::steady_clock::time_point nextPull{};
+-std::filesystem::path Mirror()
+-{
+-    auto* local = _wgetenv(L"LOCALAPPDATA");
+-    if (!local || !*local)
+-        throw std::runtime_error("LOCALAPPDATA is unavailable");
+-    return std::filesystem::path(local) / "SkyrimTogetherReborn" / "CoopJournal";
+-}
+-}
+-
+-void QuestService::PollCampaign(const UpdateEvent&) noexcept
+-{
+-    if (!m_world.GetTransport().IsOnline())
+-    {
+-        pending={};
+-        nextPull={};
+-        return;
+-    }
+-    try
+-    {
+-        if (campaignLink.Start(false)!=CampaignReplication::Link::Mode::Ready) return;
+-        auto now=std::chrono::steady_clock::now();
+-        if (now<nextPull) return;
+-        nextPull=now+std::chrono::seconds(2);
+-        pending={campaignLink.Campaign,++nonce,campaignLink.Profile,campaignLink.Journal.Current()};
+-        RequestCampaignPull request;
+-        request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
+-        request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
+-        m_world.GetTransport().Send(request);
+-    }
+-    catch (...) { campaignLink.Fail();spdlog::error("Campaign replica initialization/poll failed"); }
+-}
+-void QuestService::OnCampaignRecord(const NotifyCampaignRecord& packet) noexcept
+-{
+-    if (!m_world.GetTransport().IsOnline() || campaignLink.State()!=CampaignReplication::Link::Mode::Ready ||
+-        !pending.Nonce || packet.Nonce!=pending.Nonce || packet.Campaign!=pending.Campaign) return;
+-    try
+-    {
++#include <CampaignIdentity.h>
++#include <Services/PapyrusService.h>
++#include <PlayerCharacter.h>
++#include <Forms/TESGlobal.h>
++#include <Games/TES.h>
++#include <Interface/UI.h>
++#include <cstdlib>
++#include <Messages/RequestCampaignPull.h>
++#include <Messages/NotifyCampaignRecord.h>
++
++namespace
++{
++CampaignReplication::Link campaignLink;
++CampaignReplication::Pull pending;
++CampaignIdentity::Stamp pendingSave;
++bool enrollmentUsed{};
++bool saveWarning{};
++uint64_t nonce{};
++std::chrono::steady_clock::time_point nextPull{};
++bool SaveWorldReady()
++{
++    auto* p=PlayerCharacter::Get();
++    auto* ui=UI::Get();
++    static const BSFixedString main("Main Menu"), loading("Loading Menu");
++    return p && p->parentCell && p->GetNiNode() && !p->IsDead() && ui &&
++        !ui->GetMenuOpen(main) && !ui->GetMenuOpen(loading);
++}
++std::optional<CampaignIdentity::Stamp> ReadSave(World& world, const CampaignIdentity::Credential& credential, bool enroll)
++{
++    using namespace CampaignIdentity;
++    if (!SaveWorldReady()) return {};
++    auto* plugin=ModManager::Get()->GetByName("SkyrimCoopTrade.esp");
++    if (!plugin || !plugin->IsLoaded()) return {};
++    TESGlobal* fields[FieldCount]{};
++    Fields values{};
++    for (unsigned i=0;i<FieldCount;++i)
++    {
++        auto* f=TESForm::GetById(plugin->GetFormId(0x804+i));
++        if (!f || static_cast<unsigned>(f->formType)!=9) return {};
++        fields[i]=static_cast<TESGlobal*>(f);values[i]=fields[i]->f;
++    }
++    Stamp stamp;
++    auto state=Decode(values,stamp);
++    if (state==SaveState::Empty && enroll && !enrollmentUsed &&
++        campaignLink.Journal.Current().Revision==0)
++    {
++        const auto* flag=std::getenv("STM_CAMPAIGN_ENROLL");
++        if (!flag || std::string_view(flag)!="1") return {};
++        enrollmentUsed=true; // at most one explicit enrollment attempt per process
++        stamp={campaignLink.Campaign,credential.Character,campaignLink.Journal.Current()};
++        auto encoded=Encode(stamp);
++        const auto* method=world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue");
++        if (!encoded || !method) return {};
++        PapyrusFunction<void,TESGlobal,float> set(method);
++        // Publish schema marker last. A partial initialization is invalid, not a new character.
++        for (unsigned i=0;i<FieldCount;++i) set(fields[i],(*encoded)[i]);
++        for (unsigned i=0;i<FieldCount;++i) values[i]=fields[i]->f;
++        state=Decode(values,stamp);
++        if (state==SaveState::Valid) spdlog::info("STM campaign save enrolled; save the game to persist its identity");
++    }
++    if (state!=SaveState::Valid || stamp.Campaign!=campaignLink.Campaign || stamp.Character!=credential.Character)
++        return {};
++    return stamp;
++}
++std::filesystem::path Mirror()
++{
++    auto* local = _wgetenv(L"LOCALAPPDATA");
++    if (!local || !*local)
++        throw std::runtime_error("LOCALAPPDATA is unavailable");
++    return std::filesystem::path(local) / "SkyrimTogetherReborn" / "CoopJournal";
++}
++}
++
++void QuestService::PollCampaign(const UpdateEvent&) noexcept
++{
++    if (!m_world.GetTransport().IsOnline())
++    {
++        pending={};
++        nextPull={};
++        return;
++    }
++    try
++    {
++        if (campaignLink.Start(false)!=CampaignReplication::Link::Mode::Ready) return;
++        if (!SaveWorldReady()) {pending={};return;}
++        const auto credential=CampaignIdentity::ReadCredential(campaignLink.Root);
++        const auto stamp=credential ? ReadSave(m_world,*credential,true) : std::nullopt;
++        if (!stamp)
++        {
++            pending={};
++            if (!saveWarning) {spdlog::warn("STM campaign replication suspended: missing or incompatible save identity");saveWarning=true;}
++            return;
++        }
++        saveWarning=false;
++        auto now=std::chrono::steady_clock::now();
++        if (now<nextPull) return;
++        nextPull=now+std::chrono::seconds(2);
++        pending={campaignLink.Campaign,++nonce,campaignLink.Profile,campaignLink.Journal.Current()};
++        RequestCampaignPull request;
++        request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
++        request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
++        pendingSave=*stamp;
++        request.Character=stamp->Character;request.SaveRevision=stamp->Applied.Revision;request.SaveTag=stamp->Applied.Tag;
++        request.Credential=credential->Secret.c_str();
++        m_world.GetTransport().Send(request);
++    }
++    catch (...) { campaignLink.Fail();spdlog::error("Campaign replica initialization/poll failed"); }
++}
++void QuestService::OnCampaignRecord(const NotifyCampaignRecord& packet) noexcept
++{
++    if (!m_world.GetTransport().IsOnline() || campaignLink.State()!=CampaignReplication::Link::Mode::Ready ||
++        !pending.Nonce || packet.Nonce!=pending.Nonce || packet.Campaign!=pending.Campaign) return;
++    try
++    {
++        const auto credential=CampaignIdentity::ReadCredential(campaignLink.Root);
++        const auto stamp=credential ? ReadSave(m_world,*credential,false) : std::nullopt;
++        if (!stamp || *stamp!=pendingSave) {pending={};return;}
+         CampaignReplication::Reply reply;
+         reply.Campaign=packet.Campaign;reply.Nonce=packet.Nonce;
+         reply.Base={packet.BaseRevision,packet.BaseTag};reply.Target={packet.TargetRevision,packet.TargetTag};
+diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJournal.cpp
+--- a/Code/server/Services/QuestJournal.cpp
++++ b/Code/server/Services/QuestJournal.cpp
+@@ -7,107 +7,127 @@
+ #include <Messages/NotifyQuestUpdate.h>
+ #include <QuestJournalDisk.h>
+ #include <CampaignReplication.h>
+-#include <Messages/RequestCampaignPull.h>
+-#include <Messages/NotifyCampaignRecord.h>
+-#include <sstream>
+-#include <iomanip>
+-
+-namespace
+-{
+-CampaignReplication::Link campaignLink;
+-const std::filesystem::path kJournal{"config/CoopJournal"};
+-
+-std::string Field(const String& value)
+-{
+-    std::string out(value.begin(), value.end());
+-    for (auto& c : out)
+-        if (static_cast<unsigned char>(c) < 32)
+-            c = ' ';
+-    return out;
+-}
+-
+-void Flush(PartyService::Party& party)
+-{
+-    if (!party.JournalStream)
+-        party.JournalStream = QuestJournalDisk::CreateStream(kJournal);
+-    if (!party.JournalStream)
+-        return;
+-    // Limit recovery work per request after a transient disk failure.
+-    for (unsigned n = 0; n < 8 && party.JournalCommitted < party.JournalRows.size(); ++n)
+-    {
+-        const auto& row = party.JournalRows[party.JournalCommitted];
+-        if (!QuestJournalDisk::Store(kJournal, party.JournalStream, party.JournalCommitted + 1, {row.data(), row.size()}))
+-        {
+-            spdlog::error("Cannot commit co-op journal stream {} record {}", party.JournalStream, party.JournalCommitted + 1);
+-            break;
+-        }
+-        ++party.JournalCommitted;
+-    }
+-}
+-}
+-
+-void QuestService::RecordQuest(Player* player, const NotifyQuestUpdate& event) noexcept
+-{
+-    auto* party = m_world.GetPartyService().GetPlayerParty(player);
+-    if (!party)
+-        return;
+-    try
+-    {
+-        const auto& mods = m_world.ctx().at<ModsComponent>();
+-        std::string plugin;
+-        for (const auto* list : {&mods.GetStandardMods(), &mods.GetLiteMods()})
+-            for (const auto& item : *list)
+-                if (item.second.id == event.Id.ModId)
+-                    plugin = Field(item.first);
+-        const char* phase = event.Status == NotifyQuestUpdate::Started ? "start" :
+-            event.Status == NotifyQuestUpdate::Stopped ? "stop" : "stage";
+-        std::ostringstream row;
+-        row << "quest-v1" << '	' << plugin << '	' << std::hex << event.Id.BaseId << std::dec << '	'
+-            << phase << '	' << event.Stage << '	' << player->GetId() << '	' << Field(player->GetUsername());
+-        const auto data = row.str();
+-        party->JournalRows.emplace_back(data.c_str());
+-        Flush(*party);
+-    }
+-    catch (const std::exception& e) { spdlog::error("Writing co-op quest journal: {}", e.what()); }
+-}
+-
+-void QuestService::OnJournalRequest(const PacketEvent<RequestQuestJournal>& event) noexcept
+-{
+-    auto* party = m_world.GetPartyService().GetPlayerParty(event.pPlayer);
+-    if (!party || party->JournalRows.empty())
+-        return;
+-    try
+-    {
+-        Flush(*party);
+-        if (!party->JournalStream || !party->JournalCommitted)
+-            return;
+-        NotifyQuestJournal reply;
+-        reply.Stream = party->JournalStream;
+-        reply.Total = party->JournalCommitted;
+-        if (event.Packet.Stream != reply.Stream)
+-        {
+-            event.pPlayer->Send(reply); // announce stream identity before the client reads its durable cursor
+-            return;
+-        }
+-        for (uint32_t index = event.Packet.Sequence, n = 0; index < reply.Total && n < 8; ++index, ++n)
+-        {
+-            reply.Sequence = index + 1;
+-            reply.Row = party->JournalRows[index];
+-            event.pPlayer->Send(reply);
+-        }
+-    }
+-    catch (const std::exception& e) { spdlog::error("Serving co-op quest journal: {}", e.what()); }
+-}
+-
+-void QuestService::OnCampaignPull(const PacketEvent<RequestCampaignPull>& event) noexcept
+-{
+-    try
+-    {
+-        const auto& p=event.Packet;
+-        if (!p.Nonce || p.Profile.size()>128) return;
+-        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
+-        campaignLink.Start(true);
+-        auto reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
++#include <CampaignIdentity.h>
++#include <Messages/RequestCampaignPull.h>
++#include <Messages/NotifyCampaignRecord.h>
++#include <sstream>
++#include <iomanip>
++
++namespace
++{
++CampaignReplication::Link campaignLink;
++CampaignIdentity::Admission admission;
++bool admissionLoaded{};
++const std::filesystem::path kJournal{"config/CoopJournal"};
++
++std::string Field(const String& value)
++{
++    std::string out(value.begin(), value.end());
++    for (auto& c : out)
++        if (static_cast<unsigned char>(c) < 32)
++            c = ' ';
++    return out;
++}
++
++void Flush(PartyService::Party& party)
++{
++    if (!party.JournalStream)
++        party.JournalStream = QuestJournalDisk::CreateStream(kJournal);
++    if (!party.JournalStream)
++        return;
++    // Limit recovery work per request after a transient disk failure.
++    for (unsigned n = 0; n < 8 && party.JournalCommitted < party.JournalRows.size(); ++n)
++    {
++        const auto& row = party.JournalRows[party.JournalCommitted];
++        if (!QuestJournalDisk::Store(kJournal, party.JournalStream, party.JournalCommitted + 1, {row.data(), row.size()}))
++        {
++            spdlog::error("Cannot commit co-op journal stream {} record {}", party.JournalStream, party.JournalCommitted + 1);
++            break;
++        }
++        ++party.JournalCommitted;
++    }
++}
++}
++
++void QuestService::RecordQuest(Player* player, const NotifyQuestUpdate& event) noexcept
++{
++    auto* party = m_world.GetPartyService().GetPlayerParty(player);
++    if (!party)
++        return;
++    try
++    {
++        const auto& mods = m_world.ctx().at<ModsComponent>();
++        std::string plugin;
++        for (const auto* list : {&mods.GetStandardMods(), &mods.GetLiteMods()})
++            for (const auto& item : *list)
++                if (item.second.id == event.Id.ModId)
++                    plugin = Field(item.first);
++        const char* phase = event.Status == NotifyQuestUpdate::Started ? "start" :
++            event.Status == NotifyQuestUpdate::Stopped ? "stop" : "stage";
++        std::ostringstream row;
++        row << "quest-v1" << '	' << plugin << '	' << std::hex << event.Id.BaseId << std::dec << '	'
++            << phase << '	' << event.Stage << '	' << player->GetId() << '	' << Field(player->GetUsername());
++        const auto data = row.str();
++        party->JournalRows.emplace_back(data.c_str());
++        Flush(*party);
++    }
++    catch (const std::exception& e) { spdlog::error("Writing co-op quest journal: {}", e.what()); }
++}
++
++void QuestService::OnJournalRequest(const PacketEvent<RequestQuestJournal>& event) noexcept
++{
++    auto* party = m_world.GetPartyService().GetPlayerParty(event.pPlayer);
++    if (!party || party->JournalRows.empty())
++        return;
++    try
++    {
++        Flush(*party);
++        if (!party->JournalStream || !party->JournalCommitted)
++            return;
++        NotifyQuestJournal reply;
++        reply.Stream = party->JournalStream;
++        reply.Total = party->JournalCommitted;
++        if (event.Packet.Stream != reply.Stream)
++        {
++            event.pPlayer->Send(reply); // announce stream identity before the client reads its durable cursor
++            return;
++        }
++        for (uint32_t index = event.Packet.Sequence, n = 0; index < reply.Total && n < 8; ++index, ++n)
++        {
++            reply.Sequence = index + 1;
++            reply.Row = party->JournalRows[index];
++            event.pPlayer->Send(reply);
++        }
++    }
++    catch (const std::exception& e) { spdlog::error("Serving co-op quest journal: {}", e.what()); }
++}
++
++void QuestService::OnCampaignPull(const PacketEvent<RequestCampaignPull>& event) noexcept
++{
++    try
++    {
++        const auto& p=event.Packet;
++        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64) return;
++        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
++        CampaignReplication::Reply reply;
++        reply.Campaign=p.Campaign;reply.Nonce=p.Nonce;reply.Base=pull.Base;
++        if (campaignLink.Start(true)==CampaignReplication::Link::Mode::Ready)
++        {
++            if (!admissionLoaded)
++            {
++                admissionLoaded=admission.Load(campaignLink.Root);
++                if (!admissionLoaded) campaignLink.Fail();
++            }
++            std::vector<uint32_t> disconnected;
++            for (const auto& [id,character]:admission.Active())
++                if (!m_world.GetPlayerManager().GetById(id)) disconnected.push_back(id);
++            for (auto id:disconnected) admission.Release(id);
++            const CampaignIdentity::Stamp stamp{p.Campaign,p.Character,{p.SaveRevision,p.SaveTag}};
++            if (admissionLoaded && pull.Profile==campaignLink.Profile &&
++                CampaignIdentity::Known(campaignLink.Journal,campaignLink.Campaign,stamp) &&
++                admission.Claim(event.pPlayer->GetId(),{p.Character,std::string(p.Credential.data(),p.Credential.size())}))
++                reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
++        }
+         NotifyCampaignRecord out;
+         out.Campaign=reply.Campaign;out.Nonce=reply.Nonce;out.BaseRevision=reply.Base.Revision;out.BaseTag=reply.Base.Tag;
+         out.TargetRevision=reply.Target.Revision;out.TargetTag=reply.Target.Tag;out.Total=reply.Total;

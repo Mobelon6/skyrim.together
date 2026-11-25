@@ -1,0 +1,259 @@
+diff --git a/Code/common/TradeLedger.h b/Code/common/TradeLedger.h
+--- a/Code/common/TradeLedger.h
++++ b/Code/common/TradeLedger.h
+@@ -1,105 +1,155 @@
+ #pragma once
+ #include "QuestJournalDisk.h"
+-#include <algorithm>
+-#include <fstream>
+-#include <iomanip>
+-#include <map>
+-#include <sstream>
+-#include <vector>
+-
+-class TradeLedger
+-{
+-public:
+-    struct Row
+-    {
+-        std::string user, peer, plugin;
+-        uint32_t base{};
+-        int count{}; // Positive credits the backpack; negative reserves the deposit in escrow.
+-    };
+-    explicit TradeLedger(std::filesystem::path path) : root(std::move(path)) {}
+-    uint64_t Stream()
+-    {
+-        if (stream) return stream;
+-        uint64_t id{};
+-        if (std::filesystem::exists(root))
+-            for (const auto& file : std::filesystem::directory_iterator(root))
+-                if (file.is_directory())
+-                {
+-                    if (id) throw std::runtime_error("ambiguous trade ledger");
+-                    id = std::stoull(file.path().filename().string());
+-                }
+-        if (!id) id = QuestJournalDisk::CreateStream(root);
+-        if (!id) throw std::runtime_error("cannot initialize trade ledger");
+-        accounts.clear(); stock.clear(); confirmed.clear(); last = 0;
+-        const auto size = QuestJournalDisk::Contiguous(root,id);
+-        const auto dir = root/std::to_string(id);
+-        for (const auto& entry : std::filesystem::directory_iterator(dir))
+-            if (entry.path().extension()==".tsv" && std::stoul(entry.path().stem().string())>size)
+-                throw std::runtime_error("trade ledger sequence gap");
+-        for (uint32_t n=1;n<=size;++n)
+-        {
+-            std::ifstream f(dir/(std::to_string(n)+".tsv"), std::ios::binary);
+-            std::string line; std::getline(f,line);
+-            std::istringstream in(line);
+-            uint32_t actual{}; char kind{}; Row r;
+-            if (!(in>>actual>>kind>>std::quoted(r.user)) || actual!=n) throw std::runtime_error("invalid trade receipt");
+-            if (kind=='A') { uint32_t pos{}; if (!(in>>pos) || pos!=confirmed[r.user]+1 || pos>accounts[r.user].size()) throw std::runtime_error("invalid acknowledgement"); Confirmed(r.user,pos); }
+-            else if (kind=='T' && (in>>std::quoted(r.peer)>>std::quoted(r.plugin)>>r.base>>r.count) && r.count && std::abs(static_cast<long long>(r.count))<=9999) Append(r);
+-            else throw std::runtime_error("invalid trade operation");
+-            ++last;
+-        }
+-        stream=id;
+-        return stream;
+-    }
+-    const std::vector<Row>& History(const std::string& user) {return accounts[user];}
+-    using Items = std::map<std::pair<std::string,uint32_t>,int64_t>;
+-    const Items& Stock(const std::string& a,const std::string& b) {return stock[std::minmax(a,b)];}
+-    bool Ack(const std::string& user,uint32_t pos)
+-    {
+-        if (pos<=confirmed[user]) return true;
+-        if (pos>accounts[user].size()) return false;
+-        while (confirmed[user]<pos)
+-        {
+-            const auto n=confirmed[user]+1;
+-            std::ostringstream out; out<<"A "<<std::quoted(user)<<' '<<n;
+-            if (!Store(out.str())) return false;
+-            Confirmed(user,n);
+-        }
+-        return true;
+-    }
+-    bool Commit(const Row& r,uint32_t cursor)
+-    {
+-        if (r.user.empty() || r.peer.empty() || r.user==r.peer || r.plugin.empty() || !r.base ||
+-            cursor!=accounts[r.user].size() || cursor!=confirmed[r.user] || cursor>=0xFFFFFE ||
+-            !r.count || std::abs(static_cast<long long>(r.count))>9999) return false;
+-        if (r.count>0)
+-        {
+-            const auto& items=Stock(r.user,r.peer);
+-            auto i=items.find({r.plugin,r.base});
+-            if (i==items.end() || i->second<r.count) return false;
+-        }
+-        std::ostringstream out;
+-        out<<"T "<<std::quoted(r.user)<<' '<<std::quoted(r.peer)<<' '<<std::quoted(r.plugin)<<' '<<r.base<<' '<<r.count;
+-        if (!Store(out.str())) return false;
+-        Append(r); return true;
+-    }
+-private:
+-    bool Store(const std::string& data)
+-    {
+-        if (!QuestJournalDisk::Store(root,stream,last+1,data)) return false;
+-        ++last; return true;
+-    }
+-    void Append(const Row& r)
+-    {
+-        accounts[r.user].push_back(r);
+-        if (r.count>0) stock[std::minmax(r.user,r.peer)][{r.plugin,r.base}]-=r.count;
+-    }
+-    void Confirmed(const std::string& user,uint32_t pos)
+-    {
+-        confirmed[user]=pos;
+-        const auto& r=accounts[user][pos-1];
+-        if (r.count<0) stock[std::minmax(r.user,r.peer)][{r.plugin,r.base}]-=r.count;
+-    }
++#include "CampaignJournal.h"
++#include <algorithm>
++#include <fstream>
++#include <iomanip>
++#include <map>
++#include <sstream>
++#include <vector>
++
++class TradeLedger
++{
++public:
++    struct Row
++    {
++        std::string user, peer, plugin;
++        uint32_t base{};
++        int count{}; // Positive credits the backpack; negative reserves the deposit in escrow.
++    };
++    explicit TradeLedger(std::filesystem::path path) : root(std::move(path)) {}
++    TradeLedger(CampaignJournal::Journal& journal,uint64_t campaign) : authority(&journal), campaignId(campaign) {}
++    uint64_t Stream()
++    {
++        if (authority && !authority->Ready()) throw std::runtime_error("campaign trade authority unavailable");
++        if (stream) return stream;
++        if (authority)
++        {
++            if (!campaignId) throw std::runtime_error("invalid campaign trade stream");
++            accounts.clear(); stock.clear(); confirmed.clear(); last=0;
++            for (const auto& op:authority->Operations())
++                if (op.Kind=="trade-v1")
++                {
++                    if (op.Id!="trade-"+std::to_string(last+1)) throw std::runtime_error("invalid campaign trade sequence");
++                    Replay(op.Payload); ++last;
++                }
++            stream=campaignId; return stream;
++        }
++        uint64_t id{};
++        if (std::filesystem::exists(root))
++            for (const auto& file : std::filesystem::directory_iterator(root))
++                if (file.is_directory())
++                {
++                    if (id) throw std::runtime_error("ambiguous trade ledger");
++                    id = std::stoull(file.path().filename().string());
++                }
++        if (!id) id = QuestJournalDisk::CreateStream(root);
++        if (!id) throw std::runtime_error("cannot initialize trade ledger");
++        accounts.clear(); stock.clear(); confirmed.clear(); last = 0;
++        const auto size = QuestJournalDisk::Contiguous(root,id);
++        const auto dir = root/std::to_string(id);
++        for (const auto& entry : std::filesystem::directory_iterator(dir))
++            if (entry.path().extension()==".tsv" && std::stoul(entry.path().stem().string())>size)
++                throw std::runtime_error("trade ledger sequence gap");
++        for (uint32_t n=1;n<=size;++n)
++        {
++            std::ifstream f(dir/(std::to_string(n)+".tsv"), std::ios::binary);
++            std::string line; std::getline(f,line);
++            const auto prefix=std::to_string(n)+"\t";
++            if (!line.starts_with(prefix)) throw std::runtime_error("invalid trade receipt");
++            Replay(line.substr(prefix.size()));
++            ++last;
++        }
++        stream=id;
++        return stream;
++    }
++    const std::vector<Row>& History(const std::string& user) {return accounts[user];}
++    using Items = std::map<std::pair<std::string,uint32_t>,int64_t>;
++    const Items& Stock(const std::string& a,const std::string& b) {return stock[std::minmax(a,b)];}
++    bool Ack(const std::string& user,uint32_t pos)
++    {
++        if (pos<=confirmed[user]) return true;
++        if (pos>accounts[user].size()) return false;
++        while (confirmed[user]<pos)
++        {
++            const auto n=confirmed[user]+1;
++            std::ostringstream out; out<<"A "<<std::quoted(user)<<' '<<n;
++            if (!Store(out.str())) return false;
++            Confirmed(user,n);
++        }
++        return true;
++    }
++    bool Commit(const Row& r,uint32_t cursor)
++    {
++        if (r.user.empty() || r.peer.empty() || r.user==r.peer || r.plugin.empty() || !r.base ||
++            cursor!=accounts[r.user].size() || cursor!=confirmed[r.user] || cursor>=0xFFFFFE ||
++            !r.count || std::abs(static_cast<long long>(r.count))>9999) return false;
++        if (r.count>0)
++        {
++            const auto& items=Stock(r.user,r.peer);
++            auto i=items.find({r.plugin,r.base});
++            if (i==items.end() || i->second<r.count) return false;
++        }
++        std::ostringstream out;
++        out<<"T "<<std::quoted(r.user)<<' '<<std::quoted(r.peer)<<' '<<std::quoted(r.plugin)<<' '<<r.base<<' '<<r.count;
++        if (!Store(out.str())) return false;
++        Append(r); return true;
++    }
++private:
++    void Replay(const std::string& data)
++    {
++        std::istringstream in(data);
++        char kind{}; Row r;
++        if (!(in>>kind>>std::quoted(r.user)) || r.user.empty()) throw std::runtime_error("invalid trade receipt");
++        if (kind=='A')
++        {
++            uint32_t pos{};std::string extra;
++            if (!(in>>pos) || in>>extra || pos!=confirmed[r.user]+1 || pos>accounts[r.user].size())
++                throw std::runtime_error("invalid acknowledgement");
++            Confirmed(r.user,pos);
++        }
++        else if (kind=='T')
++        {
++            std::string extra;
++            if (!(in>>std::quoted(r.peer)>>std::quoted(r.plugin)>>r.base>>r.count) || in>>extra ||
++                r.peer.empty() || r.user==r.peer || r.plugin.empty() || !r.base || !r.count ||
++                std::abs(static_cast<long long>(r.count))>9999 ||
++                accounts[r.user].size()!=confirmed[r.user] || accounts[r.user].size()>=0xFFFFFE)
++                throw std::runtime_error("invalid trade operation");
++            if (r.count>0)
++            {
++                const auto& items=Stock(r.user,r.peer);
++                auto it=items.find({r.plugin,r.base});
++                if (it==items.end() || it->second<r.count) throw std::runtime_error("invalid trade stock");
++            }
++            Append(r);
++        }
++        else throw std::runtime_error("invalid trade operation type");
++    }
++    bool Store(const std::string& data)
++    {
++        if (last==UINT32_MAX) return false;
++        if (authority)
++        {
++            const auto result=authority->Append(authority->Current(),{"trade-"+std::to_string(last+1),"trade-v1",data});
++            if (result!=CampaignJournal::Result::Committed) return false;
++        }
++        else if (!QuestJournalDisk::Store(root,stream,last+1,data)) return false;
++        ++last; return true;
++    }
++    void Append(const Row& r)
++    {
++        accounts[r.user].push_back(r);
++        if (r.count>0) stock[std::minmax(r.user,r.peer)][{r.plugin,r.base}]-=r.count;
++    }
++    void Confirmed(const std::string& user,uint32_t pos)
++    {
++        confirmed[user]=pos;
++        const auto& r=accounts[user][pos-1];
++        if (r.count<0) stock[std::minmax(r.user,r.peer)][{r.plugin,r.base}]-=r.count;
++    }
++    CampaignJournal::Journal* authority{};
++    uint64_t campaignId{};
+     std::filesystem::path root;
+     uint64_t stream{};
+     uint32_t last{};

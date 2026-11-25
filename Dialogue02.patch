@@ -1,0 +1,693 @@
+diff --git a/Code/client/Events/HealthChangeEvent.h b/Code/client/Events/HealthChangeEvent.h
+index c6cf11a..a4e443e 100644
+--- a/Code/client/Events/HealthChangeEvent.h
++++ b/Code/client/Events/HealthChangeEvent.h
+@@ -10,14 +10,16 @@ struct TESObjectREFR;
+  */
+ struct HealthChangeEvent
+ {
+-    HealthChangeEvent(uint32_t aHitteeId, float aDeltaHealth, bool aSampleOwnerHealth = false)
++    HealthChangeEvent(uint32_t aHitteeId, float aDeltaHealth, bool aSampleOwnerHealth = false, bool aKeepAlive = false)
+         : HitteeId(aHitteeId)
+         , DeltaHealth(aDeltaHealth)
+         , SampleOwnerHealth(aSampleOwnerHealth)
++        , KeepAlive(aKeepAlive)
+     {
+     }
+ 
+     uint32_t HitteeId;
+     float DeltaHealth;
+     bool SampleOwnerHealth;
++    bool KeepAlive;
+ };
+diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor.cpp
+index 84869cf..70def70 100644
+--- a/Code/client/Games/Skyrim/Actor.cpp
++++ b/Code/client/Games/Skyrim/Actor.cpp
+@@ -992,7 +992,7 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
+     }
+ 
+     if (apHitter && apHitter->GetExtension()->IsRemotePlayer())
+-        return wouldKill;
++        return false; // The striking client resolves this hit. A replay cannot declare a fatal blow.
+ 
+     if (pExHittee->IsLocal())
+     {
+@@ -1005,11 +1005,17 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
+ 
+     if (apHitter && apHitter->GetExtension()->IsLocalPlayer())
+     {
+-        World::Get().GetRunner().Trigger(HealthChangeEvent(apThis->formID, -realDamage));
+-        return TiltedPhoques::ThisCall(RealDamageActor, apThis, aDamage, apHitter, aKillMove);
++        const bool result = TiltedPhoques::ThisCall(RealDamageActor, apThis, aDamage, apHitter, aKillMove);
++        const float after = apThis->GetActorValue(ActorValueInfo::kHealth);
++        const bool keepAlive = apThis->actorState.IsBleedingOut() || apThis->IsEssential() || (!result && after > 0.f);
++        // A brawl, stagger or invulnerability can reduce the damage actually applied.
++        // Ordinary finishing blows still reach the owner through the original damage path.
++        const float delta = keepAlive ? std::min(0.f, after - currentHealth) : -realDamage;
++        World::Get().GetRunner().Trigger(HealthChangeEvent(apThis->formID, delta, false, keepAlive));
++        return result;
+     }
+ 
+-    return wouldKill;
++    return false; // A remote NPC's owner sends its resolved life state.
+ }
+ 
+ TP_THIS_FUNCTION(TApplyActorEffect, void, ActiveEffect, Actor* apTarget, float aEffectValue, unsigned int unk1);
+diff --git a/Code/client/Services/DialogueMarkerLayout.h b/Code/client/Services/DialogueMarkerLayout.h
+new file mode 100644
+index 0000000..c7828a3
+--- /dev/null
++++ b/Code/client/Services/DialogueMarkerLayout.h
+@@ -0,0 +1,48 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++
++// Inputs are screen pixels in the game's current viewport. No per-frame smoothing or history.
++namespace DialogueMarkerLayout
++{
++struct Point { float x{}, y{}; };
++struct Projection { Point p{}; bool front{}; };
++struct Layout { Point center{}, direction{}; bool edge{}, npcLine{}, speakerLine{}; };
++
++inline Layout Place(float width, float height, float scale, Projection anchor, Projection npc, Projection speaker)
++{
++    const auto visible = [=](Projection p) {
++        return p.front && p.p.x >= 0.f && p.p.y >= 0.f && p.p.x <= width && p.p.y <= height;
++    };
++    Layout out{};
++    out.npcLine = visible(npc);
++    out.speakerLine = visible(speaker);
++    Point mid{width * .5f, height * .5f};
++    const float margin = std::min(40.f * scale, std::min(width, height) * .24f);
++    if (out.npcLine || out.speakerLine || visible(anchor))
++    {
++        Point at = out.npcLine ? npc.p : out.speakerLine ? speaker.p : anchor.p;
++        if (out.npcLine && out.speakerLine)
++        {
++            at.x = (npc.p.x + speaker.p.x) * .5f;
++            at.y = std::min(npc.p.y, speaker.p.y);
++        }
++        out.center = {std::clamp(at.x, margin, width - margin),
++                      std::clamp(at.y - 46.f * scale, margin, height - margin)};
++        return out;
++    }
++    out.edge = true;
++    float dx = anchor.p.x - mid.x, dy = anchor.p.y - mid.y;
++    float distance = std::hypot(dx, dy);
++    if (!std::isfinite(distance) || distance < .01f)
++    {
++        dx = 0.f;
++        dy = distance = 1.f;
++    }
++    out.direction = {dx / distance, dy / distance};
++    const float factor = std::max(std::abs(dx) / (mid.x - margin), std::abs(dy) / (mid.y - margin));
++    out.center = {mid.x + dx / factor, mid.y + dy / factor};
++    return out;
++}
++}
+diff --git a/Code/client/Services/Generic/ActorValueService.cpp b/Code/client/Services/Generic/ActorValueService.cpp
+index 6c27f9c..559bcc6 100644
+--- a/Code/client/Services/Generic/ActorValueService.cpp
++++ b/Code/client/Services/Generic/ActorValueService.cpp
+@@ -225,7 +225,7 @@ void ActorValueService::OnHealthChange(const HealthChangeEvent& acEvent) noexcep
+     if (epoch == 0 || !std::isfinite(acEvent.DeltaHealth))
+         return;
+ 
+-    if (acEvent.DeltaHealth > -1.0f && acEvent.DeltaHealth < 1.0f)
++    if (!acEvent.KeepAlive && acEvent.DeltaHealth > -1.0f && acEvent.DeltaHealth < 1.0f)
+     {
+         auto& pending = m_smallHealthChanges[serverId];
+         if (pending.Epoch != epoch)
+@@ -237,6 +237,9 @@ void ActorValueService::OnHealthChange(const HealthChangeEvent& acEvent) noexcep
+     RequestHealthChangeBroadcast requestHealthChange;
+     requestHealthChange.Id = serverId;
+     requestHealthChange.OwnershipEpoch = epoch;
++    if (acEvent.KeepAlive && acEvent.DeltaHealth == 0.f)
++        return;
++    requestHealthChange.KeepAlive = acEvent.KeepAlive;
+     requestHealthChange.DeltaHealth = acEvent.DeltaHealth;
+ 
+     m_transport.Send(requestHealthChange);
+@@ -362,7 +365,14 @@ void ActorValueService::OnHealthChangeBroadcast(const NotifyHealthChangeBroadcas
+ 
+     const bool isPlayer = pExtension->IsPlayer();
+     const bool isRemote = pExtension->IsRemote();
+-    const float newHealth = pActor->GetActorValue(ActorValueInfo::kHealth) + acMessage.DeltaHealth;
++    const float currentHealth = pActor->GetActorValue(ActorValueInfo::kHealth);
++    float newHealth = currentHealth + acMessage.DeltaHealth;
++    if (!isPlayer && acMessage.KeepAlive)
++    {
++        if (currentHealth <= 0.f || pActor->IsDead())
++            return;
++        newHealth = std::max(std::min(currentHealth, 1.f), newHealth);
++    }
+ 
+     // The owner confirms death separately. A projected delta can cross zero
+     // during a non-lethal fight or a transition into bleedout.
+@@ -371,7 +381,7 @@ void ActorValueService::OnHealthChangeBroadcast(const NotifyHealthChangeBroadcas
+ 
+     pActor->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, newHealth);
+ 
+-    if (!isRemote && !isPlayer)
++    if (!isRemote && !isPlayer && !acMessage.KeepAlive && acMessage.DeltaHealth < 0.f)
+     {
+         const float health = pActor->GetActorValue(ActorValueInfo::kHealth);
+         if (!pActor->IsDead() && health <= 0.f)
+diff --git a/Code/client/Services/Generic/DialogueMarker.cpp b/Code/client/Services/Generic/DialogueMarker.cpp
+new file mode 100644
+index 0000000..ca9ff1e
+--- /dev/null
++++ b/Code/client/Services/Generic/DialogueMarker.cpp
+@@ -0,0 +1,71 @@
++#include <TiltedOnlinePCH.h>
++#include <Services/OverlayService.h>
++#include <Services/DialogueMarkerLayout.h>
++#include <Interface/Menus/HUDMenuUtils.h>
++#include <imgui.h>
++
++void OverlayService::DrawDialogueMarker() noexcept
++{
++    DialogueMarker frame;
++    {
++        std::lock_guard guard(m_markerMutex);
++        if (!m_marker.Active)
++            return;
++        frame = m_marker;
++    }
++    const auto screen = ImGui::GetIO().DisplaySize;
++    if (screen.x < 4.f || screen.y < 4.f)
++        return;
++    using namespace DialogueMarkerLayout;
++    const auto project = [screen, &frame](glm::vec3 position, bool mirrorBehind = false) -> Projection {
++        NiPoint3 uv{};
++        bool front = HUDMenuUtils::WorldPtToScreenPt3(position, uv) && uv.z >= 0.f;
++        if (!front)
++        {
++            if (!mirrorBehind)
++                return {};
++            if (HUDMenuUtils::WorldPtToScreenPt3(frame.Eye + (frame.Eye - position), uv))
++            {
++                uv.x = 1.f - uv.x;
++                uv.y = 1.f - uv.y;
++            }
++            else
++                return {{screen.x * .5f, screen.y}, false};
++        }
++        if (!std::isfinite(uv.x) || !std::isfinite(uv.y))
++            return {{screen.x * .5f, screen.y}, false};
++        return {{uv.x * screen.x, (1.f - uv.y) * screen.y}, front};
++    };
++    const float scale = std::clamp(screen.y / 720.f, .75f, 3.f);
++    const Projection anchor = project(frame.Anchor, true);
++    const Projection npc = frame.HasNpc ? project(frame.Npc) : Projection{};
++    const Projection speaker = frame.HasSpeaker ? project(frame.Speaker) : Projection{};
++    const Layout layout = Place(screen.x, screen.y, scale, anchor, npc, speaker);
++    const ImVec2 center{layout.center.x, layout.center.y};
++    const auto at = [center, scale](float x, float y) { return ImVec2(center.x + x * scale, center.y + y * scale); };
++    auto* draw = ImGui::GetBackgroundDrawList();
++    constexpr ImU32 ink = IM_COL32(19, 20, 23, 238), light = IM_COL32(249, 248, 239, 255);
++    const auto line = [&](Point tip) {
++        const ImVec2 end{tip.x, tip.y};
++        draw->AddLine(center, end, ink, 3.1f * scale);
++        draw->AddLine(center, end, light, 1.15f * scale);
++    };
++    if (layout.npcLine) line(npc.p);
++    if (layout.speakerLine) line(speaker.p);
++    // A rounded speech balloon with a cut-out mouth and three dots.
++    draw->AddTriangleFilled(at(-10, 10), at(-10, 22), at(4, 11), ink);
++    draw->AddRectFilled(at(-22,-16), at(22,15), ink, 11.f * scale);
++    draw->AddRectFilled(at(-19.5f,-13.5f), at(19.5f,12.5f), light, 9.f * scale);
++    draw->AddTriangleFilled(at(-8, 10), at(-8, 17.5f), at(2, 10), light);
++    for (int i = -1; i <= 1; ++i)
++        draw->AddCircleFilled(at(8.f * i, -.5f), 2.4f * scale, ink);
++    if (layout.edge)
++    {
++        const auto arrow = [&](float forward, float side) {
++            return at(layout.direction.x * forward - layout.direction.y * side,
++                      layout.direction.y * forward + layout.direction.x * side);
++        };
++        draw->AddTriangleFilled(arrow(38,0), arrow(23,-9), arrow(23,9), ink);
++        draw->AddTriangleFilled(arrow(35,0), arrow(25,-6), arrow(25,6), light);
++    }
++}
+diff --git a/Code/client/Services/Generic/OverlayService.cpp b/Code/client/Services/Generic/OverlayService.cpp
+index 3497527..430bcee 100644
+--- a/Code/client/Services/Generic/OverlayService.cpp
++++ b/Code/client/Services/Generic/OverlayService.cpp
+@@ -38,6 +38,9 @@
+ #include <Services/PartyService.h>
+ #include <Games/Misc/MenuTopicManager.h>
+ #include <Interface/Menus/HUDMenuUtils.h>
++#include <Services/ImguiService.h>
++#include <Interface/UI.h>
++#include <Utils.h>
+ #include <cmath>
+ #include <limits>
+ #include <Forms/TESWorldSpace.h>
+@@ -144,6 +147,7 @@ OverlayService::OverlayService(World& aWorld, TransportService& transport, entt:
+     m_chatMessageConnection = aDispatcher.sink<NotifyChatMessageBroadcast>().connect<&OverlayService::OnChatMessageReceived>(this);
+     m_playerJoinedConnection = aDispatcher.sink<NotifyPlayerJoined>().connect<&OverlayService::OnPlayerJoined>(this);
+     m_playerLeftConnection = aDispatcher.sink<NotifyPlayerLeft>().connect<&OverlayService::OnPlayerLeft>(this);
++    m_drawDialogueConnection = aWorld.ctx().at<ImguiService>().OnDraw.connect<&OverlayService::DrawDialogueMarker>(this);
+     m_playerDialogueConnection = aDispatcher.sink<NotifyPlayerDialogue>().connect<&OverlayService::OnPlayerDialogue>(this);
+     m_playerAddedConnection = m_world.on_destroy<WaitingFor3D>().connect<&OverlayService::OnWaitingFor3DRemoved>(this);
+     m_playerRemovedConnection = m_world.on_destroy<PlayerComponent>().connect<&OverlayService::OnPlayerComponentRemoved>(this);
+@@ -380,10 +384,23 @@ void OverlayService::OnPlayerDialogue(const NotifyPlayerDialogue& acMessage) noe
+     if (!acMessage.Anchor.Cell)
+         m_conversations.erase(acMessage.SpeakerId);
+     else
+-        m_conversations[acMessage.SpeakerId] = {acMessage, std::chrono::steady_clock::now() + 4s};
++    {
++        uint32_t localForm = acMessage.Anchor.TargetForm ? m_world.GetModSystem().GetGameId(acMessage.Anchor.TargetForm) : 0;
++        if (!localForm && acMessage.Anchor.TargetEntity != UINT32_MAX)
++            if (auto entity = Utils::FindEntityByServerId(acMessage.Anchor.TargetEntity))
++                if (auto* form = m_world.try_get<FormIdComponent>(*entity))
++                    localForm = form->Id;
++        m_conversations[acMessage.SpeakerId] = {acMessage, localForm, std::chrono::steady_clock::now() + 4s};
++    }
+ }
+ 
+ void OverlayService::ClearDialogueHud() noexcept
++{
++    { std::lock_guard guard(m_markerMutex); m_marker.Active = false; }
++    HideDialogueText();
++}
++
++void OverlayService::HideDialogueText() noexcept
+ {
+     if (m_dialogueHudVisible && m_pOverlay)
+         m_pOverlay->ExecuteAsync("hidePartyConversation");
+@@ -393,9 +410,6 @@ void OverlayService::ClearDialogueHud() noexcept
+ void OverlayService::UpdateDialogueHud() noexcept
+ {
+     const auto now = std::chrono::steady_clock::now();
+-    if (now < m_nextDialogueHud)
+-        return;
+-    m_nextDialogueHud = now + 100ms;
+     if (m_conversations.empty())
+     {
+         ClearDialogueHud();
+@@ -404,7 +418,8 @@ void OverlayService::UpdateDialogueHud() noexcept
+     auto* pPlayer = PlayerCharacter::Get();
+     const auto* pMenu = MenuTopicManager::Get();
+     const auto& party = m_world.GetPartyService();
+-    if (!pPlayer || !pPlayer->parentCell || !party.IsInParty() || !m_pOverlay || m_active ||
++    const auto* ui = UI::Get();
++    if (!ui || !ui->menuSystemVisible || ui->numPausesGame || ui->IsUnpausedMenuOpen() || !pPlayer || !pPlayer->parentCell || !party.IsInParty() || !m_pOverlay || m_active ||
+         !m_inGame || (pMenu && pMenu->menuOpen))
+     {
+         ClearDialogueHud();
+@@ -446,49 +461,60 @@ void OverlayService::UpdateDialogueHud() noexcept
+         return;
+     }
+ 
+-    // Mode 0: another space, 1: visible marker, 2: edge arrow, 3: listening nearby.
+-    int mode = 0;
+-    double dx = 0., dy = 0.;
+-    if (sameSpace && nearest <= 350.f && !pPlayer->IsInCombat())
+-        mode = 3;
+-    else if (sameSpace)
++    DialogueMarker marker{};
++    marker.Active = sameSpace;
++    if (sameSpace)
+     {
+-        const glm::vec3 target = static_cast<const glm::vec3&>(pSelected->Anchor.Position) + glm::vec3{0.f, 0.f, 100.f};
+-        NiPoint3 projected{};
+-        bool front = HUDMenuUtils::WorldPtToScreenPt3(target, projected) && projected.z >= 0.f;
+-        if (!front)
+-        {
+-            // Reflect around the local viewpoint to get a stable direction for a point behind the camera.
+-            const glm::vec3 eye = static_cast<const glm::vec3&>(pPlayer->position) + glm::vec3{0.f, 0.f, pPlayer->GetHeight()};
+-            if (!HUDMenuUtils::WorldPtToScreenPt3(eye + (eye - target), projected))
+-                projected = glm::vec3{0.5f, 1.f, 0.f};
+-        }
+-        dx = (projected.x - 0.5) * (front ? 2. : -2.);
+-        dy = (0.5 - projected.y) * (front ? 2. : -2.);
+-        if (!std::isfinite(dx) || !std::isfinite(dy))
++        marker.Anchor = static_cast<const glm::vec3&>(pSelected->Anchor.Position) + glm::vec3{0, 0, 100};
++        marker.Eye = static_cast<const glm::vec3&>(pPlayer->position) + glm::vec3{0, 0, pPlayer->GetHeight()};
++        const auto getHead = [pCell, pWorld](uint32_t form, glm::vec3& out) {
++            auto* actor = form ? Cast<Actor>(TESForm::GetById(form)) : nullptr;
++            if (!actor || !actor->GetNiNode() || actor->IsDisabled() ||
++                actor->GetWorldSpace() != pWorld || (!pWorld && actor->GetParentCellEx() != pCell))
++                return false;
++            out = static_cast<const glm::vec3&>(actor->position) + glm::vec3{0, 0, actor->GetHeight()};
++            return true;
++        };
++        marker.HasNpc = getHead(m_conversations.at(pSelected->SpeakerId).LocalNpcForm, marker.Npc);
++        if (marker.HasNpc)
++            marker.Anchor = marker.Npc;
++        const auto players = m_world.view<PlayerComponent, FormIdComponent>();
++        for (auto entity : players)
+         {
+-            dx = 0.;
+-            dy = 1.;
+-        }
+-        mode = front && std::abs(dx) <= 0.90 && std::abs(dy) <= 0.88 ? 1 : 2;
+-        if (mode == 2)
+-        {
+-            if (std::abs(dx) + std::abs(dy) < 0.001)
+-                dy = 1.;
+-            const double edge = std::max(std::abs(dx) / 0.90, std::abs(dy) / 0.88);
+-            dx /= edge;
+-            dy /= edge;
++            if (players.get<PlayerComponent>(entity).Id == pSelected->SpeakerId)
++            {
++                marker.HasSpeaker = getHead(players.get<FormIdComponent>(entity).Id, marker.Speaker);
++                break;
++            }
+         }
+     }
++    { std::lock_guard guard(m_markerMutex); m_marker = marker; }
++
++    const int mode = sameSpace ? 3 : 0;
++    if (sameSpace && (nearest > 350.f || pPlayer->IsInCombat() || pSelected->Text.empty()))
++    {
++        HideDialogueText();
++        return;
++    }
++    // The browser handles text only. Camera motion must not generate CEF messages.
++    if (m_dialogueHudVisible && m_lastDialogueMode == mode && m_lastSpeaker == pSelected->SpeakerId &&
++        m_lastSession == pSelected->Anchor.Session && m_lastChoice == pSelected->Anchor.Choice &&
++        m_lastDialogueText == pSelected->Text)
++        return;
++    m_lastDialogueMode = mode;
++    m_lastSpeaker = pSelected->SpeakerId;
++    m_lastSession = pSelected->Anchor.Session;
++    m_lastChoice = pSelected->Anchor.Choice;
++    m_lastDialogueText = pSelected->Text;
+     auto args = CefListValue::Create();
+     args->SetInt(0, mode);
+-    args->SetDouble(1, (dx + 1.) * 50.);
+-    args->SetDouble(2, (dy + 1.) * 50.);
++    args->SetDouble(1, 50);
++    args->SetDouble(2, 8);
+     args->SetString(3, pSelected->Name.c_str());
+     args->SetString(4, mode == 3 ? pSelected->Text.c_str() : "");
+-    args->SetDouble(5, pSelected->SpeakerId);
+-    args->SetDouble(6, pSelected->Anchor.Session);
+-    args->SetDouble(7, pSelected->Anchor.Choice);
++    args->SetDouble(5, m_lastSpeaker);
++    args->SetDouble(6, m_lastSession);
++    args->SetDouble(7, m_lastChoice);
+     m_pOverlay->ExecuteAsync("partyConversation", args);
+     m_dialogueHudVisible = true;
+ }
+diff --git a/Code/client/Services/Generic/PlayerService.cpp b/Code/client/Services/Generic/PlayerService.cpp
+index 4c991ce..00749d3 100644
+--- a/Code/client/Services/Generic/PlayerService.cpp
++++ b/Code/client/Services/Generic/PlayerService.cpp
+@@ -1,6 +1,7 @@
+ #include <Services/PlayerService.h>
+ 
+ #include <World.h>
++#include <Utils.h>
+ 
+ #include <Events/UpdateEvent.h>
+ #include <Events/ConnectedEvent.h>
+@@ -182,6 +183,17 @@ void PlayerService::UpdateDialogue(const PlayerDialogueEvent* apChoice) noexcept
+             if (!m_world.GetModSystem().GetServerModId(pSpace->formID, request.Anchor.WorldSpace))
+                 return;
+         request.Anchor.Position = pTarget->position;
++        if ((pTarget->formID >> 24) != 0xFF)
++            m_world.GetModSystem().GetServerModId(pTarget->formID, request.Anchor.TargetForm);
++        auto forms = m_world.view<FormIdComponent>();
++        for (auto entity : forms)
++        {
++            if (forms.get<FormIdComponent>(entity).Id == pTarget->formID)
++            {
++                request.Anchor.TargetEntity = Utils::GetServerId(entity).value_or(UINT32_MAX);
++                break;
++            }
++        }
+         if (handle != m_dialogueHandle)
+         {
+             ++m_dialogueSession;
+diff --git a/Code/client/Services/OverlayService.h b/Code/client/Services/OverlayService.h
+index d08f321..326f51c 100644
+--- a/Code/client/Services/OverlayService.h
++++ b/Code/client/Services/OverlayService.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <include/internal/cef_ptr.h>
++#include <mutex>
+ #include <Messages/NotifyPlayerDialogue.h>
+ 
+ namespace TiltedPhoques
+@@ -87,13 +88,27 @@ private:
+     void RunDebugDataUpdates() noexcept;
+     void UpdateDialogueHud() noexcept;
+     void ClearDialogueHud() noexcept;
++    void HideDialogueText() noexcept;
++    void DrawDialogueMarker() noexcept;
++    struct DialogueMarker
++    {
++        glm::vec3 Anchor{}, Eye{}, Npc{}, Speaker{};
++        bool Active{}, HasNpc{}, HasSpeaker{};
++    };
++    // Publish plain world coordinates from the game update. Only the render thread reads the live camera.
++    std::mutex m_markerMutex;
++    DialogueMarker m_marker{};
++    entt::scoped_connection m_drawDialogueConnection;
+     struct PartyConversation
+     {
+         NotifyPlayerDialogue Last{};
++        uint32_t LocalNpcForm{};
+         std::chrono::steady_clock::time_point Expires{};
+     };
+     Map<uint32_t, PartyConversation> m_conversations;
+-    std::chrono::steady_clock::time_point m_nextDialogueHud{};
++    uint32_t m_lastSpeaker{}, m_lastSession{}, m_lastChoice{};
++    int m_lastDialogueMode{-1};
++    String m_lastDialogueText;
+     bool m_dialogueHudVisible{};
+ 
+     void RunPlayerHealthUpdates() noexcept;
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+index b396173..951e3f9 100644
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-dialogue1"
++#define BUILD_COMMIT "${GIT_TAG}-coop-dialogue2"
+diff --git a/Code/encoding/Messages/NotifyHealthChangeBroadcast.cpp b/Code/encoding/Messages/NotifyHealthChangeBroadcast.cpp
+index 7b7979e..711cde3 100644
+--- a/Code/encoding/Messages/NotifyHealthChangeBroadcast.cpp
++++ b/Code/encoding/Messages/NotifyHealthChangeBroadcast.cpp
+@@ -5,6 +5,7 @@ void NotifyHealthChangeBroadcast::SerializeRaw(TiltedPhoques::Buffer::Writer& aW
+     Serialization::WriteVarInt(aWriter, Id);
+     Serialization::WriteVarInt(aWriter, OwnershipEpoch);
+     Serialization::WriteFloat(aWriter, DeltaHealth);
++    Serialization::WriteBool(aWriter, KeepAlive);
+ }
+ 
+ void NotifyHealthChangeBroadcast::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept
+@@ -14,4 +15,5 @@ void NotifyHealthChangeBroadcast::DeserializeRaw(TiltedPhoques::Buffer::Reader&
+     Id = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+     OwnershipEpoch = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+     DeltaHealth = Serialization::ReadFloat(aReader);
++    KeepAlive = Serialization::ReadBool(aReader);
+ }
+diff --git a/Code/encoding/Messages/NotifyHealthChangeBroadcast.h b/Code/encoding/Messages/NotifyHealthChangeBroadcast.h
+index 62f2d0f..dc46e0b 100644
+--- a/Code/encoding/Messages/NotifyHealthChangeBroadcast.h
++++ b/Code/encoding/Messages/NotifyHealthChangeBroadcast.h
+@@ -14,9 +14,10 @@ struct NotifyHealthChangeBroadcast final : ServerMessage
+     void SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept override;
+     void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
+ 
+-    bool operator==(const NotifyHealthChangeBroadcast& acRhs) const noexcept { return Id == acRhs.Id && OwnershipEpoch == acRhs.OwnershipEpoch && DeltaHealth == acRhs.DeltaHealth && GetOpcode() == acRhs.GetOpcode(); }
++    bool operator==(const NotifyHealthChangeBroadcast& acRhs) const noexcept { return Id == acRhs.Id && OwnershipEpoch == acRhs.OwnershipEpoch && DeltaHealth == acRhs.DeltaHealth && KeepAlive == acRhs.KeepAlive && GetOpcode() == acRhs.GetOpcode(); }
+ 
+     uint32_t Id{};
+     uint32_t OwnershipEpoch{};
+     float DeltaHealth{};
++    bool KeepAlive{};
+ };
+diff --git a/Code/encoding/Messages/RequestHealthChangeBroadcast.cpp b/Code/encoding/Messages/RequestHealthChangeBroadcast.cpp
+index a23fb2a..ead87c6 100644
+--- a/Code/encoding/Messages/RequestHealthChangeBroadcast.cpp
++++ b/Code/encoding/Messages/RequestHealthChangeBroadcast.cpp
+@@ -5,6 +5,7 @@ void RequestHealthChangeBroadcast::SerializeRaw(TiltedPhoques::Buffer::Writer& a
+     Serialization::WriteVarInt(aWriter, Id);
+     Serialization::WriteVarInt(aWriter, OwnershipEpoch);
+     Serialization::WriteFloat(aWriter, DeltaHealth);
++    Serialization::WriteBool(aWriter, KeepAlive);
+ }
+ 
+ void RequestHealthChangeBroadcast::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept
+@@ -14,4 +15,5 @@ void RequestHealthChangeBroadcast::DeserializeRaw(TiltedPhoques::Buffer::Reader&
+     Id = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+     OwnershipEpoch = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+     DeltaHealth = Serialization::ReadFloat(aReader);
++    KeepAlive = Serialization::ReadBool(aReader);
+ }
+diff --git a/Code/encoding/Messages/RequestHealthChangeBroadcast.h b/Code/encoding/Messages/RequestHealthChangeBroadcast.h
+index 5023ae7..24d5648 100644
+--- a/Code/encoding/Messages/RequestHealthChangeBroadcast.h
++++ b/Code/encoding/Messages/RequestHealthChangeBroadcast.h
+@@ -14,9 +14,10 @@ struct RequestHealthChangeBroadcast final : ClientMessage
+     void SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept override;
+     void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
+ 
+-    bool operator==(const RequestHealthChangeBroadcast& acRhs) const noexcept { return Id == acRhs.Id && OwnershipEpoch == acRhs.OwnershipEpoch && DeltaHealth == acRhs.DeltaHealth && GetOpcode() == acRhs.GetOpcode(); }
++    bool operator==(const RequestHealthChangeBroadcast& acRhs) const noexcept { return Id == acRhs.Id && OwnershipEpoch == acRhs.OwnershipEpoch && DeltaHealth == acRhs.DeltaHealth && KeepAlive == acRhs.KeepAlive && GetOpcode() == acRhs.GetOpcode(); }
+ 
+     uint32_t Id{};
+     uint32_t OwnershipEpoch{};
+     float DeltaHealth{};
++    bool KeepAlive{};
+ };
+diff --git a/Code/encoding/Structs/DialogueAnchor.h b/Code/encoding/Structs/DialogueAnchor.h
+index dcec678..5a17570 100644
+--- a/Code/encoding/Structs/DialogueAnchor.h
++++ b/Code/encoding/Structs/DialogueAnchor.h
+@@ -10,6 +10,9 @@ struct DialogueAnchor
+ {
+     uint32_t Session{};
+     uint32_t Choice{};
++    // Runtime-created references use the shared entity ID. Placed references also carry a plugin-relative ID.
++    uint32_t TargetEntity{UINT32_MAX};
++    GameId TargetForm{};
+     GameId Cell{};
+     GameId WorldSpace{};
+     Vector3_NetQuantize Position{};
+@@ -20,6 +23,8 @@ struct DialogueAnchor
+     {
+         TiltedPhoques::Serialization::WriteVarInt(aWriter, Session);
+         TiltedPhoques::Serialization::WriteVarInt(aWriter, Choice);
++        TiltedPhoques::Serialization::WriteVarInt(aWriter, TargetEntity);
++        TargetForm.Serialize(aWriter);
+         Cell.Serialize(aWriter);
+         WorldSpace.Serialize(aWriter);
+         Position.Serialize(aWriter);
+@@ -29,6 +34,8 @@ struct DialogueAnchor
+     {
+         Session = TiltedPhoques::Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+         Choice = TiltedPhoques::Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
++        TargetEntity = TiltedPhoques::Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
++        TargetForm.Deserialize(aReader);
+         Cell.Deserialize(aReader);
+         WorldSpace.Deserialize(aReader);
+         Position.Deserialize(aReader);
+diff --git a/Code/server/Services/ActorValueService.cpp b/Code/server/Services/ActorValueService.cpp
+index 94e731c..1667eea 100644
+--- a/Code/server/Services/ActorValueService.cpp
++++ b/Code/server/Services/ActorValueService.cpp
+@@ -88,11 +88,16 @@ void ActorValueService::OnHealthChangeBroadcast(const PacketEvent<RequestHealthC
+         return;
+ 
+     auto& values = actorValuesView.get<ActorValuesComponent>(*it);
+-    values.CurrentActorValues.ActorValuesList[24] += message.DeltaHealth;
++    float& health = values.CurrentActorValues.ActorValuesList[24];
++    if (message.KeepAlive && health <= 0.f)
++        return;
++    const float next = health + message.DeltaHealth;
++    health = message.KeepAlive ? std::max(std::min(1.f, health), next) : next;
+     NotifyHealthChangeBroadcast notify;
+     notify.Id = message.Id;
+     notify.OwnershipEpoch = message.OwnershipEpoch;
+     notify.DeltaHealth = message.DeltaHealth;
++    notify.KeepAlive = message.KeepAlive;
+ 
+     const entt::entity cEntity = static_cast<entt::entity>(message.Id);
+     if (!GameServer::Get()->SendToPlayersInRange(notify, cEntity, acMessage.pPlayer))
+diff --git a/Code/skyrim_ui/src/app/components/root/root.component.scss b/Code/skyrim_ui/src/app/components/root/root.component.scss
+index 12763fc..7660cf0 100644
+--- a/Code/skyrim_ui/src/app/components/root/root.component.scss
++++ b/Code/skyrim_ui/src/app/components/root/root.component.scss
+@@ -174,8 +174,8 @@
+   text-shadow: 0 1px 3px black, 0 0 5px black;
+ }
+ .conversation-marker {
+-  width: 2rem;
+-  height: 2rem;
++  width: 2.6rem;
++  height: 2.6rem;
+   transform: translate(-50%, -50%);
+   border: 2px solid currentColor;
+   border-radius: 50%;
+@@ -185,8 +185,8 @@
+ }
+ .conversation-icon {
+   position: relative;
+-  width: 1.05rem;
+-  height: .7rem;
++  width: 1.37rem;
++  height: .91rem;
+   border-radius: .22rem;
+   background: currentColor;
+   &::after {
+@@ -219,10 +219,10 @@
+ }
+ .conversation-reply {
+   top: 54%;
+-  right: 8%;
++  right: 16%;
+   max-width: 36%;
+   line-height: 1.3;
+-  font-size: 1.25rem;
++  font-size: clamp(1.5rem, 2.65vh, 2.5rem);
+   overflow-wrap: anywhere;
+   animation: conversation-reply-fade 5s both;
+ }
+diff --git a/Code/skyrim_ui/src/app/services/setting.service.ts b/Code/skyrim_ui/src/app/services/setting.service.ts
+index 0e8a0e0..3bead85 100644
+--- a/Code/skyrim_ui/src/app/services/setting.service.ts
++++ b/Code/skyrim_ui/src/app/services/setting.service.ts
+@@ -102,6 +102,18 @@ export class SettingService {
+   ) as ScreenCorner[];
+   private readonly autoHideTimeValues = autoHideTimerLengths;
+ 
++  private initialPartyOffsetY(): number {
++    const store = this.storeService;
++    const top = Number(store.get('party_anchor', ScreenCorner.TOP_LEFT)) < ScreenCorner.BOTTOM_RIGHT;
++    if (top && store.get('party_y_dialogue2', null) === null) {
++      if (store.getFloat('party_anchor_offset_y', 30) === 3) {
++        store.set('party_anchor_offset_y', 30);
++      }
++      store.set('party_y_dialogue2', 1);
++    }
++    return top ? 30 : 3;
++  }
++
+   public settings = {
+     volume: new SliderSetting(this.storeService, 'audio_volume', 0.5),
+     muted: new ToggleSetting(this.storeService, 'audio_muted', false),
+@@ -143,7 +155,7 @@ export class SettingService {
+     partyAnchorOffsetY: new SliderSetting(
+       this.storeService,
+       'party_anchor_offset_y',
+-      3,
++      this.initialPartyOffsetY(),
+     ),
+     isDebugShown: new ToggleSetting(this.storeService, 'debug_isShown', false),
+     debugAnchor: new SelectSetting(
+diff --git a/Code/tests/encoding.cpp b/Code/tests/encoding.cpp
+index b704009..21c0c9e 100644
+--- a/Code/tests/encoding.cpp
++++ b/Code/tests/encoding.cpp
+@@ -687,6 +687,7 @@ TEST_CASE("Health deltas retain the actor ownership epoch", "[coop-state]")
+         sent.Id = 0xA1;
+         sent.OwnershipEpoch = 0x12345;
+         sent.DeltaHealth = -12.5f;
++        sent.KeepAlive = true;
+         Buffer buffer(128);
+         Buffer::Writer writer(&buffer);
+         sent.SerializeRaw(writer);
+@@ -721,6 +722,8 @@ TEST_CASE("Party dialogue anchors, replies and closure survive packet serializat
+     PlayerDialogueRequest request;
+     request.Anchor.Session = 0x156;
+     request.Anchor.Choice = 3;
++    request.Anchor.TargetEntity = 0; // zero is a valid synchronized entity
++    request.Anchor.TargetForm = GameId(13, 0x822);
+     request.Anchor.Cell = GameId(4, 0x311);
+     request.Anchor.WorldSpace = GameId(0, 0x3C);
+     request.Anchor.Position = glm::vec3{-8000.f, 42000.f, 260.f};

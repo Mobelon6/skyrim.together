@@ -1,0 +1,1640 @@
+diff --git a/Code/client/Components/RemoteComponent.h b/Code/client/Components/RemoteComponent.h
+index 9704cca..28eee6f 100644
+--- a/Code/client/Components/RemoteComponent.h
++++ b/Code/client/Components/RemoteComponent.h
+@@ -17,5 +17,7 @@ struct RemoteComponent
+ 
+     uint32_t Id;
+     uint32_t CachedRefId;
++    bool ObservedDead{};
++    bool ObservedBleedout{};
+     uint32_t OwnershipEpoch;
+ };
+diff --git a/Code/client/Components/WaitingFor3D.h b/Code/client/Components/WaitingFor3D.h
+index dcd9f54..7fbcc05 100644
+--- a/Code/client/Components/WaitingFor3D.h
++++ b/Code/client/Components/WaitingFor3D.h
+@@ -6,6 +6,9 @@
+ 
+ #include <Messages/CharacterSpawnRequest.h>
+ #include <Messages/NotifyEquipmentChanges.h>
++#include <Messages/NotifyDeathStateChange.h>
++
++#include <optional>
+ 
+ struct WaitingFor3D
+ {
+@@ -14,7 +17,24 @@ struct WaitingFor3D
+     {
+     }
+ 
++    std::optional<bool> GetDeathState(const uint32_t aOwnershipEpoch) const noexcept
++    {
++        if (aOwnershipEpoch == 0)
++            return std::nullopt;
++
++        if (PendingDeathState && PendingDeathState->OwnershipEpoch == aOwnershipEpoch)
++            return PendingDeathState->IsDead;
++
++        if (SpawnRequest.OwnershipEpoch == aOwnershipEpoch)
++            return SpawnRequest.IsDead;
++
++        return std::nullopt;
++    }
++
+     CharacterSpawnRequest SpawnRequest{};
++    // A life-state notification is newer than the spawn data already queued
++    // for this actor. It does not implicitly update the other spawn fields.
++    std::optional<NotifyDeathStateChange> PendingDeathState{};
+     // Equipment changes relayed before the 3D loaded, replayed after the spawn request's inventory is applied
+     Vector<NotifyEquipmentChanges> PendingEquipmentChanges{};
+ };
+diff --git a/Code/client/Events/HealthChangeEvent.h b/Code/client/Events/HealthChangeEvent.h
+index 64a90d1..c6cf11a 100644
+--- a/Code/client/Events/HealthChangeEvent.h
++++ b/Code/client/Events/HealthChangeEvent.h
+@@ -10,12 +10,14 @@ struct TESObjectREFR;
+  */
+ struct HealthChangeEvent
+ {
+-    HealthChangeEvent(uint32_t aHitteeId, float aDeltaHealth)
++    HealthChangeEvent(uint32_t aHitteeId, float aDeltaHealth, bool aSampleOwnerHealth = false)
+         : HitteeId(aHitteeId)
+         , DeltaHealth(aDeltaHealth)
++        , SampleOwnerHealth(aSampleOwnerHealth)
+     {
+     }
+ 
+     uint32_t HitteeId;
+     float DeltaHealth;
++    bool SampleOwnerHealth;
+ };
+diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor.cpp
+index a20e816..84869cf 100644
+--- a/Code/client/Games/Skyrim/Actor.cpp
++++ b/Code/client/Games/Skyrim/Actor.cpp
+@@ -727,28 +727,30 @@ void Actor::SetActorValues(const ActorValues& acActorValues) noexcept
+ 
+ void Actor::SetFactions(const Factions& acFactions) noexcept
+ {
+-    RemoveFromAllFactions();
++    // Runtime overrides (including removal, rank -1) take precedence over the base NPC.
++    const auto effectiveRanks = [](const Factions& acSource) {
++        Map<GameId, int8_t> ranks;
++        for (const auto& entry : acSource.NpcFactions)
++            ranks[entry.Id] = entry.Rank;
++        for (const auto& entry : acSource.ExtraFactions)
++            ranks[entry.Id] = entry.Rank;
++        return ranks;
++    };
++
++    const auto current = effectiveRanks(GetFactions());
++    auto desired = effectiveRanks(acFactions);
++    for (const auto& [id, rank] : current)
++        desired.try_emplace(id, -1);
+ 
+     auto& modSystem = World::Get().GetModSystem();
+-
+-    for (auto& entry : acFactions.NpcFactions)
++    for (const auto& [id, rank] : desired)
+     {
+-        auto pForm = GetById(modSystem.GetGameId(entry.Id));
+-        auto pFaction = Cast<TESFaction>(pForm);
+-        if (pFaction)
+-        {
+-            SetFactionRank(pFaction, entry.Rank);
+-        }
+-    }
+-
+-    for (auto& entry : acFactions.ExtraFactions)
+-    {
+-        auto pForm = GetById(modSystem.GetGameId(entry.Id));
+-        auto pFaction = Cast<TESFaction>(pForm);
+-        if (pFaction)
+-        {
+-            SetFactionRank(pFaction, entry.Rank);
+-        }
++        const auto it = current.find(id);
++        const int8_t oldRank = it == current.end() ? -1 : it->second;
++        if (oldRank == rank)
++            continue;
++        if (auto* pFaction = Cast<TESFaction>(GetById(modSystem.GetGameId(id))))
++            SetFactionRank(pFaction, rank);
+     }
+ }
+ 
+@@ -821,10 +823,18 @@ bool Actor::IsDragon() const noexcept
+ 
+ void Actor::Kill() noexcept
+ {
+-    // Never kill players
+-    ActorExtension* pExtension = GetExtension();
+-    if (pExtension->IsPlayer())
++    const ActorExtension* pExtension = GetExtension();
++    if (!pExtension || pExtension->IsPlayer())
++        return;
++
++    // Network reconciliation can see a death from an older or different
++    // actor configuration. Preserve Essential on both the reference and base.
++    const TESNPC* pBase = Cast<TESNPC>(baseForm);
++    if (IsEssential() || (pBase && pBase->actorData.IsEssential()))
++    {
++        spdlog::warn("Refusing to force death of essential actor {:X}", formID);
+         return;
++    }
+ 
+     // TODO: these args are kind of bogus of course
+     KillImpl(nullptr, 100.f, true, true);
+@@ -981,29 +991,25 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
+         return wouldKill;
+     }
+ 
+-    if (apHitter)
++    if (apHitter && apHitter->GetExtension()->IsRemotePlayer())
++        return wouldKill;
++
++    if (pExHittee->IsLocal())
+     {
+-        const auto* pExHitter = apHitter->GetExtension();
+-        if (pExHitter->IsLocalPlayer())
+-        {
+-            World::Get().GetRunner().Trigger(HealthChangeEvent(apThis->formID, -realDamage));
+-            return TiltedPhoques::ThisCall(RealDamageActor, apThis, aDamage, apHitter, aKillMove);
+-        }
+-        if (pExHitter->IsRemotePlayer())
+-        {
+-            return wouldKill;
+-        }
++        const uint32_t formId = apThis->formID;
++        const bool result = TiltedPhoques::ThisCall(RealDamageActor, apThis, aDamage, apHitter, aKillMove);
++        // Skyrim can reduce or cancel lethal damage. Read the resolved value on the runner.
++        World::Get().GetRunner().Trigger(HealthChangeEvent(formId, 0.f, true));
++        return result;
+     }
+ 
+-    if (pExHittee->IsLocal())
++    if (apHitter && apHitter->GetExtension()->IsLocalPlayer())
+     {
+         World::Get().GetRunner().Trigger(HealthChangeEvent(apThis->formID, -realDamage));
+         return TiltedPhoques::ThisCall(RealDamageActor, apThis, aDamage, apHitter, aKillMove);
+     }
+-    else
+-    {
+-        return wouldKill;
+-    }
++
++    return wouldKill;
+ }
+ 
+ TP_THIS_FUNCTION(TApplyActorEffect, void, ActiveEffect, Actor* apTarget, float aEffectValue, unsigned int unk1);
+diff --git a/Code/client/Services/ActorValueService.h b/Code/client/Services/ActorValueService.h
+index cab85f2..6040a08 100644
+--- a/Code/client/Services/ActorValueService.h
++++ b/Code/client/Services/ActorValueService.h
+@@ -31,15 +31,16 @@ struct Actor;
+  * This service is also responsible for syncing the death states of individual actors.
+  * The death state is perdiocally checked and compared to cached death states.
+  */
+-struct ActorValueService
++struct ActorValueService : public BSTEventSink<TESDeathEvent>
+ {
+ public:
+     ActorValueService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept;
+-    ~ActorValueService() noexcept = default;
++    ~ActorValueService() noexcept override;
+ 
+     TP_NOCOPYMOVE(ActorValueService);
+ 
+ private:
++    BSTEventResult OnEvent(const TESDeathEvent*, const EventDispatcher<TESDeathEvent>*) override;
+     enum ValueType : uint8_t
+     {
+         kValue,
+@@ -119,5 +120,10 @@ private:
+     TransportService& m_transport;
+ 
+     //! @brief Server ids and collected health changes.
+-    Map<uint32_t, float> m_smallHealthChanges;
++    struct PendingHealth
++    {
++        uint32_t Epoch{};
++        float Delta{};
++    };
++    Map<uint32_t, PendingHealth> m_smallHealthChanges;
+ };
+diff --git a/Code/client/Services/CharacterService.h b/Code/client/Services/CharacterService.h
+index 031d4e2..56e6d93 100644
+--- a/Code/client/Services/CharacterService.h
++++ b/Code/client/Services/CharacterService.h
+@@ -42,6 +42,7 @@ struct NotifyActorTeleport;
+ struct PartyJoinedEvent;
+ 
+ struct Actor;
++struct Factions;
+ struct World;
+ struct TransportService;
+ 
+@@ -92,6 +93,7 @@ struct CharacterService
+ private:
+     void MoveActor(const Actor* apActor, const GameId& acWorldSpaceId, const GameId& acCellId, const Vector3_NetQuantize& acPosition) const noexcept;
+ 
++    void ApplyFactionSnapshot(entt::entity aEntity, Actor* apActor, const Factions& acFactions) const noexcept;
+     void RequestServerAssignment(entt::entity aEntity) const noexcept;
+     void CancelServerAssignment(entt::entity aEntity, uint32_t aFormId) const noexcept;
+     void DeleteRemoteEntityComponents(entt::entity aEntity) const noexcept;
+diff --git a/Code/client/Services/DiscoveryService.h b/Code/client/Services/DiscoveryService.h
+index 8ff5d48..cb7e482 100644
+--- a/Code/client/Services/DiscoveryService.h
++++ b/Code/client/Services/DiscoveryService.h
+@@ -5,6 +5,8 @@
+ 
+ #include <Structs/GridCellCoords.h>
+ 
++#include <chrono>
++
+ struct World;
+ 
+ struct ConnectedEvent;
+@@ -26,6 +28,11 @@ struct DiscoveryService final : BSTEventSink<TESLoadGameEvent>
+ 
+     TP_NOCOPYMOVE(DiscoveryService);
+ 
++    bool IsDeferringFollowerRemoval(uint32_t aFormId) const noexcept
++    {
++        return m_followerRemovalDeadlines.find(aFormId) != m_followerRemovalDeadlines.end();
++    }
++
+ protected:
+     /**
+      * Checks whether the cell has changed, and if so,
+@@ -87,6 +94,7 @@ private:
+ 
+     //! @brief Cached actor forms detected in the previous frame.
+     Set<uint32_t> m_forms;
++    Map<uint32_t, std::chrono::steady_clock::time_point> m_followerRemovalDeadlines;
+     /**
+      * The center grid coordinates are the coordinates of the cell in the cell grid
+      * where the cells around it in a 5 by 5 grid (by default) are loaded.
+diff --git a/Code/client/Services/Generic/ActorValueService.cpp b/Code/client/Services/Generic/ActorValueService.cpp
+index 612564c..6c27f9c 100644
+--- a/Code/client/Services/Generic/ActorValueService.cpp
++++ b/Code/client/Services/Generic/ActorValueService.cpp
+@@ -23,12 +23,14 @@
+ #include <Messages/RequestDeathStateChange.h>
+ 
+ #include <misc/ActorValueOwner.h>
++#include <cmath>
+ 
+ ActorValueService::ActorValueService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept
+     : m_world(aWorld)
+     , m_dispatcher(aDispatcher)
+     , m_transport(aTransport)
+ {
++    EventDispatcherManager::Get()->deathEvent.RegisterSink(this);
+     m_world.on_construct<LocalComponent>().connect<&ActorValueService::OnLocalComponentAdded>(this);
+     m_dispatcher.sink<DisconnectedEvent>().connect<&ActorValueService::OnDisconnected>(this);
+     m_dispatcher.sink<ActorRemovedEvent>().connect<&ActorValueService::OnActorRemoved>(this);
+@@ -40,6 +42,20 @@ ActorValueService::ActorValueService(World& aWorld, entt::dispatcher& aDispatche
+     m_dispatcher.sink<NotifyDeathStateChange>().connect<&ActorValueService::OnDeathStateChange>(this);
+ }
+ 
++ActorValueService::~ActorValueService() noexcept
++{
++    EventDispatcherManager::Get()->deathEvent.UnRegisterSink(this);
++}
++
++BSTEventResult ActorValueService::OnEvent(const TESDeathEvent* apEvent, const EventDispatcher<TESDeathEvent>*)
++{
++    if (apEvent && apEvent->pActorDying)
++        spdlog::info("Engine death event actor {:X}, killer {:X}, final {}", apEvent->pActorDying->formID,
++                     apEvent->pActorKiller ? apEvent->pActorKiller->formID : 0, apEvent->isDead);
++
++    return BSTEventResult::kOk;
++}
++
+ void ActorValueService::CreateActorValuesComponent(const entt::entity aEntity, Actor* apActor) noexcept
+ {
+     auto& actorValuesComponent = m_world.emplace_or_replace<ActorValuesComponent>(aEntity);
+@@ -70,6 +86,7 @@ void ActorValueService::OnLocalComponentAdded(entt::registry& aRegistry, const e
+ void ActorValueService::OnDisconnected(const DisconnectedEvent& acEvent) noexcept
+ {
+     // TODO: this crashes sometimes, no clue why
++    m_smallHealthChanges.clear();
+     m_world.clear<ActorValuesComponent>();
+ }
+ 
+@@ -185,19 +202,41 @@ void ActorValueService::OnHealthChange(const HealthChangeEvent& acEvent) noexcep
+         return;
+     }
+ 
+-    uint32_t serverId = serverIdRes.value();
++    // The owner publishes an absolute value after engine processing. A queued owner hit
++    // cannot be turned back into speculative damage if the reference has changed hands.
++    if (const auto* pLocal = m_world.try_get<LocalComponent>(*hitteeIt))
++    {
++        Actor* pActor = Cast<Actor>(TESForm::GetById(acEvent.HitteeId));
++        if (pActor && pActor->GetExtension() && !pActor->GetExtension()->IsPlayer())
++        {
++            RequestActorValueChanges update{};
++            update.Id = pLocal->Id;
++            update.OwnershipEpoch = pLocal->OwnershipEpoch;
++            update.Values[ActorValueInfo::kHealth] = pActor->GetActorValue(ActorValueInfo::kHealth);
++            m_transport.Send(update);
++            return;
++        }
++    }
++    if (acEvent.SampleOwnerHealth)
++        return;
++
++    const uint32_t serverId = *serverIdRes;
++    const uint32_t epoch = OwnershipSystem::GetOwnershipEpoch(m_world, *hitteeIt);
++    if (epoch == 0 || !std::isfinite(acEvent.DeltaHealth))
++        return;
+ 
+     if (acEvent.DeltaHealth > -1.0f && acEvent.DeltaHealth < 1.0f)
+     {
+-        if (m_smallHealthChanges.find(serverId) == m_smallHealthChanges.end())
+-            m_smallHealthChanges[serverId] = acEvent.DeltaHealth;
+-        else
+-            m_smallHealthChanges[serverId] += acEvent.DeltaHealth;
++        auto& pending = m_smallHealthChanges[serverId];
++        if (pending.Epoch != epoch)
++            pending = {epoch, 0.f};
++        pending.Delta += acEvent.DeltaHealth;
+         return;
+     }
+ 
+     RequestHealthChangeBroadcast requestHealthChange;
+     requestHealthChange.Id = serverId;
++    requestHealthChange.OwnershipEpoch = epoch;
+     requestHealthChange.DeltaHealth = acEvent.DeltaHealth;
+ 
+     m_transport.Send(requestHealthChange);
+@@ -222,11 +261,12 @@ void ActorValueService::RunSmallHealthUpdates() noexcept
+         {
+             RequestHealthChangeBroadcast requestHealthChange;
+             requestHealthChange.Id = value.first;
+-            requestHealthChange.DeltaHealth = value.second;
++            requestHealthChange.OwnershipEpoch = value.second.Epoch;
++            requestHealthChange.DeltaHealth = value.second.Delta;
+ 
+             m_transport.Send(requestHealthChange);
+ 
+-            spdlog::debug("Sent out delta health through timer, {:X}:{:f}", value.first, value.second);
++            spdlog::debug("Sent out delta health through timer, {:X}:{:f}", value.first, value.second.Delta);
+         }
+ 
+         m_smallHealthChanges.clear();
+@@ -244,6 +284,27 @@ void ActorValueService::RunDeathStateUpdates() noexcept
+ 
+     lastSendTimePoint = now;
+ 
++    auto remotes = m_world.view<FormIdComponent, RemoteComponent>();
++    for (auto entity : remotes)
++    {
++        const uint32_t formId = remotes.get<FormIdComponent>(entity).Id;
++        Actor* pActor = Cast<Actor>(TESForm::GetById(formId));
++        if (!pActor || !pActor->GetNiNode())
++            continue;
++
++        auto& remote = remotes.get<RemoteComponent>(entity);
++        const bool dead = pActor->IsDead();
++        const bool bleedingOut = pActor->actorState.IsBleedingOut();
++        if (dead != remote.ObservedDead || bleedingOut != remote.ObservedBleedout)
++        {
++            spdlog::info("Remote life state actor {:X}, server {:X}, epoch {}, dead {}, bleedout {}, health {}, essential {}, combat {}",
++                         formId, remote.Id, remote.OwnershipEpoch, dead, bleedingOut, pActor->GetActorValue(ActorValueInfo::kHealth),
++                         pActor->IsEssential(), pActor->IsInCombat());
++            remote.ObservedDead = dead;
++            remote.ObservedBleedout = bleedingOut;
++        }
++    }
++
+     auto localView = m_world.view<FormIdComponent, LocalComponent>();
+ 
+     for (auto entity : localView)
+@@ -288,22 +349,32 @@ void ActorValueService::RunActorValuesUpdates() noexcept
+ 
+ void ActorValueService::OnHealthChangeBroadcast(const NotifyHealthChangeBroadcast& acMessage) const noexcept
+ {
++    const auto entity = Utils::FindEntityByServerId(acMessage.Id);
++    if (!entity || !acMessage.OwnershipEpoch || OwnershipSystem::GetOwnershipEpoch(m_world, *entity) != acMessage.OwnershipEpoch)
++        return;
+     Actor* pActor = Utils::GetByServerId<Actor>(acMessage.Id);
+     if (!pActor)
+-    {
+-        spdlog::error("{}: could not find actor server id {:X}", __FUNCTION__, acMessage.Id);
+         return;
+-    }
+ 
++    const ActorExtension* pExtension = pActor->GetExtension();
++    if (!pExtension)
++        return;
++
++    const bool isPlayer = pExtension->IsPlayer();
++    const bool isRemote = pExtension->IsRemote();
+     const float newHealth = pActor->GetActorValue(ActorValueInfo::kHealth) + acMessage.DeltaHealth;
++
++    // The owner confirms death separately. A projected delta can cross zero
++    // during a non-lethal fight or a transition into bleedout.
++    if (isRemote && !isPlayer && newHealth <= 0.f)
++        return;
++
+     pActor->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, newHealth);
+ 
+-    const float health = pActor->GetActorValue(ActorValueInfo::kHealth);
+-    if (!pActor->IsDead() && health <= 0.f)
++    if (!isRemote && !isPlayer)
+     {
+-        ActorExtension* pExtension = pActor->GetExtension();
+-        // Players should never be killed
+-        if (!pExtension->IsPlayer())
++        const float health = pActor->GetActorValue(ActorValueInfo::kHealth);
++        if (!pActor->IsDead() && health <= 0.f)
+             pActor->Kill();
+     }
+ 
+@@ -329,12 +400,19 @@ void ActorValueService::OnActorValueChanges(const NotifyActorValueChanges& acMes
+     for (const auto& [key, value] : acMessage.Values)
+     {
+         // Syncing dragon souls triggers "Dragon soul collected" event
+-        if (key == ActorValueInfo::kDragonSouls || key == ActorValueInfo::kHealth)
++        if (key == ActorValueInfo::kHealth)
++        {
++            // Health alone never means death. A distinct, epoch-checked message carries that decision.
++            if (value > 0.f && std::isfinite(value) && pActor->GetExtension() && !pActor->GetExtension()->IsPlayer() && !pActor->IsDead())
++                pActor->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, key, value);
++            continue;
++        }
++        if (key == ActorValueInfo::kDragonSouls)
+             continue;
+ 
+         spdlog::debug("Actor value update, server ID: {:X}, key: {}, value: {}", acMessage.Id, key, value);
+ 
+-        if (key == ActorValueInfo::kStamina || key == ActorValueInfo::kMagicka || key == ActorValueInfo::kHealth)
++        if (key == ActorValueInfo::kStamina || key == ActorValueInfo::kMagicka)
+         {
+             pActor->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, key, value);
+             continue;
+@@ -369,6 +447,12 @@ void ActorValueService::OnActorMaxValueChanges(const NotifyActorMaxValueChanges&
+ void ActorValueService::OnDeathStateChange(const NotifyDeathStateChange& acMessage) const noexcept
+ {
+     const auto entity = OwnershipSystem::AcceptRemoteUpdate(m_world, acMessage.Id, acMessage.OwnershipEpoch);
++    if (auto* pWaitingFor3D = entity ? m_world.try_get<WaitingFor3D>(*entity) : nullptr)
++    {
++        pWaitingFor3D->PendingDeathState = acMessage;
++        return;
++    }
++
+     const auto* pFormIdComponent = entity ? m_world.try_get<FormIdComponent>(*entity) : nullptr;
+     if (!pFormIdComponent)
+     {
+diff --git a/Code/client/Services/Generic/CharacterService.cpp b/Code/client/Services/Generic/CharacterService.cpp
+index 1f4a727..312a0d6 100644
+--- a/Code/client/Services/Generic/CharacterService.cpp
++++ b/Code/client/Services/Generic/CharacterService.cpp
+@@ -4,6 +4,7 @@
+ #include <Services/PartyService.h>
+ 
+ #include <Services/CharacterService.h>
++#include <Services/DiscoveryService.h>
+ #include <Services/InventoryService.h>
+ #include <Services/QuestService.h>
+ #include <Services/TransportService.h>
+@@ -133,8 +134,10 @@ void CharacterService::DeclineOwnership(const uint32_t aServerId, const uint32_t
+ void CharacterService::ReconcileActorData(
+     const entt::entity aEntity, Actor* apActor, const uint32_t aOwnershipEpoch, const ActorData& acActorData, const bool aApplyInventory, const bool aIsLocalOwner) noexcept
+ {
+-    if (auto* pWaitingFor3D = m_world.try_get<WaitingFor3D>(aEntity))
++    auto* pWaitingFor3D = m_world.try_get<WaitingFor3D>(aEntity);
++    if (pWaitingFor3D)
+     {
++        pWaitingFor3D->PendingDeathState.reset();
+         pWaitingFor3D->SpawnRequest.InitialActorValues = acActorData.InitialActorValues;
+         pWaitingFor3D->SpawnRequest.InventoryContent = acActorData.InitialInventory;
+         pWaitingFor3D->SpawnRequest.IsDead = acActorData.IsDead;
+@@ -156,7 +159,7 @@ void CharacterService::ReconcileActorData(
+             apActor->SetActorInventory(acActorData.InitialInventory);
+     }
+ 
+-    if (apActor->IsDead() != acActorData.IsDead)
++    if ((aIsLocalOwner || !pWaitingFor3D) && apActor->IsDead() != acActorData.IsDead)
+     {
+         if (acActorData.IsDead)
+         {
+@@ -502,6 +505,7 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
+         m_world.emplace_or_replace<ReplayedActionsDebugComponent>(cEntity, acMessage.ActionsToReplay);
+ #endif
+ 
++        ApplyFactionSnapshot(cEntity, pActor, acMessage.FactionsContent);
+         ReconcileActorData(cEntity, pActor, acMessage.OwnershipEpoch, actorData, true, false);
+ 
+         MoveActor(pActor, acMessage.WorldSpaceId, acMessage.CellId, acMessage.Position);
+@@ -535,10 +539,14 @@ void CharacterService::OnCharacterSpawn(const CharacterSpawnRequest& acMessage)
+         spdlog::info("Adopting ownership epoch {} for spawned actor {:X}, the transfer from epoch {} was missed", acMessage.OwnershipEpoch, acMessage.ServerId, remoteComponent.OwnershipEpoch);
+         remoteComponent.OwnershipEpoch = acMessage.OwnershipEpoch;
+ 
++        const auto* pForm = m_world.try_get<FormIdComponent>(*remoteItor);
++        Actor* pRemoteActor = pForm ? Cast<Actor>(TESForm::GetById(pForm->Id)) : nullptr;
++        ApplyFactionSnapshot(*remoteItor, pRemoteActor, acMessage.FactionsContent);
+         InventoryService::ApplyRemoteInventory(m_world, *remoteItor, acMessage.InventoryContent);
+ 
+         if (auto* pWaitingFor3D = m_world.try_get<WaitingFor3D>(*remoteItor))
+         {
++            pWaitingFor3D->PendingDeathState.reset();
+             pWaitingFor3D->SpawnRequest.InitialActorValues = acMessage.InitialActorValues;
+             pWaitingFor3D->SpawnRequest.IsDead = acMessage.IsDead;
+             pWaitingFor3D->SpawnRequest.OwnershipEpoch = acMessage.OwnershipEpoch;
+@@ -771,27 +779,34 @@ void CharacterService::OnActionEvent(const ActionEvent& acActionEvent) const noe
+     }
+ }
+ 
+-void CharacterService::OnFactionsChanges(const NotifyFactionsChanges& acEvent) const noexcept
++void CharacterService::ApplyFactionSnapshot(const entt::entity aEntity, Actor* apActor, const Factions& acFactions) const noexcept
+ {
+-    auto view = m_world.view<RemoteComponent, FormIdComponent, CacheComponent>();
++    if (auto* pWaiting = m_world.try_get<WaitingFor3D>(aEntity))
++        pWaiting->SpawnRequest.FactionsContent = acFactions;
+ 
+-    for (const auto& [id, factions] : acEvent.Changes)
+-    {
+-        const auto itor = std::find_if(std::begin(view), std::end(view), [id = id, view](entt::entity entity) { return view.get<RemoteComponent>(entity).Id == id; });
++    if (!apActor)
++        return;
+ 
+-        if (itor != std::end(view))
+-        {
+-            auto& formIdComponent = view.get<FormIdComponent>(*itor);
++    apActor->SetFactions(acFactions);
+ 
+-            auto* const pActor = Cast<Actor>(TESForm::GetById(formIdComponent.Id));
+-            if (!pActor)
+-                return;
++    if (auto* pCache = m_world.try_get<CacheComponent>(aEntity))
++        pCache->FactionsContent = acFactions;
++}
+ 
+-            auto& cacheComponent = view.get<CacheComponent>(*itor);
+-            cacheComponent.FactionsContent = factions;
++void CharacterService::OnFactionsChanges(const NotifyFactionsChanges& acEvent) const noexcept
++{
++    for (const auto& [id, factions] : acEvent.Changes)
++    {
++        // A delta cannot reconstruct a missed ownership transfer. The full snapshot
++        // for a new epoch arrives on the reliable assignment/transfer path.
++        const auto entity = Utils::FindEntityByServerId(id);
++        const auto* pRemote = entity ? m_world.try_get<RemoteComponent>(*entity) : nullptr;
++        if (!pRemote || pRemote->OwnershipEpoch != factions.OwnershipEpoch || m_world.any_of<LocalComponent>(*entity))
++            continue;
+ 
+-            pActor->SetFactions(cacheComponent.FactionsContent);
+-        }
++        const auto* pForm = m_world.try_get<FormIdComponent>(*entity);
++        Actor* pActor = pForm ? Cast<Actor>(TESForm::GetById(pForm->Id)) : nullptr;
++        ApplyFactionSnapshot(*entity, pActor, factions.Content);
+     }
+ }
+ 
+@@ -851,6 +866,9 @@ void CharacterService::OnOwnershipTransfer(const NotifyOwnershipTransfer& acMess
+             else if (cachedRefId != 0)
+                 m_world.emplace<RemoteComponent>(cEntity, acMessage.ServerId, cachedRefId, acMessage.OwnershipEpoch);
+ 
++            if (auto* pWaiting = m_world.try_get<WaitingFor3D>(cEntity))
++                pWaiting->SpawnRequest.FactionsContent = acMessage.FactionsContent;
++
+             spdlog::warn("Declined ownership of actor {:X} at epoch {} because the actor is not ready", acMessage.ServerId, acMessage.OwnershipEpoch);
+             DeclineOwnership(acMessage.ServerId, acMessage.OwnershipEpoch);
+             return;
+@@ -861,6 +879,7 @@ void CharacterService::OnOwnershipTransfer(const NotifyOwnershipTransfer& acMess
+         m_world.remove<LocalAnimationComponent, LocalComponent>(cEntity);
+         m_world.emplace_or_replace<RemoteComponent>(cEntity, acMessage.ServerId, pFormIdComponent->Id, acMessage.OwnershipEpoch);
+ 
++        ApplyFactionSnapshot(cEntity, pActor, acMessage.FactionsContent);
+         ReconcileActorData(cEntity, pActor, acMessage.OwnershipEpoch, acMessage.CurrentActorData, true, true);
+         ApplyLeveledNpcPick(pActor, acMessage.LeveledNpcPickId);
+ 
+@@ -900,6 +919,7 @@ void CharacterService::OnOwnershipTransfer(const NotifyOwnershipTransfer& acMess
+         pRemoteComponent->OwnershipEpoch = acMessage.OwnershipEpoch;
+     }
+ 
++    ApplyFactionSnapshot(cEntity, pActor, acMessage.FactionsContent);
+     ReconcileActorData(cEntity, pActor, acMessage.OwnershipEpoch, acMessage.CurrentActorData, pActor && pActor->GetNiNode(), false);
+     if (pActor)
+         ApplyLeveledNpcPick(pActor, acMessage.LeveledNpcPickId);
+@@ -1603,6 +1623,15 @@ void CharacterService::CancelServerAssignment(const entt::entity aEntity, const
+ 
+         if (Actor* pActor = Cast<Actor>(TESForm::GetById(aFormId)))
+         {
++            Factions finalFactions = pActor->GetFactions();
++            const auto* pCache = m_world.try_get<CacheComponent>(aEntity);
++            if (!pCache || pCache->FactionsContent != finalFactions)
++            {
++                RequestFactionsChanges changed{};
++                changed.Changes[localComponent.Id] = {localComponent.OwnershipEpoch, std::move(finalFactions)};
++                m_transport.Send(changed);
++            }
++
+             if (!pActor->IsTemporary())
+             {
+                 auto& modSystem = m_world.GetModSystem();
+@@ -1901,6 +1930,7 @@ void CharacterService::RunLocalUpdates() const noexcept
+     movementMessage.Tick = m_transport.GetClock().GetCurrentTick();
+ 
+     const auto* pPlayer = PlayerCharacter::Get();
++    const auto& discovery = m_world.ctx().at<DiscoveryService>();
+     auto animatedLocalView = m_world.view<LocalComponent, LocalAnimationComponent, FormIdComponent>();
+ 
+     for (auto entity : animatedLocalView)
+@@ -1910,7 +1940,7 @@ void CharacterService::RunLocalUpdates() const noexcept
+         auto& formIdComponent = animatedLocalView.get<FormIdComponent>(entity);
+ 
+         auto* pActor = Cast<Actor>(TESForm::GetById(formIdComponent.Id));
+-        if (!pActor)
++        if (!pActor || discovery.IsDeferringFollowerRemoval(formIdComponent.Id))
+             continue;
+ 
+         // Remote clients play actions on the same timeline as movement, by the time playback reaches an action it waits
+@@ -2029,8 +2059,9 @@ void CharacterService::RunRemoteUpdates() noexcept
+ 
+         m_weaponDrawUpdates[pActor->formID] = {waitingFor3D.SpawnRequest.IsWeaponDrawn};
+ 
+-        if (pActor->IsDead() != waitingFor3D.SpawnRequest.IsDead)
+-            waitingFor3D.SpawnRequest.IsDead ? pActor->Kill() : pActor->Respawn();
++        const uint32_t ownershipEpoch = OwnershipSystem::GetOwnershipEpoch(m_world, entity);
++        if (const auto isDead = waitingFor3D.GetDeathState(ownershipEpoch); isDead && pActor->IsDead() != *isDead)
++            *isDead ? pActor->Kill() : pActor->Respawn();
+ 
+         if (pActor->IsVampireLord())
+             pActor->FixVampireLordModel();
+@@ -2083,7 +2114,12 @@ void CharacterService::RunFactionsUpdates() const noexcept
+         cacheComponent.FactionsContent = factions;
+ 
+         // If not send the current factions and replace the cached factions
+-        message.Changes[localComponent.Id] = factions;
++        if (message.Changes.size() == 255)
++        {
++            m_transport.Send(message);
++            message.Changes.clear();
++        }
++        message.Changes[localComponent.Id] = {localComponent.OwnershipEpoch, factions};
+     }
+ 
+     if (!message.Changes.empty())
+diff --git a/Code/client/Services/Generic/DiscoveryService.cpp b/Code/client/Services/Generic/DiscoveryService.cpp
+index cea7919..b7080e1 100644
+--- a/Code/client/Services/Generic/DiscoveryService.cpp
++++ b/Code/client/Services/Generic/DiscoveryService.cpp
+@@ -19,11 +19,27 @@
+ #include <Events/ConnectionErrorEvent.h>
+ 
+ #include <World.h>
++#include <Components.h>
+ #include <BranchInfo.h>
+ 
+-#if (IS_MASTER)
+ namespace
+ {
++bool IsActiveFollower(const Actor& acActor, const GameId& acFollowerFaction) noexcept
++{
++    const Factions factions = acActor.GetFactions();
++    const auto matchesFaction = [&acFollowerFaction](const Faction& acFaction) {
++        return acFaction.Id == acFollowerFaction;
++    };
++
++    const auto extra = std::find_if(factions.ExtraFactions.begin(), factions.ExtraFactions.end(), matchesFaction);
++    if (extra != factions.ExtraFactions.end())
++        return extra->Rank >= 0;
++
++    const auto base = std::find_if(factions.NpcFactions.begin(), factions.NpcFactions.end(), matchesFaction);
++    return base != factions.NpcFactions.end() && base->Rank >= 0;
++}
++
++#if (IS_MASTER)
+ bool IsDefaultModlist(GameList<Mod>& aCurrentModlist) noexcept
+ {
+     static const auto s_defaultModlist = std::to_array<TiltedPhoques::String>(
+@@ -45,8 +61,8 @@ bool IsDefaultModlist(GameList<Mod>& aCurrentModlist) noexcept
+ 
+     return true;
+ }
+-} // namespace
+ #endif
++} // namespace
+ 
+ DiscoveryService::DiscoveryService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
+     : m_world(aWorld)
+@@ -214,6 +230,7 @@ void DiscoveryService::VisitForms() noexcept
+     const auto visitor = [this](TESObjectREFR* apReference)
+     {
+         const auto formId = apReference->formID;
++        m_followerRemovalDeadlines.erase(formId);
+ 
+         if (!m_forms.count(formId))
+         {
+@@ -244,6 +261,10 @@ void DiscoveryService::VisitForms() noexcept
+     // Not in actor holder
+     visitor(PlayerCharacter::Get());
+ 
++    constexpr auto cFollowerLoadGrace = std::chrono::milliseconds(1500);
++    const auto cNow = std::chrono::steady_clock::now();
++    const auto locallyOwnedActors = m_world.view<FormIdComponent, LocalComponent>();
++
+     // We dispatch removal events first to prevent needless reallocations
+     for (uint32_t formId : s_previousForms)
+     {
+@@ -261,8 +282,39 @@ void DiscoveryService::VisitForms() noexcept
+             {
+                 continue;
+             }
++
++            // A follower can drop out of the loaded actor list as vanilla moves it
++            // through a door. Keep the assignment while the same reference reloads.
++            if (!pActor->GetExtension()->IsRemote() && !pActor->IsDead())
++            {
++                const auto owner = std::find_if(locallyOwnedActors.begin(), locallyOwnedActors.end(), [&locallyOwnedActors, formId](entt::entity aEntity) {
++                    return locallyOwnedActors.get<FormIdComponent>(aEntity).Id == formId;
++                });
++
++                if (owner != locallyOwnedActors.end())
++                {
++                    const auto pending = m_followerRemovalDeadlines.find(formId);
++                    if (pending != m_followerRemovalDeadlines.end())
++                    {
++                        if (cNow < pending->second)
++                            continue;
++                    }
++                    else
++                    {
++                        // Skyrim.esm: CurrentFollowerFaction
++                        GameId followerFaction{};
++                        if (m_world.GetModSystem().GetServerModId(0x5C84E, followerFaction) && IsActiveFollower(*pActor, followerFaction))
++                        {
++                            m_followerRemovalDeadlines.emplace(formId, cNow + cFollowerLoadGrace);
++                            spdlog::info("Holding ownership of follower {:X} while its 3D reloads", formId);
++                            continue;
++                        }
++                    }
++                }
++            }
+         }
+ 
++        m_followerRemovalDeadlines.erase(formId);
+         m_dispatcher.trigger(ActorRemovedEvent(formId));
+         m_forms.erase(formId);
+     }
+@@ -281,6 +333,8 @@ void DiscoveryService::OnUpdate(const PreUpdateEvent& acUpdateEvent) noexcept
+ 
+ void DiscoveryService::OnConnected(const ConnectedEvent& acEvent) noexcept
+ {
++    m_followerRemovalDeadlines.clear();
++
+     // uGridsToLoad should always be 5, as this is what the server enforces
+     auto* pSetting = INISettingCollection::Get()->GetSetting("uGridsToLoad:General");
+     if (pSetting && pSetting->data != 5)
+@@ -296,6 +350,7 @@ void DiscoveryService::OnConnected(const ConnectedEvent& acEvent) noexcept
+ 
+ BSTEventResult DiscoveryService::OnEvent(const TESLoadGameEvent*, const EventDispatcher<TESLoadGameEvent>*)
+ {
++    m_followerRemovalDeadlines.clear();
+     spdlog::info("Finished loading, triggering visit cell");
+ 
+ #if (IS_MASTER)
+diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Services/Generic/QuestService.cpp
+index f6a5d39..ea8a488 100644
+--- a/Code/client/Services/Generic/QuestService.cpp
++++ b/Code/client/Services/Generic/QuestService.cpp
+@@ -13,6 +13,7 @@
+ #include <OverlayApp.hpp>
+ 
+ #include <PlayerCharacter.h>
++#include <Games/ActorExtension.h>
+ #include <Forms/TESQuest.h>
+ #include <Games/TES.h>
+ #include <Games/Overrides.h>
+@@ -78,7 +79,7 @@ void QuestService::OnConnected(const ConnectedEvent&) noexcept
+ 
+ void QuestService::OnUpdate(const UpdateEvent&) noexcept
+ {
+-    if (m_heldStages.empty())
++    if (m_heldStages.empty() && m_afterHeldStages.empty())
+         return;
+ 
+     // Checked every frame rather than on scene events: an action's done event fires before its fragment runs, and the
+@@ -96,15 +97,31 @@ void QuestService::OnUpdate(const UpdateEvent&) noexcept
+             ReleaseUncheckedStages(pQuest, *pHeld);
+         }
+     }
++
++    // Dispatching may start a new run and defer its own stop, so detach each batch before dispatch.
++    Vector<uint32_t> ready;
++    for (const auto& [formId, events] : m_afterHeldStages)
++        if (m_heldStages.find(formId) == m_heldStages.end())
++            ready.push_back(formId);
++    for (uint32_t formId : ready)
++    {
++        auto it = m_afterHeldStages.find(formId);
++        auto events = std::move(it.value());
++        m_afterHeldStages.erase(it);
++        for (const auto& update : events)
++            OnQuestUpdate(update);
++    }
+ }
+ 
+ void QuestService::OnDisconnected(const DisconnectedEvent&) noexcept
+ {
++    m_afterHeldStages.clear();
+     m_heldStages.clear();
+ }
+ 
+ void QuestService::OnPartyLeft(const PartyLeftEvent&) noexcept
+ {
++    m_afterHeldStages.clear();
+     m_heldStages.clear();
+ }
+ 
+@@ -195,7 +212,7 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageEvent* apEvent, const Ev
+             if (modSys.GetServerModId(pQuest->formID, Id))
+             {
+                 spdlog::info(__FUNCTION__ ": queuing type none/misc quest gameId {:X} questStage {} questStatus {} questType {} formId {:X} name {}",
+-                             Id.LogFormat(), pQuest->currentStage,
++                             Id.LogFormat(), apEvent->stageId,
+                              RequestQuestUpdate::StageUpdate,
+                              static_cast<std::underlying_type_t<TESQuest::Type>>(pQuest->type),
+                              pQuest->formID, pQuest->fullName.value.AsAscii());
+@@ -205,6 +222,18 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageEvent* apEvent, const Ev
+         m_world.GetRunner().Queue(
+             [&, formId = apEvent->formId, stageId = apEvent->stageId, type = pQuest->type]()
+             {
++                // Observe the actual opponent picked by the vanilla brawl quest without changing its scripts.
++                if (formId == 0x47AE6)
++                {
++                    auto* pBrawl = Cast<TESQuest>(TESForm::GetById(formId));
++                    auto* pOpponent = pBrawl ? Cast<Actor>(pBrawl->GetAliasedRef(0)) : nullptr;
++                    if (pOpponent)
++                    {
++                        spdlog::info("Brawl stage {}, opponent {:X}, dead {}, bleedout {}, essential {}, combat {}",
++                                     stageId, pOpponent->formID, pOpponent->IsDead(), pOpponent->actorState.IsBleedingOut(),
++                                     pOpponent->IsEssential(), pOpponent->IsInCombat());
++                    }
++                }
+                 GameId Id;
+                 auto& modSys = m_world.GetModSystem();
+                 if (modSys.GetServerModId(formId, Id))
+@@ -286,6 +315,23 @@ BSTEventResult QuestService::OnEvent(const TESScenePhaseEvent* apEvent, const Ev
+ 
+ BSTEventResult QuestService::OnEvent(const TESTopicInfoEvent* apEvent, const EventDispatcher<TESTopicInfoEvent>*)
+ {
++    if (apEvent->eType == 0 && apEvent->pSpeakerRef && m_world.GetPartyService().IsInParty())
++    {
++        m_world.GetRunner().Queue([this, speakerId = apEvent->pSpeakerRef->formID, topic = apEvent->uiTopicInfoFormID]()
++        {
++            if (!m_world.GetPartyService().IsInParty())
++                return;
++            Actor* pSpeaker = Cast<Actor>(TESForm::GetById(speakerId));
++            if (!pSpeaker || !pSpeaker->GetExtension())
++                return;
++            // Skyrim.esm DialogueFollower alias 0 is the human follower.
++            auto* pQuest = Cast<TESQuest>(TESForm::GetById(0x750BA));
++            const auto* pFollower = pQuest ? pQuest->GetAliasedRef(0) : nullptr;
++            spdlog::info("Party dialogue topic {:X}, speaker {:X}, follower alias {:X}, remote {}, dead {}, bleedout {}, speaker combat {}, player combat {}",
++                         topic, speakerId, pFollower ? pFollower->formID : 0, pSpeaker->GetExtension()->IsRemote(),
++                         pSpeaker->IsDead(), pSpeaker->actorState.IsBleedingOut(), pSpeaker->IsInCombat(), PlayerCharacter::Get()->IsInCombat());
++        });
++    }
+     spdlog::debug(
+         "Dialogue line {:X} {}, speaker: {:X}", apEvent->uiTopicInfoFormID, apEvent->eType == 0 ? "begin" : "end", apEvent->pSpeakerRef ? apEvent->pSpeakerRef->formID : 0);
+     return BSTEventResult::kOk;
+@@ -403,34 +449,29 @@ static bool IsCheckedByPlayingScene(TESQuest* apQuest, uint16_t aStage) noexcept
+ void QuestService::HoldStage(TESQuest* apQuest, uint16_t aStage) noexcept
+ {
+     Vector<uint16_t>& stages = m_heldStages[apQuest->formID].Stages;
+-    auto it = std::lower_bound(stages.begin(), stages.end(), aStage);
+-    if (it == stages.end() || *it != aStage)
+-        stages.insert(it, aStage);
++    if (std::find(stages.begin(), stages.end(), aStage) != stages.end())
++        return;
++    stages.push_back(aStage);
+ 
+     spdlog::info("Holding member quest stage {} for {:X} until no playing scene of it checks it", aStage, apQuest->formID);
+ }
+ 
+-static void ApplyHeldStages(TESQuest* apQuest, HeldStages& aHeld, size_t aCount) noexcept
++static void ApplyNextHeldStage(TESQuest* apQuest, HeldStages& aHeld) noexcept
+ {
+     ScopedQuestOverride _;
+-
+-    // In order, a later stage's scripts can rely on the earlier ones
+-    for (size_t i = 0; i < aCount; ++i)
+-    {
+-        // A scene the fragments start only plays once they've run, and the next stage may be what it waits on. Each log
+-        // entry reports when its fragment is done.
+-        const uint16_t cStage = aHeld.Stages[i];
+-        if (apQuest->ScriptSetStage(cStage))
+-            aHeld.PendingItems.insert(aHeld.PendingItems.end(), apQuest->GetStageItemCount(cStage), cStage);
+-    }
+-
+-    aHeld.Stages.erase(aHeld.Stages.begin(), aHeld.Stages.begin() + aCount);
++    const uint16_t stage = aHeld.Stages.front();
++    aHeld.Stages.erase(aHeld.Stages.begin());
++    if (apQuest->ScriptSetStage(stage))
++        aHeld.PendingItems.insert(aHeld.PendingItems.end(), apQuest->GetStageItemCount(stage), stage);
+ }
+ 
+ static void ReleaseStagesForWaitingPhases(TESQuest* apQuest, HeldStages& aHeld) noexcept
+ {
++    if (!aHeld.PendingItems.empty())
++        return;
++
+     // A phase whose own actions are done and whose completion conditions want a held stage only moves on with it.
+-    // Release up to the first stage that does it, the leader's scene then carries on at its own pace.
++    // Advance the queue in arrival order until the phase can progress.
+     for (BGSScene* pScene : apQuest->scenes)
+     {
+         if (aHeld.Stages.empty())
+@@ -451,9 +492,10 @@ static void ReleaseStagesForWaitingPhases(TESQuest* apQuest, HeldStages& aHeld)
+             continue;
+ 
+         spdlog::info(
+-            "Releasing held member quest stages for {:X} up to {}, scene {:X} phase {} waits on it", apQuest->formID, *cStageIt, pScene->formID,
++            "Releasing held quest stage {} for {:X}; scene {:X} phase {} is waiting", aHeld.Stages.front(), apQuest->formID, pScene->formID,
+             pScene->currentPhaseIndex);
+-        ApplyHeldStages(apQuest, aHeld, cStageIt - aHeld.Stages.begin() + 1);
++        ApplyNextHeldStage(apQuest, aHeld);
++        return;
+     }
+ }
+ 
+@@ -464,7 +506,7 @@ static void ReleaseUncheckedStages(TESQuest* apQuest, HeldStages& aHeld) noexcep
+     while (!aHeld.Stages.empty() && aHeld.PendingItems.empty() && !IsCheckedByPlayingScene(apQuest, aHeld.Stages.front()))
+     {
+         spdlog::info("Applying held member quest stage {} for {:X}, no playing scene checks it", aHeld.Stages.front(), apQuest->formID);
+-        ApplyHeldStages(apQuest, aHeld, 1);
++        ApplyNextHeldStage(apQuest, aHeld);
+     }
+ }
+ 
+@@ -517,6 +559,13 @@ void QuestService::OnQuestUpdate(const NotifyQuestUpdate& aUpdate) noexcept
+         return;
+     }
+ 
++    auto deferred = m_afterHeldStages.find(formId);
++    if (deferred != m_afterHeldStages.end())
++    {
++        deferred.value().push_back(aUpdate);
++        return;
++    }
++
+     if (aUpdate.Status == NotifyQuestUpdate::StageUpdate && pQuest->IsStageReached(aUpdate.Stage))
+     {
+         spdlog::info("Remote quest {:X} already reached stage {}, current stage: {}", formId, aUpdate.Stage, pQuest->currentStage);
+@@ -533,11 +582,12 @@ void QuestService::OnQuestUpdate(const NotifyQuestUpdate& aUpdate) noexcept
+         return;
+     }
+ 
+-    // The member reached the held stages before stopping the quest, and once it's stopped here they're dropped
+-    if (pHeld && !pHeld->Stages.empty())
++    // Let the scene and its running fragments finish before stopping. A restart received
++    // meanwhile belongs behind this stop, even if it uses the same form and stage numbers.
++    if (aUpdate.Status == NotifyQuestUpdate::Stopped && pHeld)
+     {
+-        spdlog::info("Applying {} held member quest stages for {:X} before it stops", pHeld->Stages.size(), formId);
+-        ApplyHeldStages(pQuest, *pHeld, pHeld->Stages.size());
++        m_afterHeldStages[formId].push_back(aUpdate);
++        return;
+     }
+ 
+     if (pQuest->type == TESQuest::Type::None || pQuest->type == TESQuest::Type::Miscellaneous)
+diff --git a/Code/client/Services/QuestService.h b/Code/client/Services/QuestService.h
+index fd0ae9e..f8b26cd 100644
+--- a/Code/client/Services/QuestService.h
++++ b/Code/client/Services/QuestService.h
+@@ -3,8 +3,8 @@
+ #include <World.h>
+ #include <Events/EventDispatcher.h>
+ #include <Games/Events.h>
++#include <Messages/NotifyQuestUpdate.h>
+ 
+-struct NotifyQuestUpdate;
+ struct DisconnectedEvent;
+ struct PartyLeftEvent;
+ struct UpdateEvent;
+@@ -49,7 +49,7 @@ public:
+ 
+     struct HeldStages
+     {
+-        // Member stages not applied yet, sorted
++        // Member stages in the order accepted by the server
+         Vector<uint16_t> Stages{};
+         // A stage per log entry of the applied stages whose fragment hasn't run yet
+         Vector<uint16_t> PendingItems{};
+@@ -79,6 +79,8 @@ private:
+     World& m_world;
+     // Keyed by quest form ID
+     Map<uint32_t, HeldStages> m_heldStages{};
++    // From the first deferred stop through any events belonging to the next run of this quest.
++    Map<uint32_t, Vector<NotifyQuestUpdate>> m_afterHeldStages{};
+ 
+     entt::scoped_connection m_joinedConnection;
+     entt::scoped_connection m_updateConnection;
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+index 5db8d87..5ec992c 100644
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}"
++#define BUILD_COMMIT "${GIT_TAG}-coop-state3"
+diff --git a/Code/encoding/Messages/AssignCharacterResponse.cpp b/Code/encoding/Messages/AssignCharacterResponse.cpp
+index 61438c0..591ba5f 100644
+--- a/Code/encoding/Messages/AssignCharacterResponse.cpp
++++ b/Code/encoding/Messages/AssignCharacterResponse.cpp
+@@ -16,6 +16,7 @@ void AssignCharacterResponse::SerializeRaw(TiltedPhoques::Buffer::Writer& aWrite
+     Serialization::WriteBool(aWriter, IsDead);
+     Serialization::WriteBool(aWriter, IsWeaponDrawn);
+     LeveledNpcPickId.Serialize(aWriter);
++    FactionsContent.Serialize(aWriter);
+ }
+ 
+ void AssignCharacterResponse::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept
+@@ -34,4 +35,5 @@ void AssignCharacterResponse::DeserializeRaw(TiltedPhoques::Buffer::Reader& aRea
+     IsDead = Serialization::ReadBool(aReader);
+     IsWeaponDrawn = Serialization::ReadBool(aReader);
+     LeveledNpcPickId.Deserialize(aReader);
++    FactionsContent.Deserialize(aReader);
+ }
+diff --git a/Code/encoding/Messages/AssignCharacterResponse.h b/Code/encoding/Messages/AssignCharacterResponse.h
+index dc35837..fe9fcde 100644
+--- a/Code/encoding/Messages/AssignCharacterResponse.h
++++ b/Code/encoding/Messages/AssignCharacterResponse.h
+@@ -6,6 +6,7 @@
+ #include <Structs/ActorValues.h>
+ #include <Structs/Vector3_NetQuantize.h>
+ #include <Structs/GameId.h>
++#include <Structs/Factions.h>
+ #include <Structs/Inventory.h>
+ 
+ struct AssignCharacterResponse final : ServerMessage
+@@ -23,7 +24,7 @@ struct AssignCharacterResponse final : ServerMessage
+     bool operator==(const AssignCharacterResponse& achRhs) const noexcept
+     {
+         return GetOpcode() == achRhs.GetOpcode() && Cookie == achRhs.Cookie && ServerId == achRhs.ServerId && PlayerId == achRhs.PlayerId && Position == achRhs.Position && CellId == achRhs.CellId && WorldSpaceId == achRhs.WorldSpaceId && AllActorValues == achRhs.AllActorValues &&
+-               CurrentInventory == achRhs.CurrentInventory && ActionsToReplay == achRhs.ActionsToReplay && OwnershipEpoch == achRhs.OwnershipEpoch && Owner == achRhs.Owner && IsDead == achRhs.IsDead && IsWeaponDrawn == achRhs.IsWeaponDrawn && LeveledNpcPickId == achRhs.LeveledNpcPickId;
++               CurrentInventory == achRhs.CurrentInventory && ActionsToReplay == achRhs.ActionsToReplay && OwnershipEpoch == achRhs.OwnershipEpoch && Owner == achRhs.Owner && IsDead == achRhs.IsDead && IsWeaponDrawn == achRhs.IsWeaponDrawn && LeveledNpcPickId == achRhs.LeveledNpcPickId && FactionsContent == achRhs.FactionsContent;
+     }
+ 
+     uint32_t Cookie{};
+@@ -33,6 +34,7 @@ struct AssignCharacterResponse final : ServerMessage
+     GameId CellId{};
+     GameId WorldSpaceId{};
+     GameId LeveledNpcPickId{};
++    Factions FactionsContent{};
+     ActorValues AllActorValues{};
+     Inventory CurrentInventory{};
+     ActionReplayChain ActionsToReplay;
+diff --git a/Code/encoding/Messages/NotifyFactionsChanges.h b/Code/encoding/Messages/NotifyFactionsChanges.h
+index d4e005d..7c25993 100644
+--- a/Code/encoding/Messages/NotifyFactionsChanges.h
++++ b/Code/encoding/Messages/NotifyFactionsChanges.h
+@@ -17,5 +17,5 @@ struct NotifyFactionsChanges final : ServerMessage
+ 
+     bool operator==(const NotifyFactionsChanges& acRhs) const noexcept { return Changes == acRhs.Changes && GetOpcode() == acRhs.GetOpcode(); }
+ 
+-    TiltedPhoques::Map<uint32_t, Factions> Changes{};
++    TiltedPhoques::Map<uint32_t, FactionsAtEpoch> Changes{};
+ };
+diff --git a/Code/encoding/Messages/NotifyHealthChangeBroadcast.cpp b/Code/encoding/Messages/NotifyHealthChangeBroadcast.cpp
+index 4ab6f64..7b7979e 100644
+--- a/Code/encoding/Messages/NotifyHealthChangeBroadcast.cpp
++++ b/Code/encoding/Messages/NotifyHealthChangeBroadcast.cpp
+@@ -3,6 +3,7 @@
+ void NotifyHealthChangeBroadcast::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
+ {
+     Serialization::WriteVarInt(aWriter, Id);
++    Serialization::WriteVarInt(aWriter, OwnershipEpoch);
+     Serialization::WriteFloat(aWriter, DeltaHealth);
+ }
+ 
+@@ -11,5 +12,6 @@ void NotifyHealthChangeBroadcast::DeserializeRaw(TiltedPhoques::Buffer::Reader&
+     ServerMessage::DeserializeRaw(aReader);
+ 
+     Id = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
++    OwnershipEpoch = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+     DeltaHealth = Serialization::ReadFloat(aReader);
+ }
+diff --git a/Code/encoding/Messages/NotifyHealthChangeBroadcast.h b/Code/encoding/Messages/NotifyHealthChangeBroadcast.h
+index 65bad8d..62f2d0f 100644
+--- a/Code/encoding/Messages/NotifyHealthChangeBroadcast.h
++++ b/Code/encoding/Messages/NotifyHealthChangeBroadcast.h
+@@ -14,8 +14,9 @@ struct NotifyHealthChangeBroadcast final : ServerMessage
+     void SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept override;
+     void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
+ 
+-    bool operator==(const NotifyHealthChangeBroadcast& acRhs) const noexcept { return Id == acRhs.Id && DeltaHealth == acRhs.DeltaHealth && GetOpcode() == acRhs.GetOpcode(); }
++    bool operator==(const NotifyHealthChangeBroadcast& acRhs) const noexcept { return Id == acRhs.Id && OwnershipEpoch == acRhs.OwnershipEpoch && DeltaHealth == acRhs.DeltaHealth && GetOpcode() == acRhs.GetOpcode(); }
+ 
+-    uint32_t Id;
+-    float DeltaHealth;
++    uint32_t Id{};
++    uint32_t OwnershipEpoch{};
++    float DeltaHealth{};
+ };
+diff --git a/Code/encoding/Messages/NotifyOwnershipTransfer.cpp b/Code/encoding/Messages/NotifyOwnershipTransfer.cpp
+index 5be53e4..041cc42 100644
+--- a/Code/encoding/Messages/NotifyOwnershipTransfer.cpp
++++ b/Code/encoding/Messages/NotifyOwnershipTransfer.cpp
+@@ -7,6 +7,7 @@ void NotifyOwnershipTransfer::SerializeRaw(TiltedPhoques::Buffer::Writer& aWrite
+     Serialization::WriteVarInt(aWriter, OwnershipEpoch);
+     CurrentActorData.Serialize(aWriter);
+     LeveledNpcPickId.Serialize(aWriter);
++    FactionsContent.Serialize(aWriter);
+ }
+ 
+ void NotifyOwnershipTransfer::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept
+@@ -18,4 +19,5 @@ void NotifyOwnershipTransfer::DeserializeRaw(TiltedPhoques::Buffer::Reader& aRea
+     OwnershipEpoch = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+     CurrentActorData.Deserialize(aReader);
+     LeveledNpcPickId.Deserialize(aReader);
++    FactionsContent.Deserialize(aReader);
+ }
+diff --git a/Code/encoding/Messages/NotifyOwnershipTransfer.h b/Code/encoding/Messages/NotifyOwnershipTransfer.h
+index d3e4dbf..3ed41b3 100644
+--- a/Code/encoding/Messages/NotifyOwnershipTransfer.h
++++ b/Code/encoding/Messages/NotifyOwnershipTransfer.h
+@@ -3,6 +3,7 @@
+ #include "Message.h"
+ #include <Structs/ActorData.h>
+ #include <Structs/GameId.h>
++#include <Structs/Factions.h>
+ 
+ struct NotifyOwnershipTransfer final : ServerMessage
+ {
+@@ -19,7 +20,7 @@ struct NotifyOwnershipTransfer final : ServerMessage
+ 
+     bool operator==(const NotifyOwnershipTransfer& achRhs) const noexcept
+     {
+-        return ServerId == achRhs.ServerId && OwnerPlayerId == achRhs.OwnerPlayerId && OwnershipEpoch == achRhs.OwnershipEpoch && CurrentActorData == achRhs.CurrentActorData && LeveledNpcPickId == achRhs.LeveledNpcPickId && GetOpcode() == achRhs.GetOpcode();
++        return ServerId == achRhs.ServerId && OwnerPlayerId == achRhs.OwnerPlayerId && OwnershipEpoch == achRhs.OwnershipEpoch && CurrentActorData == achRhs.CurrentActorData && LeveledNpcPickId == achRhs.LeveledNpcPickId && FactionsContent == achRhs.FactionsContent && GetOpcode() == achRhs.GetOpcode();
+     }
+ 
+     uint32_t ServerId{};
+@@ -27,4 +28,5 @@ struct NotifyOwnershipTransfer final : ServerMessage
+     uint32_t OwnershipEpoch{};
+     ActorData CurrentActorData{};
+     GameId LeveledNpcPickId{};
++    Factions FactionsContent{};
+ };
+diff --git a/Code/encoding/Messages/RequestFactionsChanges.h b/Code/encoding/Messages/RequestFactionsChanges.h
+index 9d48c39..9fcc217 100644
+--- a/Code/encoding/Messages/RequestFactionsChanges.h
++++ b/Code/encoding/Messages/RequestFactionsChanges.h
+@@ -19,5 +19,5 @@ struct RequestFactionsChanges final : ClientMessage
+ 
+     bool operator==(const RequestFactionsChanges& acRhs) const noexcept { return Changes == acRhs.Changes && GetOpcode() == acRhs.GetOpcode(); }
+ 
+-    TiltedPhoques::Map<uint32_t, Factions> Changes;
++    TiltedPhoques::Map<uint32_t, FactionsAtEpoch> Changes;
+ };
+diff --git a/Code/encoding/Messages/RequestHealthChangeBroadcast.cpp b/Code/encoding/Messages/RequestHealthChangeBroadcast.cpp
+index cfa78d6..a23fb2a 100644
+--- a/Code/encoding/Messages/RequestHealthChangeBroadcast.cpp
++++ b/Code/encoding/Messages/RequestHealthChangeBroadcast.cpp
+@@ -3,6 +3,7 @@
+ void RequestHealthChangeBroadcast::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
+ {
+     Serialization::WriteVarInt(aWriter, Id);
++    Serialization::WriteVarInt(aWriter, OwnershipEpoch);
+     Serialization::WriteFloat(aWriter, DeltaHealth);
+ }
+ 
+@@ -11,5 +12,6 @@ void RequestHealthChangeBroadcast::DeserializeRaw(TiltedPhoques::Buffer::Reader&
+     ClientMessage::DeserializeRaw(aReader);
+ 
+     Id = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
++    OwnershipEpoch = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+     DeltaHealth = Serialization::ReadFloat(aReader);
+ }
+diff --git a/Code/encoding/Messages/RequestHealthChangeBroadcast.h b/Code/encoding/Messages/RequestHealthChangeBroadcast.h
+index 057595a..5023ae7 100644
+--- a/Code/encoding/Messages/RequestHealthChangeBroadcast.h
++++ b/Code/encoding/Messages/RequestHealthChangeBroadcast.h
+@@ -14,8 +14,9 @@ struct RequestHealthChangeBroadcast final : ClientMessage
+     void SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept override;
+     void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
+ 
+-    bool operator==(const RequestHealthChangeBroadcast& acRhs) const noexcept { return Id == acRhs.Id && DeltaHealth == acRhs.DeltaHealth && GetOpcode() == acRhs.GetOpcode(); }
++    bool operator==(const RequestHealthChangeBroadcast& acRhs) const noexcept { return Id == acRhs.Id && OwnershipEpoch == acRhs.OwnershipEpoch && DeltaHealth == acRhs.DeltaHealth && GetOpcode() == acRhs.GetOpcode(); }
+ 
+-    uint32_t Id;
+-    float DeltaHealth;
++    uint32_t Id{};
++    uint32_t OwnershipEpoch{};
++    float DeltaHealth{};
+ };
+diff --git a/Code/encoding/Structs/Factions.cpp b/Code/encoding/Structs/Factions.cpp
+index 7c29620..30aebd4 100644
+--- a/Code/encoding/Structs/Factions.cpp
++++ b/Code/encoding/Structs/Factions.cpp
+@@ -54,3 +54,15 @@ void Factions::Deserialize(TiltedPhoques::Buffer::Reader& aReader)
+         entry.Deserialize(aReader);
+     }
+ }
++
++void FactionsAtEpoch::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
++{
++    Serialization::WriteVarInt(aWriter, OwnershipEpoch);
++    Content.Serialize(aWriter);
++}
++
++void FactionsAtEpoch::Deserialize(TiltedPhoques::Buffer::Reader& aReader)
++{
++    OwnershipEpoch = static_cast<uint32_t>(Serialization::ReadVarInt(aReader));
++    Content.Deserialize(aReader);
++}
+diff --git a/Code/encoding/Structs/Factions.h b/Code/encoding/Structs/Factions.h
+index 351411b..3970fb2 100644
+--- a/Code/encoding/Structs/Factions.h
++++ b/Code/encoding/Structs/Factions.h
+@@ -18,3 +18,14 @@ struct Factions
+     Vector<Faction> NpcFactions;
+     Vector<Faction> ExtraFactions;
+ };
++
++struct FactionsAtEpoch
++{
++    uint32_t OwnershipEpoch{};
++    Factions Content{};
++
++    bool operator==(const FactionsAtEpoch&) const noexcept = default;
++
++    void Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept;
++    void Deserialize(TiltedPhoques::Buffer::Reader& aReader);
++};
+diff --git a/Code/encoding/Structs/Inventory.cpp b/Code/encoding/Structs/Inventory.cpp
+index 8221c63..4a5ff4c 100644
+--- a/Code/encoding/Structs/Inventory.cpp
++++ b/Code/encoding/Structs/Inventory.cpp
+@@ -1,4 +1,5 @@
+ #include <Structs/Inventory.h>
++#include <limits>
+ #include <TiltedCore/Serialization.hpp>
+ 
+ using TiltedPhoques::Serialization;
+@@ -143,20 +144,49 @@ int32_t Inventory::GetEntryCountById(GameId& aItemId) const noexcept
+     return entry->Count;
+ }
+ 
+-// TODO: unit testing
+ void Inventory::AddOrRemoveEntry(const Entry& acEntry) noexcept
+ {
+-    auto duplicate = std::find_if(Entries.begin(), Entries.end(), [acEntry](Entry& entry) { return entry.CanBeMerged(acEntry); });
++    if (acEntry.Count == 0)
++        return;
+ 
+-    if (duplicate != Entries.end())
++    if (acEntry.Count > 0)
+     {
+-        duplicate->Count += acEntry.Count;
+-        if (duplicate->Count <= 0)
+-            Entries.erase(duplicate);
++        auto existing = std::find_if(Entries.begin(), Entries.end(), [&](const Entry& e) { return e.CanBeMerged(acEntry); });
++        if (existing == Entries.end())
++            Entries.push_back(acEntry);
++        else
++        {
++            // Very large stacks can span several entries. Keep every unit without wrapping a signed count.
++            const int64_t sum = int64_t{existing->Count} + acEntry.Count;
++            constexpr int32_t limit = (std::numeric_limits<int32_t>::max)();
++            existing->Count = static_cast<int32_t>((std::min)(sum, int64_t{limit}));
++            if (sum > limit)
++            {
++                auto extra = acEntry;
++                extra.Count = static_cast<int32_t>(sum - limit);
++                Entries.push_back(std::move(extra));
++            }
++        }
++        return;
+     }
+-    else
++
++    // Entries are a snapshot of possessions. A missed add or repeated remove cannot create a debt.
++    int64_t remaining = -int64_t{acEntry.Count};
++    for (auto it = Entries.begin(); it != Entries.end() && remaining > 0;)
+     {
+-        Entries.push_back(acEntry);
++        if (!it->CanBeMerged(acEntry))
++        {
++            ++it;
++            continue;
++        }
++
++        const auto take = (std::min)(remaining, int64_t{(std::max)(int32_t{0}, it->Count)});
++        remaining -= take;
++        it->Count -= static_cast<int32_t>(take);
++        if (it->Count <= 0)
++            it = Entries.erase(it);
++        else
++            ++it;
+     }
+ }
+ 
+diff --git a/Code/encoding/Structs/Inventory.h b/Code/encoding/Structs/Inventory.h
+index 72a4d0a..8a264a7 100644
+--- a/Code/encoding/Structs/Inventory.h
++++ b/Code/encoding/Structs/Inventory.h
+@@ -16,6 +16,8 @@ struct Inventory
+         float RawCost{};
+         GameId EffectId{};
+ 
++        bool operator==(const EffectItem&) const noexcept = default;
++
+         void Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept;
+         void Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept;
+     };
+@@ -64,7 +66,8 @@ struct Inventory
+             // TODO: the whole server side state thing is very flawed
+             // since many of these things can and will change, like poison id or charge
+             // or the fact that the enchant id can be temp
+-            return ExtraCharge == acRhs.ExtraCharge && ExtraEnchantId == acRhs.ExtraEnchantId && ExtraEnchantCharge == acRhs.ExtraEnchantCharge && ExtraEnchantRemoveUnequip == acRhs.ExtraEnchantRemoveUnequip && ExtraHealth == acRhs.ExtraHealth && ExtraPoisonId == acRhs.ExtraPoisonId &&
++            return EnchantData.Effects == acRhs.EnchantData.Effects && (EnchantData.Effects.empty() || EnchantData.IsWeapon == acRhs.EnchantData.IsWeapon)
++                && ExtraCharge == acRhs.ExtraCharge && ExtraEnchantId == acRhs.ExtraEnchantId && ExtraEnchantCharge == acRhs.ExtraEnchantCharge && ExtraEnchantRemoveUnequip == acRhs.ExtraEnchantRemoveUnequip && ExtraHealth == acRhs.ExtraHealth && ExtraPoisonId == acRhs.ExtraPoisonId &&
+                    ExtraPoisonCount == acRhs.ExtraPoisonCount && ExtraSoulLevel == acRhs.ExtraSoulLevel && ExtraWorn == acRhs.ExtraWorn && ExtraWornLeft == acRhs.ExtraWornLeft && IsQuestItem == acRhs.IsQuestItem;
+         }
+ 
+diff --git a/Code/server/Services/ActorValueService.cpp b/Code/server/Services/ActorValueService.cpp
+index bf711b5..94e731c 100644
+--- a/Code/server/Services/ActorValueService.cpp
++++ b/Code/server/Services/ActorValueService.cpp
+@@ -4,6 +4,7 @@
+ #include <Messages/RequestHealthChangeBroadcast.h>
+ #include <Messages/RequestDeathStateChange.h>
+ #include <Services/ActorValueService.h>
++#include <cmath>
+ #include <World.h>
+ #include <GameServer.h>
+ #include <Messages/NotifyActorValueChanges.h>
+@@ -78,20 +79,19 @@ void ActorValueService::OnHealthChangeBroadcast(const PacketEvent<RequestHealthC
+ {
+     auto& message = acMessage.Packet;
+ 
+-    // TODO(cosideci): should server side health not be updated?
+     auto actorValuesView = m_world.view<ActorValuesComponent, OwnerComponent>();
++    const auto it = actorValuesView.find(static_cast<entt::entity>(message.Id));
++    if (it == actorValuesView.end() || message.OwnershipEpoch == 0 || !std::isfinite(message.DeltaHealth))
++        return;
++    const auto& owner = actorValuesView.get<OwnerComponent>(*it);
++    if (!owner.GetOwner() || owner.OwnershipEpoch != message.OwnershipEpoch)
++        return;
+ 
+-    auto it = actorValuesView.find(static_cast<entt::entity>(message.Id));
+-
+-    if (it != actorValuesView.end())
+-    {
+-        auto& actorValuesComponent = actorValuesView.get<ActorValuesComponent>(*it);
+-        auto currentHealth = actorValuesComponent.CurrentActorValues.ActorValuesList[24];
+-        actorValuesComponent.CurrentActorValues.ActorValuesList[24] = currentHealth - message.DeltaHealth;
+-    }
+-
++    auto& values = actorValuesView.get<ActorValuesComponent>(*it);
++    values.CurrentActorValues.ActorValuesList[24] += message.DeltaHealth;
+     NotifyHealthChangeBroadcast notify;
+     notify.Id = message.Id;
++    notify.OwnershipEpoch = message.OwnershipEpoch;
+     notify.DeltaHealth = message.DeltaHealth;
+ 
+     const entt::entity cEntity = static_cast<entt::entity>(message.Id);
+diff --git a/Code/server/Services/CharacterService.cpp b/Code/server/Services/CharacterService.cpp
+index 21c4b23..b61112c 100644
+--- a/Code/server/Services/CharacterService.cpp
++++ b/Code/server/Services/CharacterService.cpp
+@@ -370,6 +370,7 @@ void CharacterService::OnOwnershipClaimRequest(const PacketEvent<RequestOwnershi
+         notify.OwnershipEpoch = ownerComponent.OwnershipEpoch;
+         notify.CurrentActorData = BuildActorData(cEntity);
+         notify.LeveledNpcPickId = view.get<CharacterComponent>(*it).LeveledNpcPickId.Id;
++        notify.FactionsContent = view.get<CharacterComponent>(*it).FactionsContent;
+         acMessage.pPlayer->Send(notify);
+         return;
+     }
+@@ -484,11 +485,11 @@ void CharacterService::OnFactionsChanges(const PacketEvent<RequestFactionsChange
+     {
+         auto it = view.find(static_cast<entt::entity>(id));
+ 
+-        if (it == std::end(view) || view.get<OwnerComponent>(*it).GetOwner() != acMessage.pPlayer)
++        if (it == std::end(view) || !view.get<OwnerComponent>(*it).IsCurrentOwner(acMessage.pPlayer, factions.OwnershipEpoch))
+             continue;
+ 
+         auto& characterComponent = view.get<CharacterComponent>(*it);
+-        characterComponent.FactionsContent = factions;
++        characterComponent.FactionsContent = factions.Content;
+         characterComponent.SetDirtyFactions(true);
+     }
+ }
+@@ -750,6 +751,7 @@ void CharacterService::PopulateAssignmentResponse(const entt::entity aEntity, As
+         aResponse.IsDead = pCharacterComponent->IsDead();
+         aResponse.IsWeaponDrawn = pCharacterComponent->IsWeaponDrawn();
+         aResponse.LeveledNpcPickId = pCharacterComponent->LeveledNpcPickId.Id;
++        aResponse.FactionsContent = pCharacterComponent->FactionsContent;
+ 
+         if (pCharacterComponent->LeveledNpcPickId)
+         {
+@@ -872,6 +874,7 @@ bool CharacterService::TransferOwnership(Player* apPlayer, const entt::entity aE
+     notify.OwnershipEpoch = newEpoch;
+     notify.CurrentActorData = BuildActorData(aEntity);
+     notify.LeveledNpcPickId = view.get<CharacterComponent>(*it).LeveledNpcPickId.Id;
++    notify.FactionsContent = view.get<CharacterComponent>(*it).FactionsContent;
+ 
+     ownerComponent.SetOwner(apPlayer);
+     ownerComponent.OwnershipEpoch = newEpoch;
+@@ -988,9 +991,14 @@ void CharacterService::ProcessFactionsChanges() const noexcept
+                 continue;
+ 
+             auto& message = messages[pPlayer];
++            if (message.Changes.size() == 1023)
++            {
++                pPlayer->Send(message);
++                message.Changes.clear();
++            }
+             auto& change = message.Changes[World::ToInteger(entity)];
+ 
+-            change = characterComponent.FactionsContent;
++            change = {ownerComponent.OwnershipEpoch, characterComponent.FactionsContent};
+         }
+ 
+         characterComponent.SetDirtyFactions(false);
+diff --git a/Code/server/Services/PartyService.h b/Code/server/Services/PartyService.h
+index acd0c4f..15319de 100644
+--- a/Code/server/Services/PartyService.h
++++ b/Code/server/Services/PartyService.h
+@@ -24,8 +24,14 @@ struct PartyService
+         uint32_t LeaderPlayerId;
+         Vector<Player*> Members;
+         GameId CachedWeather{};
+-        // Stages each quest reached since it started, as relayed to the party
+-        Map<GameId, TiltedPhoques::Set<uint16_t>> QuestStages{};
++        struct QuestRun
++        {
++            TiltedPhoques::Set<uint16_t> Stages;
++            bool Stopped = false;
++            bool Started = false;
++        };
++
++        Map<GameId, QuestRun> QuestRuns{};
+     };
+ 
+     PartyService(World& aWorld, entt::dispatcher& aDispatcher) noexcept;
+diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestService.cpp
+index 9f9e67f..f496759 100644
+--- a/Code/server/Services/QuestService.cpp
++++ b/Code/server/Services/QuestService.cpp
+@@ -95,19 +95,33 @@ void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessa
+     if (!pParty)
+         return;
+ 
+-    // Party members' scripts often reach the same stage on their own, only relay it once
+-    if (message.Status == RequestQuestUpdate::StageUpdate)
++    auto& run = pParty->QuestRuns[message.Id];
++    // The sender's local quest log and the party's shared lifecycle are independent.
++    // A late start from a second client must not clear stages the first client sent.
++    switch (message.Status)
+     {
+-        if (!pParty->QuestStages[message.Id].insert(message.Stage).second)
+-        {
+-            spdlog::debug("Dropped duplicate quest stage from player {}, quest: {:X}, stage: {}", pPlayer->GetId(), message.Id.LogFormat(), message.Stage);
++    case RequestQuestUpdate::Started:
++        if (run.Started && !run.Stopped)
+             return;
+-        }
+-    }
+-    else
+-    {
+-        // A started quest has run none of its stages yet, a stopped one may run them again when restarted
+-        pParty->QuestStages.erase(message.Id);
++        run.Started = true;
++        run.Stopped = false;
++        notify.Status = NotifyQuestUpdate::Started;
++        break;
++    case RequestQuestUpdate::StageUpdate:
++        // A party may form partway through a quest, so a stage can be its first event.
++        // Once a stop is observed, only an explicit new start opens the next run.
++        if (run.Stopped || !run.Stages.insert(message.Stage).second)
++            return;
++        break;
++    case RequestQuestUpdate::Stopped:
++        if (run.Stopped)
++            return;
++        run.Stopped = true;
++        run.Started = false;
++        run.Stages.clear();
++        break;
++    default:
++        return;
+     }
+ 
+     GameServer::Get()->SendToParty(notify, partyComponent, acMessage.GetSender());
+diff --git a/Code/tests/encoding.cpp b/Code/tests/encoding.cpp
+index 322ad0d..173cd07 100644
+--- a/Code/tests/encoding.cpp
++++ b/Code/tests/encoding.cpp
+@@ -614,3 +614,91 @@ TEST_CASE("StringCache", "[encoding.string_cache]")
+         REQUIRE(update == recvUpdate);
+     }
+ }
++
++TEST_CASE("NPC faction snapshots preserve removals and ownership", "[coop-state]")
++{
++    Faction base{};
++    base.Id = GameId(0, 0x5C84E);
++    base.Rank = 0;
++    Faction removed = base;
++    removed.Rank = -1;
++    Factions factions;
++    factions.NpcFactions.push_back(base);
++    factions.ExtraFactions.push_back(removed);
++
++    const auto check = [](const auto& sent) {
++        Buffer buffer(4096);
++        Buffer::Writer writer(&buffer);
++        sent.SerializeRaw(writer);
++        writer.WriteBits(0xAD, 8);
++        Buffer::Reader reader(&buffer);
++        std::decay_t<decltype(sent)> received{};
++        received.DeserializeRaw(reader);
++        REQUIRE(received == sent);
++        uint64_t end = 0;
++        reader.ReadBits(end, 8);
++        REQUIRE(end == 0xAD);
++    };
++
++    AssignCharacterResponse assignment{};
++    assignment.OwnershipEpoch = 3;
++    assignment.FactionsContent = factions;
++    check(assignment);
++    NotifyOwnershipTransfer transfer{};
++    transfer.OwnershipEpoch = 4;
++    transfer.FactionsContent = factions;
++    check(transfer);
++    RequestFactionsChanges request{};
++    request.Changes[0x6D] = {3, factions};
++    check(request);
++    NotifyFactionsChanges notify{};
++    notify.Changes[0x6D] = {4, factions};
++    check(notify);
++}
++
++TEST_CASE("Inventory snapshots do not record a debt or merge different enchantments", "[coop-state]")
++{
++    Inventory bag;
++    Inventory::Entry sword;
++    sword.BaseId = GameId(0, 0x12EB7);
++    sword.Count = -1;
++    bag.AddOrRemoveEntry(sword);
++    REQUIRE(bag.Entries.empty());
++
++    sword.Count = 1;
++    Inventory::EffectItem effect;
++    effect.EffectId = GameId(0, 10);
++    sword.EnchantData.Effects.push_back(effect);
++    bag.AddOrRemoveEntry(sword);
++    auto second = sword;
++    second.EnchantData.Effects.front().EffectId = GameId(0, 11);
++    bag.AddOrRemoveEntry(second);
++    REQUIRE(bag.Entries.size() == 2);
++
++    sword.Count = -2;
++    bag.AddOrRemoveEntry(sword);
++    REQUIRE(bag.Entries.size() == 1);
++    REQUIRE(bag.Entries.front() == second);
++}
++
++TEST_CASE("Health deltas retain the actor ownership epoch", "[coop-state]")
++{
++    const auto check = [](auto sent) {
++        sent.Id = 0xA1;
++        sent.OwnershipEpoch = 0x12345;
++        sent.DeltaHealth = -12.5f;
++        Buffer buffer(128);
++        Buffer::Writer writer(&buffer);
++        sent.SerializeRaw(writer);
++        writer.WriteBits(0xAD, 8);
++        Buffer::Reader reader(&buffer);
++        decltype(sent) received{};
++        received.DeserializeRaw(reader);
++        REQUIRE(received == sent);
++        uint64_t end = 0;
++        reader.ReadBits(end, 8);
++        REQUIRE(end == 0xAD);
++    };
++    check(RequestHealthChangeBroadcast{});
++    check(NotifyHealthChangeBroadcast{});
++}
+diff --git a/Code/tp_process/main.cpp b/Code/tp_process/main.cpp
+--- a/Code/tp_process/main.cpp
++++ b/Code/tp_process/main.cpp
+@@ -5,5 +5,5 @@
+ 
+ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
+ {
+-    TiltedPhoques::UIMain(lpCmdLine, hInstance, []() { return new ProcessHandler; });
++    return TiltedPhoques::UIMain(lpCmdLine, hInstance, []() { return new ProcessHandler; });
+ }

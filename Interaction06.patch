@@ -1,0 +1,1956 @@
+diff --git a/Code/client/Components/RemoteComponent.h b/Code/client/Components/RemoteComponent.h
+index d65fc16..1a75b94 100644
+--- a/Code/client/Components/RemoteComponent.h
++++ b/Code/client/Components/RemoteComponent.h
+@@ -20,6 +20,8 @@ struct RemoteComponent
+     uint32_t CachedRefId;
+     uint32_t ConfirmedCorpseEpoch{};
+     std::chrono::steady_clock::time_point NextLifeCheck{};
++    uint64_t LastCombatTick{};
++    uint8_t CombatMode{};
+     bool ObservedDead{};
+     bool ObservedBleedout{};
+     uint32_t OwnershipEpoch;
+diff --git a/Code/client/Games/Skyrim/Actor.h b/Code/client/Games/Skyrim/Actor.h
+index 74722b0..97b7ff6 100644
+--- a/Code/client/Games/Skyrim/Actor.h
++++ b/Code/client/Games/Skyrim/Actor.h
+@@ -21,6 +21,7 @@ struct ExPlayerCharacter;
+ struct ActorExtension;
+ struct AIProcess;
+ struct CombatController;
++struct CombatGroup;
+ struct TESIdleForm;
+ 
+ struct Actor : TESObjectREFR
+@@ -89,7 +90,7 @@ struct Actor : TESObjectREFR
+     virtual void sub_D1();
+     virtual bool sub_D2() const;
+     virtual void sub_D3();
+-    virtual void sub_D4();
++    virtual CombatGroup* GetCombatGroup() const;
+     virtual void sub_D5();
+     virtual void sub_D6();
+     virtual void sub_D7();
+diff --git a/Code/client/Games/Skyrim/BSGraphics/BSGraphicsRenderer.cpp b/Code/client/Games/Skyrim/BSGraphics/BSGraphicsRenderer.cpp
+index a8c105d..2d7664d 100644
+--- a/Code/client/Games/Skyrim/BSGraphics/BSGraphicsRenderer.cpp
++++ b/Code/client/Games/Skyrim/BSGraphics/BSGraphicsRenderer.cpp
+@@ -22,6 +22,8 @@ static RendererWindow* g_RenderWindow = nullptr;
+ static constexpr char kTogetherWindowName[]{"Skyrim Together"};
+ 
+ } // namespace
++static RendererData* g_rendererData{};
++RendererData* GetRendererData() { return g_rendererData; }
+ RendererWindow* GetMainWindow()
+ {
+     return g_RenderWindow;
+@@ -58,6 +60,7 @@ void Hook_Renderer_Init(Renderer* self, BSGraphics::RendererInitOSData* aOSData,
+ 
+     g_sRs = &World::Get().ctx().at<RenderSystemD3D11>();
+     // This how the game does it too
++    g_rendererData = &self->Data;
+     g_RenderWindow = &self->Data.RenderWindowA[0];
+ 
+     const BSGraphics::RendererData& renderer = self->Data;
+diff --git a/Code/client/Games/Skyrim/BSGraphics/BSGraphicsRenderer.h b/Code/client/Games/Skyrim/BSGraphics/BSGraphicsRenderer.h
+index 7579c10..bcb2567 100644
+--- a/Code/client/Games/Skyrim/BSGraphics/BSGraphicsRenderer.h
++++ b/Code/client/Games/Skyrim/BSGraphics/BSGraphicsRenderer.h
+@@ -86,6 +86,8 @@ static_assert(offsetof(RendererData, pRenderTargetsA) == 0xA48);
+ static_assert(offsetof(RendererData, pDepthStencilTargetsA) == 0x1FA8);
+ static_assert(offsetof(RendererData, pCubeMapRenderTargetsA) == 0x26C8);
+ 
++RendererData* GetRendererData();
++
+ struct Renderer
+ {
+     bool bSkipNextPresent;
+diff --git a/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.cpp b/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.cpp
+index 24b8b49..ab23e4b 100644
+--- a/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.cpp
++++ b/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.cpp
+@@ -12,6 +12,16 @@ bool WorldPtToScreenPt3(const NiPoint3& aWorldPt, NiPoint3& aScreenPt)
+ {
+     return NiCamera::WorldPtToScreenPt3(reinterpret_cast<float*>(CameraWorldToCam), CameraPort, &aWorldPt, &aScreenPt.x, &aScreenPt.y, &aScreenPt.z, 1e-5f);
+ }
++bool SceneDepth(const NiPoint3& p,float& depth)
++{
++    if (!CameraWorldToCam) return false;
++    const auto& m=*CameraWorldToCam;
++    const auto component=[&](int i){return m[i][0]*p.x+m[i][1]*p.y+m[i][2]*p.z+m[i][3];};
++    const float w=component(3);
++    if (!(w>1e-5f)) return false;
++    depth=component(2)/w;
++    return std::isfinite(depth) && depth>=0.f && depth<=1.f;
++}
+ bool ProjectForOverlay(const NiPoint3& point, NiPoint3& uv)
+ {
+     // The engine publishes the projection used for the HUD separately from the player camera.
+diff --git a/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.h b/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.h
+index 85b09cd..1a93356 100644
+--- a/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.h
++++ b/Code/client/Games/Skyrim/Interface/Menus/HUDMenuUtils.h
+@@ -2,6 +2,7 @@
+ 
+ namespace HUDMenuUtils
+ {
++bool SceneDepth(const NiPoint3& point,float& depth);
+ bool ProjectForOverlay(const NiPoint3& point, NiPoint3& uv);
+ bool WorldPtToScreenPt3(const NiPoint3& aWorldPt, NiPoint3& aScreenPt);
+ }
+diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyrim/TESObjectREFR.cpp
+index dd40225..6d1bc34 100644
+--- a/Code/client/Games/Skyrim/TESObjectREFR.cpp
++++ b/Code/client/Games/Skyrim/TESObjectREFR.cpp
+@@ -1024,6 +1024,8 @@ bool TP_MAKE_THISCALL(HookActivate, TESObjectREFR, TESObjectREFR* apActivator, u
+         auto& service = World::Get().GetOverlayService();
+         if (service.TryJoinConversation(apThis->formID))
+             return true;
++        if (service.TryHouseDoor(apThis->formID)) return true;
++        if (service.TryTrade(apThis->formID)) return true;
+         service.NoteActivation(apThis->formID);
+     }
+     Actor* pActivator = Cast<Actor>(apActivator);
+diff --git a/Code/client/Services/Generic/CharacterService.cpp b/Code/client/Services/Generic/CharacterService.cpp
+index 844e18b..f45d912 100644
+--- a/Code/client/Services/Generic/CharacterService.cpp
++++ b/Code/client/Services/Generic/CharacterService.cpp
+@@ -48,6 +48,7 @@
+ #include <Messages/RequestActionEvents.h>
+ #include <Messages/NotifyActionEvents.h>
+ #include <Messages/CharacterSpawnRequest.h>
++#include <Services/HomeInstance.h>
+ #include <Messages/RequestFactionsChanges.h>
+ #include <Messages/NotifyFactionsChanges.h>
+ #include <Messages/NotifyRemoveCharacter.h>
+@@ -517,6 +518,8 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
+ 
+ void CharacterService::OnCharacterSpawn(const CharacterSpawnRequest& acMessage) const noexcept
+ {
++    // Visiting is read-only. Never move a persistent NPC from the visitor's personal save into a display cell.
++    if (!acMessage.IsPlayer && HomeInstance::Foreign(acMessage.CellId.ModId)) return;
+     if (acMessage.OwnershipEpoch == 0)
+     {
+         spdlog::warn("Ignored spawn for actor {:X} because the ownership epoch is invalid", acMessage.ServerId);
+@@ -721,6 +724,23 @@ void CharacterService::OnReferencesMoveRequest(const ServerReferencesMoveRequest
+         auto& interpolationComponent = view.get<InterpolationComponent>(*itor);
+ 
+         InterpolationComponent::TimePoint point;
++        auto& remote = view.get<RemoteComponent>(*itor);
++        if (movement.CombatMode && movement.CombatEpoch == remote.OwnershipEpoch && acMessage.Tick > remote.LastCombatTick)
++        {
++            remote.LastCombatTick = acMessage.Tick;
++            const auto* ref = m_world.try_get<FormIdComponent>(*itor);
++            if (ref && m_world.GetPartyService().IsInParty())
++            {
++                if (movement.CombatMode == 2 && remote.CombatMode != 2) OverlayService::ObservePartyCombat(ref->Id);
++                if (movement.CombatMode == 1 && remote.CombatMode == 2)
++                    OverlayService::BeginCombatSettlement(ref->Id);
++                if (movement.CombatMode != 1 && remote.CombatMode == 1)
++                    OverlayService::CancelCombatSettlement(ref->Id);
++            }
++            // Targetless combat during surrender is still part of the previous encounter.
++            if (movement.CombatMode != 3 || remote.CombatMode != 2)
++                remote.CombatMode = movement.CombatMode;
++        }
+         point.Tick = acMessage.Tick;
+         point.Position = movement.Position;
+         point.Rotation = {movement.Rotation.x, 0.f, movement.Rotation.y};
+@@ -1960,7 +1980,15 @@ void CharacterService::RunLocalUpdates() const noexcept
+             movementMessage.Updates.clear();
+         }
+ 
+-        AnimationSystem::SerializeMovement(m_world, pActor, movementMessage.Updates[localComponent.Id]);
++        auto& movement = movementMessage.Updates[localComponent.Id];
++        AnimationSystem::SerializeMovement(m_world, pActor, movement);
++        if (pActor != pPlayer && pActor->GetExtension() && !pActor->GetExtension()->IsPlayer() && !pActor->IsDead())
++        {
++            auto* target = pActor->GetCombatTarget();
++            movement.CombatEpoch = localComponent.OwnershipEpoch;
++            movement.CombatMode = !pActor->IsInCombat() ? 1 :
++                (target && (target == pPlayer || (target->GetExtension() && target->GetExtension()->IsPlayer()))) ? 2 : 3;
++        }
+     }
+ 
+     if (!actionsMessage.Actions.empty())
+diff --git a/Code/client/Services/Generic/CombatService.cpp b/Code/client/Services/Generic/CombatService.cpp
+index df07fd3..487d0c0 100644
+--- a/Code/client/Services/Generic/CombatService.cpp
++++ b/Code/client/Services/Generic/CombatService.cpp
+@@ -1,4 +1,6 @@
+ #include <Services/CombatService.h>
++#include <Services/OverlayService.h>
++#include <PlayerCharacter.h>
+ #include <Services/TransportService.h>
+ 
+ #include <Events/UpdateEvent.h>
+@@ -162,6 +164,8 @@ void CombatService::OnNotifyProjectileLaunch(const NotifyProjectileLaunch& acMes
+ 
+ void CombatService::OnHitEvent(const HitEvent& acEvent) const noexcept
+ {
++    if (auto* local = PlayerCharacter::Get(); local && local->formID == acEvent.HitterId)
++        OverlayService::CancelCombatSettlement(acEvent.HitteeId);
+ #if 0
+     if (!m_transport.IsConnected())
+         return;
+diff --git a/Code/client/Services/Generic/CoopInteraction.cpp b/Code/client/Services/Generic/CoopInteraction.cpp
+index a4aa3c5..4103eaa 100644
+--- a/Code/client/Services/Generic/CoopInteraction.cpp
++++ b/Code/client/Services/Generic/CoopInteraction.cpp
+@@ -94,8 +94,7 @@ bool VerifyStanding(World& world, Actor* npc, PeaceSnapshot& state, Clock::time_
+     if (npc->IsInCombat() || (!state.initiated && target))
+     {
+         if (!state.encounter || (target && !IsPartyTarget(world, target, state.speaker))) return true;
+-        if (!state.initiated) npc->StopCombat();
+-        else if (now - state.started > 600ms) return true;
++        // Native combat and pose are verified separately. An animation can finish first.
+     }
+     // Seated, mounted, sleeping and flying actors have legitimate non-standing poses.
+     if (((npc->actorState.flags1 >> 14) & 0x7f) != 0) return true;
+@@ -317,6 +316,9 @@ void OverlayService::ClearInteraction() noexcept
+     localOpponent.store(0);
+     m_pendingJoin = m_requestedTalk = 0;
+     recoveries.clear();
++    ClearCombatSettlements();
++    ClearTrade();
++    ClearHomes();
+     m_rejoinKey = 0;
+     ClearProgress();
+     m_watch = {};
+@@ -365,6 +367,7 @@ void OverlayService::OnInteraction(const NotifyCoopInteraction& packet) noexcept
+             spdlog::info("Co-op encounter {}: received peaceful outcome for actor {:X} from {}", e.Session, form, e.Speaker);
+             state.expires = now + 15s;
+             state.encounter = true;
++            BeginCombatSettlement(form);
+             recoveries.insert_or_assign(form, state);
+             opponent = form;
+             opponentExpires = now + 3s;
+@@ -377,7 +380,10 @@ void OverlayService::OnInteraction(const NotifyCoopInteraction& packet) noexcept
+     if (e.Kind == Interaction::OpponentState && m_peaceSession.count(form) &&
+         m_peaceSession.at(form) == key) return;
+     if (e.Kind == Interaction::OpponentState && e.Value != 2)
++    {
+         recoveries.erase(form);
++        CancelCombatSettlement(form);
++    }
+     if (e.Kind == Interaction::FollowerReserved || e.Kind == Interaction::FollowerReleased)
+     {
+         bool newlyReserved = false;
+@@ -548,6 +554,7 @@ void OverlayService::OnInteraction(const NotifyCoopInteraction& packet) noexcept
+             if (!change || (actor->animationGraphHolder.IsReady() && actor->SendAnimationEvent(pose == 1 ? &down : &up)))
+                 lastPose = pose;
+         }
++        ObservePartyCombat(form);
+         if (actor->GetCombatTarget() == PlayerCharacter::Get())
+         {
+             auto players = m_world.view<PlayerComponent, FormIdComponent>();
+@@ -626,6 +633,7 @@ void OverlayService::UpdateInteraction() noexcept
+         auto* follower = followerQuest->GetAliasedRef(0);
+         Transmit(Interaction::FollowerReport, 0, 0, follower ? NetworkForm(follower->formID) : GameId{});
+     }
++    UpdateCombatSettlements(m_world);
+     ApplyPeace(m_world);
+     ApplyFavorSettlements();
+     UpdateHireOffer();
+diff --git a/Code/client/Services/Generic/DialogueInvitation.cpp b/Code/client/Services/Generic/DialogueInvitation.cpp
+index 5b30478..4616d02 100644
+--- a/Code/client/Services/Generic/DialogueInvitation.cpp
++++ b/Code/client/Services/Generic/DialogueInvitation.cpp
+@@ -26,15 +26,15 @@ std::atomic_uint32_t invitedNpc{}, invitedSpeaker{};
+ bool JoinText(TESNPC* base, TESObjectREFR* ref, BSString& destination)
+ {
+     const bool result = nextText(base, ref, destination);
+-    if (invitedNpc.load() == 0)
+-        return result;
+     const auto* pick = Picked();
+-    if (!pick || pick->baseForm != base || (pick->formID != invitedNpc.load() && pick->formID != invitedSpeaker.load()))
++    if (!pick || pick->baseForm != base) return result;
++    const bool join = invitedNpc.load() && (pick->formID == invitedNpc.load() || pick->formID == invitedSpeaker.load());
++    if (!join && World::Get().GetOverlayService().TradePeer(pick->formID)==UINT32_MAX)
+         return result;
+     // Vanilla HUD accepts "verb\\nname". Preserve the name supplied by Skyrim or other UI mods.
+     const char* text = destination.AsAscii();
+     const char* name = text ? std::strchr(text, '\n') : nullptr;
+-    std::string replacement = "Присоединиться";
++    std::string replacement = join ? "Присоединиться" : "Обменяться";
+     if (name)
+         replacement += name;
+     return destination.Assign(replacement.c_str()) || result;
+@@ -79,6 +79,7 @@ void OverlayService::PublishInvitation(uint32_t speaker, uint32_t session, uint3
+     m_invitedTalk = session ? (uint64_t(speaker) << 32) | session : 0;
+     m_invitedSpeaker = speakerForm;
+     m_invitedNpc = npcForm;
++    if (!nextText && PlayerCharacter::Get()) Install(Cast<TESNPC>(PlayerCharacter::Get()->baseForm));
+     if (npcForm && !nextText)
+         if (auto* actor = Cast<Actor>(TESForm::GetById(npcForm)))
+             Install(Cast<TESNPC>(actor->baseForm));
+diff --git a/Code/client/Services/Generic/DialogueMarker.cpp b/Code/client/Services/Generic/DialogueMarker.cpp
+index 0b0f7b0..14e2948 100644
+--- a/Code/client/Services/Generic/DialogueMarker.cpp
++++ b/Code/client/Services/Generic/DialogueMarker.cpp
+@@ -3,6 +3,7 @@
+ #include <Services/DialogueMarkerLayout.h>
+ #include <Interface/Menus/HUDMenuUtils.h>
+ #include <imgui.h>
++#include <Services/MarkerDepth.h>
+ #include <Interface/UI.h>
+ 
+ void OverlayService::DrawDialogueMarker() noexcept
+@@ -54,8 +55,26 @@ void OverlayService::DrawDialogueMarker() noexcept
+         draw->AddLine(center, end, ink, 3.1f * scale);
+         draw->AddLine(center, end, light, 1.15f * scale);
+     };
+-    if (layout.npcLine) line(npc.p);
+-    if (layout.speakerLine) line(speaker.p);
++    if (layout.npcLine || layout.speakerLine)
++    {
++        // Use the same camera matrix as the pixel anchors. Put the leaders behind both actors.
++        float a{}, b{}, farther{};
++        const auto point = layout.npcLine ? frame.Npc : frame.Speaker;
++        if (HUDMenuUtils::SceneDepth(point, a) &&
++            HUDMenuUtils::SceneDepth(point + (point - frame.Eye), farther))
++        {
++            const bool reversed = farther < a;
++            float depth = a;
++            if (layout.speakerLine && HUDMenuUtils::SceneDepth(frame.Speaker, b))
++                depth = reversed ? std::min(depth,b) : std::max(depth,b);
++            if (MarkerDepth::Begin(draw,screen.x,screen.y,depth,reversed))
++            {
++                if (layout.npcLine) line(npc.p);
++                if (layout.speakerLine) line(speaker.p);
++                MarkerDepth::End(draw);
++            }
++        }
++    }
+     // A rounded speech balloon with a cut-out mouth and three dots.
+     draw->AddTriangleFilled(at(-10, 10), at(-10, 22), at(4, 11), ink);
+     draw->AddRectFilled(at(-22,-16), at(22,15), ink, 11.f * scale);
+diff --git a/Code/client/Services/Generic/EncounterCombat.cpp b/Code/client/Services/Generic/EncounterCombat.cpp
+new file mode 100644
+index 0000000..3f879ec
+--- /dev/null
++++ b/Code/client/Services/Generic/EncounterCombat.cpp
+@@ -0,0 +1,141 @@
++#include <TiltedOnlinePCH.h>
++#include <World.h>
++#include <Services/OverlayService.h>
++#include <Services/PartyService.h>
++#include <PlayerCharacter.h>
++#include <Games/ActorExtension.h>
++#include <Combat/CombatGroup.h>
++#include <map>
++#include <Games/TES.h>
++#include <vector>
++
++namespace
++{
++using Clock = std::chrono::steady_clock;
++using namespace std::chrono_literals;
++struct Settlement
++{
++    Clock::time_point deadline{}, next{}, quiet{};
++    bool associated{}, localInvolved{};
++    unsigned attempts{};
++};
++std::map<uint32_t, Settlement> settling;
++std::map<uint32_t,Clock::time_point> guestInvolved;
++
++struct Threats { bool participant{}, other{}; };
++Threats Classify(Actor* actor, const std::vector<uint32_t>& allowed)
++{
++    Threats result;
++    const auto classify = [&](uint32_t handle) {
++        if (!handle) return;
++        if (std::find(allowed.begin(), allowed.end(), handle) != allowed.end()) result.participant = true;
++        else result.other = true;
++    };
++    if (auto* current = actor->GetCombatTarget()) classify(current->GetHandle().handle.iBits);
++    if (auto* group = actor->GetCombatGroup())
++    {
++        group->lock.LockForRead();
++        for (uint32_t i = 0; i < group->targets.length; ++i)
++            classify(group->targets[i].targetHandle);
++        group->lock.UnlockRead();
++    }
++    return result;
++}
++
++bool Settle(World& world, Actor* npc, Settlement& state, Clock::time_point now)
++{
++    if (!npc || npc->IsDead() || npc->IsDisabled()) return true;
++    auto* me = PlayerCharacter::Get();
++    if (!me || !npc->GetNiNode() || !me->GetNiNode()) return false;
++    std::vector<Actor*> actors{me};
++    std::vector<uint32_t> handles{me->GetHandle().handle.iBits};
++    const auto& members = world.GetPartyService().GetPartyMembers();
++    auto view = world.view<FormIdComponent, PlayerComponent>();
++    for (auto entity : view)
++    {
++        const auto id = view.get<PlayerComponent>(entity).Id;
++        if (std::find(members.begin(), members.end(), id) == members.end()) continue;
++        auto* replica = Cast<Actor>(TESForm::GetById(view.get<FormIdComponent>(entity).Id));
++        if (replica && replica != me && replica->GetNiNode())
++        {
++            actors.push_back(replica);
++            handles.push_back(replica->GetHandle().handle.iBits);
++        }
++    }
++    const auto theirs = Classify(npc, handles);
++    const std::vector<uint32_t> subject{npc->GetHandle().handle.iBits};
++    bool involved = theirs.participant;
++    for (auto* actor : actors) involved |= Classify(actor, subject).participant;
++    state.associated |= involved;
++    state.localInvolved |= Classify(me,subject).participant || npc->GetCombatTarget()==me;
++    bool otherAttacker=false;
++    if (state.localInvolved && me->IsInCombat())
++        if (auto* list=ProcessLists::Get())
++            for (auto h:list->highActorHandleArray)
++            {
++                auto* a=Cast<Actor>(TESObjectREFR::GetByHandle(h));
++                if (a && a!=npc && a!=me && a->IsInCombat() && a->GetCombatTarget()==me)
++                {otherAttacker=true;break;}
++            }
++    bool outstanding = false;
++    const auto stop = [&](Actor* actor, Threats threats, bool allowTargetless) {
++        if (threats.other || (!threats.participant && !(allowTargetless && actor->IsInCombat()))) return;
++        outstanding = true;
++        if (now >= state.next)
++        {
++            actor->StopCombat();
++            ++state.attempts;
++        }
++    };
++    // Stop each side independently. Never stop an actor fighting another threat.
++    stop(npc, theirs, true);
++    for (auto* actor : actors)
++    {
++        const auto theirTargets = Classify(actor, subject);
++        // Only clear a targetless combat flag on the local player if this encounter implicated them.
++        if (actor!=me || !otherAttacker) stop(actor, theirTargets, actor == me && state.localInvolved && !theirs.other);
++    }
++    if (outstanding)
++    {
++        state.quiet = {};
++        if (now >= state.next) state.next = now + 350ms;
++        return false;
++    }
++    if (state.quiet == Clock::time_point{}) state.quiet = now;
++    return now - state.quiet >= 2500ms;
++}
++}
++void OverlayService::ObservePartyCombat(uint32_t form) noexcept
++{
++    auto* player=PlayerCharacter::Get();
++    auto* npc=Cast<Actor>(TESForm::GetById(form));
++    if (!player || !npc || !npc->GetNiNode()) return;
++    if (Classify(player,{npc->GetHandle().handle.iBits}).participant ||
++        Classify(npc,{player->GetHandle().handle.iBits}).participant)
++        guestInvolved[form]=Clock::now()+10s;
++}
++void OverlayService::BeginCombatSettlement(uint32_t form) noexcept
++{
++    if (!form) return;
++    auto [it, inserted] = settling.try_emplace(form, Settlement{Clock::now() + 15s});
++    const auto earlier=guestInvolved.find(form);
++    if (earlier!=guestInvolved.end() && earlier->second>Clock::now()) it->second.localInvolved=true;
++}
++void OverlayService::CancelCombatSettlement(uint32_t form) noexcept { settling.erase(form); }
++void OverlayService::ClearCombatSettlements() noexcept { settling.clear(); guestInvolved.clear(); }
++void OverlayService::UpdateCombatSettlements(World& world) noexcept
++{
++    const auto now = Clock::now();
++    std::erase_if(guestInvolved,[now](const auto& entry){return entry.second<=now;});
++    for (auto it = settling.begin(); it != settling.end();)
++    {
++        const bool expired = now >= it->second.deadline;
++        if (expired || Settle(world, Cast<Actor>(TESForm::GetById(it->first)), it->second, now))
++        {
++            spdlog::info("Co-op combat actor {:X}: {}, native stops {}, party threat observed {}", it->first,
++                expired ? "timed out" : "settled", it->second.attempts, it->second.associated);
++            it = settling.erase(it);
++        }
++        else ++it;
++    }
++}
+diff --git a/Code/client/Services/Generic/MarkerDepth.cpp b/Code/client/Services/Generic/MarkerDepth.cpp
+new file mode 100644
+index 0000000..dc53545
+--- /dev/null
++++ b/Code/client/Services/Generic/MarkerDepth.cpp
+@@ -0,0 +1,93 @@
++#include <TiltedOnlinePCH.h>
++#include <Services/MarkerDepth.h>
++#include <BSGraphics/BSGraphicsRenderer.h>
++#include <imgui.h>
++#include <d3dcompiler.h>
++#include <wrl/client.h>
++
++namespace MarkerDepth
++{
++namespace
++{
++using Microsoft::WRL::ComPtr;
++ComPtr<ID3D11PixelShader> shader;
++ComPtr<ID3D11Buffer> constants;
++ComPtr<ID3D11ShaderResourceView> previousDepth;
++ComPtr<ID3D11Buffer> previousConstants;
++ID3D11Device* lastDevice{};
++struct Parameters { float width, height, depth, sign; };
++Parameters parameters;
++BSGraphics::RendererData* renderer{};
++ID3D11ShaderResourceView* depthView{};
++
++bool Prepare(ID3D11Device* device)
++{
++    if (lastDevice == device) return shader && constants;
++    lastDevice = device;
++    shader.Reset();
++    constants.Reset();
++    constexpr char source[] = R"(
++        Texture2D font : register(t0); SamplerState fontSampler : register(s0);
++        Texture2D<float> scene : register(t1);
++        cbuffer Frame : register(b1) { float2 display; float z; float signZ; }
++        float4 main(float4 pos: SV_POSITION, float4 color: COLOR0,float2 uv: TEXCOORD0) : SV_Target {
++            uint w,h; scene.GetDimensions(w,h);
++            int2 pixel = clamp(int2(pos.xy/display*float2(w,h)),int2(0,0),int2(w-1,h-1));
++            clip((scene.Load(int3(pixel,0))-z)*signZ);
++            return color*font.Sample(fontSampler,uv);
++        })";
++    ComPtr<ID3DBlob> compiled;
++    if (FAILED(D3DCompile(source, sizeof(source)-1, nullptr, nullptr, nullptr, "main", "ps_4_0", 0,0,&compiled,nullptr)) ||
++        FAILED(device->CreatePixelShader(compiled->GetBufferPointer(),compiled->GetBufferSize(),nullptr,&shader))) return false;
++    D3D11_BUFFER_DESC desc{};
++    desc.ByteWidth = sizeof(Parameters);
++    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++    return SUCCEEDED(device->CreateBuffer(&desc,nullptr,&constants));
++}
++void Bind(const ImDrawList*, const ImDrawCmd*)
++{
++    auto* ctx = renderer->pContext;
++    ctx->PSGetShaderResources(1,1,previousDepth.ReleaseAndGetAddressOf());
++    ctx->PSGetConstantBuffers(1,1,previousConstants.ReleaseAndGetAddressOf());
++    ctx->UpdateSubresource(constants.Get(),0,nullptr,&parameters,0,0);
++    ctx->PSSetConstantBuffers(1,1,constants.GetAddressOf());
++    ctx->PSSetShaderResources(1,1,&depthView);
++    ctx->PSSetShader(shader.Get(),nullptr,0);
++}
++void Restore(const ImDrawList*, const ImDrawCmd*)
++{
++    auto* ctx = renderer->pContext;
++    ctx->PSSetShaderResources(1,1,previousDepth.GetAddressOf());
++    ctx->PSSetConstantBuffers(1,1,previousConstants.GetAddressOf());
++    previousConstants.Reset();
++    previousDepth.Reset();
++}
++}
++bool Begin(ImDrawList* draw, float width, float height, float depth, bool reversed)
++{
++    renderer = BSGraphics::GetRendererData();
++    if (!renderer || !renderer->pDepthStencilTargetsA[0].pSRViewDepth || !std::isfinite(depth) || depth < 0 || depth > 1)
++        return false;
++    depthView=renderer->pDepthStencilTargetsA[0].pSRViewDepth;
++    ComPtr<ID3D11DepthStencilView> bound;
++    renderer->pContext->OMGetRenderTargets(0,nullptr,&bound);
++    if (bound)
++    {
++        ComPtr<ID3D11Resource> resource; bound->GetResource(&resource);
++        if (resource.Get()==renderer->pDepthStencilTargetsA[0].pTexture)
++            depthView=renderer->pDepthStencilTargetsA[1].pSRViewDepth;
++    }
++    if (!depthView) return false;
++    D3D11_SHADER_RESOURCE_VIEW_DESC view{};
++    depthView->GetDesc(&view);
++    if (view.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || !Prepare(renderer->pForwarder)) return false;
++    parameters = {width,height,depth,reversed ? -1.f : 1.f};
++    draw->AddCallback(Bind,nullptr);
++    return true;
++}
++void End(ImDrawList* draw)
++{
++    draw->AddCallback(Restore,nullptr);
++    draw->AddCallback(ImDrawCallback_ResetRenderState,nullptr);
++}
++}
+diff --git a/Code/client/Services/Generic/ObjectService.cpp b/Code/client/Services/Generic/ObjectService.cpp
+index da04d8e..f5330f2 100644
+--- a/Code/client/Services/Generic/ObjectService.cpp
++++ b/Code/client/Services/Generic/ObjectService.cpp
+@@ -4,6 +4,7 @@
+ #include <Events/DisconnectedEvent.h>
+ #include <Events/UpdateEvent.h>
+ #include <Events/CellChangeEvent.h>
++#include <Services/HomeInstance.h>
+ #include <Events/ActivateEvent.h>
+ #include <Events/LockChangeEvent.h>
+ #include <Events/ScriptAnimationEvent.h>
+@@ -122,6 +123,7 @@ void ObjectService::OnCellChange(const CellChangeEvent& acEvent) noexcept
+     PlayerCharacter* pPlayer = PlayerCharacter::Get();
+     TESObjectCELL* pCell = pPlayer->parentCell;
+ 
++    if (pCell && HomeInstance::PrivateCell(pCell->formID)) return;
+     // Player homes should not be synced, so that chest contents,
+     // which are often used as storage, are never accidentally wiped.
+     if (!World::Get().GetServerSettings().SyncPlayerHomes && IsPlayerHome(pCell))
+diff --git a/Code/client/Services/Generic/OverlayClient.cpp b/Code/client/Services/Generic/OverlayClient.cpp
+index 0999dbb..a504104 100644
+--- a/Code/client/Services/Generic/OverlayClient.cpp
++++ b/Code/client/Services/Generic/OverlayClient.cpp
+@@ -88,6 +88,18 @@ bool OverlayClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefR
+             const bool accept = eventArgs->GetInt(1) == 1;
+             World::Get().GetRunner().Queue([token, accept]() { World::Get().GetOverlayService().AnswerProgress(token, accept); });
+         }
++        else if (eventName=="chooseHome")
++        {
++            const uint32_t token=eventArgs->GetInt(0);
++            const int choice=eventArgs->GetInt(1);
++            World::Get().GetRunner().Queue([=] {World::Get().GetOverlayService().ChooseHome(token,choice);});
++        }
++        else if (eventName == "tradeAction")
++        {
++            const uint32_t session = eventArgs->GetInt(0), row = eventArgs->GetInt(2), count = eventArgs->GetInt(3);
++            const int action = eventArgs->GetInt(1);
++            World::Get().GetRunner().Queue([=] { World::Get().GetOverlayService().TradeAction(session, action, row, count); });
++        }
+         else if (eventName == "answerCarriage")
+         {
+             const uint32_t rider = eventArgs->GetInt(0), trip = eventArgs->GetInt(1);
+diff --git a/Code/client/Services/Generic/OverlayService.cpp b/Code/client/Services/Generic/OverlayService.cpp
+index 237ebc9..222b6ee 100644
+--- a/Code/client/Services/Generic/OverlayService.cpp
++++ b/Code/client/Services/Generic/OverlayService.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include <OverlayApp.hpp>
+ #include <Messages/NotifyCoopInteraction.h>
++#include <Messages/NotifyPartyHome.h>
++#include <Messages/NotifyPartyTrade.h>
+ 
+ #include <D3D11Hook.hpp>
+ #include <OverlayRenderHandlerD3D11.hpp>
+@@ -143,6 +145,8 @@ OverlayService::OverlayService(World& aWorld, TransportService& transport, entt:
+     : m_world(aWorld)
+     , m_transport(transport)
+ {
++    m_homeConnection = aDispatcher.sink<NotifyPartyHome>().connect<&OverlayService::OnHome>(this);
++    m_tradeConnection = aDispatcher.sink<NotifyPartyTrade>().connect<&OverlayService::OnTrade>(this);
+     m_interactionConnection = aDispatcher.sink<NotifyCoopInteraction>().connect<&OverlayService::OnInteraction>(this);
+     m_boardConnection = aDispatcher.sink<ActivateEvent>().connect<&OverlayService::OnBoardCarriage>(this);
+     m_noticeConnection = aDispatcher.sink<NotifyPartyTravel>().connect<&OverlayService::OnTravelNotice>(this);
+@@ -333,6 +337,8 @@ void OverlayService::OnUpdate(const UpdateEvent&) noexcept
+ {
+     RunDebugDataUpdates();
+     RunPlayerHealthUpdates();
++    UpdateHomes();
++    UpdateTrade();
+     UpdateInteraction();
+     UpdateDialogueHud();
+     UpdateMapTravel();
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+new file mode 100644
+index 0000000..79a30ea
+--- /dev/null
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -0,0 +1,231 @@
++#include <TiltedOnlinePCH.h>
++#include <World.h>
++#include <Services/HomeInstance.h>
++#include <Services/OverlayClient.h>
++#include <Services/OverlayService.h>
++#include <Services/PapyrusService.h>
++#include <OverlayApp.hpp>
++#include <PlayerCharacter.h>
++#include <Games/TES.h>
++#include <Forms/TESFaction.h>
++#include <Forms/TESNPC.h>
++#include <Forms/TESObjectCELL.h>
++#include <Messages/NotifyPartyHome.h>
++#include <Messages/RequestPartyHome.h>
++#include <Interface/UI.h>
++#include <atomic>
++#include <filesystem>
++#include <fstream>
++#include <iomanip>
++#include <map>
++
++namespace
++{
++using Clock=std::chrono::steady_clock;
++using namespace std::chrono_literals;
++struct Ref {uint32_t original, copy;};
++struct House {uint32_t slot{},original{},copy{}; std::vector<Ref> refs;std::string visible;bool owned{};};
++struct Door {uint32_t slot; glm::vec3 pos,rotation;};
++struct Advert {std::string visible; Clock::time_point until;};
++std::map<uint32_t,House> houses;
++std::map<uint32_t,Door> doors;
++std::map<std::pair<uint32_t,uint32_t>,Advert> ads;
++uint32_t door{}, token{}, guestSlot{}, guestOwner{};
++std::vector<uint32_t> options;
++Clock::time_point refresh{}, applyAt{};
++std::string applied;
++bool selection{}, initialized{};
++struct Route {uint32_t source{},copy{},slot{};std::atomic_uint32_t own{},visit{};};
++Route routes[5];
++std::atomic_uint32_t routeCount{},self{UINT32_MAX};
++constexpr uint32_t invalid=UINT32_MAX;
++
++bool Init()
++{
++    if (initialized) return !houses.empty();
++    auto* mods=ModManager::Get();
++    if (!mods) return false;
++    auto* p=mods->GetByName("SkyrimCoopGuestHomes.esp");
++    if (!p || !p->IsLoaded()) {initialized=true;return false;}
++    std::ifstream f(std::filesystem::path("Data")/"SkyrimTogetherReborn"/"config"/"CoopHomes.txt");
++    if (!f) return false;
++    char kind{};uint32_t original{},slot{},copy{};std::string mod;
++    while (f>>kind)
++    {
++        if (kind=='H' && (f>>original>>slot))
++        {
++            auto& h=houses[slot];h.slot=slot;h.original=original;h.copy=p->GetFormId(slot);
++        }
++        else if (kind=='R' && (f>>std::quoted(mod)>>original>>copy>>slot))
++        {
++            auto* m=mods->GetByName(mod.c_str());
++            houses[slot].refs.push_back({m && m->IsLoaded()?m->GetFormId(original):0,p->GetFormId(copy)});
++        }
++        else if (kind=='D' && (f>>std::quoted(mod)>>original>>slot))
++        {
++            Door d{slot};f>>d.pos.x>>d.pos.y>>d.pos.z>>d.rotation.x>>d.rotation.y>>d.rotation.z;
++            if (auto* m=mods->GetByName(mod.c_str());m && m->IsLoaded()) doors[m->GetFormId(original)]=d;
++        }
++        else {houses.clear();break;}
++    }
++    initialized=true;
++    if (!f.eof() || houses.empty() || houses.size()>std::size(routes)) {houses.clear();return false;}
++    uint32_t i=0;
++    for (const auto& [id,h]:houses)
++    {
++        auto& r=routes[i++];r.source=h.original;r.copy=h.copy;r.slot=id;
++    }
++    routeCount.store(i);return true;
++}
++bool Owned(World& w,TESObjectCELL* cell,PlayerCharacter* p)
++{
++    if (!cell || !p) return false;
++    auto& vm=w.ctx().at<PapyrusService>();
++    auto* a=vm.Get("Cell","GetActorOwner");
++    auto* f=vm.Get("Cell","GetFactionOwner");
++    if (a && PapyrusFunction<TESNPC*,TESObjectCELL>(a)(cell)==p->baseForm) return true;
++    if (!f) return false;
++    auto* faction=PapyrusFunction<TESFaction*,TESObjectCELL>(f)(cell);
++    return faction && faction->formID==0xDB1; // PlayerFaction, assigned by the purchase fragment
++}
++void SetVisit(uint32_t slot,uint32_t owner)
++{
++    for (unsigned i=0;i<routeCount.load();++i) routes[i].visit.store(routes[i].slot==slot ? owner+1 : 0);
++    guestSlot=slot;guestOwner=owner;applied.clear();applyAt={};
++}
++}
++namespace HomeInstance
++{
++bool Tagged(uint32_t mod) noexcept {return (mod&0xFFFF0000u)==0xFFFE0000u;}
++bool Foreign(uint32_t mod) noexcept {return Tagged(mod) && (mod&0xffff)!=self.load();}
++bool Encode(uint32_t local,uint32_t& mod,uint32_t& base) noexcept
++{
++    for (uint32_t i=0;i<routeCount.load();++i)
++    {
++        const auto& r=routes[i];
++        uint32_t who=local==r.source?r.own.load():local==r.copy?r.visit.load():0;
++        if (who && who<=65535) {mod=0xFFFE0000u | (who-1);base=r.slot;return true;}
++    }
++    return false;
++}
++uint32_t Decode(uint32_t mod,uint32_t base) noexcept
++{
++    uint32_t who=(mod&0xffff)+1;
++    for (uint32_t i=0;i<routeCount.load();++i)
++        if (routes[i].slot==base)
++        {
++            if (routes[i].own.load()==who) return routes[i].source;
++            if (routes[i].visit.load()==who) return routes[i].copy;
++        }
++    return 0;
++}
++bool PrivateCell(uint32_t local) noexcept
++{
++    for (uint32_t i=0;i<routeCount.load();++i)
++        if (local==routes[i].copy || (local==routes[i].source && routes[i].own.load())) return true;
++    return false;
++}
++}
++void OverlayService::ClearHomes() noexcept
++{
++    if (selection && m_pOverlay && m_gameOverlayClient)
++    {m_pOverlay->ExecuteAsync("hideHome");m_gameOverlayClient->SetUIVisible(false);}
++    selection=false;door=0;options.clear();ads.clear();SetVisit(0,0);refresh={};self.store(invalid);
++    for (unsigned i=0;i<routeCount.load();++i) routes[i].own.store(0);
++    for (auto& [_,h]:houses){h.owned=false;h.visible.clear();}
++}
++void OverlayService::OnHome(const NotifyPartyHome& msg) noexcept
++{
++    if (!Init()) return;
++    const auto& e=msg.Event;
++    const auto& members=m_world.GetPartyService().GetPartyMembers();
++    if (!houses.count(e.House) || std::find(members.begin(),members.end(),e.Owner)==members.end() ||
++        (!e.Visible.empty() && e.Visible.size()!=houses.at(e.House).refs.size())) return;
++    auto& a=ads[{e.House,e.Owner}];a.visible.assign(e.Visible.begin(),e.Visible.end());a.until=Clock::now()+12s;
++}
++bool OverlayService::TryHouseDoor(uint32_t form) noexcept
++{
++    if (!m_world.GetPartyService().IsInParty() || !m_inGame || m_active || !m_pOverlay || !m_gameOverlayClient ||
++        !doors.count(form) || selection) return false;
++    const auto slot=doors.at(form).slot;
++    if (!houses[slot].owned) return false;
++    options.clear();std::string labels;
++    const auto& players=m_world.GetPartyService().GetPlayers();
++    for (const auto& [key,a]:ads)
++        if (key.first==slot && a.until>Clock::now() && players.count(key.second))
++        {
++            auto name=players.at(key.second);
++            for(char& c:name) if (c=='\n' || c=='\r') c=' ';
++            if (!options.empty()) labels+='\n';
++            labels+=name.c_str();options.push_back(key.second);
++        }
++    if (options.empty()) return false;
++    selection=true;door=form;if (!++token) ++token;
++    auto args=CefListValue::Create();args->SetInt(0,token);args->SetString(1,labels);
++    m_pOverlay->ExecuteAsync("offerHome",args);m_gameOverlayClient->SetUIVisible(true);return true;
++}
++void OverlayService::ChooseHome(uint32_t nonce,int choice) noexcept
++{
++    if (!selection || nonce!=token) return;
++    selection=false;m_pOverlay->ExecuteAsync("hideHome");m_gameOverlayClient->SetUIVisible(false);
++    auto* player=PlayerCharacter::Get();
++    auto* entrance=Cast<TESObjectREFR>(TESForm::GetById(door));
++    if (!player || !entrance || choice<0 || !doors.count(door) ||
++        player->GetParentCellEx()!=entrance->GetParentCellEx() ||
++        glm::distance(static_cast<const glm::vec3&>(player->position),static_cast<const glm::vec3&>(entrance->position))>350.f) return;
++    if (!choice) {entrance->Activate(player,0,nullptr,1,0);return;}
++    if (static_cast<size_t>(choice)>options.size()) return;
++    const auto& d=doors.at(door);auto owner=options[choice-1];auto a=ads.find({d.slot,owner});
++    if (a==ads.end() || Clock::now()>=a->second.until) return;
++    auto* copy=Cast<TESObjectCELL>(TESForm::GetById(houses.at(d.slot).copy));
++    if (!copy) return;
++    SetVisit(d.slot,owner);player->SetRotation(d.rotation.x,d.rotation.y,d.rotation.z);
++    player->MoveTo(copy,d.pos);
++}
++void OverlayService::UpdateHomes() noexcept
++{
++    if (!m_transport.IsConnected() || !m_world.GetPartyService().IsInParty() || !m_inGame) return;
++    auto* p=PlayerCharacter::Get();
++    if (!p || !p->parentCell || !Init()) return;
++    if (selection && !GetActive()) {selection=false;m_pOverlay->ExecuteAsync("hideHome");}
++    auto* current=p->GetParentCellEx();
++    const auto now=Clock::now();
++    if (now>=refresh)
++    {
++        refresh=now+3s;
++        const auto id=m_transport.GetLocalPlayerId();self.store(id);
++        unsigned i=0;
++        for (auto& [slot,h]:houses)
++        {
++            auto* cell=Cast<TESObjectCELL>(TESForm::GetById(h.original));
++            h.owned=Owned(m_world,cell,p);routes[i++].own.store(h.owned?id+1:0);
++            if (!h.owned) continue;
++            if (cell==current && cell->IsAttached())
++            {
++                h.visible.clear();h.visible.reserve(h.refs.size());
++                for (const auto& entry:h.refs)
++                {
++                    auto* ref=entry.original?Cast<TESObjectREFR>(TESForm::GetById(entry.original)):nullptr;
++                    h.visible+=ref?(ref->IsDisabled()?'0':'1'):'?';
++                }
++            }
++            RequestPartyHome m;m.Event.House=slot;m.Event.Visible=h.visible.c_str();m_transport.Send(m);
++        }
++    }
++    if (!guestSlot || !current || current->formID!=houses.at(guestSlot).copy || !current->IsAttached() || now<applyAt) return;
++    applyAt=now+1s;
++    auto a=ads.find({guestSlot,guestOwner});if (a==ads.end()) return;
++    auto& h=houses.at(guestSlot);
++    const auto& visible=a->second.visible;
++    if (visible.size()!=h.refs.size()) return;
++    if (applied.size()!=visible.size()) applied.assign(visible.size(),'?');
++    for (size_t i=0;i<visible.size();++i)
++    {
++        if (visible[i]=='?' || visible[i]==applied[i]) continue;
++        auto* ref=Cast<TESObjectREFR>(TESForm::GetById(h.refs[i].copy));
++        if (!ref) continue;
++        if (visible[i]=='1' && ref->IsDisabled()) ref->Enable();
++        if (visible[i]=='0' && !ref->IsDisabled()) ref->Disable();
++        applied[i]=visible[i];
++    }
++}
+diff --git a/Code/client/Services/Generic/PartyTrade.cpp b/Code/client/Services/Generic/PartyTrade.cpp
+new file mode 100644
+index 0000000..baada80
+--- /dev/null
++++ b/Code/client/Services/Generic/PartyTrade.cpp
+@@ -0,0 +1,215 @@
++#include <TiltedOnlinePCH.h>
++#include <World.h>
++#include <Services/OverlayService.h>
++#include <Services/OverlayClient.h>
++#include <Services/PapyrusService.h>
++#include <Services/PartyService.h>
++#include <OverlayApp.hpp>
++#include <include/cef_parser.h>
++#include <Messages/RequestPartyTrade.h>
++#include <Messages/NotifyPartyTrade.h>
++#include <PlayerCharacter.h>
++#include <Forms/TESGlobal.h>
++#include <Games/TES.h>
++#include <ExtraData/ExtraContainerChanges.h>
++#include <Games/ActorExtension.h>
++#include <Utils.h>
++#include <Interface/UI.h>
++#include <map>
++#include <set>
++
++namespace
++{
++using Clock=std::chrono::steady_clock;
++using namespace std::chrono_literals;
++struct Wallet
++{
++    TESGlobal* fields[4]{};
++    const void* setter{};
++    bool Load(World& world)
++    {
++        auto* plugin=ModManager::Get()->GetByName("SkyrimCoopTrade.esp");
++        if (!plugin || !plugin->IsLoaded()) return false;
++        for (unsigned i=0;i<4;++i)
++        {
++            auto* f=TESForm::GetById(plugin->GetFormId(0x800+i));
++            if (!f || static_cast<unsigned>(f->formType)!=9) return false;
++            fields[i]=static_cast<TESGlobal*>(f);
++        }
++        setter=world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue");
++        return setter!=nullptr;
++    }
++    uint64_t Stream() const {return uint64_t(fields[0]->f) | (uint64_t(fields[1]->f)<<22) | (uint64_t(fields[2]->f)<<44);}
++    uint32_t Cursor() const {return static_cast<uint32_t>(fields[3]->f);}
++    void Write(uint64_t stream, uint32_t cursor)
++    {
++        PapyrusFunction<void,TESGlobal,float> set(setter);
++        if (!Stream()) for (unsigned i=0;i<3;++i) set(fields[i],float((stream>>(22*i))&0x3FFFFF));
++        set(fields[3],float(cursor));
++    }
++};
++uint32_t session{},peer{};
++bool tradeOpen{}, ownsUI{}, dirty{};
++std::string partner;
++Clock::time_point pollAt{};
++std::map<uint32_t,int> buffer;
++void Send(PartyTrade e)
++{
++    RequestPartyTrade m; m.Event=std::move(e); World::Get().GetTransport().Send(m);
++}
++std::set<uint32_t> Unsuitable(PlayerCharacter& p)
++{
++    std::set<uint32_t> bad;
++    auto* changes=p.GetContainerChanges();
++    if (!changes || !changes->entries) return bad;
++    for (auto* e:*changes->entries)
++    {
++        if (!e || !e->form) continue;
++        if (e->IsQuestObject()) {bad.insert(e->form->formID);continue;}
++        if (!e->dataList) continue;
++        for (auto* list:*e->dataList)
++        {
++            if (!list) continue;
++            list->lock.LockForRead();
++            bool special=false;
++            for (auto* x=list->data;x;x=x->next)
++                if (x->GetType()!=ExtraDataType::Count) {special=true;break;}
++            list->lock.UnlockRead();
++            if (special) {bad.insert(e->form->formID);break;}
++        }
++    }
++    return bad;
++}
++std::map<uint32_t,int> Pocket(World& world, PlayerCharacter& p)
++{
++    std::map<uint32_t,int> items;
++    const auto bad=Unsuitable(p);
++    for (const auto& e:p.GetInventory().Entries)
++    {
++        const auto id=world.GetModSystem().GetGameId(e.BaseId);
++        if (id && (id>>24)!=0xFF && e.Count>0 && !e.ContainsExtraData() && !bad.count(id))
++            items[id]+=e.Count;
++    }
++    return items;
++}
++CefString Rows(const std::map<uint32_t,int>& items)
++{
++    auto list=CefListValue::Create();
++    for (const auto& [id,count]:items)
++    {
++        auto* f=TESForm::GetById(id);
++        const char* label=f?f->GetName():nullptr;
++        if (!label || !*label || count<=0) continue;
++        auto row=CefDictionaryValue::Create();
++        row->SetDouble("id",id); row->SetString("name",label); row->SetInt("count",count);
++        list->SetDictionary(list->GetSize(),row);
++    }
++    auto value=CefValue::Create(); value->SetList(list); return CefWriteJSON(value,JSON_WRITER_DEFAULT);
++}
++}
++
++uint32_t OverlayService::TradePeer(uint32_t form) const noexcept
++{
++    if (!form || !m_world.GetPartyService().IsInParty()) return UINT32_MAX;
++    auto view=m_world.view<PlayerComponent,FormIdComponent>();
++    const auto& members=m_world.GetPartyService().GetPartyMembers();
++    for (auto e:view)
++        if (view.get<FormIdComponent>(e).Id==form)
++        {
++            const auto id=view.get<PlayerComponent>(e).Id;
++            if (id!=m_transport.GetLocalPlayerId() && std::find(members.begin(),members.end(),id)!=members.end()) return id;
++        }
++    return UINT32_MAX;
++}
++bool OverlayService::TryTrade(uint32_t form) noexcept
++{
++    const auto id=TradePeer(form);
++    if (id==UINT32_MAX) return false;
++    Wallet w;
++    if (!w.Load(m_world)) Utils::ShowHudMessage("Для обмена включите SkyrimCoopTrade.esp.");
++    else if (!session && !m_active) Send({TradeOp::Invite,id,0,w.Cursor(),0,w.Stream()});
++    return true;
++}
++void OverlayService::ClearTrade() noexcept
++{
++    if (session && m_pOverlay) m_pOverlay->ExecuteAsync("hideTrade");
++    if (ownsUI && m_gameOverlayClient && GetActive()) m_gameOverlayClient->SetUIVisible(false);
++    session=peer=0; tradeOpen=ownsUI=dirty=false; buffer.clear(); partner.clear(); pollAt={};
++}
++void OverlayService::TradeAction(uint32_t token,int action,uint32_t id,uint32_t count) noexcept
++{
++    if (!session || session!=token) return;
++    Wallet w;
++    if (action==0) {Send({TradeOp::Close,peer,session}); ClearTrade();return;}
++    if (!w.Load(m_world)) return;
++    PartyTrade e{TradeOp::Accept,peer,session,w.Cursor(),count,w.Stream()};
++    if (action==1 && !tradeOpen) {Send(e);return;}
++    if (!tradeOpen || (action!=2 && action!=3) || !count || count>9999) return;
++    auto* p=PlayerCharacter::Get(); if (!p) return;
++    if (action==2 && Pocket(m_world,*p)[id]<static_cast<int>(count)) return;
++    if (action==3 && (!buffer.count(id) || buffer[id]<static_cast<int>(count))) return;
++    if (!m_world.GetModSystem().GetServerModId(id,e.Item)) return;
++    e.Op=action==2?TradeOp::Deposit:TradeOp::Take; Send(e);
++}
++void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
++{
++    auto* p=PlayerCharacter::Get();
++    if (!m_inGame || !p || !p->parentCell || !m_pOverlay || !m_gameOverlayClient) return;
++    const auto& e=msg.Event;
++    Wallet w; if (!w.Load(m_world)) return;
++    if (e.Stream && w.Stream() && w.Stream()!=e.Stream) {Utils::ShowHudMessage("Обмен привязан к другому журналу сервера.");return;}
++    if (e.Op==TradeOp::Receipt)
++    {
++        if (!e.Stream || e.Cursor!=w.Cursor()+1 || !e.Count || e.Count>9999 || !e.Item.BaseId || p->IsDead() || !p->GetNiNode()) return;
++        auto* mod=ModManager::Get()->GetByName(e.Text.c_str());
++        if (!mod || !mod->IsLoaded()) return;
++        const auto id=mod->GetFormId(e.Item.BaseId);
++        auto* form=TESForm::GetById(id);
++        if (!form || !Cast<TESBoundObject>(form)) return;
++        const int count=(e.Peer?1:-1)*int(e.Count);
++        if (count<0 && Pocket(m_world,*p)[id]<-count) return;
++        Inventory::Entry item{};
++        if (!m_world.GetModSystem().GetServerModId(id,item.BaseId)) return;
++        const auto before=p->GetItemCountInInventory(form);
++        item.Count=count; p->AddOrRemoveItem(item,true);
++        if (p->GetItemCountInInventory(form)!=before+count) {spdlog::error("Unexpected inventory count applying trade receipt {}",e.Cursor);return;}
++        w.Write(e.Stream,e.Cursor); pollAt={}; return;
++    }
++    if (e.Op==TradeOp::Error) {Utils::ShowHudMessage("Сервер не подтвердил операцию обмена.");return;}
++    if (e.Op==TradeOp::Offer || e.Op==TradeOp::Open)
++    {
++        if ((session && session!=e.Session) || !m_world.GetPartyService().IsInParty() || m_promptOpen || m_showingProgress || m_observerCamera || (GetActive() && !ownsUI))
++        {Send({TradeOp::Close,e.Peer,e.Session});return;}
++        session=e.Session;peer=e.Peer;partner=e.Text.c_str();tradeOpen=e.Op==TradeOp::Open;
++        ownsUI=true; m_gameOverlayClient->SetUIVisible(true);
++    }
++    else if (!session || e.Session!=session) return;
++    else if (e.Op==TradeOp::Close) {ClearTrade();return;}
++    else if (e.Op==TradeOp::Reset) buffer.clear();
++    else if (e.Op==TradeOp::Entry)
++    {
++        auto* mod=ModManager::Get()->GetByName(e.Text.c_str());
++        if (mod && mod->IsLoaded()) buffer[mod->GetFormId(e.Item.BaseId)]=int(e.Count);
++    }
++    dirty=true;
++}
++void OverlayService::UpdateTrade() noexcept
++{
++    if (!m_transport.IsConnected() || !m_inGame || !PlayerCharacter::Get() || !PlayerCharacter::Get()->GetNiNode()) return;
++    if (session && (!GetActive() || !m_world.GetPartyService().IsInParty()))
++    {Send({TradeOp::Close,peer,session});ClearTrade();}
++    if (session && dirty && m_pOverlay)
++    {
++        dirty=false;
++        auto* p=PlayerCharacter::Get();
++        auto args=CefListValue::Create();
++        args->SetInt(0,session); args->SetString(1,partner);args->SetBool(2,tradeOpen);
++        args->SetString(3,tradeOpen?Rows(Pocket(m_world,*p)):CefString("[]"));args->SetString(4,Rows(buffer));
++        m_pOverlay->ExecuteAsync("partyTrade",args);
++    }
++    const auto now=Clock::now();
++    if (now<pollAt) return;
++    pollAt=now+(session?1s:5s);
++    Wallet w;
++    if (w.Load(m_world)) Send({TradeOp::Poll,peer,session,w.Cursor(),0,w.Stream()});
++}
+diff --git a/Code/client/Services/HomeInstance.h b/Code/client/Services/HomeInstance.h
+new file mode 100644
+index 0000000..932ade1
+--- /dev/null
++++ b/Code/client/Services/HomeInstance.h
+@@ -0,0 +1,10 @@
++#pragma once
++#include <cstdint>
++namespace HomeInstance
++{
++bool Encode(uint32_t local,uint32_t& mod,uint32_t& base) noexcept;
++bool Tagged(uint32_t mod) noexcept;
++bool Foreign(uint32_t mod) noexcept;
++uint32_t Decode(uint32_t mod,uint32_t base) noexcept;
++bool PrivateCell(uint32_t local) noexcept;
++}
+diff --git a/Code/client/Services/MarkerDepth.h b/Code/client/Services/MarkerDepth.h
+new file mode 100644
+index 0000000..4528edb
+--- /dev/null
++++ b/Code/client/Services/MarkerDepth.h
+@@ -0,0 +1,7 @@
++#pragma once
++struct ImDrawList;
++namespace MarkerDepth
++{
++bool Begin(ImDrawList*, float width, float height, float depth, bool reversed);
++void End(ImDrawList*);
++}
+diff --git a/Code/client/Services/OverlayService.h b/Code/client/Services/OverlayService.h
+index 62f287e..75eed2c 100644
+--- a/Code/client/Services/OverlayService.h
++++ b/Code/client/Services/OverlayService.h
+@@ -21,6 +21,8 @@ struct RenderSystemD3D11;
+ struct D3D11RenderProvider;
+ struct FormIdComponent;
+ struct World;
++struct NotifyPartyHome;
++struct NotifyPartyTrade;
+ struct Actor;
+ struct UpdateEvent;
+ struct ConnectedEvent;
+@@ -74,6 +76,15 @@ struct OverlayService
+     void SendSystemMessage(const std::string& acMessage);
+ 
+     void NoteActivation(uint32_t form) noexcept;
++    uint32_t TradePeer(uint32_t form) const noexcept;
++    bool TryTrade(uint32_t form) noexcept;
++    void TradeAction(uint32_t session, int action, uint32_t row, uint32_t count) noexcept;
++    bool TryHouseDoor(uint32_t form) noexcept;
++    void ChooseHome(uint32_t token, int choice) noexcept;
++    void UpdateHomes() noexcept;
++    void ClearHomes() noexcept;
++    void UpdateTrade() noexcept;
++    void ClearTrade() noexcept;
+     bool WasActivated(uint32_t form) const noexcept;
+     static void RequestObserverExit() noexcept;
+     static bool ObservingDialogue() noexcept;
+@@ -81,6 +92,11 @@ struct OverlayService
+     bool BeginHire(uint32_t npc, uint32_t info, int32_t index) noexcept;
+     static void InstallReplicaLifeGuard(Actor* actor) noexcept;
+     static bool FollowerBusy(uint32_t npc) noexcept;
++    static void ObservePartyCombat(uint32_t form) noexcept;
++    static void BeginCombatSettlement(uint32_t form) noexcept;
++    static void CancelCombatSettlement(uint32_t form) noexcept;
++    static void UpdateCombatSettlements(World& world) noexcept;
++    static void ClearCombatSettlements() noexcept;
+     static void CheckRevivedReplica(uint32_t form) noexcept;
+     void BrawlBleedout(uint32_t form) noexcept;
+     static bool NonlethalOpponent(uint32_t npc) noexcept;
+@@ -114,6 +130,10 @@ protected:
+     void OnPartyLeftEvent(const PartyLeftEvent& acEvent) noexcept;
+ 
+ private:
++    void OnTrade(const NotifyPartyTrade&) noexcept;
++    void OnHome(const NotifyPartyHome&) noexcept;
++    entt::scoped_connection m_homeConnection;
++    entt::scoped_connection m_tradeConnection;
+     void OnInteraction(const struct NotifyCoopInteraction&) noexcept;
+     void UpdateInteraction() noexcept;
+     using ProgressKey = std::tuple<bool,uint32_t,uint32_t,uint32_t>;
+diff --git a/Code/client/Systems/ModSystem.cpp b/Code/client/Systems/ModSystem.cpp
+index 8586d2e..536d485 100644
+--- a/Code/client/Systems/ModSystem.cpp
++++ b/Code/client/Systems/ModSystem.cpp
+@@ -6,6 +6,7 @@
+ #include <Structs/GameId.h>
+ 
+ #include <Games/TES.h>
++#include <Services/HomeInstance.h>
+ 
+ ModSystem::ModSystem(entt::dispatcher& aDispatcher) noexcept
+ {
+@@ -18,6 +19,7 @@ ModSystem::ModSystem(entt::dispatcher& aDispatcher) noexcept
+ 
+ bool ModSystem::GetServerModId(const uint32_t aGameId, uint32_t& aModId, uint32_t& aBaseId) const noexcept
+ {
++    if (HomeInstance::Encode(aGameId,aModId,aBaseId)) return true;
+     uint32_t hiByte = aGameId >> 24;
+ 
+     // If it's a lite mod
+@@ -50,6 +52,7 @@ bool ModSystem::GetServerModId(uint32_t aGameId, GameId& aServerId) const noexce
+ 
+ uint32_t ModSystem::GetGameId(uint32_t aServerId, uint32_t aFormId) const noexcept
+ {
++    if (HomeInstance::Tagged(aServerId)) return HomeInstance::Decode(aServerId,aFormId);
+     auto itor = m_serverToGame.find(aServerId);
+     if (itor != std::end(m_serverToGame))
+     {
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+index c823984..ec7dc06 100644
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction5"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction6"
+diff --git a/Code/common/TradeLedger.h b/Code/common/TradeLedger.h
+new file mode 100644
+index 0000000..d82a53a
+--- /dev/null
++++ b/Code/common/TradeLedger.h
+@@ -0,0 +1,109 @@
++#pragma once
++#include "QuestJournalDisk.h"
++#include <algorithm>
++#include <fstream>
++#include <iomanip>
++#include <map>
++#include <sstream>
++#include <vector>
++
++class TradeLedger
++{
++public:
++    struct Row
++    {
++        std::string user, peer, plugin;
++        uint32_t base{};
++        int count{}; // Positive credits the backpack; negative reserves the deposit in escrow.
++    };
++    explicit TradeLedger(std::filesystem::path path) : root(std::move(path)) {}
++    uint64_t Stream()
++    {
++        if (stream) return stream;
++        uint64_t id{};
++        if (std::filesystem::exists(root))
++            for (const auto& file : std::filesystem::directory_iterator(root))
++                if (file.is_directory())
++                {
++                    if (id) throw std::runtime_error("ambiguous trade ledger");
++                    id = std::stoull(file.path().filename().string());
++                }
++        if (!id) id = QuestJournalDisk::CreateStream(root);
++        if (!id) throw std::runtime_error("cannot initialize trade ledger");
++        accounts.clear(); stock.clear(); confirmed.clear(); last = 0;
++        const auto size = QuestJournalDisk::Contiguous(root,id);
++        const auto dir = root/std::to_string(id);
++        for (const auto& entry : std::filesystem::directory_iterator(dir))
++            if (entry.path().extension()==".tsv" && std::stoul(entry.path().stem().string())>size)
++                throw std::runtime_error("trade ledger sequence gap");
++        for (uint32_t n=1;n<=size;++n)
++        {
++            std::ifstream f(dir/(std::to_string(n)+".tsv"), std::ios::binary);
++            std::string line; std::getline(f,line);
++            std::istringstream in(line);
++            uint32_t actual{}; char kind{}; Row r;
++            if (!(in>>actual>>kind>>std::quoted(r.user)) || actual!=n) throw std::runtime_error("invalid trade receipt");
++            if (kind=='A') { uint32_t pos{}; if (!(in>>pos) || pos!=confirmed[r.user]+1 || pos>accounts[r.user].size()) throw std::runtime_error("invalid acknowledgement"); Confirmed(r.user,pos); }
++            else if (kind=='T' && (in>>std::quoted(r.peer)>>std::quoted(r.plugin)>>r.base>>r.count) && r.count && std::abs(static_cast<long long>(r.count))<=9999) Append(r);
++            else throw std::runtime_error("invalid trade operation");
++            ++last;
++        }
++        stream=id;
++        return stream;
++    }
++    const std::vector<Row>& History(const std::string& user) {return accounts[user];}
++    using Items = std::map<std::pair<std::string,uint32_t>,int64_t>;
++    const Items& Stock(const std::string& a,const std::string& b) {return stock[std::minmax(a,b)];}
++    bool Ack(const std::string& user,uint32_t pos)
++    {
++        if (pos<=confirmed[user]) return true;
++        if (pos>accounts[user].size()) return false;
++        while (confirmed[user]<pos)
++        {
++            const auto n=confirmed[user]+1;
++            std::ostringstream out; out<<"A "<<std::quoted(user)<<' '<<n;
++            if (!Store(out.str())) return false;
++            Confirmed(user,n);
++        }
++        return true;
++    }
++    bool Commit(const Row& r,uint32_t cursor)
++    {
++        if (r.user.empty() || r.peer.empty() || r.user==r.peer || r.plugin.empty() || !r.base ||
++            cursor!=accounts[r.user].size() || cursor!=confirmed[r.user] || cursor>=0xFFFFFE ||
++            !r.count || std::abs(static_cast<long long>(r.count))>9999) return false;
++        if (r.count>0)
++        {
++            const auto& items=Stock(r.user,r.peer);
++            auto i=items.find({r.plugin,r.base});
++            if (i==items.end() || i->second<r.count) return false;
++        }
++        std::ostringstream out;
++        out<<"T "<<std::quoted(r.user)<<' '<<std::quoted(r.peer)<<' '<<std::quoted(r.plugin)<<' '<<r.base<<' '<<r.count;
++        if (!Store(out.str())) return false;
++        Append(r); return true;
++    }
++private:
++    bool Store(const std::string& data)
++    {
++        if (!QuestJournalDisk::Store(root,stream,last+1,data)) return false;
++        ++last; return true;
++    }
++    void Append(const Row& r)
++    {
++        accounts[r.user].push_back(r);
++        if (r.count>0) stock[std::minmax(r.user,r.peer)][{r.plugin,r.base}]-=r.count;
++    }
++    void Confirmed(const std::string& user,uint32_t pos)
++    {
++        confirmed[user]=pos;
++        const auto& r=accounts[user][pos-1];
++        if (r.count<0) stock[std::minmax(r.user,r.peer)][{r.plugin,r.base}]-=r.count;
++    }
++    std::filesystem::path root;
++    uint64_t stream{};
++    uint32_t last{};
++    std::map<std::string,std::vector<Row>> accounts;
++    std::map<std::string,uint32_t> confirmed;
++    std::map<std::pair<std::string,std::string>,Items> stock;
++};
+diff --git a/Code/encoding/Messages/ClientMessageFactory.h b/Code/encoding/Messages/ClientMessageFactory.h
+index 1a59183..08ae228 100644
+--- a/Code/encoding/Messages/ClientMessageFactory.h
++++ b/Code/encoding/Messages/ClientMessageFactory.h
+@@ -4,6 +4,8 @@
+ #include <MetaMessage.h>
+ #include <Messages/RequestQuestJournal.h>
+ #include <Messages/RequestCoopInteraction.h>
++#include <Messages/RequestPartyHome.h>
++#include <Messages/RequestPartyTrade.h>
+ #include <Messages/RequestNpcLifeCheck.h>
+ #include <Messages/PartyTravelRequest.h>
+ 
+@@ -75,7 +77,7 @@ struct ClientMessageFactory
+             PartyChangeLeaderRequest, PartyKickRequest, RequestActorValueChanges, RequestActorMaxValueChanges, EnterExteriorCellRequest, RequestHealthChangeBroadcast, ActivateRequest, LockChangeRequest, AssignObjectsRequest, RequestDeathStateChange, ShiftGridCellRequest,
+             RequestOwnershipTransfer, RequestOwnershipClaim, RequestObjectInventoryChanges, SpellCastRequest, ProjectileLaunchRequest, InterruptCastRequest, AddTargetRequest, ScriptAnimationRequest, DrawWeaponRequest, MountRequest, NewPackageRequest, RequestRespawn, SyncExperienceRequest,
+             RequestEquipmentChanges, SendChatMessageRequest, TeleportCommandRequest, PlayerRespawnRequest, DialogueRequest, SubtitleRequest, PlayerDialogueRequest, PlayerLevelRequest, TeleportRequest, RequestPlayerHealthUpdate, RequestWeatherChange, RequestCurrentWeather, RequestSetWaypoint,
+-            RequestRemoveWaypoint, RemoveSpellRequest, SetTimeCommandRequest, RequestActionEvents, PartyTravelRequest, RequestNpcLifeCheck, RequestQuestJournal, RequestCoopInteraction>;
++            RequestRemoveWaypoint, RemoveSpellRequest, SetTimeCommandRequest, RequestActionEvents, PartyTravelRequest, RequestNpcLifeCheck, RequestQuestJournal, RequestCoopInteraction, RequestPartyTrade, RequestPartyHome>;
+ 
+         return s_visitor(std::forward<T>(func));
+     }
+diff --git a/Code/encoding/Messages/NotifyPartyHome.h b/Code/encoding/Messages/NotifyPartyHome.h
+new file mode 100644
+index 0000000..cd00d54
+--- /dev/null
++++ b/Code/encoding/Messages/NotifyPartyHome.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include "Message.h"
++#include <Structs/PartyHome.h>
++struct NotifyPartyHome final : ServerMessage
++{
++    static constexpr ServerOpcode Opcode = kNotifyPartyHome;
++    NotifyPartyHome() : ServerMessage(Opcode) {}
++    PartyHome Event{};
++    void SerializeRaw(TiltedPhoques::Buffer::Writer& w) const noexcept override { Event.Serialize(w); }
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept override { ServerMessage::DeserializeRaw(r); Event.Deserialize(r); }
++    bool operator==(const NotifyPartyHome& other) const noexcept { return Event == other.Event; }
++};
+diff --git a/Code/encoding/Messages/NotifyPartyTrade.h b/Code/encoding/Messages/NotifyPartyTrade.h
+new file mode 100644
+index 0000000..7be964a
+--- /dev/null
++++ b/Code/encoding/Messages/NotifyPartyTrade.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include "Message.h"
++#include <Structs/PartyTrade.h>
++struct NotifyPartyTrade final : ServerMessage
++{
++    static constexpr ServerOpcode Opcode = kNotifyPartyTrade;
++    NotifyPartyTrade() : ServerMessage(Opcode) {}
++    PartyTrade Event{};
++    void SerializeRaw(TiltedPhoques::Buffer::Writer& w) const noexcept override { Event.Serialize(w); }
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept override { ServerMessage::DeserializeRaw(r); Event.Deserialize(r); }
++    bool operator==(const NotifyPartyTrade& other) const noexcept { return Event == other.Event; }
++};
+diff --git a/Code/encoding/Messages/RequestPartyHome.h b/Code/encoding/Messages/RequestPartyHome.h
+new file mode 100644
+index 0000000..f33377e
+--- /dev/null
++++ b/Code/encoding/Messages/RequestPartyHome.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include "Message.h"
++#include <Structs/PartyHome.h>
++struct RequestPartyHome final : ClientMessage
++{
++    static constexpr ClientOpcode Opcode = kRequestPartyHome;
++    RequestPartyHome() : ClientMessage(Opcode) {}
++    PartyHome Event{};
++    void SerializeRaw(TiltedPhoques::Buffer::Writer& w) const noexcept override { Event.Serialize(w); }
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept override { ClientMessage::DeserializeRaw(r); Event.Deserialize(r); }
++    bool operator==(const RequestPartyHome& other) const noexcept { return Event == other.Event; }
++};
+diff --git a/Code/encoding/Messages/RequestPartyTrade.h b/Code/encoding/Messages/RequestPartyTrade.h
+new file mode 100644
+index 0000000..5889051
+--- /dev/null
++++ b/Code/encoding/Messages/RequestPartyTrade.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include "Message.h"
++#include <Structs/PartyTrade.h>
++struct RequestPartyTrade final : ClientMessage
++{
++    static constexpr ClientOpcode Opcode = kRequestPartyTrade;
++    RequestPartyTrade() : ClientMessage(Opcode) {}
++    PartyTrade Event{};
++    void SerializeRaw(TiltedPhoques::Buffer::Writer& w) const noexcept override { Event.Serialize(w); }
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept override { ClientMessage::DeserializeRaw(r); Event.Deserialize(r); }
++    bool operator==(const RequestPartyTrade& other) const noexcept { return Event == other.Event; }
++};
+diff --git a/Code/encoding/Messages/ServerMessageFactory.h b/Code/encoding/Messages/ServerMessageFactory.h
+index 207736a..b4e6721 100644
+--- a/Code/encoding/Messages/ServerMessageFactory.h
++++ b/Code/encoding/Messages/ServerMessageFactory.h
+@@ -5,6 +5,8 @@
+ #include <MetaMessage.h>
+ #include <Messages/NotifyQuestJournal.h>
+ #include <Messages/NotifyCoopInteraction.h>
++#include <Messages/NotifyPartyHome.h>
++#include <Messages/NotifyPartyTrade.h>
+ #include <Messages/NotifyNpcLifeCheck.h>
+ #include <Messages/NotifyPartyTravel.h>
+ 
+@@ -78,7 +80,7 @@ struct ServerMessageFactory
+             NotifyActorValueChanges, NotifyPartyJoined, NotifyPartyLeft, NotifyActorMaxValueChanges, NotifyHealthChangeBroadcast, NotifyActivate, NotifyLockChange, AssignObjectsResponse, NotifyDeathStateChange, NotifyOwnershipTransfer, NotifyObjectInventoryChanges, NotifySpellCast,
+             NotifyProjectileLaunch, NotifyInterruptCast, NotifyAddTarget, NotifyScriptAnimation, NotifyDrawWeapon, NotifyMount, NotifyNewPackage, NotifyRespawn, NotifySyncExperience, NotifyEquipmentChanges, NotifyChatMessageBroadcast, TeleportCommandResponse, NotifyPlayerRespawn, NotifyDialogue,
+             NotifySubtitle, NotifyPlayerDialogue, NotifyActorTeleport, NotifyPlayerLeft, NotifyPlayerJoined, NotifyDialogue, NotifySubtitle, NotifyPlayerDialogue, NotifyPlayerLevel, NotifyPlayerCellChanged, NotifyTeleport, NotifyPlayerHealthUpdate, NotifySettingsChange,
+-            NotifyWeatherChange, NotifySetWaypoint, NotifyRemoveWaypoint, NotifySetTimeResult, NotifyRemoveSpell, NotifyActionEvents, NotifyPartyTravel, NotifyNpcLifeCheck, NotifyQuestJournal, NotifyCoopInteraction>;
++            NotifyWeatherChange, NotifySetWaypoint, NotifyRemoveWaypoint, NotifySetTimeResult, NotifyRemoveSpell, NotifyActionEvents, NotifyPartyTravel, NotifyNpcLifeCheck, NotifyQuestJournal, NotifyCoopInteraction, NotifyPartyTrade, NotifyPartyHome>;
+ 
+         return s_visitor(std::forward<T>(func));
+     }
+diff --git a/Code/encoding/Opcodes.h b/Code/encoding/Opcodes.h
+index 1888495..b843cb8 100644
+--- a/Code/encoding/Opcodes.h
++++ b/Code/encoding/Opcodes.h
+@@ -59,6 +59,8 @@ enum ClientOpcode : unsigned char
+     kRequestNpcLifeCheck,
+     kRequestQuestJournal,
+     kRequestCoopInteraction,
++    kRequestPartyTrade,
++    kRequestPartyHome,
+     kClientOpcodeMax
+ };
+ 
+@@ -124,5 +126,7 @@ enum ServerOpcode : unsigned char
+     kNotifyNpcLifeCheck,
+     kNotifyQuestJournal,
+     kNotifyCoopInteraction,
++    kNotifyPartyTrade,
++    kNotifyPartyHome,
+     kServerOpcodeMax
+ };
+diff --git a/Code/encoding/Structs/Movement.cpp b/Code/encoding/Structs/Movement.cpp
+index b765fdb..183d1b7 100644
+--- a/Code/encoding/Structs/Movement.cpp
++++ b/Code/encoding/Structs/Movement.cpp
+@@ -5,7 +5,7 @@ using TiltedPhoques::Serialization;
+ 
+ bool Movement::operator==(const Movement& acRhs) const noexcept
+ {
+-    return CellId == acRhs.CellId && WorldSpaceId == acRhs.WorldSpaceId && Position == acRhs.Position && Rotation == acRhs.Rotation && Variables == acRhs.Variables && Direction == acRhs.Direction && HasLookAt == acRhs.HasLookAt && LookOffset == acRhs.LookOffset;
++    return CombatEpoch == acRhs.CombatEpoch && CombatMode == acRhs.CombatMode && CellId == acRhs.CellId && WorldSpaceId == acRhs.WorldSpaceId && Position == acRhs.Position && Rotation == acRhs.Rotation && Variables == acRhs.Variables && Direction == acRhs.Direction && HasLookAt == acRhs.HasLookAt && LookOffset == acRhs.LookOffset;
+ }
+ 
+ bool Movement::operator!=(const Movement& acRhs) const noexcept
+@@ -22,6 +22,8 @@ void Movement::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
+     Variables.GenerateDiff(AnimationVariables{}, aWriter);
+     aWriter.WriteBits(*reinterpret_cast<const uint32_t*>(&Direction), 32);
+ 
++    aWriter.WriteBits(CombatMode, 2);
++    if (CombatMode) Serialization::WriteVarInt(aWriter, CombatEpoch);
+     Serialization::WriteBool(aWriter, HasLookAt);
+     if (HasLookAt)
+         LookOffset.Serialize(aWriter);
+@@ -41,6 +43,9 @@ void Movement::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
+     uint32_t tmp32 = tmp & 0xFFFFFFFF;
+     Direction = *reinterpret_cast<float*>(&tmp32);
+ 
++    aReader.ReadBits(tmp, 2);
++    CombatMode = static_cast<uint8_t>(tmp & 3);
++    CombatEpoch = CombatMode ? static_cast<uint32_t>(Serialization::ReadVarInt(aReader)) : 0;
+     HasLookAt = Serialization::ReadBool(aReader);
+     LookOffset = glm::vec3{};
+     if (HasLookAt)
+diff --git a/Code/encoding/Structs/Movement.h b/Code/encoding/Structs/Movement.h
+index e1673e2..b388161 100644
+--- a/Code/encoding/Structs/Movement.h
++++ b/Code/encoding/Structs/Movement.h
+@@ -25,6 +25,9 @@ struct Movement
+     Rotator2_NetQuantize Rotation{};
+     AnimationVariables Variables{};
+     float Direction{};
++    // Epoch 0 means no NPC combat sample. Mode 1 is idle, 2 fights a player, 3 other combat.
++    uint32_t CombatEpoch{};
++    uint8_t CombatMode{};
+     bool HasLookAt{};
+     Vector3_NetQuantize LookOffset{}; // From the head to the look-at target
+ };
+diff --git a/Code/encoding/Structs/PartyHome.h b/Code/encoding/Structs/PartyHome.h
+new file mode 100644
+index 0000000..0de9243
+--- /dev/null
++++ b/Code/encoding/Structs/PartyHome.h
+@@ -0,0 +1,20 @@
++#pragma once
++#include <Structs/GameId.h>
++#include <TiltedCore/Serialization.hpp>
++struct PartyHome
++{
++    uint32_t House{}, Owner{};
++    TiltedPhoques::String Visible;
++    bool operator==(const PartyHome&) const noexcept=default;
++    void Serialize(TiltedPhoques::Buffer::Writer& w) const noexcept
++    {
++        using TiltedPhoques::Serialization;
++        Serialization::WriteVarInt(w,House); Serialization::WriteVarInt(w,Owner); Serialization::WriteString(w,Visible);
++    }
++    void Deserialize(TiltedPhoques::Buffer::Reader& r) noexcept
++    {
++        using TiltedPhoques::Serialization;
++        House=static_cast<uint32_t>(Serialization::ReadVarInt(r));
++        Owner=static_cast<uint32_t>(Serialization::ReadVarInt(r)); Visible=Serialization::ReadString(r);
++    }
++};
+diff --git a/Code/encoding/Structs/PartyTrade.h b/Code/encoding/Structs/PartyTrade.h
+new file mode 100644
+index 0000000..7334490
+--- /dev/null
++++ b/Code/encoding/Structs/PartyTrade.h
+@@ -0,0 +1,30 @@
++#pragma once
++#include <Structs/GameId.h>
++#include <TiltedCore/Serialization.hpp>
++
++enum class TradeOp : uint8_t { Poll, Invite, Offer, Accept, Open, Close, Deposit, Take, Entry, Reset, Receipt, Error };
++struct PartyTrade
++{
++    TradeOp Op{};
++    uint32_t Peer{}, Session{}, Cursor{}, Count{};
++    uint64_t Stream{};
++    GameId Item{};
++    TiltedPhoques::String Text{};
++    bool operator==(const PartyTrade&) const noexcept = default;
++    void Serialize(TiltedPhoques::Buffer::Writer& w) const noexcept
++    {
++        using S = TiltedPhoques::Serialization;
++        w.WriteBits(static_cast<uint8_t>(Op),4);
++        for (uint32_t x : {Peer,Session,Cursor,Count}) S::WriteVarInt(w,x);
++        S::WriteVarInt(w,Stream);
++        Item.Serialize(w);
++        S::WriteString(w,Text);
++    }
++    void Deserialize(TiltedPhoques::Buffer::Reader& r) noexcept
++    {
++        using S = TiltedPhoques::Serialization;
++        uint64_t raw{}; r.ReadBits(raw,4); Op=static_cast<TradeOp>(raw);
++        for (auto* x : {&Peer,&Session,&Cursor,&Count}) *x=static_cast<uint32_t>(S::ReadVarInt(r));
++        Stream=S::ReadVarInt(r); Item.Deserialize(r); Text=S::ReadString(r);
++    }
++};
+diff --git a/Code/server/Services/OverlayService.cpp b/Code/server/Services/OverlayService.cpp
+index 8a36ce2..0b441c4 100644
+--- a/Code/server/Services/OverlayService.cpp
++++ b/Code/server/Services/OverlayService.cpp
+@@ -19,6 +19,8 @@
+ #include <regex>
+ #include <Messages/RequestCoopInteraction.h>
+ #include <Messages/NotifyCoopInteraction.h>
++#include <Messages/RequestPartyHome.h>
++#include <Messages/RequestPartyTrade.h>
+ #include <Messages/PartyTravelRequest.h>
+ #include <Events/UpdateEvent.h>
+ 
+@@ -26,6 +28,8 @@
+ OverlayService::OverlayService(World& aWorld, entt::dispatcher& aDispatcher)
+     : m_world(aWorld)
+ {
++    m_homeConnection = aDispatcher.sink<PacketEvent<RequestPartyHome>>().connect<&OverlayService::OnHome>(this);
++    m_tradeConnection = aDispatcher.sink<PacketEvent<RequestPartyTrade>>().connect<&OverlayService::OnTrade>(this);
+     m_interactionConnection = aDispatcher.sink<PacketEvent<RequestCoopInteraction>>().connect<&OverlayService::OnInteraction>(this);
+     m_rideConnection = aDispatcher.sink<PacketEvent<PartyTravelRequest>>().connect<&OverlayService::OnPartyTravel>(this);
+     m_tickRides = aDispatcher.sink<UpdateEvent>().connect<&OverlayService::UpdateRides>(this);
+diff --git a/Code/server/Services/OverlayService.h b/Code/server/Services/OverlayService.h
+index a51008c..37e055c 100644
+--- a/Code/server/Services/OverlayService.h
++++ b/Code/server/Services/OverlayService.h
+@@ -6,6 +6,8 @@
+ #include <Events/PlayerEnterWorldEvent.h>
+ 
+ struct World;
++struct RequestPartyHome;
++struct RequestPartyTrade;
+ 
+ #include <Messages/NotifyPartyTravel.h>
+ #include <chrono>
+@@ -37,6 +39,10 @@ protected:
+     void OnPlayerHealthUpdate(const PacketEvent<RequestPlayerHealthUpdate>& acMessage) const noexcept;
+ 
+ private:
++    void OnTrade(const PacketEvent<RequestPartyTrade>&) noexcept;
++    void OnHome(const PacketEvent<RequestPartyHome>&) noexcept;
++    entt::scoped_connection m_homeConnection;
++    entt::scoped_connection m_tradeConnection;
+     void OnInteraction(const PacketEvent<RequestCoopInteraction>&) noexcept;
+     entt::scoped_connection m_interactionConnection;
+     struct Ride
+diff --git a/Code/server/Services/PartyHome.cpp b/Code/server/Services/PartyHome.cpp
+new file mode 100644
+index 0000000..460974d
+--- /dev/null
++++ b/Code/server/Services/PartyHome.cpp
+@@ -0,0 +1,18 @@
++#include <GameServer.h>
++#include <World.h>
++#include <Game/Player.h>
++#include <Services/OverlayService.h>
++#include <Messages/RequestPartyHome.h>
++#include <Messages/NotifyPartyHome.h>
++
++void OverlayService::OnHome(const PacketEvent<RequestPartyHome>& packet) noexcept
++{
++    auto* owner=packet.pPlayer;
++    auto* party=m_world.GetPartyService().GetPlayerParty(owner);
++    const auto& e=packet.Packet.Event;
++    if (!party || !e.House || e.Visible.size()>16384 ||
++        std::any_of(e.Visible.begin(),e.Visible.end(),[](char c){return c!='1' && c!='0' && c!='?';})) return;
++    NotifyPartyHome msg;
++    msg.Event=e; msg.Event.Owner=owner->GetId();
++    for (auto* other:party->Members) if (other!=owner) other->Send(msg);
++}
+diff --git a/Code/server/Services/PartyTrade.cpp b/Code/server/Services/PartyTrade.cpp
+new file mode 100644
+index 0000000..5629674
+--- /dev/null
++++ b/Code/server/Services/PartyTrade.cpp
+@@ -0,0 +1,129 @@
++#include <GameServer.h>
++#include <World.h>
++#include <Game/Player.h>
++#include <Services/OverlayService.h>
++#include <Messages/RequestPartyTrade.h>
++#include <Messages/NotifyPartyTrade.h>
++#include <TradeLedger.h>
++
++namespace
++{
++using Clock=std::chrono::steady_clock;
++using namespace std::chrono_literals;
++struct Session {uint32_t a,b; bool open{}; Clock::time_point expires;};
++std::map<uint32_t,Session> sessions;
++uint32_t serial{};
++TradeLedger ledger("config/CoopTrade");
++std::string Name(Player& player) {return {player.GetUsername().begin(),player.GetUsername().end()};}
++bool Near(World& world, Player& a, Player& b)
++{
++    if (!a.GetCharacter() || !b.GetCharacter() || !a.GetParty().JoinedPartyId ||
++        a.GetParty().JoinedPartyId!=b.GetParty().JoinedPartyId ||
++        !a.GetCellComponent().IsInRange(b.GetCellComponent(),false)) return false;
++    auto* p=world.try_get<MovementComponent>(*a.GetCharacter());
++    auto* q=world.try_get<MovementComponent>(*b.GetCharacter());
++    return p && q && glm::distance(p->Position,q->Position)<=420.f;
++}
++void Send(Player& to, PartyTrade event) {NotifyPartyTrade n; n.Event=std::move(event); to.Send(n);}
++std::string Plugin(World& w,uint32_t mod)
++{
++    auto& mods=w.ctx().at<ModsComponent>();
++    for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
++        for (const auto& [name,entry]:*list) if (entry.id==mod) return {name.begin(),name.end()};
++    return {};
++}
++void ShowStock(Player& p,Player& q,uint32_t session)
++{
++    Send(p,{TradeOp::Reset,q.GetId(),session});
++    for (const auto& [item,count]:ledger.Stock(Name(p),Name(q)))
++    {
++        if (count<=0) continue;
++        PartyTrade event{TradeOp::Entry,q.GetId(),session};
++        event.Count=static_cast<uint32_t>(std::min<int64_t>(count,9999));
++        event.Item.BaseId=item.second; event.Text=item.first.c_str(); Send(p,event);
++    }
++}
++}
++
++void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexcept
++{
++    try
++    {
++        auto& p=*packet.pPlayer; const auto& e=packet.Packet.Event; const auto id=p.GetId();
++        if (!p.GetCharacter()) return;
++        const auto user=Name(p);
++        if (user.empty()) return;
++        for (auto* other:m_world.GetPlayerManager())
++            if (other!=&p && other->GetUsername()==p.GetUsername()) return;
++        const auto uuid=ledger.Stream();
++        auto next=[&] {
++            const auto& log=ledger.History(user);
++            if (e.Cursor<log.size())
++            {
++                const auto& r=log[e.Cursor];
++                PartyTrade op{TradeOp::Receipt,static_cast<uint32_t>(r.count>0),0,e.Cursor+1,static_cast<uint32_t>(std::abs(r.count)),uuid};
++                op.Text=r.plugin.c_str(); op.Item.BaseId=r.base; Send(p,op);
++            }
++        };
++        if (e.Stream && e.Stream!=uuid) return;
++        if (e.Op==TradeOp::Poll)
++        {
++            if (!ledger.Ack(user,e.Cursor)) return;
++            next();
++        }
++        const auto now=Clock::now();
++        for (auto it=sessions.begin();it!=sessions.end();)
++        {
++            auto* a=m_world.GetPlayerManager().GetById(it->second.a);
++            auto* b=m_world.GetPlayerManager().GetById(it->second.b);
++            if (!a || !b || now>=it->second.expires || !Near(m_world,*a,*b))
++            {
++                if (a) Send(*a,{TradeOp::Close,0,it->first});
++                if (b) Send(*b,{TradeOp::Close,0,it->first});
++                it=sessions.erase(it);
++            } else ++it;
++        }
++        if (e.Op==TradeOp::Invite)
++        {
++            auto* other=m_world.GetPlayerManager().GetById(e.Peer);
++            if (!other || other==&p || Name(*other)==user || !Near(m_world,p,*other)) return;
++            for (const auto& [_,s]:sessions)
++                if (s.a==id || s.b==id || s.a==e.Peer || s.b==e.Peer) return;
++            if (!++serial) ++serial;
++            sessions[serial]={id,e.Peer,false,now+30s};
++            Send(*other,{TradeOp::Offer,id,serial,0,0,uuid,{},p.GetUsername()});
++            return;
++        }
++        auto found=sessions.find(e.Session);
++        if (found==sessions.end()) return;
++        auto& s=found->second;
++        if (id!=s.a && id!=s.b) return;
++        auto& peer=*m_world.GetPlayerManager().GetById(id==s.a?s.b:s.a);
++        if (e.Op==TradeOp::Close)
++        {
++            Send(p,{TradeOp::Close,0,e.Session}); Send(peer,{TradeOp::Close,0,e.Session}); sessions.erase(found); return;
++        }
++        if (e.Op==TradeOp::Accept && id==s.b && !s.open)
++        {
++            s.open=true;
++            Send(p,{TradeOp::Open,peer.GetId(),e.Session,0,0,uuid,{},peer.GetUsername()});
++            Send(peer,{TradeOp::Open,id,e.Session,0,0,uuid,{},p.GetUsername()});
++        }
++        if (!s.open) return;
++        s.expires=now+20s;
++        if (e.Op==TradeOp::Deposit || e.Op==TradeOp::Take)
++        {
++            if (!e.Count || e.Count>9999 || !e.Item.BaseId) return;
++            const auto plugin=Plugin(m_world,e.Item.ModId);
++            bool ok=ledger.Ack(user,e.Cursor) && ledger.Commit({user,Name(peer),plugin,e.Item.BaseId,(e.Op==TradeOp::Take?1:-1)*int(e.Count)},e.Cursor);
++            if (!ok) Send(p,{TradeOp::Error,0,e.Session});
++            next();
++        }
++        if (e.Op==TradeOp::Poll || e.Op==TradeOp::Accept || e.Op==TradeOp::Deposit || e.Op==TradeOp::Take)
++        {
++            ShowStock(p,peer,e.Session);
++            if (e.Op!=TradeOp::Poll) ShowStock(peer,p,e.Session);
++        }
++    }
++    catch(const std::exception& ex) {spdlog::error("Co-op trade: {}",ex.what()); Send(*packet.pPlayer,{TradeOp::Error,0,packet.Packet.Event.Session});}
++}
+diff --git a/Code/skyrim_ui/src/app/components/root/root.component.html b/Code/skyrim_ui/src/app/components/root/root.component.html
+index 6b397ee..f043a15 100644
+--- a/Code/skyrim_ui/src/app/components/root/root.component.html
++++ b/Code/skyrim_ui/src/app/components/root/root.component.html
+@@ -40,6 +40,44 @@
+       </div>
+     }
+   }
++  @if (home$ | async; as h) {
++    <div class="carriage-shade"><section class="carriage-offer" role="dialog" aria-modal="true" aria-labelledby="home-title">
++      <p id="home-title">Дом</p>
++      <button (click)="chooseHome(h.token,0)">Войти как обычно</button>
++      @for (name of h.names; track $index) {
++        <button (click)="chooseHome(h.token,$index+1)">{{name}}</button>
++      }
++      <button (click)="chooseHome(h.token,-1)">Отмена</button>
++    </section></div>
++  }
++  @if (trade$ | async; as t) {
++    <div class="carriage-shade trade-shade">
++      <section class="carriage-offer" [class.trade-panel]="t.open" role="dialog" aria-modal="true" aria-labelledby="trade-title">
++        @if (!t.open) {
++          <p id="trade-title">{{ t.name }} предлагает вам обмен. Согласиться?</p>
++          <button (click)="tradeAction(t.session,1)">Да</button>
++          <button (click)="tradeAction(t.session,0)">Нет</button>
++        } @else {
++          <h2 id="trade-title">Обмен с {{ t.name }}</h2>
++          <div class="trade-columns">
++            @for (side of [0,1]; track side) {
++              <section><h3>{{ side ? 'Общий контейнер' : 'Мой инвентарь' }}</h3>
++                <ul>
++                @for (r of (side ? t.buffer : t.pocket); track r.id) {
++                  <li><span>{{r.name}} × {{r.count}}</span>
++                    <input type="number" #qty min="1" [max]="r.count" value="1" aria-label="Количество">
++                    <button (click)="tradeAction(t.session,side ? 3 : 2,r.id,+qty.value)">{{ side ? 'Забрать' : 'Положить' }}</button>
++                  </li>
++                } @empty { <li>{{ side ? 'Контейнер пуст' : 'Нет доступных предметов' }}</li> }
++                </ul>
++              </section>
++            }
++          </div>
++          <button (click)="tradeAction(t.session,0)">Закрыть</button>
++        }
++      </section>
++    </div>
++  }
+   @if (carriage$ | async; as ride) {
+     @if (!(menuOpen$ | async)) {
+       <div class="carriage-shade">
+diff --git a/Code/skyrim_ui/src/app/components/root/root.component.scss b/Code/skyrim_ui/src/app/components/root/root.component.scss
+index 75de890..9a9c9ec 100644
+--- a/Code/skyrim_ui/src/app/components/root/root.component.scss
++++ b/Code/skyrim_ui/src/app/components/root/root.component.scss
+@@ -287,3 +287,12 @@
+   text-shadow: 0 1px 4px black;
+   pointer-events: none;
+ }
++
++.trade-shade { z-index: 1001; }
++.trade-panel { width: min(86vw, 72rem); max-height: 84vh; }
++.trade-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 1.4em; text-align: left; }
++.trade-columns section { min-width: 0; }
++.trade-columns ul { padding: 0; height: 48vh; overflow-y: auto; }
++.trade-columns li { display: flex; align-items: center; gap: .4em; padding: .35em 0; border-bottom: 1px solid #666; }
++.trade-columns li span { flex: 1; }
++.trade-columns input { width: 3.3em; color: white; background: #222; }
+diff --git a/Code/skyrim_ui/src/app/components/root/root.component.ts b/Code/skyrim_ui/src/app/components/root/root.component.ts
+index 7a2992e..5122501 100644
+--- a/Code/skyrim_ui/src/app/components/root/root.component.ts
++++ b/Code/skyrim_ui/src/app/components/root/root.component.ts
+@@ -50,6 +50,12 @@ export class RootComponent implements OnInit {
+   answerProgress(token: number, accept: boolean): void {
+     skyrimtogether.answerProgress(token, accept ? 1 : 0);
+   }
++  readonly home$ = this.client.home.asObservable();
++  chooseHome(token: number, choice: number): void { skyrimtogether.chooseHome(token,choice); }
++  readonly trade$ = this.client.trade.asObservable();
++  tradeAction(session: number, action: number, row = 0, count = 1): void {
++    skyrimtogether.tradeAction(session, action, row | 0, Math.min(9999, Math.max(1, Math.trunc(count || 1))));
++  }
+   readonly carriage$ = this.client.carriageOffer.asObservable();
+   public answerCarriage(rider: number, trip: number, yes: boolean): void {
+     skyrimtogether.answerCarriage(rider, trip, yes ? 1 : 0);
+diff --git a/Code/skyrim_ui/src/app/mock/skyrimtogether.mock.ts b/Code/skyrim_ui/src/app/mock/skyrimtogether.mock.ts
+index e2fd8ed..c5bee1f 100644
+--- a/Code/skyrim_ui/src/app/mock/skyrimtogether.mock.ts
++++ b/Code/skyrim_ui/src/app/mock/skyrimtogether.mock.ts
+@@ -125,6 +125,8 @@ export class SkyrimtogetherMock extends EventEmitter implements SkyrimTogether {
+ 
+   travelPreferences(_npc: number, _markers: number): void {}
+   answerProgress(_token: number, _accept: number): void {}
++  chooseHome(_token: number, _choice: number): void {}
++  tradeAction(_session: number, _action: number, _row: number, _count: number): void {}
+   answerCarriage(_rider: number, _trip: number, _decision: number): void {}
+ 
+   teleportToPlayer(playerId: number): void {
+diff --git a/Code/skyrim_ui/src/app/services/client.service.ts b/Code/skyrim_ui/src/app/services/client.service.ts
+index a91490e..e1716c6 100644
+--- a/Code/skyrim_ui/src/app/services/client.service.ts
++++ b/Code/skyrim_ui/src/app/services/client.service.ts
+@@ -39,6 +39,9 @@ export class ClientService implements OnDestroy {
+   public readonly syncRange = new BehaviorSubject<Record<number, boolean>>({});
+   public readonly observerMode = new BehaviorSubject(false);
+   public readonly progressOffer = new BehaviorSubject<{token: number; label: string} | null>(null);
++  readonly home = new BehaviorSubject<{token: number;names: string[]} | null>(null);
++  readonly trade = new BehaviorSubject<{session: number; name: string; open: boolean;
++    pocket: {id: number; name: string; count: number}[]; buffer: {id: number; name: string; count: number}[]} | null>(null);
+   public carriageOffer = new BehaviorSubject<{rider: number; trip: number; name: string; marker?: boolean} | null>(null);
+   public openingMenuChange = new BehaviorSubject(false);
+ 
+@@ -153,6 +156,12 @@ export class ClientService implements OnDestroy {
+     skyrimtogether.on('observerMode', watch => this.zone.run(() => this.observerMode.next(watch)));
+     skyrimtogether.on('offerProgress', (token, label) => this.zone.run(() => this.progressOffer.next({token, label})));
+     skyrimtogether.on('hideProgress', () => this.zone.run(() => this.progressOffer.next(null)));
++    skyrimtogether.on('offerHome', (token,names) => this.zone.run(() => this.home.next({token,names:names.split('\n')})));
++    skyrimtogether.on('hideHome', () => this.zone.run(() => this.home.next(null)));
++    skyrimtogether.on('partyTrade', (session,name,open,pocket,buffer) => this.zone.run(() => {
++      this.trade.next({session,name,open,pocket:JSON.parse(pocket),buffer:JSON.parse(buffer)});
++    }));
++    skyrimtogether.on('hideTrade', () => this.zone.run(() => this.trade.next(null)));
+     skyrimtogether.on('offerCarriage', (rider, trip, name, marker) =>
+       this.zone.run(() => this.carriageOffer.next({rider, trip, name, marker: !!marker})));
+     skyrimtogether.on('hideCarriage', () => this.zone.run(() => this.carriageOffer.next(null)));
+@@ -209,6 +218,10 @@ export class ClientService implements OnDestroy {
+     skyrimtogether.off('observerMode');
+     skyrimtogether.off('offerProgress');
+     skyrimtogether.off('hideProgress');
++    skyrimtogether.off('offerHome');
++    skyrimtogether.off('hideHome');
++    skyrimtogether.off('partyTrade');
++    skyrimtogether.off('hideTrade');
+     skyrimtogether.off('offerCarriage');
+     skyrimtogether.off('hideCarriage');
+     skyrimtogether.off('openingMenu');
+diff --git a/Code/skyrim_ui/src/typings.d.ts b/Code/skyrim_ui/src/typings.d.ts
+index 9fee568..dc56911 100644
+--- a/Code/skyrim_ui/src/typings.d.ts
++++ b/Code/skyrim_ui/src/typings.d.ts
+@@ -111,6 +111,14 @@ interface SkyrimTogether {
+   on(event: 'hideProgress', callback: () => void): void;
+   off(event: 'peerRange' | 'observerMode' | 'offerProgress' | 'hideProgress'): void;
+   answerProgress(token: number, accept: number): void;
++  on(event: 'offerHome', callback: (token: number, names: string) => void): void;
++  on(event: 'hideHome', callback: () => void): void;
++  off(event: 'offerHome' | 'hideHome'): void;
++  chooseHome(token: number, choice: number): void;
++  on(event: 'partyTrade', callback: (session: number, name: string, open: boolean, pocket: string, buffer: string) => void): void;
++  on(event: 'hideTrade', callback: () => void): void;
++  off(event: 'partyTrade' | 'hideTrade'): void;
++  tradeAction(session: number, action: number, row: number, count: number): void;
+   on(event: 'offerCarriage', callback: (rider: number, trip: number, name: string, marker: number) => void): void;
+   on(event: 'hideCarriage', callback: () => void): void;
+   off(event: 'offerCarriage' | 'hideCarriage'): void;
+diff --git a/Code/tp_process/ProcessHandler.cpp b/Code/tp_process/ProcessHandler.cpp
+index 6188332..4e45050 100644
+--- a/Code/tp_process/ProcessHandler.cpp
++++ b/Code/tp_process/ProcessHandler.cpp
+@@ -27,6 +27,8 @@ void ProcessHandler::OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<C
+     m_pCoreObject->SetValue("changePartyLeader", CefV8Value::CreateFunction("changePartyLeader", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);
+     m_pCoreObject->SetValue("travelPreferences", CefV8Value::CreateFunction("travelPreferences", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);
+     m_pCoreObject->SetValue("answerProgress", CefV8Value::CreateFunction("answerProgress", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);
++    m_pCoreObject->SetValue("chooseHome", CefV8Value::CreateFunction("chooseHome", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);
++    m_pCoreObject->SetValue("tradeAction", CefV8Value::CreateFunction("tradeAction", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);
+     m_pCoreObject->SetValue("answerCarriage", CefV8Value::CreateFunction("answerCarriage", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);
+     m_pCoreObject->SetValue("teleportToPlayer", CefV8Value::CreateFunction("teleportToPlayer", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);
+     m_pCoreObject->SetValue("toggleDebugUI", CefV8Value::CreateFunction("toggleDebugUI", m_pOverlayHandler), V8_PROPERTY_ATTRIBUTE_NONE);

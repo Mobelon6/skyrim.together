@@ -1,0 +1,499 @@
+diff --git a/Code/common/HomeResidentPlan.h b/Code/common/HomeResidentPlan.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/HomeResidentPlan.h
+@@ -0,0 +1,21 @@
++#pragma once
++#include "HomeCatalog.h"
++#include "HomeResidents.h"
++
++namespace HomeResidentPlan
++{
++// Only explicit catalog bindings and a committed coverage set can authorize
++// restoration. Old omitted counts and unknown ACHR are never reinterpreted.
++inline std::optional<HomeResidents::Residents> Build(const HomeCatalog::Cell& cell,
++    const HomeSnapshot::State& baseline,const HomeResidents::Residents& records)
++{
++    if (!HomeCatalog::Bind(cell,baseline) || records.size()!=cell.ResidentBases.size()) return {};
++    for (const auto& [key,base]:cell.ResidentBases)
++    {
++        const auto it=records.find(key);
++        if (it==records.end() || !it->second.Revision || !it->second.Value.Valid() ||
++            it->second.Value.Reference.Encode()!=key || it->second.Value.Base.Encode()!=base.Encode()) return {};
++    }
++    return records;
++}
++}
+diff --git a/Code/client/Services/HomeResidentProjection.h b/Code/client/Services/HomeResidentProjection.h
+new file mode 100644
+--- /dev/null
++++ b/Code/client/Services/HomeResidentProjection.h
+@@ -0,0 +1,14 @@
++#pragma once
++#include <HomeResidents.h>
++struct World;
++struct TESObjectCELL;
++namespace HomeResidentProjection
++{
++struct Entry
++{
++    uint32_t Source{},Base{};
++    HomeResidents::Record Record;
++};
++bool Sync(World&,TESObjectCELL&,uint32_t slot,const std::vector<Entry>&);
++void Clear() noexcept;
++}
+diff --git a/Code/common/HomeSnapshot.h b/Code/common/HomeSnapshot.h
+--- a/Code/common/HomeSnapshot.h
++++ b/Code/common/HomeSnapshot.h
+@@ -33,10 +33,16 @@
+ struct State
+ {
+     uint32_t Omitted{};
+-    std::vector<Ref> Refs;
++    std::vector<Ref> Refs;
++    std::set<std::string> ResidentKeys;
+     bool Valid() const
+     {
+-        if (Refs.empty() || Refs.size()>16384) return false;
++        if (Refs.empty() || Refs.size()>16384 || ResidentKeys.size()>128) return false;
++        for (const auto& key:ResidentKeys)
++        {
++            const auto form=TradeProperties::DecodeForm(key);
++            if (!form || !form->Valid() || form->Encode()!=key || form->Plugin=="skyrimcoophomeinstances.esp") return false;
++        }
+         std::string prior;
+         for (const auto& r:Refs)
+         {
+@@ -46,7 +52,8 @@
+                 (r.Type!=28 && r.Inventory!=0) || (r.Type==28 && r.Inventory==0) ||
+                 (r.Inventory!=1 && !r.Items.empty())) return false;
+             for (auto v:r.Transform) if (!std::isfinite(std::bit_cast<float>(v))) return false;
+-            const auto key=r.Key.Encode();
++            const auto key=r.Key.Encode();
++            if (ResidentKeys.count(key)) return false;
+             if (!prior.empty() && key<=prior) return false;
+             prior=key;
+             std::pair<std::string,std::string> last;
+@@ -67,7 +74,8 @@
+     }
+     std::string Encode() const
+     {
+-        std::string out="static-v1 "+std::to_string(Omitted)+"\n";
++        std::string out=std::string(ResidentKeys.empty()?"static-v1 ":"static-v2 ")+std::to_string(Omitted)+"\n";
++        for (const auto& key:ResidentKeys) out+="A "+key+"\n";
+         for (const auto& r:Refs)
+         {
+             out+="R "+r.Key.Encode()+" "+r.Base.Encode()+" "+std::to_string(r.Type)+" "+
+@@ -90,12 +98,18 @@
+     std::string line,tag,key,base,variant,extra;
+     if (!std::getline(input,line)) return {};
+     std::istringstream header(line);
+-    if (!(header>>tag>>s.Omitted) || tag!="static-v1" || header>>extra) return {};
++    if (!(header>>tag>>s.Omitted) || (tag!="static-v1" && tag!="static-v2") || header>>extra) return {};
++    const bool withResidents=tag=="static-v2";
+     while (std::getline(input,line))
+     {
+         std::istringstream row(line);
+         if (!(row>>tag)) return {};
+-        if (tag=="R")
++        if (tag=="A")
++        {
++            if (!withResidents || !s.Refs.empty() || !(row>>key) || row>>extra ||
++                s.ResidentKeys.size()>=128 || !s.ResidentKeys.insert(key).second) return {};
++        }
++        else if (tag=="R")
+         {
+             Ref r;
+             if (!(row>>key>>base>>r.Type>>r.Flags>>r.Scale>>r.Inventory>>r.LockState>>r.LockLevel)) return {};
+diff --git a/Code/common/HomeCatalog.h b/Code/common/HomeCatalog.h
+--- a/Code/common/HomeCatalog.h
++++ b/Code/common/HomeCatalog.h
+@@ -24,7 +24,8 @@
+     std::vector<Ref> Refs;
+     std::vector<Entrance> Entrances;
+     std::set<std::string> Unsupported;
+-    std::set<std::string> ResidentCandidates;
++    std::set<std::string> ResidentCandidates;
++    std::map<std::string,TradeProperties::FormKey> ResidentBases;
+     std::vector<TradeProperties::FormKey> Navigation;
+ };
+ using Catalog=std::map<std::string,Cell>;
+@@ -74,7 +75,16 @@
+                 !targets.insert(id).second || !sources.insert(source).second) return {};
+             c.Navigation.push_back({std::string(Plugin),id});
+         }
+-        else if (tag=="U")
++        else if (tag=="A")
++        {
++            if (!(row>>base) || row>>extra || !sources.insert(source).second ||
++                c.ResidentBases.size()>=128) return {};
++            const auto b=TradeProperties::DecodeForm(base);
++            if (!b || !b->Valid() || b->Encode()!=base || b->Plugin==Plugin) return {};
++            c.ResidentCandidates.insert(source);
++            c.ResidentBases.emplace(source,*b);
++        }
++        else if (tag=="U")
+         {
+             if (!(row>>reason) || row>>extra || !sources.insert(source).second) return {};
+             c.Unsupported.insert(source);
+@@ -101,7 +111,8 @@
+ inline std::optional<std::vector<HomeProjection::Binding>> Bind(const Cell& cell,const HomeSnapshot::State& state)
+ {
+     if (!cell.Unsupported.empty() || cell.Entrances.empty() || state.Omitted ||
+-        cell.Refs.size()!=state.Refs.size()) return {};
++        cell.Refs.size()!=state.Refs.size() || cell.ResidentBases.size()!=state.ResidentKeys.size()) return {};
++    for (const auto& [key,_]:cell.ResidentBases) if (!state.ResidentKeys.count(key)) return {};
+     std::map<std::string,const Ref*> refs;
+     for (const auto& r:cell.Refs) refs.emplace(r.Source.Encode(),&r);
+     std::vector<HomeProjection::Binding> bindings;
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -17,7 +17,9 @@
+ #include <Games/TES.h>
+ #include <Forms/TESFaction.h>
+ #include <Forms/TESNPC.h>
+-#include <Games/ActorExtension.h>
++#include <Games/ActorExtension.h>
++#include <HomeResidentPlan.h>
++#include <Services/HomeResidentProjection.h>
+ #include <Forms/TESObjectCELL.h>
+ #include <Forms/BGSEncounterZone.h>
+ #include <Messages/NotifyPartyHome.h>
+@@ -204,14 +206,36 @@
+     return ref && p.GetParentCellEx()==ref->GetParentCellEx() &&
+         glm::distance(static_cast<const glm::vec3&>(p.position),static_cast<const glm::vec3&>(ref->position))<=350.f;
+ }
+-void AddVisits(const CampaignAccess::Identity& id,const HomeCatalog::Cell& cell,std::string& labels)
++std::optional<HomeResidents::Residents> ResidentPlan(const HomeCatalog::Cell& cell,
++    const HomeSnapshot::State& state,uint64_t campaign,uint32_t slot)
++{
++    const auto records=CampaignAccess::HomeResidentView(campaign,slot);
++    if (!records) return {};
++    return HomeResidentPlan::Build(cell,state,*records);
++}
++bool ApplyResidents(World& world,TESObjectCELL& target,const HomeCatalog::Cell& cell,
++    const HomeSnapshot::State& state,uint64_t campaign,uint32_t slot)
++{
++    auto plan=ResidentPlan(cell,state,campaign,slot);
++    if (!plan) return false;
++    std::vector<HomeResidentProjection::Entry> entries;
++    for (const auto& [key,record]:*plan)
++    {
++        const auto source=CatalogForm(record.Value.Reference),base=CatalogForm(record.Value.Base);
++        if (!source || !base) return false;
++        entries.push_back({source,base,record});
++    }
++    return HomeResidentProjection::Sync(world,target,slot,entries);
++}
++Clock::time_point residentDisplayNext{};
++void AddVisits(const CampaignAccess::Identity& id,const HomeCatalog::Cell& cell,std::string& labels)
+ {
+     accessMenu.Visits.clear();
+     for (const auto& [slot,owner]:CampaignAccess::HomeOffers(id.Save.Campaign,id.Save.Character,cell.Root.Encode()))
+     {
+         const auto bytes=CampaignAccess::HomeBaseline(id.Save.Campaign,slot);
+         const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
+-        if (!state || !HomeCatalog::Bind(cell,*state)) continue;
++        if (!state || !ResidentPlan(cell,*state,id.Save.Campaign,slot)) continue;
+         if (!labels.empty()) labels+='\n';
+         labels+="В гости к персонажу "+std::to_string(owner);
+         accessMenu.Visits.push_back({slot,owner});
+@@ -228,8 +252,9 @@
+     {
+         if (preferred && CatalogForm(e.Door)!=preferred) continue;
+         auto* out=Cast<TESObjectCELL>(TESForm::GetById(CatalogForm(e.Outside)));
+-        if (!out || HomeInstance::ProjectionForm(out->formID)) continue;
+-        visit={};
++        if (!out || HomeInstance::ProjectionForm(out->formID)) continue;
++        HomeResidentProjection::Clear();residentDisplayNext={};
++        visit={};
+         const auto local=p.GetParentCellEx()->formID;
+         const auto id=World::Get().GetTransport().GetLocalPlayerId();
+         activeHomeRoute.store(id<=0xFFFFu?(uint64_t(HomeRegistry::PendingPrefix|id)<<32)|local:0);
+@@ -413,14 +438,31 @@
+ {
+     if (!cell.IsAttached() || !cell.refData.refArray || !cell.refData.capacity ||
+         cell.refData.capacity>131072) return {};
+-    HomeSnapshot::State state;
+-    for (uint32_t i=0;i<cell.refData.capacity;++i)
++    HomeSnapshot::State state;
++    const auto* catalog=CatalogCell(cell.formID);
++    for (uint32_t i=0;i<cell.refData.capacity;++i)
+     {
+         auto* ref=cell.refData.refArray[i].Get();
+         if (!ref) continue;
+-        if (ref->formID==0x14 || NativeTrade::IsProxy(ref)) continue;
+-        if (!ref->baseForm || ref->IsTemporary() || ref->baseForm->IsTemporary() ||
+-            Cast<Actor>(ref) ||
++        if (ref->formID==0x14 || NativeTrade::IsProxy(ref)) continue;
++        if (catalog && Cast<Actor>(ref) && !ref->IsTemporary())
++        {
++            const auto key=InventoryEvidence::Resolve(ref->formID,slots);
++            if (key)
++            {
++                const auto encoded=TradeProperties::FormKey{key->Plugin,key->Local}.Encode();
++                const auto known=catalog->ResidentBases.find(encoded);
++                if (known!=catalog->ResidentBases.end())
++                {
++                    const auto observed=ObserveResident(encoded,cell,slots);
++                    if (!observed || observed->Base.Encode()!=known->second.Encode()) return {};
++                    state.ResidentKeys.insert(encoded);
++                    continue;
++                }
++            }
++        }
++        if (!ref->baseForm || ref->IsTemporary() || ref->baseForm->IsTemporary() ||
++            Cast<Actor>(ref) ||
+             ref->GetParentCellEx()!=&cell)
+         {++state.Omitted;continue;}
+         auto key=InventoryEvidence::Resolve(ref->formID,slots);
+@@ -445,7 +487,8 @@
+         state.Refs.push_back(std::move(row));
+         if (state.Refs.size()>16384) return {};
+     }
+-    std::sort(state.Refs.begin(),state.Refs.end(),[](const auto& a,const auto& b){return a.Key.Encode()<b.Key.Encode();});
++    if (catalog && state.ResidentKeys.size()!=catalog->ResidentBases.size()) return {};
++    std::sort(state.Refs.begin(),state.Refs.end(),[](const auto& a,const auto& b){return a.Key.Encode()<b.Key.Encode();});
+     if (!state.Valid()) return {};
+     auto bytes=state.Encode();
+     if (bytes.size()>HomeSnapshot::MaxBytes) return {};
+@@ -537,8 +580,9 @@
+     return false;
+ }
+ }
+-void OverlayService::ClearHomes() noexcept
+-{
++void OverlayService::ClearHomes() noexcept
++{
++    HomeResidentProjection::Clear();residentDisplayNext={};
+     if (selection && m_pOverlay && m_gameOverlayClient)
+     {m_pOverlay->ExecuteAsync("hideHome");m_gameOverlayClient->SetUIVisible(false);}
+     selection=false;door=0;options.clear();accessMenu={};visit={};lockContext={};projectedRoot.store(0);ads.clear();SetVisit(0,0);refresh={};self.store(invalid);
+@@ -757,14 +801,28 @@
+                 const auto bytes=CampaignAccess::HomeBaseline(visit.Campaign,visit.Slot);
+                 const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
+                 const auto bindings=state?HomeCatalog::Bind(*copy,*state):std::nullopt;
+-                if (!bindings || !HomeProjection::Apply(*current,*state,*bindings))
++                if (!bindings || !ResidentPlan(*copy,*state,visit.Campaign,visit.Slot) ||
++                    !HomeProjection::Apply(*current,*state,*bindings) ||
++                    !ApplyResidents(m_world,*current,*copy,*state,visit.Campaign,visit.Slot))
+                 {ClearTrade();LeaveCopy(*p,*copy,visit.Door);return;}
+                 projectedRoot.store((uint64_t(visit.Base)<<32)|visit.Copy);
+                 visit.Ready=true;
+             }
+-            if (visit.Ready && identity) SyncLocks(*current,*identity,visit.Slot,visit.Root,copy);
+-        }
+-        else if (visit.Moved && visit.Ready) {ClearTrade();visit={};projectedRoot.store(0);}
++            if (visit.Ready && identity)
++            {
++                SyncLocks(*current,*identity,visit.Slot,visit.Root,copy);
++                if (now>=residentDisplayNext && current->IsAttached())
++                {
++                    residentDisplayNext=now+1s;
++                    const auto bytes=CampaignAccess::HomeBaseline(visit.Campaign,visit.Slot);
++                    const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
++                    if (!state || !ApplyResidents(m_world,*current,*copy,*state,visit.Campaign,visit.Slot))
++                    {ClearTrade();LeaveCopy(*p,*copy,visit.Door);return;}
++                }
++            }
++        }
++        else if (visit.Moved && visit.Ready)
++        {HomeResidentProjection::Clear();residentDisplayNext={};ClearTrade();visit={};projectedRoot.store(0);}
+         else if (visit.Nonce && !valid) visit={};
+         else if (valid && visit.Granted && !visit.Moved)
+         {
+diff --git a/Code/client/Services/Generic/CharacterService.cpp b/Code/client/Services/Generic/CharacterService.cpp
+--- a/Code/client/Services/Generic/CharacterService.cpp
++++ b/Code/client/Services/Generic/CharacterService.cpp
+@@ -49,7 +49,8 @@
+ #include <Messages/NotifyActionEvents.h>
+ #include <Messages/CharacterSpawnRequest.h>
+ #include <Services/HomeInstance.h>
+-#include <HomeScope.h>
++#include <HomeScope.h>
++#include <Services/HomeResidentProjection.h>
+ #include <Messages/RequestFactionsChanges.h>
+ #include <Messages/NotifyFactionsChanges.h>
+ #include <Messages/NotifyRemoveCharacter.h>
+@@ -78,9 +79,42 @@
+ {
+ struct HomeProjectedActor
+ {
+-    GameId Cell;
+-};
++    GameId Cell,Reference;
++};
+-TESObjectCELL* CurrentActorCell() noexcept
++struct ResidentDisplay
++{
++    uint32_t Ref{},Base{},Cell{},Revision{},Handle{};
++};
++std::map<uint32_t,ResidentDisplay> residentDisplays;
++uint32_t residentSlot{};
++uint32_t residentCell{};
++Actor* DisplayActor(const ResidentDisplay& display) noexcept
++{
++    auto* actor=Cast<Actor>(TESForm::GetById(display.Ref));
++    if (!actor || !actor->IsTemporary() || !actor->baseForm || actor->baseForm->formID!=display.Base ||
++        !display.Handle || actor->GetHandle().handle.iBits!=display.Handle ||
++        !actor->GetExtension() || !actor->GetExtension()->IsRemote() ||
++        actor->GetExtension()->IsPlayer()) return nullptr;
++    return actor;
++}
++void DropResidentDisplay(uint32_t source) noexcept
++{
++    auto it=residentDisplays.find(source);
++    if (it==residentDisplays.end()) return;
++    auto* actor=DisplayActor(it->second);
++    residentDisplays.erase(it);
++    if (actor) {actor->Disable();actor->Delete();}
++}
++bool LiveResident(World& world,uint32_t slot,const GameId& reference) noexcept
++{
++    for (auto entity:world.view<HomeProjectedActor,RemoteComponent>())
++    {
++        const auto& projected=world.get<HomeProjectedActor>(entity);
++        if (projected.Cell.ModId==(HomeRegistry::ScopePrefix|slot) && projected.Reference==reference) return true;
++    }
++    return false;
++}
++TESObjectCELL* CurrentActorCell() noexcept
+ {
+     auto* player=PlayerCharacter::Get();
+     return player?player->GetParentCellEx():nullptr;
+@@ -108,10 +142,76 @@
+     if (!base || HomeInstance::Tagged(base.ModId)) return nullptr;
+     auto* npc=Cast<TESNPC>(TESForm::GetById(world.GetModSystem().GetGameId(base)));
+     if (!npc || npc->IsTemporary()) return nullptr;
+-    return Actor::Create(npc);
+-}
+-}
+-
+-CharacterService::CharacterService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept
++    // Do not delete the frozen representation until creation succeeds.
++    Actor* actor=Actor::Create(npc);
++    if (actor) DropResidentDisplay(world.GetModSystem().GetGameId(spawn.FormId));
++    return actor;
++}
++}
++void HomeResidentProjection::Clear() noexcept
++{
++    while (!residentDisplays.empty()) DropResidentDisplay(residentDisplays.begin()->first);
++    residentSlot=0;residentCell=0;
++}
++bool HomeResidentProjection::Sync(World& world,TESObjectCELL& cell,uint32_t slot,const std::vector<Entry>& entries)
++{
++    if (!slot || !HomeInstance::ProjectionForm(cell.formID) || !cell.IsAttached()) return false;
++    if (residentSlot!=slot || residentCell!=cell.formID)
++    {Clear();residentSlot=slot;residentCell=cell.formID;}
++    std::set<uint32_t> seen;
++    for (const auto& e:entries)
++    {
++        GameId reference{};
++        if (!e.Source || !e.Base || !seen.insert(e.Source).second ||
++            !world.GetModSystem().GetServerModId(e.Source,reference) ||
++            !e.Record.Value.Valid()) return false;
++        auto* npc=Cast<TESNPC>(TESForm::GetById(e.Base));
++        if (!npc || npc->IsTemporary()) return false;
++        const auto& s=e.Record.Value;
++        // Live network state wins while it exists. Otherwise show the last
++        // committed observation, never the visitor's original reference.
++        if (LiveResident(world,slot,reference) || (s.Flags&5u))
++        {DropResidentDisplay(e.Source);continue;}
++        auto it=residentDisplays.find(e.Source);
++        auto* actor=it==residentDisplays.end()?nullptr:DisplayActor(it->second);
++        if (actor && actor->GetParentCellEx()==&cell && it->second.Revision==e.Record.Revision) continue;
++        if (actor && actor->GetParentCellEx()!=&cell)
++        {DropResidentDisplay(e.Source);actor=nullptr;}
++        if (!actor)
++        {
++            DropResidentDisplay(e.Source);
++            actor=Actor::Create(npc);
++            if (!actor) return false;
++            if (!actor->IsTemporary() || !actor->GetExtension() ||
++                !actor->GetExtension()->IsRemote() || actor->GetExtension()->IsPlayer()) return false;
++            const auto handle=actor->GetHandle().handle.iBits;
++            if (!handle || actor->baseForm!=npc || actor->scale!=s.Scale)
++            {actor->Disable();actor->Delete();return false;}
++            residentDisplays.emplace(e.Source,ResidentDisplay{actor->formID,e.Base,cell.formID,0,handle});
++        }
++        if (actor->baseForm!=npc || actor->scale!=s.Scale)
++        {DropResidentDisplay(e.Source);return false;}
++        const auto v=[&](size_t n){return std::bit_cast<float>(s.Transform[n]);};
++        actor->SetRotation(v(3),v(4),v(5));
++        actor->MoveTo(&cell,glm::vec3{v(0),v(1),v(2)});
++        if (actor->GetParentCellEx()!=&cell) {DropResidentDisplay(e.Source);return false;}
++        const bool dead=(s.Flags&2u)!=0;
++        if (actor->IsDead()!=dead)
++        {
++            if (dead) actor->Kill();
++            else actor->RestoreRemoteLife();
++        }
++        if (actor->IsDead()!=dead) {DropResidentDisplay(e.Source);return false;}
++        residentDisplays.at(e.Source).Revision=e.Record.Revision;
++    }
++    for (auto it=residentDisplays.begin();it!=residentDisplays.end();)
++    {
++        const auto source=it++->first;
++        if (!seen.count(source)) DropResidentDisplay(source);
++    }
++    return true;
++}
++
++CharacterService::CharacterService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept
+     : m_world(aWorld)
+     , m_dispatcher(aDispatcher)
+@@ -379,6 +479,7 @@
+ 
+-void CharacterService::OnDisconnected(const DisconnectedEvent& acDisconnectedEvent) const noexcept
+-{
++void CharacterService::OnDisconnected(const DisconnectedEvent& acDisconnectedEvent) const noexcept
++{
++    HomeResidentProjection::Clear();
+     Vector<uint32_t> projected;
+     for (auto entity:m_world.view<HomeProjectedActor,RemoteComponent>())
+         projected.push_back(m_world.get<RemoteComponent>(entity).Id);
+@@ -622,9 +723,10 @@
+     std::optional<entt::entity> entity;
+ 
+     // A placed resident in another player's home must be a separate reference.
+-    if (projectedNpc && acMessage.FormId!=GameId{})
+-    {
+-        pActor=CreateProjectedActor(m_world,acMessage);
++    if (projectedNpc && acMessage.FormId!=GameId{})
++    {
++        if (LiveResident(m_world,acMessage.CellId.ModId&0xFFFFu,acMessage.FormId)) return;
++        pActor=CreateProjectedActor(m_world,acMessage);
+         if (!pActor) return;
+         entity=m_world.create();
+     }
+@@ -711,7 +813,7 @@
+     if (projectedNpc)
+     {
+         if (!pActor->IsTemporary()) return;
+-        m_world.emplace_or_replace<HomeProjectedActor>(*entity,HomeProjectedActor{acMessage.CellId});
++        m_world.emplace_or_replace<HomeProjectedActor>(*entity,HomeProjectedActor{acMessage.CellId,acMessage.FormId});
+     }
+ 
+     spdlog::info("CharacterSpawnRequest, server id: {:X}, form id: {:X}, dead: {}", acMessage.ServerId, pActor->formID, acMessage.IsDead);
+@@ -2097,6 +2199,7 @@
+ 
+-void CharacterService::RunRemoteUpdates() noexcept
+-{
++void CharacterService::RunRemoteUpdates() noexcept
++{
++    if (!InHomeProjection()) HomeResidentProjection::Clear();
+     // Lost remove packets and revoked visits cannot leave a network clone
+     // in another instance of the same root CELL.
+     Vector<uint32_t> staleProjected;
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign16"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign17"

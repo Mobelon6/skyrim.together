@@ -1,0 +1,1619 @@
+diff --git a/Code/common/TradeLedger.h b/Code/common/TradeLedger.h
+--- a/Code/common/TradeLedger.h
++++ b/Code/common/TradeLedger.h
+@@ -16,103 +16,148 @@
+         std::string user, peer, plugin;
+         uint32_t base{};
+         int count{}; // Positive credits the backpack; negative reserves the deposit in escrow.
+-    };
+-    explicit TradeLedger(std::filesystem::path path) : root(std::move(path)) {}
+-    TradeLedger(CampaignJournal::Journal& journal,uint64_t campaign) : authority(&journal), campaignId(campaign) {}
+-    uint64_t Stream()
+-    {
+-        if (authority && !authority->Ready()) throw std::runtime_error("campaign trade authority unavailable");
+-        if (stream) return stream;
+-        if (authority)
+-        {
+-            if (!campaignId) throw std::runtime_error("invalid campaign trade stream");
+-            accounts.clear(); stock.clear(); confirmed.clear(); last=0;
+-            for (const auto& op:authority->Operations())
+-                if (op.Kind=="trade-v1")
+-                {
+-                    if (op.Id!="trade-"+std::to_string(last+1)) throw std::runtime_error("invalid campaign trade sequence");
+-                    Replay(op.Payload); ++last;
+-                }
+-            stream=campaignId; return stream;
+-        }
+-        uint64_t id{};
+-        if (std::filesystem::exists(root))
+-            for (const auto& file : std::filesystem::directory_iterator(root))
+-                if (file.is_directory())
+-                {
+-                    if (id) throw std::runtime_error("ambiguous trade ledger");
+-                    id = std::stoull(file.path().filename().string());
+-                }
+-        if (!id) id = QuestJournalDisk::CreateStream(root);
+-        if (!id) throw std::runtime_error("cannot initialize trade ledger");
+-        accounts.clear(); stock.clear(); confirmed.clear(); last = 0;
+-        const auto size = QuestJournalDisk::Contiguous(root,id);
+-        const auto dir = root/std::to_string(id);
+-        for (const auto& entry : std::filesystem::directory_iterator(dir))
+-            if (entry.path().extension()==".tsv" && std::stoul(entry.path().stem().string())>size)
+-                throw std::runtime_error("trade ledger sequence gap");
+-        for (uint32_t n=1;n<=size;++n)
+-        {
+-            std::ifstream f(dir/(std::to_string(n)+".tsv"), std::ios::binary);
+-            std::string line; std::getline(f,line);
+-            const auto prefix=std::to_string(n)+"\t";
+-            if (!line.starts_with(prefix)) throw std::runtime_error("invalid trade receipt");
+-            Replay(line.substr(prefix.size()));
+-            ++last;
+-        }
+-        stream=id;
+-        return stream;
+-    }
+-    const std::vector<Row>& History(const std::string& user) {return accounts[user];}
+-    using Items = std::map<std::pair<std::string,uint32_t>,int64_t>;
+-    const Items& Stock(const std::string& a,const std::string& b) {return stock[std::minmax(a,b)];}
+-    bool Ack(const std::string& user,uint32_t pos)
+-    {
+-        if (pos<=confirmed[user]) return true;
+-        if (pos>accounts[user].size()) return false;
+-        while (confirmed[user]<pos)
+-        {
+-            const auto n=confirmed[user]+1;
+-            std::ostringstream out; out<<"A "<<std::quoted(user)<<' '<<n;
+-            if (!Store(out.str())) return false;
+-            Confirmed(user,n);
+-        }
+-        return true;
+-    }
+-    bool Commit(const Row& r,uint32_t cursor)
+-    {
+-        if (r.user.empty() || r.peer.empty() || r.user==r.peer || r.plugin.empty() || !r.base ||
+-            cursor!=accounts[r.user].size() || cursor!=confirmed[r.user] || cursor>=0xFFFFFE ||
+-            !r.count || std::abs(static_cast<long long>(r.count))>9999) return false;
+-        if (r.count>0)
+-        {
+-            const auto& items=Stock(r.user,r.peer);
+-            auto i=items.find({r.plugin,r.base});
+-            if (i==items.end() || i->second<r.count) return false;
+-        }
+-        std::ostringstream out;
+-        out<<"T "<<std::quoted(r.user)<<' '<<std::quoted(r.peer)<<' '<<std::quoted(r.plugin)<<' '<<r.base<<' '<<r.count;
+-        if (!Store(out.str())) return false;
+-        Append(r); return true;
+-    }
+-private:
+-    void Replay(const std::string& data)
+-    {
+-        std::istringstream in(data);
+-        char kind{}; Row r;
+-        if (!(in>>kind>>std::quoted(r.user)) || r.user.empty()) throw std::runtime_error("invalid trade receipt");
+-        if (kind=='A')
+-        {
+-            uint32_t pos{};std::string extra;
+-            if (!(in>>pos) || in>>extra || pos!=confirmed[r.user]+1 || pos>accounts[r.user].size())
+-                throw std::runtime_error("invalid acknowledgement");
+-            Confirmed(r.user,pos);
+-        }
+-        else if (kind=='T')
+-        {
+-            std::string extra;
+-            if (!(in>>std::quoted(r.peer)>>std::quoted(r.plugin)>>r.base>>r.count) || in>>extra ||
+-                r.peer.empty() || r.user==r.peer || r.plugin.empty() || !r.base || !r.count ||
++        int64_t before{-1}; // -1 = legacy receipt without an inventory checkpoint.
++    };
++    explicit TradeLedger(std::filesystem::path path) : root(std::move(path)) {}
++    TradeLedger(CampaignJournal::Journal& journal,uint64_t campaign) : authority(&journal), campaignId(campaign) {}
++    uint64_t Stream()
++    {
++        if (authority && !authority->Ready()) throw std::runtime_error("campaign trade authority unavailable");
++        if (stream) return stream;
++        if (authority)
++        {
++            if (!campaignId) throw std::runtime_error("invalid campaign trade stream");
++            accounts.clear(); stock.clear(); confirmed.clear(); last=0;
++            for (const auto& op:authority->Operations())
++                if (op.Kind=="trade-v1")
++                {
++                    if (op.Id!="trade-"+std::to_string(last+1)) throw std::runtime_error("invalid campaign trade sequence");
++                    Replay(op.Payload); ++last;
++                }
++            stream=campaignId; return stream;
++        }
++        uint64_t id{};
++        if (std::filesystem::exists(root))
++            for (const auto& file : std::filesystem::directory_iterator(root))
++                if (file.is_directory())
++                {
++                    if (id) throw std::runtime_error("ambiguous trade ledger");
++                    id = std::stoull(file.path().filename().string());
++                }
++        if (!id) id = QuestJournalDisk::CreateStream(root);
++        if (!id) throw std::runtime_error("cannot initialize trade ledger");
++        accounts.clear(); stock.clear(); confirmed.clear(); last = 0;
++        const auto size = QuestJournalDisk::Contiguous(root,id);
++        const auto dir = root/std::to_string(id);
++        for (const auto& entry : std::filesystem::directory_iterator(dir))
++            if (entry.path().extension()==".tsv" && std::stoul(entry.path().stem().string())>size)
++                throw std::runtime_error("trade ledger sequence gap");
++        for (uint32_t n=1;n<=size;++n)
++        {
++            std::ifstream f(dir/(std::to_string(n)+".tsv"), std::ios::binary);
++            std::string line; std::getline(f,line);
++            const auto prefix=std::to_string(n)+"\t";
++            if (!line.starts_with(prefix)) throw std::runtime_error("invalid trade receipt");
++            Replay(line.substr(prefix.size()));
++            ++last;
++        }
++        stream=id;
++        return stream;
++    }
++    const std::vector<Row>& History(const std::string& user) {return accounts[user];}
++    using Items = std::map<std::pair<std::string,uint32_t>,int64_t>;
++    const Items& Stock(const std::string& a,const std::string& b) {return stock[std::minmax(a,b)];}
++    // The acknowledged cursor protects escrow, not the age of a loaded save.
++    // In a campaign an older valid save may replay its own checkpointed receipts
++    // without re-crediting escrow. Uncheckpointed historical receipts cannot be
++    // recovered safely. Legacy sessions retain the conservative refusal.
++    bool AcceptCursor(const std::string& user,uint64_t savedStream,uint32_t cursor)
++    {
++        if (user.empty() || !Stream() || (savedStream && savedStream!=stream) ||
++            (!savedStream && cursor)) return false;
++        const auto total=accounts[user].size();
++        const auto done=confirmed[user];
++        if (cursor>total || total>static_cast<uint64_t>(done)+1) return false;
++        if (cursor<done)
++        {
++            if (!authority) return false;
++            for (size_t i=cursor;i<done;++i)
++                if (accounts[user][i].before<0) return false;
++        }
++        return true;
++    }
++    bool MatchesReceipt(const std::string& user,uint64_t savedStream,uint32_t cursor,uint32_t receipt,
++                        const std::string& plugin,uint32_t base,int count,int64_t before)
++    {
++        if (!AcceptCursor(user,savedStream,cursor) || receipt!=cursor+1 ||
++            receipt>accounts[user].size()) return false;
++        const auto& r=accounts[user][receipt-1];
++        return r.plugin==plugin && r.base==base && r.count==count && r.before==before;
++    }
++    // This is a pure precondition check for a receipt whose cursor is not yet
++    // applied. Never infer application from a matching after-count alone.
++    static bool CanApply(const Row& row,int64_t current)
++    {
++        return row.before>=0 && current==row.before && ValidCounts(row);
++    }
++    bool Ack(const std::string& user,uint32_t pos)
++    {
++        if (pos<=confirmed[user]) return true;
++        if (pos>accounts[user].size()) return false;
++        while (confirmed[user]<pos)
++        {
++            const auto n=confirmed[user]+1;
++            std::ostringstream out; out<<"A "<<std::quoted(user)<<' '<<n;
++            if (!Store(out.str())) return false;
++            Confirmed(user,n);
++        }
++        return true;
++    }
++    bool Commit(const Row& r,uint32_t cursor)
++    {
++        if (r.user.empty() || r.peer.empty() || r.user==r.peer || r.plugin.empty() || !r.base ||
++            cursor!=accounts[r.user].size() || cursor!=confirmed[r.user] || cursor>=0xFFFFFE ||
++            !r.count || std::abs(static_cast<long long>(r.count))>9999 || !ValidCounts(r)) return false;
++        if (r.count>0)
++        {
++            const auto& items=Stock(r.user,r.peer);
++            auto i=items.find({r.plugin,r.base});
++            if (i==items.end() || i->second<r.count) return false;
++        }
++        std::ostringstream out;
++        out<<"T "<<std::quoted(r.user)<<' '<<std::quoted(r.peer)<<' '<<std::quoted(r.plugin)<<' '<<r.base<<' '<<r.count;
++        if (r.before>=0) out<<' '<<r.before;
++        if (!Store(out.str())) return false;
++        Append(r); return true;
++    }
++private:
++    static bool ValidCounts(const Row& r)
++    {
++        return r.before==-1 || (r.before>=0 && r.before<=INT32_MAX &&
++            r.before+static_cast<int64_t>(r.count)>=0 &&
++            r.before+static_cast<int64_t>(r.count)<=INT32_MAX);
++    }
++    void Replay(const std::string& data)
++    {
++        std::istringstream in(data);
++        char kind{}; Row r;
++        if (!(in>>kind>>std::quoted(r.user)) || r.user.empty()) throw std::runtime_error("invalid trade receipt");
++        if (kind=='A')
++        {
++            uint32_t pos{};std::string extra;
++            if (!(in>>pos) || in>>extra || pos!=confirmed[r.user]+1 || pos>accounts[r.user].size())
++                throw std::runtime_error("invalid acknowledgement");
++            Confirmed(r.user,pos);
++        }
++        else if (kind=='T')
++        {
++            std::string extra;
++            if (!(in>>std::quoted(r.peer)>>std::quoted(r.plugin)>>r.base>>r.count))
++                throw std::runtime_error("invalid trade operation");
++            in>>std::ws;
++            if (!in.eof() && (!(in>>r.before) || in>>extra || r.before<0))
++                throw std::runtime_error("invalid trade checkpoint");
++            if (!ValidCounts(r) || r.peer.empty() || r.user==r.peer || r.plugin.empty() || !r.base || !r.count ||
+                 std::abs(static_cast<long long>(r.count))>9999 ||
+                 accounts[r.user].size()!=confirmed[r.user] || accounts[r.user].size()>=0xFFFFFE)
+                 throw std::runtime_error("invalid trade operation");
+diff --git a/Code/server/Services/CampaignAccess.h b/Code/server/Services/CampaignAccess.h
+new file mode 100644
+--- /dev/null
++++ b/Code/server/Services/CampaignAccess.h
+@@ -0,0 +1,11 @@
++#pragma once
++#include <CampaignIdentity.h>
++#include <CampaignReplication.h>
++struct World;
++struct Player;
++namespace CampaignAccess
++{
++CampaignReplication::Link& Authority();
++bool Admit(World&, Player&, const CampaignIdentity::Stamp&, std::string_view profile, std::string_view secret);
++uint64_t Character(const Player&);
++}
+diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJournal.cpp
+--- a/Code/server/Services/QuestJournal.cpp
++++ b/Code/server/Services/QuestJournal.cpp
+@@ -8,126 +8,136 @@
+ #include <QuestJournalDisk.h>
+ #include <CampaignReplication.h>
+ #include <CampaignIdentity.h>
+-#include <Messages/RequestCampaignPull.h>
+-#include <Messages/NotifyCampaignRecord.h>
+-#include <sstream>
+-#include <iomanip>
+-
+-namespace
+-{
+-CampaignReplication::Link campaignLink;
+-CampaignIdentity::Admission admission;
+-bool admissionLoaded{};
+-const std::filesystem::path kJournal{"config/CoopJournal"};
+-
+-std::string Field(const String& value)
+-{
+-    std::string out(value.begin(), value.end());
+-    for (auto& c : out)
+-        if (static_cast<unsigned char>(c) < 32)
+-            c = ' ';
+-    return out;
+-}
+-
+-void Flush(PartyService::Party& party)
+-{
+-    if (!party.JournalStream)
+-        party.JournalStream = QuestJournalDisk::CreateStream(kJournal);
+-    if (!party.JournalStream)
+-        return;
+-    // Limit recovery work per request after a transient disk failure.
+-    for (unsigned n = 0; n < 8 && party.JournalCommitted < party.JournalRows.size(); ++n)
+-    {
+-        const auto& row = party.JournalRows[party.JournalCommitted];
+-        if (!QuestJournalDisk::Store(kJournal, party.JournalStream, party.JournalCommitted + 1, {row.data(), row.size()}))
+-        {
+-            spdlog::error("Cannot commit co-op journal stream {} record {}", party.JournalStream, party.JournalCommitted + 1);
+-            break;
+-        }
+-        ++party.JournalCommitted;
+-    }
+-}
+-}
+-
+-void QuestService::RecordQuest(Player* player, const NotifyQuestUpdate& event) noexcept
+-{
+-    auto* party = m_world.GetPartyService().GetPlayerParty(player);
+-    if (!party)
+-        return;
+-    try
+-    {
+-        const auto& mods = m_world.ctx().at<ModsComponent>();
+-        std::string plugin;
+-        for (const auto* list : {&mods.GetStandardMods(), &mods.GetLiteMods()})
+-            for (const auto& item : *list)
+-                if (item.second.id == event.Id.ModId)
+-                    plugin = Field(item.first);
+-        const char* phase = event.Status == NotifyQuestUpdate::Started ? "start" :
+-            event.Status == NotifyQuestUpdate::Stopped ? "stop" : "stage";
+-        std::ostringstream row;
+-        row << "quest-v1" << '	' << plugin << '	' << std::hex << event.Id.BaseId << std::dec << '	'
+-            << phase << '	' << event.Stage << '	' << player->GetId() << '	' << Field(player->GetUsername());
+-        const auto data = row.str();
+-        party->JournalRows.emplace_back(data.c_str());
+-        Flush(*party);
+-    }
+-    catch (const std::exception& e) { spdlog::error("Writing co-op quest journal: {}", e.what()); }
+-}
+-
+-void QuestService::OnJournalRequest(const PacketEvent<RequestQuestJournal>& event) noexcept
+-{
+-    auto* party = m_world.GetPartyService().GetPlayerParty(event.pPlayer);
+-    if (!party || party->JournalRows.empty())
+-        return;
+-    try
+-    {
+-        Flush(*party);
+-        if (!party->JournalStream || !party->JournalCommitted)
+-            return;
+-        NotifyQuestJournal reply;
+-        reply.Stream = party->JournalStream;
+-        reply.Total = party->JournalCommitted;
+-        if (event.Packet.Stream != reply.Stream)
+-        {
+-            event.pPlayer->Send(reply); // announce stream identity before the client reads its durable cursor
+-            return;
+-        }
+-        for (uint32_t index = event.Packet.Sequence, n = 0; index < reply.Total && n < 8; ++index, ++n)
+-        {
+-            reply.Sequence = index + 1;
+-            reply.Row = party->JournalRows[index];
+-            event.pPlayer->Send(reply);
+-        }
+-    }
+-    catch (const std::exception& e) { spdlog::error("Serving co-op quest journal: {}", e.what()); }
+-}
+-
+-void QuestService::OnCampaignPull(const PacketEvent<RequestCampaignPull>& event) noexcept
+-{
+-    try
+-    {
+-        const auto& p=event.Packet;
+-        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64) return;
+-        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
+-        CampaignReplication::Reply reply;
+-        reply.Campaign=p.Campaign;reply.Nonce=p.Nonce;reply.Base=pull.Base;
+-        if (campaignLink.Start(true)==CampaignReplication::Link::Mode::Ready)
+-        {
+-            if (!admissionLoaded)
+-            {
+-                admissionLoaded=admission.Load(campaignLink.Root);
+-                if (!admissionLoaded) campaignLink.Fail();
+-            }
+-            std::vector<uint32_t> disconnected;
+-            for (const auto& [id,character]:admission.Active())
+-                if (!m_world.GetPlayerManager().GetById(id)) disconnected.push_back(id);
+-            for (auto id:disconnected) admission.Release(id);
+-            const CampaignIdentity::Stamp stamp{p.Campaign,p.Character,{p.SaveRevision,p.SaveTag}};
+-            if (admissionLoaded && pull.Profile==campaignLink.Profile &&
+-                CampaignIdentity::Known(campaignLink.Journal,campaignLink.Campaign,stamp) &&
+-                admission.Claim(event.pPlayer->GetId(),{p.Character,std::string(p.Credential.data(),p.Credential.size())}))
+-                reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
+-        }
++#include <Services/CampaignAccess.h>
++#include <Messages/RequestCampaignPull.h>
++#include <Messages/NotifyCampaignRecord.h>
++#include <sstream>
++#include <iomanip>
++
++namespace
++{
++CampaignReplication::Link campaignLink;
++CampaignIdentity::Admission admission;
++bool admissionLoaded{};
++const std::filesystem::path kJournal{"config/CoopJournal"};
++
++std::string Field(const String& value)
++{
++    std::string out(value.begin(), value.end());
++    for (auto& c : out)
++        if (static_cast<unsigned char>(c) < 32)
++            c = ' ';
++    return out;
++}
++
++void Flush(PartyService::Party& party)
++{
++    if (!party.JournalStream)
++        party.JournalStream = QuestJournalDisk::CreateStream(kJournal);
++    if (!party.JournalStream)
++        return;
++    // Limit recovery work per request after a transient disk failure.
++    for (unsigned n = 0; n < 8 && party.JournalCommitted < party.JournalRows.size(); ++n)
++    {
++        const auto& row = party.JournalRows[party.JournalCommitted];
++        if (!QuestJournalDisk::Store(kJournal, party.JournalStream, party.JournalCommitted + 1, {row.data(), row.size()}))
++        {
++            spdlog::error("Cannot commit co-op journal stream {} record {}", party.JournalStream, party.JournalCommitted + 1);
++            break;
++        }
++        ++party.JournalCommitted;
++    }
++}
++}
++
++CampaignReplication::Link& CampaignAccess::Authority() { campaignLink.Start(true); return campaignLink; }
++bool CampaignAccess::Admit(World& world, Player& player, const CampaignIdentity::Stamp& stamp, std::string_view profile, std::string_view secret)
++{
++    if (Authority().State()!=CampaignReplication::Link::Mode::Ready || profile!=campaignLink.Profile || secret.size()!=64)
++        return false;
++    if (!admissionLoaded)
++    {
++        admissionLoaded=admission.Load(campaignLink.Root);
++        if (!admissionLoaded) { campaignLink.Fail(); return false; }
++    }
++    std::vector<uint32_t> disconnected;
++    for (const auto& entry:admission.Active())
++        if (!world.GetPlayerManager().GetById(entry.first)) disconnected.push_back(entry.first);
++    for (auto id:disconnected) admission.Release(id);
++    return CampaignIdentity::Known(campaignLink.Journal,campaignLink.Campaign,stamp) &&
++        admission.Claim(player.GetId(),{stamp.Character,std::string(secret)});
++}
++uint64_t CampaignAccess::Character(const Player& player)
++{
++    const auto it=admission.Active().find(player.GetId());
++    return it==admission.Active().end()?0:it->second;
++}
++
++void QuestService::RecordQuest(Player* player, const NotifyQuestUpdate& event) noexcept
++{
++    auto* party = m_world.GetPartyService().GetPlayerParty(player);
++    if (!party)
++        return;
++    try
++    {
++        const auto& mods = m_world.ctx().at<ModsComponent>();
++        std::string plugin;
++        for (const auto* list : {&mods.GetStandardMods(), &mods.GetLiteMods()})
++            for (const auto& item : *list)
++                if (item.second.id == event.Id.ModId)
++                    plugin = Field(item.first);
++        const char* phase = event.Status == NotifyQuestUpdate::Started ? "start" :
++            event.Status == NotifyQuestUpdate::Stopped ? "stop" : "stage";
++        std::ostringstream row;
++        row << "quest-v1" << '	' << plugin << '	' << std::hex << event.Id.BaseId << std::dec << '	'
++            << phase << '	' << event.Stage << '	' << player->GetId() << '	' << Field(player->GetUsername());
++        const auto data = row.str();
++        party->JournalRows.emplace_back(data.c_str());
++        Flush(*party);
++    }
++    catch (const std::exception& e) { spdlog::error("Writing co-op quest journal: {}", e.what()); }
++}
++
++void QuestService::OnJournalRequest(const PacketEvent<RequestQuestJournal>& event) noexcept
++{
++    auto* party = m_world.GetPartyService().GetPlayerParty(event.pPlayer);
++    if (!party || party->JournalRows.empty())
++        return;
++    try
++    {
++        Flush(*party);
++        if (!party->JournalStream || !party->JournalCommitted)
++            return;
++        NotifyQuestJournal reply;
++        reply.Stream = party->JournalStream;
++        reply.Total = party->JournalCommitted;
++        if (event.Packet.Stream != reply.Stream)
++        {
++            event.pPlayer->Send(reply); // announce stream identity before the client reads its durable cursor
++            return;
++        }
++        for (uint32_t index = event.Packet.Sequence, n = 0; index < reply.Total && n < 8; ++index, ++n)
++        {
++            reply.Sequence = index + 1;
++            reply.Row = party->JournalRows[index];
++            event.pPlayer->Send(reply);
++        }
++    }
++    catch (const std::exception& e) { spdlog::error("Serving co-op quest journal: {}", e.what()); }
++}
++
++void QuestService::OnCampaignPull(const PacketEvent<RequestCampaignPull>& event) noexcept
++{
++    try
++    {
++        const auto& p=event.Packet;
++        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64) return;
++        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
++        CampaignReplication::Reply reply;
++        reply.Campaign=p.Campaign;reply.Nonce=p.Nonce;reply.Base=pull.Base;
++        const CampaignIdentity::Stamp stamp{p.Campaign,p.Character,{p.SaveRevision,p.SaveTag}};
++        if (CampaignAccess::Admit(m_world,*event.pPlayer,stamp,pull.Profile,{p.Credential.data(),p.Credential.size()}))
++            reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
+         NotifyCampaignRecord out;
+         out.Campaign=reply.Campaign;out.Nonce=reply.Nonce;out.BaseRevision=reply.Base.Revision;out.BaseTag=reply.Base.Tag;
+         out.TargetRevision=reply.Target.Revision;out.TargetTag=reply.Target.Tag;out.Total=reply.Total;
+diff --git a/Code/client/Services/CampaignAccess.h b/Code/client/Services/CampaignAccess.h
+new file mode 100644
+--- /dev/null
++++ b/Code/client/Services/CampaignAccess.h
+@@ -0,0 +1,19 @@
++#pragma once
++#include <CampaignIdentity.h>
++#include <CampaignReplication.h>
++struct World;
++namespace CampaignAccess
++{
++struct Identity
++{
++    CampaignIdentity::Stamp Save;
++    CampaignIdentity::Credential Credential;
++    std::string Profile;
++};
++CampaignReplication::Link::Mode Mode();
++std::optional<Identity> Current(World&);
++bool GameReady();
++bool TradeEnabled();
++bool ConfirmReceipt(World&, uint64_t stream, uint64_t savedStream, uint32_t cursor, uint32_t receipt,
++                    std::string_view plugin, uint32_t base, int count,int64_t before);
++}
+diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
+--- a/Code/client/Services/Generic/QuestJournal.cpp
++++ b/Code/client/Services/Generic/QuestJournal.cpp
+@@ -9,76 +9,110 @@
+ #include <QuestJournalDisk.h>
+ #include <CampaignReplication.h>
+ #include <CampaignIdentity.h>
+-#include <Services/PapyrusService.h>
+-#include <PlayerCharacter.h>
+-#include <Forms/TESGlobal.h>
+-#include <Games/TES.h>
+-#include <Interface/UI.h>
+-#include <cstdlib>
+-#include <Messages/RequestCampaignPull.h>
+-#include <Messages/NotifyCampaignRecord.h>
+-
+-namespace
+-{
+-CampaignReplication::Link campaignLink;
+-CampaignReplication::Pull pending;
+-CampaignIdentity::Stamp pendingSave;
+-bool enrollmentUsed{};
+-bool saveWarning{};
+-uint64_t nonce{};
+-std::chrono::steady_clock::time_point nextPull{};
+-bool SaveWorldReady()
+-{
+-    auto* p=PlayerCharacter::Get();
+-    auto* ui=UI::Get();
+-    static const BSFixedString main("Main Menu"), loading("Loading Menu");
+-    return p && p->parentCell && p->GetNiNode() && !p->IsDead() && ui &&
+-        !ui->GetMenuOpen(main) && !ui->GetMenuOpen(loading);
+-}
+-std::optional<CampaignIdentity::Stamp> ReadSave(World& world, const CampaignIdentity::Credential& credential, bool enroll)
+-{
+-    using namespace CampaignIdentity;
+-    if (!SaveWorldReady()) return {};
+-    auto* plugin=ModManager::Get()->GetByName("SkyrimCoopTrade.esp");
+-    if (!plugin || !plugin->IsLoaded()) return {};
+-    TESGlobal* fields[FieldCount]{};
+-    Fields values{};
+-    for (unsigned i=0;i<FieldCount;++i)
+-    {
+-        auto* f=TESForm::GetById(plugin->GetFormId(0x804+i));
+-        if (!f || static_cast<unsigned>(f->formType)!=9) return {};
+-        fields[i]=static_cast<TESGlobal*>(f);values[i]=fields[i]->f;
+-    }
+-    Stamp stamp;
+-    auto state=Decode(values,stamp);
+-    if (state==SaveState::Empty && enroll && !enrollmentUsed &&
+-        campaignLink.Journal.Current().Revision==0)
+-    {
+-        const auto* flag=std::getenv("STM_CAMPAIGN_ENROLL");
+-        if (!flag || std::string_view(flag)!="1") return {};
+-        enrollmentUsed=true; // at most one explicit enrollment attempt per process
+-        stamp={campaignLink.Campaign,credential.Character,campaignLink.Journal.Current()};
+-        auto encoded=Encode(stamp);
+-        const auto* method=world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue");
+-        if (!encoded || !method) return {};
+-        PapyrusFunction<void,TESGlobal,float> set(method);
+-        // Publish schema marker last. A partial initialization is invalid, not a new character.
+-        for (unsigned i=0;i<FieldCount;++i) set(fields[i],(*encoded)[i]);
+-        for (unsigned i=0;i<FieldCount;++i) values[i]=fields[i]->f;
+-        state=Decode(values,stamp);
+-        if (state==SaveState::Valid) spdlog::info("STM campaign save enrolled; save the game to persist its identity");
+-    }
+-    if (state!=SaveState::Valid || stamp.Campaign!=campaignLink.Campaign || stamp.Character!=credential.Character)
+-        return {};
+-    return stamp;
+-}
+-std::filesystem::path Mirror()
+-{
+-    auto* local = _wgetenv(L"LOCALAPPDATA");
+-    if (!local || !*local)
+-        throw std::runtime_error("LOCALAPPDATA is unavailable");
+-    return std::filesystem::path(local) / "SkyrimTogetherReborn" / "CoopJournal";
+-}
++#include <Services/CampaignAccess.h>
++#include <TradeLedger.h>
++#include <Services/PapyrusService.h>
++#include <PlayerCharacter.h>
++#include <Forms/TESGlobal.h>
++#include <Games/TES.h>
++#include <Interface/UI.h>
++#include <cstdlib>
++#include <Messages/RequestCampaignPull.h>
++#include <Messages/NotifyCampaignRecord.h>
++
++namespace
++{
++CampaignReplication::Link campaignLink;
++CampaignReplication::Pull pending;
++CampaignIdentity::Stamp pendingSave;
++bool enrollmentUsed{};
++bool saveWarning{};
++uint64_t nonce{};
++std::chrono::steady_clock::time_point nextPull{};
++bool SaveWorldReady()
++{
++    auto* p=PlayerCharacter::Get();
++    auto* ui=UI::Get();
++    static const BSFixedString main("Main Menu"), loading("Loading Menu");
++    return p && p->parentCell && p->GetNiNode() && !p->IsDead() && ui &&
++        !ui->GetMenuOpen(main) && !ui->GetMenuOpen(loading);
++}
++std::optional<CampaignIdentity::Stamp> ReadSave(World& world, const CampaignIdentity::Credential& credential, bool enroll)
++{
++    using namespace CampaignIdentity;
++    if (!SaveWorldReady()) return {};
++    auto* plugin=ModManager::Get()->GetByName("SkyrimCoopTrade.esp");
++    if (!plugin || !plugin->IsLoaded()) return {};
++    TESGlobal* fields[FieldCount]{};
++    Fields values{};
++    for (unsigned i=0;i<FieldCount;++i)
++    {
++        auto* f=TESForm::GetById(plugin->GetFormId(0x804+i));
++        if (!f || static_cast<unsigned>(f->formType)!=9) return {};
++        fields[i]=static_cast<TESGlobal*>(f);values[i]=fields[i]->f;
++    }
++    Stamp stamp;
++    auto state=Decode(values,stamp);
++    if (state==SaveState::Empty && enroll && !enrollmentUsed &&
++        campaignLink.Journal.Current().Revision==0)
++    {
++        const auto* flag=std::getenv("STM_CAMPAIGN_ENROLL");
++        if (!flag || std::string_view(flag)!="1") return {};
++        enrollmentUsed=true; // at most one explicit enrollment attempt per process
++        stamp={campaignLink.Campaign,credential.Character,campaignLink.Journal.Current()};
++        auto encoded=Encode(stamp);
++        const auto* method=world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue");
++        if (!encoded || !method) return {};
++        PapyrusFunction<void,TESGlobal,float> set(method);
++        // Publish schema marker last. A partial initialization is invalid, not a new character.
++        for (unsigned i=0;i<FieldCount;++i) set(fields[i],(*encoded)[i]);
++        for (unsigned i=0;i<FieldCount;++i) values[i]=fields[i]->f;
++        state=Decode(values,stamp);
++        if (state==SaveState::Valid) spdlog::info("STM campaign save enrolled; save the game to persist its identity");
++    }
++    if (state!=SaveState::Valid || stamp.Campaign!=campaignLink.Campaign || stamp.Character!=credential.Character)
++        return {};
++    return stamp;
++}
++std::filesystem::path Mirror()
++{
++    auto* local = _wgetenv(L"LOCALAPPDATA");
++    if (!local || !*local)
++        throw std::runtime_error("LOCALAPPDATA is unavailable");
++    return std::filesystem::path(local) / "SkyrimTogetherReborn" / "CoopJournal";
++}
++}
++
++CampaignReplication::Link::Mode CampaignAccess::Mode() { return campaignLink.Start(false); }
++bool CampaignAccess::GameReady() { return SaveWorldReady(); }
++bool CampaignAccess::TradeEnabled()
++{
++    using Mode=CampaignReplication::Link::Mode;
++    const auto mode=CampaignAccess::Mode();
++    if (mode==Mode::Disabled) return true;
++    const auto* flag=std::getenv("STM_CAMPAIGN_TRADE");
++    return mode==Mode::Ready && flag && std::string_view(flag)=="1";
++}
++bool CampaignAccess::ConfirmReceipt(World& world,uint64_t stream,uint64_t savedStream,uint32_t cursor,
++                                     uint32_t receipt,std::string_view plugin,uint32_t base,int count,int64_t before,std::string_view variant)
++{
++    try
++    {
++        const auto identity=Current(world);
++        if (!identity || stream!=identity->Save.Campaign) return false;
++        TradeLedger view(campaignLink.Journal,stream);
++        return view.MatchesReceipt(std::to_string(identity->Save.Character),savedStream,cursor,receipt,
++                                   std::string(plugin),base,count,before,std::string(variant));
++    }
++    catch (...) { return false; }
++}
++std::optional<CampaignAccess::Identity> CampaignAccess::Current(World& world)
++{
++    if (Mode()!=CampaignReplication::Link::Mode::Ready || !world.GetTransport().IsOnline()) return {};
++    const auto credential=CampaignIdentity::ReadCredential(campaignLink.Root);
++    const auto stamp=credential ? ReadSave(world,*credential,false) : std::nullopt;
++    if (!stamp || !CampaignIdentity::Known(campaignLink.Journal,campaignLink.Campaign,*stamp)) return {};
++    return Identity{*stamp,*credential,campaignLink.Profile};
+ }
+ 
+ void QuestService::PollCampaign(const UpdateEvent&) noexcept
+diff --git a/Code/encoding/Structs/PartyTrade.h b/Code/encoding/Structs/PartyTrade.h
+--- a/Code/encoding/Structs/PartyTrade.h
++++ b/Code/encoding/Structs/PartyTrade.h
+@@ -2,29 +2,36 @@
+ #include <Structs/GameId.h>
+ #include <TiltedCore/Serialization.hpp>
+ 
+-enum class TradeOp : uint8_t { Poll, Invite, Offer, Accept, Open, Close, Deposit, Take, Entry, Reset, Receipt, Error };
+-struct PartyTrade
+-{
+-    TradeOp Op{};
+-    uint32_t Peer{}, Session{}, Cursor{}, Count{};
+-    uint64_t Stream{};
+-    GameId Item{};
+-    TiltedPhoques::String Text{};
+-    bool operator==(const PartyTrade&) const noexcept = default;
+-    void Serialize(TiltedPhoques::Buffer::Writer& w) const noexcept
+-    {
+-        using S = TiltedPhoques::Serialization;
+-        w.WriteBits(static_cast<uint8_t>(Op),4);
+-        for (uint32_t x : {Peer,Session,Cursor,Count}) S::WriteVarInt(w,x);
+-        S::WriteVarInt(w,Stream);
+-        Item.Serialize(w);
+-        S::WriteString(w,Text);
+-    }
+-    void Deserialize(TiltedPhoques::Buffer::Reader& r) noexcept
+-    {
+-        using S = TiltedPhoques::Serialization;
+-        uint64_t raw{}; r.ReadBits(raw,4); Op=static_cast<TradeOp>(raw);
+-        for (auto* x : {&Peer,&Session,&Cursor,&Count}) *x=static_cast<uint32_t>(S::ReadVarInt(r));
+-        Stream=S::ReadVarInt(r); Item.Deserialize(r); Text=S::ReadString(r);
++enum class TradeOp : uint8_t { Poll, Invite, Offer, Accept, Open, Close, Deposit, Take, Entry, Reset, Receipt, Error, Ready, RecoveryConflict };
++struct PartyTrade
++{
++    TradeOp Op{};
++    uint32_t Peer{}, Session{}, Cursor{}, Count{};
++    uint64_t Stream{};
++    GameId Item{};
++    TiltedPhoques::String Text{};
++    uint64_t Campaign{}, Character{}, SaveTag{};
++    uint32_t SaveRevision{}, BeforePlusOne{}; // zero = no checkpoint
++    TiltedPhoques::String Profile{}, Credential{};
++    bool operator==(const PartyTrade&) const noexcept = default;
++    void Serialize(TiltedPhoques::Buffer::Writer& w) const noexcept
++    {
++        using S = TiltedPhoques::Serialization;
++        w.WriteBits(static_cast<uint8_t>(Op),4);
++        for (uint32_t x : {Peer,Session,Cursor,Count}) S::WriteVarInt(w,x);
++        S::WriteVarInt(w,Stream);
++        Item.Serialize(w);
++        S::WriteString(w,Text);
++        S::WriteVarInt(w,Campaign);S::WriteVarInt(w,Character);S::WriteVarInt(w,SaveTag);S::WriteVarInt(w,SaveRevision);
++        S::WriteString(w,Profile);S::WriteString(w,Credential);S::WriteVarInt(w,BeforePlusOne);
++    }
++    void Deserialize(TiltedPhoques::Buffer::Reader& r) noexcept
++    {
++        using S = TiltedPhoques::Serialization;
++        uint64_t raw{}; r.ReadBits(raw,4); Op=static_cast<TradeOp>(raw);
++        for (auto* x : {&Peer,&Session,&Cursor,&Count}) *x=static_cast<uint32_t>(S::ReadVarInt(r));
++        Stream=S::ReadVarInt(r); Item.Deserialize(r); Text=S::ReadString(r);
++        Campaign=S::ReadVarInt(r);Character=S::ReadVarInt(r);SaveTag=S::ReadVarInt(r);SaveRevision=static_cast<uint32_t>(S::ReadVarInt(r));
++        Profile=S::ReadString(r);Credential=S::ReadString(r);BeforePlusOne=static_cast<uint32_t>(S::ReadVarInt(r));
+     }
+ };
+diff --git a/Code/server/Services/PartyTrade.cpp b/Code/server/Services/PartyTrade.cpp
+--- a/Code/server/Services/PartyTrade.cpp
++++ b/Code/server/Services/PartyTrade.cpp
+@@ -5,124 +5,185 @@
+ #include <Messages/RequestPartyTrade.h>
+ #include <Messages/NotifyPartyTrade.h>
+ #include <TradeLedger.h>
+-
+-namespace
+-{
+-using Clock=std::chrono::steady_clock;
+-using namespace std::chrono_literals;
+-struct Session {uint32_t a,b; bool open{}; Clock::time_point expires;};
+-std::map<uint32_t,Session> sessions;
+-uint32_t serial{};
+-TradeLedger ledger("config/CoopTrade");
+-std::string Name(Player& player) {return {player.GetUsername().begin(),player.GetUsername().end()};}
+-bool Near(World& world, Player& a, Player& b)
+-{
+-    if (!a.GetCharacter() || !b.GetCharacter() || !a.GetParty().JoinedPartyId ||
+-        a.GetParty().JoinedPartyId!=b.GetParty().JoinedPartyId ||
+-        !a.GetCellComponent().IsInRange(b.GetCellComponent(),false)) return false;
+-    auto* p=world.try_get<MovementComponent>(*a.GetCharacter());
+-    auto* q=world.try_get<MovementComponent>(*b.GetCharacter());
+-    return p && q && glm::distance(p->Position,q->Position)<=420.f;
+-}
+-void Send(Player& to, PartyTrade event) {NotifyPartyTrade n; n.Event=std::move(event); to.Send(n);}
+-std::string Plugin(World& w,uint32_t mod)
+-{
+-    auto& mods=w.ctx().at<ModsComponent>();
+-    for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
+-        for (const auto& [name,entry]:*list) if (entry.id==mod) return {name.begin(),name.end()};
+-    return {};
+-}
+-void ShowStock(Player& p,Player& q,uint32_t session)
+-{
+-    Send(p,{TradeOp::Reset,q.GetId(),session});
+-    for (const auto& [item,count]:ledger.Stock(Name(p),Name(q)))
+-    {
+-        if (count<=0) continue;
+-        PartyTrade event{TradeOp::Entry,q.GetId(),session};
+-        event.Count=static_cast<uint32_t>(std::min<int64_t>(count,9999));
+-        event.Item.BaseId=item.second; event.Text=item.first.c_str(); Send(p,event);
+-    }
+-}
+-}
+-
+-void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexcept
+-{
+-    try
+-    {
+-        auto& p=*packet.pPlayer; const auto& e=packet.Packet.Event; const auto id=p.GetId();
+-        if (!p.GetCharacter()) return;
+-        const auto user=Name(p);
+-        if (user.empty()) return;
+-        for (auto* other:m_world.GetPlayerManager())
+-            if (other!=&p && other->GetUsername()==p.GetUsername()) return;
+-        const auto uuid=ledger.Stream();
+-        auto next=[&] {
+-            const auto& log=ledger.History(user);
+-            if (e.Cursor<log.size())
+-            {
+-                const auto& r=log[e.Cursor];
+-                PartyTrade op{TradeOp::Receipt,static_cast<uint32_t>(r.count>0),0,e.Cursor+1,static_cast<uint32_t>(std::abs(r.count)),uuid};
+-                op.Text=r.plugin.c_str(); op.Item.BaseId=r.base; Send(p,op);
+-            }
+-        };
+-        if (e.Stream && e.Stream!=uuid) return;
+-        if (e.Op==TradeOp::Poll)
+-        {
+-            if (!ledger.Ack(user,e.Cursor)) return;
+-            next();
+-        }
+-        const auto now=Clock::now();
+-        for (auto it=sessions.begin();it!=sessions.end();)
+-        {
+-            auto* a=m_world.GetPlayerManager().GetById(it->second.a);
+-            auto* b=m_world.GetPlayerManager().GetById(it->second.b);
+-            if (!a || !b || now>=it->second.expires || !Near(m_world,*a,*b))
+-            {
+-                if (a) Send(*a,{TradeOp::Close,0,it->first});
+-                if (b) Send(*b,{TradeOp::Close,0,it->first});
+-                it=sessions.erase(it);
+-            } else ++it;
+-        }
+-        if (e.Op==TradeOp::Invite)
+-        {
+-            auto* other=m_world.GetPlayerManager().GetById(e.Peer);
+-            if (!other || other==&p || Name(*other)==user || !Near(m_world,p,*other)) return;
+-            for (const auto& [_,s]:sessions)
+-                if (s.a==id || s.b==id || s.a==e.Peer || s.b==e.Peer) return;
+-            if (!++serial) ++serial;
+-            sessions[serial]={id,e.Peer,false,now+30s};
+-            Send(*other,{TradeOp::Offer,id,serial,0,0,uuid,{},p.GetUsername()});
+-            return;
+-        }
+-        auto found=sessions.find(e.Session);
+-        if (found==sessions.end()) return;
+-        auto& s=found->second;
+-        if (id!=s.a && id!=s.b) return;
+-        auto& peer=*m_world.GetPlayerManager().GetById(id==s.a?s.b:s.a);
+-        if (e.Op==TradeOp::Close)
+-        {
+-            Send(p,{TradeOp::Close,0,e.Session}); Send(peer,{TradeOp::Close,0,e.Session}); sessions.erase(found); return;
+-        }
+-        if (e.Op==TradeOp::Accept && id==s.b && !s.open)
+-        {
+-            s.open=true;
+-            Send(p,{TradeOp::Open,peer.GetId(),e.Session,0,0,uuid,{},peer.GetUsername()});
+-            Send(peer,{TradeOp::Open,id,e.Session,0,0,uuid,{},p.GetUsername()});
+-        }
+-        if (!s.open) return;
+-        s.expires=now+20s;
+-        if (e.Op==TradeOp::Deposit || e.Op==TradeOp::Take)
+-        {
+-            if (!e.Count || e.Count>9999 || !e.Item.BaseId) return;
+-            const auto plugin=Plugin(m_world,e.Item.ModId);
+-            bool ok=ledger.Ack(user,e.Cursor) && ledger.Commit({user,Name(peer),plugin,e.Item.BaseId,(e.Op==TradeOp::Take?1:-1)*int(e.Count)},e.Cursor);
+-            if (!ok) Send(p,{TradeOp::Error,0,e.Session});
+-            next();
+-        }
+-        if (e.Op==TradeOp::Poll || e.Op==TradeOp::Accept || e.Op==TradeOp::Deposit || e.Op==TradeOp::Take)
+-        {
+-            ShowStock(p,peer,e.Session);
+-            if (e.Op!=TradeOp::Poll) ShowStock(peer,p,e.Session);
++#include <Services/CampaignAccess.h>
++#include <memory>
++#include <cstdlib>
++
++namespace
++{
++using Clock=std::chrono::steady_clock;
++using namespace std::chrono_literals;
++struct Session {uint32_t a,b; bool open{}; Clock::time_point expires;};
++std::map<uint32_t,Session> sessions;
++uint32_t serial{};
++TradeLedger legacy("config/CoopTrade");
++std::unique_ptr<TradeLedger> persistent;
++TradeLedger& Ledger()
++{
++    auto& link=CampaignAccess::Authority();
++    using Mode=CampaignReplication::Link::Mode;
++    if (link.State()==Mode::Disabled) return legacy;
++    if (link.State()!=Mode::Ready) throw std::runtime_error("campaign storage unavailable");
++    const auto* flag=std::getenv("STM_CAMPAIGN_TRADE");
++    if (!flag || std::string_view(flag)!="1") throw std::runtime_error("experimental campaign trade disabled");
++    // Until an explicit migration is implemented, do not switch an existing
++    // legacy account to a fresh stream. Keep its files untouched.
++    if (std::filesystem::exists("config/CoopTrade") && !std::filesystem::is_empty("config/CoopTrade"))
++        throw std::runtime_error("legacy trade history requires migration");
++    if (!persistent) persistent=std::make_unique<TradeLedger>(link.Journal,link.Campaign);
++    return *persistent;
++}
++std::string Name(Player& player)
++{
++    if (CampaignAccess::Authority().State()==CampaignReplication::Link::Mode::Disabled)
++        return {player.GetUsername().begin(),player.GetUsername().end()};
++    const auto id=CampaignAccess::Character(player);
++    return id?std::to_string(id):std::string{};
++}
++bool Near(World& world, Player& a, Player& b)
++{
++    if (!a.GetCharacter() || !b.GetCharacter() || Name(a).empty() || Name(b).empty() ||
++        !a.GetCellComponent().IsInRange(b.GetCellComponent(),false)) return false;
++    auto* p=world.try_get<MovementComponent>(*a.GetCharacter());
++    auto* q=world.try_get<MovementComponent>(*b.GetCharacter());
++    return p && q && glm::distance(p->Position,q->Position)<=420.f;
++}
++void Send(Player& to, PartyTrade event)
++{
++    auto& link=CampaignAccess::Authority();
++    if (link.State()!=CampaignReplication::Link::Mode::Disabled)
++    {
++        event.Campaign=link.Campaign;
++        event.Character=CampaignAccess::Character(to);
++    }
++    NotifyPartyTrade n; n.Event=std::move(event); to.Send(n);
++}
++std::string Plugin(World& w,uint32_t mod)
++{
++    auto& mods=w.ctx().at<ModsComponent>();
++    for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
++        for (const auto& [name,entry]:*list) if (entry.id==mod) return {name.begin(),name.end()};
++    return {};
++}
++void ShowStock(TradeLedger& ledger,Player& p,Player& q,uint32_t session)
++{
++    Send(p,{TradeOp::Reset,q.GetId(),session});
++    for (const auto& [item,count]:ledger.Stock(Name(p),Name(q)))
++    {
++        if (count<=0) continue;
++        PartyTrade event{TradeOp::Entry,q.GetId(),session};
++        event.Count=static_cast<uint32_t>(std::min<int64_t>(count,9999));
++        event.Item.BaseId=item.second; event.Text=item.first.c_str(); Send(p,event);
++    }
++}
++}
++
++void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexcept
++{
++    try
++    {
++        auto& p=*packet.pPlayer; const auto& e=packet.Packet.Event; const auto id=p.GetId();
++        if (!p.GetCharacter()) return;
++        auto& link=CampaignAccess::Authority();
++        const bool campaign=link.State()!=CampaignReplication::Link::Mode::Disabled;
++        if (campaign)
++        {
++            const CampaignIdentity::Stamp stamp{e.Campaign,e.Character,{e.SaveRevision,e.SaveTag}};
++            if (!CampaignAccess::Admit(m_world,p,stamp,{e.Profile.data(),e.Profile.size()},{e.Credential.data(),e.Credential.size()})) return;
++        }
++        else if (e.Campaign || e.Character || !e.Credential.empty()) return;
++        const auto user=Name(p);
++        if (user.empty()) return;
++        if (!campaign)
++            for (auto* other:m_world.GetPlayerManager())
++                if (other!=&p && other->GetUsername()==p.GetUsername()) return;
++        auto& ledger=Ledger();
++        const auto uuid=ledger.Stream();
++        auto next=[&] {
++            const auto& log=ledger.History(user);
++            if (e.Cursor<log.size())
++            {
++                const auto& r=log[e.Cursor];
++                PartyTrade op{TradeOp::Receipt,static_cast<uint32_t>(r.count>0),0,e.Cursor+1,static_cast<uint32_t>(std::abs(r.count)),uuid};
++                op.Text=r.plugin.c_str(); op.Item.BaseId=r.base;
++                if (r.before>=0) op.BeforePlusOne=static_cast<uint32_t>(r.before+1);
++                Send(p,op);
++            }
++        };
++        if (e.Op!=TradeOp::Close && !ledger.AcceptCursor(user,e.Stream,e.Cursor))
++        { Send(p,{TradeOp::RecoveryConflict,0,e.Session,e.Cursor,0,uuid});return; }
++        if (e.Op==TradeOp::Poll)
++        {
++            if (!ledger.Ack(user,e.Cursor)) return;
++            if (e.Cursor<ledger.History(user).size())
++            {
++                // A stale save receives one receipt at a time. Ack of an already
++                // confirmed receipt is a no-op and never credits escrow again.
++                next();
++                return;
++            }
++            Send(p,{TradeOp::Ready,0,e.Session,e.Cursor,0,uuid});
++        }
++        else if (e.Op!=TradeOp::Close && e.Cursor<ledger.History(user).size())
++        {
++            next();
++            return;
++        }
++        const auto now=Clock::now();
++        for (auto it=sessions.begin();it!=sessions.end();)
++        {
++            auto* a=m_world.GetPlayerManager().GetById(it->second.a);
++            auto* b=m_world.GetPlayerManager().GetById(it->second.b);
++            if (!a || !b || now>=it->second.expires || !Near(m_world,*a,*b))
++            {
++                if (a) Send(*a,{TradeOp::Close,0,it->first});
++                if (b) Send(*b,{TradeOp::Close,0,it->first});
++                it=sessions.erase(it);
++            } else ++it;
++        }
++        if (e.Op==TradeOp::Invite)
++        {
++            auto* other=m_world.GetPlayerManager().GetById(e.Peer);
++            if (!other || other==&p || Name(*other)==user || !Near(m_world,p,*other)) return;
++            for (const auto& [_,s]:sessions)
++                if (s.a==id || s.b==id || s.a==e.Peer || s.b==e.Peer) return;
++            if (!++serial) ++serial;
++            sessions[serial]={id,e.Peer,false,now+30s};
++            Send(*other,{TradeOp::Offer,id,serial,0,0,uuid,{},p.GetUsername()});
++            return;
++        }
++        auto found=sessions.find(e.Session);
++        if (found==sessions.end()) return;
++        auto& s=found->second;
++        if (id!=s.a && id!=s.b) return;
++        auto& peer=*m_world.GetPlayerManager().GetById(id==s.a?s.b:s.a);
++        if (e.Op==TradeOp::Close)
++        {
++            Send(p,{TradeOp::Close,0,e.Session}); Send(peer,{TradeOp::Close,0,e.Session}); sessions.erase(found); return;
++        }
++        if (e.Op==TradeOp::Accept && id==s.b && !s.open)
++        {
++            s.open=true;
++            Send(p,{TradeOp::Open,peer.GetId(),e.Session,0,0,uuid,{},peer.GetUsername()});
++            Send(peer,{TradeOp::Open,id,e.Session,0,0,uuid,{},p.GetUsername()});
++        }
++        if (!s.open) return;
++        s.expires=now+20s;
++        if (e.Op==TradeOp::Deposit || e.Op==TradeOp::Take)
++        {
++            if (!e.Count || e.Count>9999 || !e.Item.BaseId) return;
++            const auto plugin=Plugin(m_world,e.Item.ModId);
++            if (campaign && (!e.BeforePlusOne || e.BeforePlusOne>0x80000000u))
++            { Send(p,{TradeOp::Error,0,e.Session});return; }
++            const int64_t before=campaign?static_cast<int64_t>(e.BeforePlusOne)-1:-1;
++            bool ok=ledger.Ack(user,e.Cursor) && ledger.Commit({user,Name(peer),plugin,e.Item.BaseId,(e.Op==TradeOp::Take?1:-1)*int(e.Count),before},e.Cursor);
++            if (!ok) Send(p,{TradeOp::Error,0,e.Session});
++            next();
++        }
++        if (e.Op==TradeOp::Poll || e.Op==TradeOp::Accept || e.Op==TradeOp::Deposit || e.Op==TradeOp::Take)
++        {
++            ShowStock(ledger,p,peer,e.Session);
++            if (e.Op!=TradeOp::Poll) ShowStock(ledger,peer,p,e.Session);
+         }
+     }
+     catch(const std::exception& ex) {spdlog::error("Co-op trade: {}",ex.what()); Send(*packet.pPlayer,{TradeOp::Error,0,packet.Packet.Event.Session});}
+diff --git a/Code/client/Services/Generic/PartyTrade.cpp b/Code/client/Services/Generic/PartyTrade.cpp
+--- a/Code/client/Services/Generic/PartyTrade.cpp
++++ b/Code/client/Services/Generic/PartyTrade.cpp
+@@ -3,200 +3,308 @@
+ #include <Services/OverlayService.h>
+ #include <Services/OverlayClient.h>
+ #include <Services/PapyrusService.h>
+-#include <Services/PartyService.h>
+-#include <OverlayApp.hpp>
+-#include <include/cef_parser.h>
+-#include <Messages/RequestPartyTrade.h>
+-#include <Messages/NotifyPartyTrade.h>
+-#include <PlayerCharacter.h>
+-#include <Forms/TESGlobal.h>
+-#include <Games/TES.h>
+-#include <ExtraData/ExtraContainerChanges.h>
+-#include <Games/ActorExtension.h>
+-#include <Utils.h>
+-#include <Interface/UI.h>
+-#include <map>
+-#include <set>
+-
+-namespace
+-{
+-using Clock=std::chrono::steady_clock;
+-using namespace std::chrono_literals;
+-struct Wallet
+-{
+-    TESGlobal* fields[4]{};
+-    const void* setter{};
+-    bool Load(World& world)
+-    {
+-        auto* plugin=ModManager::Get()->GetByName("SkyrimCoopTrade.esp");
+-        if (!plugin || !plugin->IsLoaded()) return false;
+-        for (unsigned i=0;i<4;++i)
+-        {
+-            auto* f=TESForm::GetById(plugin->GetFormId(0x800+i));
+-            if (!f || static_cast<unsigned>(f->formType)!=9) return false;
+-            fields[i]=static_cast<TESGlobal*>(f);
+-        }
+-        setter=world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue");
+-        return setter!=nullptr;
+-    }
+-    uint64_t Stream() const {return uint64_t(fields[0]->f) | (uint64_t(fields[1]->f)<<22) | (uint64_t(fields[2]->f)<<44);}
+-    uint32_t Cursor() const {return static_cast<uint32_t>(fields[3]->f);}
+-    void Write(uint64_t stream, uint32_t cursor)
+-    {
+-        PapyrusFunction<void,TESGlobal,float> set(setter);
+-        if (!Stream()) for (unsigned i=0;i<3;++i) set(fields[i],float((stream>>(22*i))&0x3FFFFF));
+-        set(fields[3],float(cursor));
+-    }
+-};
+-uint32_t session{},peer{};
+-bool tradeOpen{}, ownsUI{}, dirty{};
+-std::string partner;
+-Clock::time_point pollAt{};
+-std::map<uint32_t,int> buffer;
+-void Send(PartyTrade e)
+-{
+-    RequestPartyTrade m; m.Event=std::move(e); World::Get().GetTransport().Send(m);
+-}
+-std::set<uint32_t> Unsuitable(PlayerCharacter& p)
+-{
+-    std::set<uint32_t> bad;
+-    auto* changes=p.GetContainerChanges();
+-    if (!changes || !changes->entries) return bad;
+-    for (auto* e:*changes->entries)
+-    {
+-        if (!e || !e->form) continue;
+-        if (e->IsQuestObject()) {bad.insert(e->form->formID);continue;}
+-        if (!e->dataList) continue;
+-        for (auto* list:*e->dataList)
+-        {
+-            if (!list) continue;
+-            list->lock.LockForRead();
+-            bool special=false;
+-            for (auto* x=list->data;x;x=x->next)
+-                if (x->GetType()!=ExtraDataType::Count) {special=true;break;}
+-            list->lock.UnlockRead();
+-            if (special) {bad.insert(e->form->formID);break;}
+-        }
+-    }
+-    return bad;
+-}
+-std::map<uint32_t,int> Pocket(World& world, PlayerCharacter& p)
+-{
+-    std::map<uint32_t,int> items;
+-    const auto bad=Unsuitable(p);
+-    for (const auto& e:p.GetInventory().Entries)
+-    {
+-        const auto id=world.GetModSystem().GetGameId(e.BaseId);
+-        if (id && (id>>24)!=0xFF && e.Count>0 && !e.ContainsExtraData() && !bad.count(id))
+-            items[id]+=e.Count;
+-    }
+-    return items;
+-}
+-CefString Rows(const std::map<uint32_t,int>& items)
+-{
+-    auto list=CefListValue::Create();
+-    for (const auto& [id,count]:items)
+-    {
+-        auto* f=TESForm::GetById(id);
+-        const char* label=f?f->GetName():nullptr;
+-        if (!label || !*label || count<=0) continue;
+-        auto row=CefDictionaryValue::Create();
+-        row->SetDouble("id",id); row->SetString("name",label); row->SetInt("count",count);
+-        list->SetDictionary(list->GetSize(),row);
+-    }
+-    auto value=CefValue::Create(); value->SetList(list); return CefWriteJSON(value,JSON_WRITER_DEFAULT);
+-}
+-}
+-
+-uint32_t OverlayService::TradePeer(uint32_t form) const noexcept
+-{
+-    if (!form || !m_world.GetPartyService().IsInParty()) return UINT32_MAX;
+-    auto view=m_world.view<PlayerComponent,FormIdComponent>();
+-    const auto& members=m_world.GetPartyService().GetPartyMembers();
+-    for (auto e:view)
+-        if (view.get<FormIdComponent>(e).Id==form)
+-        {
+-            const auto id=view.get<PlayerComponent>(e).Id;
+-            if (id!=m_transport.GetLocalPlayerId() && std::find(members.begin(),members.end(),id)!=members.end()) return id;
+-        }
+-    return UINT32_MAX;
+-}
+-bool OverlayService::TryTrade(uint32_t form) noexcept
+-{
+-    const auto id=TradePeer(form);
+-    if (id==UINT32_MAX) return false;
+-    Wallet w;
+-    if (!w.Load(m_world)) Utils::ShowHudMessage("Для обмена включите SkyrimCoopTrade.esp.");
+-    else if (!session && !m_active) Send({TradeOp::Invite,id,0,w.Cursor(),0,w.Stream()});
+-    return true;
+-}
+-void OverlayService::ClearTrade() noexcept
+-{
+-    if (session && m_pOverlay) m_pOverlay->ExecuteAsync("hideTrade");
+-    if (ownsUI && m_gameOverlayClient && GetActive()) m_gameOverlayClient->SetUIVisible(false);
+-    session=peer=0; tradeOpen=ownsUI=dirty=false; buffer.clear(); partner.clear(); pollAt={};
+-}
+-void OverlayService::TradeAction(uint32_t token,int action,uint32_t id,uint32_t count) noexcept
+-{
+-    if (!session || session!=token) return;
+-    Wallet w;
+-    if (action==0) {Send({TradeOp::Close,peer,session}); ClearTrade();return;}
+-    if (!w.Load(m_world)) return;
+-    PartyTrade e{TradeOp::Accept,peer,session,w.Cursor(),count,w.Stream()};
+-    if (action==1 && !tradeOpen) {Send(e);return;}
+-    if (!tradeOpen || (action!=2 && action!=3) || !count || count>9999) return;
+-    auto* p=PlayerCharacter::Get(); if (!p) return;
+-    if (action==2 && Pocket(m_world,*p)[id]<static_cast<int>(count)) return;
+-    if (action==3 && (!buffer.count(id) || buffer[id]<static_cast<int>(count))) return;
+-    if (!m_world.GetModSystem().GetServerModId(id,e.Item)) return;
+-    e.Op=action==2?TradeOp::Deposit:TradeOp::Take; Send(e);
+-}
+-void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
+-{
+-    auto* p=PlayerCharacter::Get();
+-    if (!m_inGame || !p || !p->parentCell || !m_pOverlay || !m_gameOverlayClient) return;
+-    const auto& e=msg.Event;
+-    Wallet w; if (!w.Load(m_world)) return;
+-    if (e.Stream && w.Stream() && w.Stream()!=e.Stream) {Utils::ShowHudMessage("Обмен привязан к другому журналу сервера.");return;}
+-    if (e.Op==TradeOp::Receipt)
+-    {
+-        if (!e.Stream || e.Cursor!=w.Cursor()+1 || !e.Count || e.Count>9999 || !e.Item.BaseId || p->IsDead() || !p->GetNiNode()) return;
+-        auto* mod=ModManager::Get()->GetByName(e.Text.c_str());
+-        if (!mod || !mod->IsLoaded()) return;
+-        const auto id=mod->GetFormId(e.Item.BaseId);
+-        auto* form=TESForm::GetById(id);
+-        if (!form || !Cast<TESBoundObject>(form)) return;
+-        const int count=(e.Peer?1:-1)*int(e.Count);
+-        if (count<0 && Pocket(m_world,*p)[id]<-count) return;
+-        Inventory::Entry item{};
+-        if (!m_world.GetModSystem().GetServerModId(id,item.BaseId)) return;
+-        const auto before=p->GetItemCountInInventory(form);
+-        item.Count=count; p->AddOrRemoveItem(item,true);
+-        if (p->GetItemCountInInventory(form)!=before+count) {spdlog::error("Unexpected inventory count applying trade receipt {}",e.Cursor);return;}
+-        w.Write(e.Stream,e.Cursor); pollAt={}; return;
+-    }
+-    if (e.Op==TradeOp::Error) {Utils::ShowHudMessage("Сервер не подтвердил операцию обмена.");return;}
+-    if (e.Op==TradeOp::Offer || e.Op==TradeOp::Open)
+-    {
+-        if ((session && session!=e.Session) || !m_world.GetPartyService().IsInParty() || m_promptOpen || m_showingProgress || m_observerCamera || (GetActive() && !ownsUI))
+-        {Send({TradeOp::Close,e.Peer,e.Session});return;}
+-        session=e.Session;peer=e.Peer;partner=e.Text.c_str();tradeOpen=e.Op==TradeOp::Open;
+-        ownsUI=true; m_gameOverlayClient->SetUIVisible(true);
+-    }
+-    else if (!session || e.Session!=session) return;
+-    else if (e.Op==TradeOp::Close) {ClearTrade();return;}
+-    else if (e.Op==TradeOp::Reset) buffer.clear();
+-    else if (e.Op==TradeOp::Entry)
+-    {
+-        auto* mod=ModManager::Get()->GetByName(e.Text.c_str());
+-        if (mod && mod->IsLoaded()) buffer[mod->GetFormId(e.Item.BaseId)]=int(e.Count);
+-    }
+-    dirty=true;
+-}
+-void OverlayService::UpdateTrade() noexcept
+-{
+-    if (!m_transport.IsConnected() || !m_inGame || !PlayerCharacter::Get() || !PlayerCharacter::Get()->GetNiNode()) return;
+-    if (session && (!GetActive() || !m_world.GetPartyService().IsInParty()))
++#include <Services/CampaignAccess.h>
++#include <cmath>
++#include <TradeLedger.h>
++#include <Services/PartyService.h>
++#include <OverlayApp.hpp>
++#include <include/cef_parser.h>
++#include <Messages/RequestPartyTrade.h>
++#include <Messages/NotifyPartyTrade.h>
++#include <PlayerCharacter.h>
++#include <Forms/TESGlobal.h>
++#include <Games/TES.h>
++#include <ExtraData/ExtraContainerChanges.h>
++#include <Games/ActorExtension.h>
++#include <Utils.h>
++#include <Interface/UI.h>
++#include <map>
++#include <set>
++
++namespace
++{
++using Clock=std::chrono::steady_clock;
++using namespace std::chrono_literals;
++struct Wallet
++{
++    TESGlobal* fields[4]{};
++    const void* setter{};
++    bool Load(World& world)
++    {
++        auto* plugin=ModManager::Get()->GetByName("SkyrimCoopTrade.esp");
++        if (!plugin || !plugin->IsLoaded()) return false;
++        for (unsigned i=0;i<4;++i)
++        {
++            auto* f=TESForm::GetById(plugin->GetFormId(0x800+i));
++            if (!f || static_cast<unsigned>(f->formType)!=9) return false;
++            fields[i]=static_cast<TESGlobal*>(f);
++            const auto value=fields[i]->f;
++            const auto limit=i==2?1048575.f:i==3?16777214.f:4194303.f;
++            if (!std::isfinite(value) || value<0 || value>limit || std::floor(value)!=value) return false;
++        }
++        if (!Stream() && Cursor()) return false;
++        setter=world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue");
++        return setter!=nullptr;
++    }
++    uint64_t Stream() const {return uint64_t(fields[0]->f) | (uint64_t(fields[1]->f)<<22) | (uint64_t(fields[2]->f)<<44);}
++    uint32_t Cursor() const {return static_cast<uint32_t>(fields[3]->f);}
++    bool Write(uint64_t stream, uint32_t cursor)
++    {
++        PapyrusFunction<void,TESGlobal,float> set(setter);
++        if (!Stream()) for (unsigned i=0;i<3;++i) set(fields[i],float((stream>>(22*i))&0x3FFFFF));
++        set(fields[3],float(cursor));
++        return Stream()==stream && Cursor()==cursor;
++    }
++};
++uint32_t session{},peer{};
++bool tradeOpen{}, ownsUI{}, dirty{}, receiptFailure{}, walletReady{};
++bool receiptFailureCampaign{};
++uint64_t readyStream{};
++uint32_t readyCursor{};
++uint32_t lastConflict=UINT32_MAX;
++std::string partner;
++Clock::time_point pollAt{};
++std::map<uint32_t,int> buffer;
++void Send(PartyTrade e)
++{
++    auto& world=World::Get();
++    if (receiptFailure || !world.GetTransport().IsOnline() || !CampaignAccess::GameReady() || !CampaignAccess::TradeEnabled()) return;
++    using Mode=CampaignReplication::Link::Mode;
++    if (CampaignAccess::Mode()!=Mode::Disabled)
++    {
++        const auto identity=CampaignAccess::Current(world);
++        if (!identity || (e.Stream && e.Stream!=identity->Save.Campaign)) return;
++        e.Campaign=identity->Save.Campaign;e.Character=identity->Save.Character;
++        e.SaveTag=identity->Save.Applied.Tag;e.SaveRevision=identity->Save.Applied.Revision;
++        e.Profile=identity->Profile.c_str();e.Credential=identity->Credential.Secret.c_str();
++    }
++    RequestPartyTrade m; m.Event=std::move(e); world.GetTransport().Send(m);
++}
++std::set<uint32_t> Unsuitable(PlayerCharacter& p)
++{
++    std::set<uint32_t> bad;
++    auto* changes=p.GetContainerChanges();
++    if (!changes || !changes->entries) return bad;
++    for (auto* e:*changes->entries)
++    {
++        if (!e || !e->form) continue;
++        if (e->IsQuestObject()) {bad.insert(e->form->formID);continue;}
++        if (!e->dataList) continue;
++        for (auto* list:*e->dataList)
++        {
++            if (!list) continue;
++            list->lock.LockForRead();
++            bool special=false;
++            for (auto* x=list->data;x;x=x->next)
++                if (x->GetType()!=ExtraDataType::Count) {special=true;break;}
++            list->lock.UnlockRead();
++            if (special) {bad.insert(e->form->formID);break;}
++        }
++    }
++    return bad;
++}
++std::map<uint32_t,int> Pocket(World& world, PlayerCharacter& p)
++{
++    std::map<uint32_t,int> items;
++    const auto bad=Unsuitable(p);
++    for (const auto& e:p.GetInventory().Entries)
++    {
++        const auto id=world.GetModSystem().GetGameId(e.BaseId);
++        if (id && (id>>24)!=0xFF && e.Count>0 && !e.ContainsExtraData() && !bad.count(id))
++            items[id]+=e.Count;
++    }
++    return items;
++}
++bool Ready(const Wallet& w)
++{
++    return !receiptFailure && walletReady && readyCursor==w.Cursor() && (!w.Stream() || readyStream==w.Stream());
++}
++CefString Rows(const std::map<uint32_t,int>& items)
++{
++    auto list=CefListValue::Create();
++    for (const auto& [id,count]:items)
++    {
++        auto* f=TESForm::GetById(id);
++        const char* label=f?f->GetName():nullptr;
++        if (!label || !*label || count<=0) continue;
++        auto row=CefDictionaryValue::Create();
++        row->SetDouble("id",id); row->SetString("name",label); row->SetInt("count",count);
++        list->SetDictionary(list->GetSize(),row);
++    }
++    auto value=CefValue::Create(); value->SetList(list); return CefWriteJSON(value,JSON_WRITER_DEFAULT);
++}
++}
++
++uint32_t OverlayService::TradePeer(uint32_t form) const noexcept
++{
++    if (!form || !m_transport.IsOnline()) return UINT32_MAX;
++    auto view=m_world.view<PlayerComponent,FormIdComponent>();
++    for (auto e:view)
++        if (view.get<FormIdComponent>(e).Id==form)
++        {
++            const auto id=view.get<PlayerComponent>(e).Id;
++            if (id!=m_transport.GetLocalPlayerId()) return id;
++        }
++    return UINT32_MAX;
++}
++bool OverlayService::TryTrade(uint32_t form) noexcept
++{
++    const auto id=TradePeer(form);
++    if (id==UINT32_MAX) return false;
++    Wallet w;
++    if (receiptFailure) {Utils::ShowHudMessage("Обмен остановлен: загрузите сохранение до ошибки квитанции.");return true;}
++    if (!CampaignAccess::TradeEnabled()) {Utils::ShowHudMessage("Обмен кампании отключён.");return true;}
++    if (!w.Load(m_world)) Utils::ShowHudMessage("Для обмена включите SkyrimCoopTrade.esp.");
++    else if (!Ready(w)) {pollAt={};Utils::ShowHudMessage("Обмен: проверка и восстановление квитанций.");}
++    else if (!session && !m_active) Send({TradeOp::Invite,id,0,w.Cursor(),0,w.Stream()});
++    return true;
++}
++void OverlayService::ClearTrade() noexcept
++{
++    if (session && m_pOverlay) m_pOverlay->ExecuteAsync("hideTrade");
++    if (ownsUI && m_gameOverlayClient && GetActive()) m_gameOverlayClient->SetUIVisible(false);
++    session=peer=0; tradeOpen=ownsUI=dirty=false; buffer.clear(); partner.clear(); pollAt={};
++    walletReady=false;readyStream=0;readyCursor=0;
++}
++void OverlayService::RecheckTradeAfterLoad() noexcept
++{
++    // A confirmed world replacement permits a new receipt check, not automatic acceptance.
++    // Legacy receipts have no verified before-count; retain their failure latch.
++    if (receiptFailure && receiptFailureCampaign)
++    {
++        receiptFailure=false;
++        receiptFailureCampaign=false;
++    }
++    walletReady=false;readyStream=0;readyCursor=0;lastConflict=UINT32_MAX;pollAt={};
++}
++void OverlayService::TradeAction(uint32_t token,int action,uint32_t id,uint32_t count) noexcept
++{
++    if (!session || session!=token) return;
++    Wallet w;
++    if (action==0) {Send({TradeOp::Close,peer,session}); ClearTrade();return;}
++    if (!w.Load(m_world) || !Ready(w)) return;
++    PartyTrade e{TradeOp::Accept,peer,session,w.Cursor(),count,w.Stream()};
++    if (action==1 && !tradeOpen) {Send(e);return;}
++    if (!tradeOpen || (action!=2 && action!=3) || !count || count>9999) return;
++    auto* p=PlayerCharacter::Get(); if (!p) return;
++    if (action==2 && Pocket(m_world,*p)[id]<static_cast<int>(count)) return;
++    if (action==3 && (!buffer.count(id) || buffer[id]<static_cast<int>(count))) return;
++    if (!m_world.GetModSystem().GetServerModId(id,e.Item)) return;
++    if (CampaignAccess::Mode()!=CampaignReplication::Link::Mode::Disabled)
++    {
++        auto* form=TESForm::GetById(id);
++        if (!form || Unsuitable(*p).count(id)) return;
++        const int64_t before=p->GetItemCountInInventory(form);
++        if (before<0 || before>INT32_MAX || before!=Pocket(m_world,*p)[id] ||
++            (action==3 && before+count>INT32_MAX)) return;
++        e.BeforePlusOne=static_cast<uint32_t>(before+1);
++    }
++    walletReady=false;
++    e.Op=action==2?TradeOp::Deposit:TradeOp::Take; Send(e);
++}
++void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
++{
++    auto* p=PlayerCharacter::Get();
++    if (receiptFailure || !m_transport.IsOnline() || !m_inGame || !p || !CampaignAccess::GameReady() || !CampaignAccess::TradeEnabled() || !m_pOverlay || !m_gameOverlayClient) return;
++    const auto& e=msg.Event;
++    using Mode=CampaignReplication::Link::Mode;
++    if (CampaignAccess::Mode()!=Mode::Disabled)
++    {
++        const auto identity=CampaignAccess::Current(m_world);
++        if (!identity || e.Campaign!=identity->Save.Campaign || e.Character!=identity->Save.Character) return;
++    }
++    else if (e.Campaign || e.Character) return;
++    Wallet w; if (!w.Load(m_world)) return;
++    if (e.Stream && w.Stream() && w.Stream()!=e.Stream) {Utils::ShowHudMessage("Обмен привязан к другому журналу сервера.");return;}
++    if (e.Op==TradeOp::Receipt)
++    {
++        if (!e.Stream || e.Cursor!=w.Cursor()+1 || !e.Count || e.Count>9999 || !e.Item.BaseId || p->IsDead() || !p->GetNiNode()) return;
++        auto* mod=ModManager::Get()->GetByName(e.Text.c_str());
++        if (!mod || !mod->IsLoaded()) return;
++        const auto id=mod->GetFormId(e.Item.BaseId);
++        auto* form=TESForm::GetById(id);
++        if (!form || !Cast<TESBoundObject>(form)) return;
++        if (e.Peer>1) return;
++        const int count=(e.Peer?1:-1)*int(e.Count);
++        walletReady=false;
++        const int64_t checkpoint=e.BeforePlusOne?static_cast<int64_t>(e.BeforePlusOne)-1:-1;
++        if (CampaignAccess::Mode()!=Mode::Disabled)
++        {
++            if (!CampaignAccess::ConfirmReceipt(m_world,e.Stream,w.Stream(),w.Cursor(),e.Cursor,
++                                           {e.Text.data(),e.Text.size()},e.Item.BaseId,count,checkpoint))
++                return; // replica may still be behind; poll again after it catches up
++            const int64_t actual=p->GetItemCountInInventory(form);
++            TradeLedger::Row row{"","","",e.Item.BaseId,count,checkpoint};
++            if (!TradeLedger::CanApply(row,actual) || Unsuitable(*p).count(id) || actual!=Pocket(m_world,*p)[id])
++            {
++                if (lastConflict!=e.Cursor)
++                {
++                    lastConflict=e.Cursor;
++                    spdlog::warn("Trade recovery conflict at receipt {}: expected {}, found {}",e.Cursor,checkpoint,actual);
++                    Utils::ShowHudMessage("Обмен приостановлен: имущество не соответствует квитанции.");
++                }
++                ClearTrade();
++                return;
++            }
++        }
++        if (count<0 && Pocket(m_world,*p)[id]<-count) return;
++        Inventory::Entry item{};
++        if (!m_world.GetModSystem().GetServerModId(id,item.BaseId)) return;
++        const auto before=p->GetItemCountInInventory(form);
++        item.Count=count; p->AddOrRemoveItem(item,true);
++        if (p->GetItemCountInInventory(form)!=before+count || !w.Write(e.Stream,e.Cursor))
++        {
++            receiptFailure=true;
++            receiptFailureCampaign=CampaignAccess::Mode()==Mode::Ready;
++            spdlog::error("Trade receipt {} has uncertain local result; stop further trade until save recovery",e.Cursor);
++            ClearTrade();
++            Utils::ShowHudMessage("Обмен остановлен: ошибка квитанции. Не сохраняйте игру.");
++            return;
++        }
++        lastConflict=UINT32_MAX;
++        pollAt={}; return;
++    }
++    if (e.Op==TradeOp::Ready)
++    {
++        if (e.Stream && e.Cursor==w.Cursor() && (!w.Stream() || e.Stream==w.Stream()))
++        { walletReady=true;readyCursor=e.Cursor;readyStream=e.Stream;lastConflict=UINT32_MAX; }
++        return;
++    }
++    if (e.Op==TradeOp::RecoveryConflict)
++    {
++        walletReady=false;
++        if (lastConflict!=w.Cursor())
++        {
++            lastConflict=w.Cursor();
++            Utils::ShowHudMessage("Обмен приостановлен: сохранение или журнал несовместимы.");
++        }
++        ClearTrade();return;
++    }
++    if (e.Op==TradeOp::Error) {Utils::ShowHudMessage("Сервер не подтвердил операцию обмена.");return;}
++    if (e.Op==TradeOp::Offer || e.Op==TradeOp::Open)
++    {
++        if (!Ready(w) || (session && session!=e.Session) || m_promptOpen || m_showingProgress || m_observerCamera || (GetActive() && !ownsUI))
++        {Send({TradeOp::Close,e.Peer,e.Session});return;}
++        session=e.Session;peer=e.Peer;partner=e.Text.c_str();tradeOpen=e.Op==TradeOp::Open;
++        ownsUI=true; m_gameOverlayClient->SetUIVisible(true);
++    }
++    else if (!session || e.Session!=session) return;
++    else if (e.Op==TradeOp::Close) {ClearTrade();return;}
++    else if (e.Op==TradeOp::Reset) buffer.clear();
++    else if (e.Op==TradeOp::Entry)
++    {
++        auto* mod=ModManager::Get()->GetByName(e.Text.c_str());
++        if (mod && mod->IsLoaded()) buffer[mod->GetFormId(e.Item.BaseId)]=int(e.Count);
++    }
++    dirty=true;
++}
++void OverlayService::UpdateTrade() noexcept
++{
++    if (receiptFailure || !m_transport.IsOnline() || !m_inGame || !CampaignAccess::GameReady())
++    {
++        walletReady=false;pollAt={};return;
++    }
++    if (session && !GetActive())
+     {Send({TradeOp::Close,peer,session});ClearTrade();}
+     if (session && dirty && m_pOverlay)
+     {
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign2"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign4"

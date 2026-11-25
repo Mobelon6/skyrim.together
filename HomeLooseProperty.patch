@@ -1,0 +1,469 @@
+diff --git a/Code/common/HomeSnapshot.h b/Code/common/HomeSnapshot.h
+--- a/Code/common/HomeSnapshot.h
++++ b/Code/common/HomeSnapshot.h
+@@ -17,8 +17,18 @@
+ inline constexpr size_t PartBytes=1400;
+ inline constexpr uint32_t MaxParts=1024;
+ inline constexpr size_t MaxBytes=PartBytes*MaxParts;
+-struct Item
+-{
++// Stable pickable records have one ledger account per placed reference.
++inline bool LooseType(uint32_t type) noexcept
++{
++    switch(type)
++    {
++        case 23: case 26: case 27: case 30: case 32: case 33:
++        case 41: case 42: case 45: case 46: case 52: return true;
++        default: return false;
++    }
++}
++struct Item
++{
+     TradeProperties::FormKey Base;
+     uint32_t Count{};
+     std::string Variant;
+@@ -47,10 +57,14 @@
+         for (const auto& r:Refs)
+         {
+             if (!r.Key.Valid() || !r.Base.Valid() || r.Type>=0x87 ||
+-                r.Flags>3 || r.Scale>65535 || r.Inventory>2 || r.LockState>2 || r.LockLevel>255 ||
++                r.Flags>3 || r.Scale>65535 || r.Inventory>3 || r.LockState>2 || r.LockLevel>255 ||
+                 (!r.LockState && r.LockLevel) ||
+-                (r.Type!=28 && r.Inventory!=0) || (r.Type==28 && r.Inventory==0) ||
+-                (r.Inventory!=1 && !r.Items.empty())) return false;
++                (r.Type!=28 && r.Inventory!=0 && r.Inventory!=3) || (r.Type==28 && (r.Inventory==0 || r.Inventory==3)) ||
++                (r.Inventory!=1 && r.Inventory!=3 && !r.Items.empty())) return false;
++            if (r.Inventory==3 && (!LooseType(r.Type) || r.LockState ||
++                ((r.Flags&3u)?!r.Items.empty():r.Items.size()!=1) ||
++                (!r.Items.empty() && (r.Items.front().Base.Encode()!=r.Base.Encode() ||
++                                      r.Items.front().Count>9999)))) return false;
+             for (auto v:r.Transform) if (!std::isfinite(std::bit_cast<float>(v))) return false;
+             const auto key=r.Key.Encode();
+             if (ResidentKeys.count(key)) return false;
+@@ -74,7 +88,9 @@
+     }
+     std::string Encode() const
+     {
+-        std::string out=std::string(ResidentKeys.empty()?"static-v1 ":"static-v2 ")+std::to_string(Omitted)+"\n";
++        bool loose=false;
++        for (const auto& ref:Refs) if (ref.Inventory==3) {loose=true;break;}
++        std::string out=std::string(loose?"static-v3 ":ResidentKeys.empty()?"static-v1 ":"static-v2 ")+std::to_string(Omitted)+"\n";
+         for (const auto& key:ResidentKeys) out+="A "+key+"\n";
+         for (const auto& r:Refs)
+         {
+@@ -98,8 +114,8 @@
+     std::string line,tag,key,base,variant,extra;
+     if (!std::getline(input,line)) return {};
+     std::istringstream header(line);
+-    if (!(header>>tag>>s.Omitted) || (tag!="static-v1" && tag!="static-v2") || header>>extra) return {};
+-    const bool withResidents=tag=="static-v2";
++    if (!(header>>tag>>s.Omitted) || (tag!="static-v1" && tag!="static-v2" && tag!="static-v3") || header>>extra) return {};
++    const bool withResidents=tag!="static-v1";
+     while (std::getline(input,line))
+     {
+         std::istringstream row(line);
+diff --git a/Code/common/HomeProjectionPlan.h b/Code/common/HomeProjectionPlan.h
+--- a/Code/common/HomeProjectionPlan.h
++++ b/Code/common/HomeProjectionPlan.h
+@@ -35,7 +35,7 @@
+     {
+         auto it=bySource.find(row.Key.Encode());
+         if (it==bySource.end() || row.Type!=it->second.Type ||
+-            row.Inventory==2 || (row.Flags&2)) return {};
++            row.Inventory==2 || (HomeSnapshot::LooseType(row.Type) && row.Inventory!=3) || (row.Flags&2)) return {};
+         // Source deletion is not reproduced by destroying a reusable shell.
+         // Missing/unsupported inventory is never interpreted as empty.
+         result.push_back({&row,it->second});
+diff --git a/Code/common/TradeLedger.h b/Code/common/TradeLedger.h
+--- a/Code/common/TradeLedger.h
++++ b/Code/common/TradeLedger.h
+@@ -35,7 +35,7 @@
+         if (authority)
+         {
+             if (!campaignId) throw std::runtime_error("invalid campaign trade stream");
+-            accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); confirmed.clear(); last=0;
++            accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); looseAccounts.clear(); confirmed.clear(); last=0;
+             size_t position=0;
+             for (const auto& op:authority->Operations())
+             {
+@@ -58,7 +58,7 @@
+                 }
+         if (!id) id = QuestJournalDisk::CreateStream(root);
+         if (!id) throw std::runtime_error("cannot initialize trade ledger");
+-        accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); confirmed.clear(); last = 0;
++        accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); looseAccounts.clear(); confirmed.clear(); last = 0;
+         const auto size = QuestJournalDisk::Contiguous(root,id);
+         const auto dir = root/std::to_string(id);
+         for (const auto& entry : std::filesystem::directory_iterator(dir))
+@@ -175,7 +175,7 @@
+         if (!state) return {};
+         for (auto& ref:state->Refs)
+         {
+-            if (ref.Inventory!=1) continue;
++            if (ref.Inventory!=1 && ref.Inventory!=3) continue;
+             const auto account=HomeAccount(slot,ref.Key);
+             auto* items=LoadHome(account,authority->Operations().size()+1);
+             if (!items) return {};
+@@ -186,7 +186,8 @@
+                 if (count<0 || count>INT32_MAX) return {};
+                 ref.Items.push_back({{key.first,key.second},static_cast<uint32_t>(count),key.variant});
+             }
+-            std::sort(ref.Items.begin(),ref.Items.end(),[](const auto& a,const auto& b)
++            if (ref.Inventory==3 && ref.Items.empty()) ref.Flags|=1u;
++            std::sort(ref.Items.begin(),ref.Items.end(),[](const auto& a,const auto& b)
+             {return std::pair{a.Base.Encode(),a.Variant}<std::pair{b.Base.Encode(),b.Variant};});
+         }
+         if (!HomeLocks::Apply(*authority,slot,*state) || state->Encode().size()>HomeSnapshot::MaxBytes) return {};
+@@ -245,7 +246,8 @@
+         for (const auto& ref:state->Refs)
+         {
+             if (ref.Key.Encode()!=key->Encode()) continue;
+-            if (ref.Inventory!=1) return nullptr;
++            if (ref.Inventory!=1 && ref.Inventory!=3) return nullptr;
++            if (ref.Inventory==3) looseAccounts.insert(account);
+             Items items;
+             for (const auto& item:ref.Items)
+                 items.emplace(ItemKey{item.Base.Plugin,item.Base.Local,item.Variant},item.Count);
+@@ -263,7 +265,11 @@
+         auto* items=LoadHome(r.peer,beforePosition);
+         if (!items) return false;
+         auto item=items->find({r.plugin,r.base,r.variant});
+-        if (r.count>0) return item!=items->end() && item->second>=r.count;
++        // A world reference is one stack, not an arbitrary container.
++        // Its whole stack is removed by the same durable receipt.
++        if (looseAccounts.count(r.peer))
++            return r.count>0 && item!=items->end() && item->second==r.count;
++        if (r.count>0) return item!=items->end() && item->second>=r.count;
+         // All pending deposits reserve capacity but remain unavailable until
+         // the shared backpack receipt is acknowledged. Check base totals,
+         // not just the exact variant (engine counts are signed 32-bit).
+@@ -386,5 +392,6 @@
+     std::map<std::string,uint32_t> confirmed;
+     std::map<std::pair<std::string,std::string>,Items> stock;
+     std::map<std::pair<std::string,std::string>,Items> contributions;
+-    std::map<std::string,Items> homeStock;
++    std::map<std::string,Items> homeStock;
++    std::set<std::string> looseAccounts;
+ };
+diff --git a/Code/client/Services/HomeInventory.h b/Code/client/Services/HomeInventory.h
+--- a/Code/client/Services/HomeInventory.h
++++ b/Code/client/Services/HomeInventory.h
+@@ -3,5 +3,6 @@
+ struct TESObjectREFR;
+ namespace HomeInventory
+ {
+-std::optional<std::vector<HomeSnapshot::Item>> Capture(TESObjectREFR&);
++std::optional<std::vector<HomeSnapshot::Item>> Capture(TESObjectREFR&);
++std::optional<std::vector<HomeSnapshot::Item>> CaptureLoose(TESObjectREFR&);
+ }
+diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
+--- a/Code/client/Services/Generic/QuestJournal.cpp
++++ b/Code/client/Services/Generic/QuestJournal.cpp
+@@ -128,7 +128,11 @@
+     auto state=HomeSnapshot::Decode(b.Bytes);
+     if (!state) return 2;
+     for (const auto& r:state->Refs)
+-        if (r.Key.Encode()==reference && r.Inventory==1) return 1;
++    {
++        if (r.Key.Encode()!=reference) continue;
++        if (r.Inventory==1 || r.Inventory==3) return 1;
++        if (HomeSnapshot::LooseType(r.Type) && r.Inventory==0) return 3;
++    }
+     return 2;
+ }
+ 
+diff --git a/Code/client/Services/Generic/PartyTrade.cpp b/Code/client/Services/Generic/PartyTrade.cpp
+--- a/Code/client/Services/Generic/PartyTrade.cpp
++++ b/Code/client/Services/Generic/PartyTrade.cpp
+@@ -1032,7 +1032,22 @@
+ }
+ }
+ 
+-std::optional<std::vector<HomeSnapshot::Item>> HomeInventory::Capture(TESObjectREFR& object)
++std::optional<std::vector<HomeSnapshot::Item>> HomeInventory::CaptureLoose(TESObjectREFR& object)
++{
++    if (!object.baseForm || !HomeSnapshot::LooseType(static_cast<uint32_t>(object.baseForm->formType)) ||
++        object.IsTemporary() || object.baseForm->IsTemporary()) return {};
++    if (object.IsDeleted() || object.IsDisabled()) return std::vector<HomeSnapshot::Item>{};
++    auto base=PropertyKey(object.baseForm->formID);
++    auto* extra=object.GetExtraDataList();
++    if (extra && extra->HasQuestObjectAlias()) return {};
++    auto observed=ReadExtra(extra);
++    if (!base || !observed || observed->Count<=0 || observed->Count>9999) return {};
++    auto props=TradeProperties::Decode(observed->Variant);
++    if (!props || !PropertiesAvailable(*props)) return {};
++    return std::vector<HomeSnapshot::Item>{{*base,static_cast<uint32_t>(observed->Count),observed->Variant}};
++}
++
++std::optional<std::vector<HomeSnapshot::Item>> HomeInventory::Capture(TESObjectREFR& object)
+ {
+     // Base counts and runtime deltas can coexist. The trade proxy's
+     // ShadowCounts assumes an empty base, so do not use it here.
+@@ -1182,7 +1197,9 @@
+ struct ManagedContainer {uint32_t Slot{};TradeProperties::FormKey Ref;bool Ready{};};
+ std::optional<ManagedContainer> ManagedHome(const TESObjectREFR* object)
+ {
+-    if (!object || !object->baseForm || object->baseForm->formType!=FormType::Container) return {};
++    if (!object || !object->baseForm) return {};
++    const bool loose=HomeSnapshot::LooseType(static_cast<uint32_t>(object->baseForm->formType));
++    if (!loose && object->baseForm->formType!=FormType::Container) return {};
+     auto* cell=const_cast<TESObjectREFR*>(object)->GetParentCellEx();
+     if (!cell || cell->worldspace) return {};
+     auto& world=World::Get();
+@@ -1201,7 +1218,9 @@
+     const auto slot=CampaignAccess::HomeScope(id->Save.Campaign,id->Save.Character,root->Encode());
+     if (!slot) return {};
+     const auto status=CampaignAccess::HomeContainerState(id->Save.Campaign,slot,ref->Encode());
+-    if (status==2) return {};
++    // An explicitly untracked legacy loose reference remains native for its owner.
++    // The projection plan rejects that baseline; never invent its balance.
++    if (status==3 || (status==2 && !loose)) return {};
+     return ManagedContainer{slot,*ref,status==1};
+ }
+ bool ProtectHome(const TESObjectREFR* object) noexcept
+@@ -1274,8 +1293,40 @@
+     auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
+     if (auto home=ManagedHome(object))
+     {
+-        Wallet w;
+-        if (!home->Ready || !m_transport.IsOnline() || !CampaignAccess::TradeEnabled() ||
++        Wallet w;
++        if (object && object->baseForm && HomeSnapshot::LooseType(static_cast<uint32_t>(object->baseForm->formType)))
++        {
++            // Normal activation, no second physical pickup or scratch menu.
++            const auto id=CampaignAccess::Current(m_world);
++            if (!home->Ready || !id || !CampaignAccess::TradeEnabled() || session || m_active ||
++                !w.Load(m_world) || !Ready(w))
++            {pollAt={};Utils::ShowHudMessage("Предмет дома: ожидается журнал имущества.");return true;}
++            const auto bytes=CampaignAccess::HomeBaseline(id->Save.Campaign,home->Slot);
++            const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
++            if (!state) return true;
++            for (const auto& row:state->Refs)
++            {
++                if (row.Key.Encode()!=home->Ref.Encode() || row.Inventory!=3 || (row.Flags&3u) ||
++                    row.Items.size()!=1) continue;
++                const auto& item=row.Items.front();
++                auto* base=ResolvePropertyForm(item.Base);
++                const auto props=TradeProperties::Decode(item.Variant);
++                auto* player=PlayerCharacter::Get();
++                if (!base || object->baseForm!=base || !props || !PropertiesAvailable(*props) || !player) return true;
++                if (props->Created && !RecreateEnchant(*props->Created)) return true;
++                const LocalItem key{base->formID,item.Variant};
++                auto before=ReceiptCount(m_world,*player,key,true);
++                if (!before || *before+item.Count>INT32_MAX) return true;
++                PartyTrade request{TradeOp::Take,home->Slot,0,w.Cursor(),item.Count,w.Stream()};
++                request.Text=home->Ref.Encode().c_str();request.Variant=item.Variant.c_str();
++                request.BeforePlusOne=static_cast<uint32_t>(*before+1);
++                if (!m_world.GetModSystem().GetServerModId(base->formID,request.Item)) return true;
++                if (Send(request)) {walletReady=false;pollAt={};}
++                return true;
++            }
++            return true;
++        }
++        if (!home->Ready || !m_transport.IsOnline() || !CampaignAccess::TradeEnabled() ||
+             !NativeEnabled() || !w.Load(m_world) || !Ready(w) || session || m_active)
+         {
+             pollAt={};
+diff --git a/Code/server/Services/PartyTrade.cpp b/Code/server/Services/PartyTrade.cpp
+--- a/Code/server/Services/PartyTrade.cpp
++++ b/Code/server/Services/PartyTrade.cpp
+@@ -102,7 +102,7 @@
+     auto* movement=world.try_get<MovementComponent>(*player.GetCharacter());
+     if (!movement) return {};
+     for (const auto& r:state->Refs)
+-        if (r.Key.Encode()==h.Ref.Encode() && r.Inventory==1 && !(r.Flags&3) && r.LockState!=2)
++        if (r.Key.Encode()==h.Ref.Encode() && (r.Inventory==1 || r.Inventory==3) && !(r.Flags&3) && r.LockState!=2)
+         {
+             const glm::vec3 position{std::bit_cast<float>(r.Transform[0]),std::bit_cast<float>(r.Transform[1]),std::bit_cast<float>(r.Transform[2])};
+             if (glm::distance(movement->Position,position)<=420.f) return r;
+@@ -220,15 +220,37 @@
+             }
+             next();return;
+         }
+-        if (e.Op==TradeOp::HomeOpen)
+-        {
++        // A zero-session Take is a direct pickup from a stable house ref.
++        // It never enters the ordinary trade or native container session.
++        if (e.Op==TradeOp::Take && !e.Session)
++        {
++            if (!campaign || !e.Peer || e.Peer>HomeRegistry::MaxSlot ||
++                ActiveAccount(user) || ledger.HasOutstanding(user) ||
++                e.Text.size()>220 || !e.Count || e.Count>9999 ||
++                !e.BeforePlusOne || e.BeforePlusOne>0x80000000u) return;
++            auto ref=TradeProperties::DecodeForm({e.Text.data(),e.Text.size()});
++            if (!ref || !ref->Valid()) return;
++            HomeSession h{id,e.Peer,CampaignAccess::Character(p),*ref,now+20s};
++            const auto row=HomeContainer(ledger,m_world,p,h);
++            const TradeProperties::FormKey item{InventoryEvidence::CanonicalPlugin(Plugin(m_world,e.Item.ModId)),e.Item.BaseId};
++            const std::string variant(e.Variant.data(),e.Variant.size());
++            if (!row || row->Inventory!=3 || row->Items.size()!=1 ||
++                row->Items.front().Base.Encode()!=item.Encode() || row->Items.front().Count!=e.Count ||
++                row->Items.front().Variant!=variant || !ledger.Ack(user,e.Cursor) ||
++                !ledger.CommitHome(h.Character,h.Slot,h.Ref,item,variant,int(e.Count),
++                    int64_t(e.BeforePlusOne)-1,e.Cursor))
++            {Send(p,{TradeOp::Error,0,0});return;}
++            next();return;
++        }
++        if (e.Op==TradeOp::HomeOpen)
++        {
+             if (!campaign || e.Session || e.Count || !e.Peer || e.Peer>HomeRegistry::MaxSlot ||
+                 ActiveAccount(user) || ledger.HasOutstanding(user) || e.Text.size()>220) return;
+             auto key=TradeProperties::DecodeForm({e.Text.data(),e.Text.size()});
+             if (!key || !key->Valid()) return;
+             HomeSession h{id,e.Peer,CampaignAccess::Character(p),*key,now+20s};
+             auto container=HomeContainer(ledger,m_world,p,h);
+-            if (!container) {Send(p,{TradeOp::Error,0,0});return;}
++            if (!container || container->Inventory!=1) {Send(p,{TradeOp::Error,0,0});return;}
+             do {if (!++serial) ++serial;} while (sessions.count(serial)||homeSessions.count(serial));
+             homeSessions.emplace(serial,std::move(h));
+             PartyTrade open{TradeOp::Open,0,serial,0,0,uuid};
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -227,7 +227,37 @@
+     }
+     return HomeResidentProjection::Sync(world,target,slot,entries);
+ }
+-Clock::time_point residentDisplayNext{};
++// Use only committed balances, never infer removal from a missing shell.
++bool ApplyLoose(TESObjectCELL& target,const HomeSnapshot::State& state,const HomeCatalog::Cell* copy)
++{
++    for (const auto& row:state.Refs)
++    {
++        if (row.Inventory!=3) continue;
++        auto key=row.Key;
++        if (copy)
++        {
++            auto it=std::find_if(copy->Refs.begin(),copy->Refs.end(),
++                [&](const auto& ref){return ref.Source.Encode()==key.Encode();});
++            if (it==copy->Refs.end()) return false;
++            key=it->Target;
++        }
++        auto* ref=Cast<TESObjectREFR>(TESForm::GetById(CatalogForm(key)));
++        if (!ref || !ref->baseForm || ref->baseForm->formID!=CatalogForm(row.Base) ||
++            ref->GetParentCellEx()!=&target || ref->IsDeleted())
++        {
++            // A spent owner reference may already have been removed by the engine.
++            if (!copy && row.Items.empty()) continue;
++            return false;
++        }
++        const bool hide=(row.Flags&3u)!=0 || row.Items.empty();
++        if (hide && !ref->IsDisabled()) ref->Disable();
++        // A visitor shell is reusable across different owner instances.
++        if (copy && !hide && ref->IsDisabled()) ref->Enable();
++        if ((copy || hide) && ref->IsDisabled()!=hide) return false;
++    }
++    return true;
++}
++Clock::time_point residentDisplayNext{};
+ void AddVisits(const CampaignAccess::Identity& id,const HomeCatalog::Cell& cell,std::string& labels)
+ {
+     accessMenu.Visits.clear();
+@@ -482,9 +512,15 @@
+         {
+             auto items=HomeInventory::Capture(*ref);
+             row.Inventory=items?1:2;
+-            if (items) row.Items=std::move(*items);
+-        }
+-        state.Refs.push_back(std::move(row));
++            if (items) row.Items=std::move(*items);
++        }
++        else if (HomeSnapshot::LooseType(row.Type))
++        {
++            auto items=HomeInventory::CaptureLoose(*ref);
++            if (items) {row.Inventory=3;row.Items=std::move(*items);}
++            else ++state.Omitted;
++        }
++        state.Refs.push_back(std::move(row));
+         if (state.Refs.size()>16384) return {};
+     }
+     if (catalog && state.ResidentKeys.size()!=catalog->ResidentBases.size()) return {};
+@@ -816,7 +852,8 @@
+                     residentDisplayNext=now+1s;
+                     const auto bytes=CampaignAccess::HomeBaseline(visit.Campaign,visit.Slot);
+                     const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
+-                    if (!state || !ApplyResidents(m_world,*current,*copy,*state,visit.Campaign,visit.Slot))
++                    if (!state || !ApplyLoose(*current,*state,copy) ||
++                        !ApplyResidents(m_world,*current,*copy,*state,visit.Campaign,visit.Slot))
+                     {ClearTrade();LeaveCopy(*p,*copy,visit.Door);return;}
+                 }
+             }
+@@ -1034,7 +1071,15 @@
+             activeHomeRoute.store((uint64_t(HomeRegistry::ScopePrefix|slot)<<32)|cell->formID);
+             UploadBaseline(world,*cell,*identity,slot,encoded,slots);
+             SyncLocks(*cell,*identity,slot,encoded,nullptr);
+-            SyncResidents(world,*cell,*identity,slot,encoded,slots);
+-            return;
++            SyncResidents(world,*cell,*identity,slot,encoded,slots);
++            static Clock::time_point looseNext{};
++            if (Clock::now()>=looseNext && cell->IsAttached())
++            {
++                looseNext=Clock::now()+1s;
++                const auto bytes=CampaignAccess::HomeBaseline(identity->Save.Campaign,slot);
++                const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
++                if (state) ApplyLoose(*cell,*state,nullptr);
++            }
++            return;
+         }
+         activeHomeRoute.store(quarantine);
+diff --git a/Code/client/Services/HomeActorProtection.h b/Code/client/Services/HomeActorProtection.h
+--- a/Code/client/Services/HomeActorProtection.h
++++ b/Code/client/Services/HomeActorProtection.h
+@@ -1,5 +1,6 @@
+ #pragma once
+-#include <Services/HomeInstance.h>
++#include <Services/HomeInstance.h>
++#include <Services/NativeTrade.h>
+ #include <Games/References.h>
+ #include <Forms/TESObjectCELL.h>
+ 
+@@ -17,6 +18,7 @@
+ }
+ inline bool PickupBlocked(const TESObjectREFR* object) noexcept
+ {
+-    return object && (HomeInstance::ProjectionForm(object->formID) || Resident(object));
++    return object && (HomeInstance::ProjectionForm(object->formID) || Resident(object) ||
++        NativeTrade::BlockAdd(nullptr,object));
+ }
+ }
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign17"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign18"
+diff --git a/Code/client/Games/Skyrim/PlayerCharacter.cpp b/Code/client/Games/Skyrim/PlayerCharacter.cpp
+--- a/Code/client/Games/Skyrim/PlayerCharacter.cpp
++++ b/Code/client/Games/Skyrim/PlayerCharacter.cpp
+@@ -13,7 +13,9 @@
+ #include <Events/RemoveWaypointEvent.h>
+ 
+ #include <World.h>
+-#include <Services/HomeActorProtection.h>
++#include <Services/HomeActorProtection.h>
++#include <Services/OverlayService.h>
++#include <HomeSnapshot.h>
+ 
+ #include <Games/Skyrim/Forms/ActorValueInfo.h>
+ #include <Games/ActorExtension.h>
+@@ -165,7 +167,16 @@
+ 
+ char TP_MAKE_THISCALL(HookPickUpObject, PlayerCharacter, TESObjectREFR* apObject, int32_t aCount, bool aUnk1, bool aUnk2)
+ {
+-    if (HomeActorProtection::PickupBlocked(apObject)) return 0;
++    if (HomeActorProtection::PickupBlocked(apObject))
++    {
++        // QuickLoot and other native pickup paths must use the same receipt.
++        // A remote replay may never initiate another transaction.
++        if (apObject && apObject->baseForm &&
++            HomeSnapshot::LooseType(static_cast<uint32_t>(apObject->baseForm->formType)) &&
++            !ScopedActivateOverride::IsOverriden() && !ScopedInventoryOverride::IsOverriden())
++            World::Get().GetOverlayService().TryTrade(apObject->formID);
++        return 0;
++    }
+     auto& modSystem = World::Get().GetModSystem();
+ 
+     Inventory::Entry item{};

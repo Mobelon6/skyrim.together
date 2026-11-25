@@ -1,0 +1,1064 @@
+diff --git a/Code/common/HomeRegistry.h b/Code/common/HomeRegistry.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/HomeRegistry.h
+@@ -0,0 +1,86 @@
++#pragma once
++#include "CampaignJournal.h"
++#include "TradeProperties.h"
++#include <algorithm>
++#include <charconv>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++// One registry per authoritative campaign journal. A slot is a compact wire
++// namespace, never a connection ID, save-local FormID or ownership epoch.
++// The first registered interior is the root of the home. Other cells and
++// exterior boundaries must be explicitly associated with that root later.
++namespace HomeRegistry
++{
++inline constexpr uint32_t ScopePrefix=0xFFFD0000u;
++inline constexpr uint32_t PendingPrefix=0xFFFC0000u;
++inline constexpr uint32_t MaxSlot=0xFFFFu;
++inline bool Scoped(uint32_t mod) {return (mod&0xFFFF0000u)==ScopePrefix;}
++inline bool Pending(uint32_t mod) {return (mod&0xFFFF0000u)==PendingPrefix;}
++struct Home
++{
++    uint64_t Owner{};
++    TradeProperties::FormKey Root{};
++    uint32_t Slot{};
++    bool Same(uint64_t owner,const TradeProperties::FormKey& root) const
++    {return Owner==owner && Root.Plugin==root.Plugin && Root.Local==root.Local;}
++};
++inline std::string Id(uint32_t slot) {return "home-register-"+std::to_string(slot);}
++inline std::string Payload(const Home& h)
++{return std::to_string(h.Owner)+" "+h.Root.Encode();}
++inline std::optional<std::vector<Home>> Read(const CampaignJournal::Journal& journal)
++{
++    if (!journal.Ready()) return {};
++    std::vector<Home> homes;
++    for (const auto& row:journal.Operations())
++    {
++        if (row.Kind!="home-register-v1") continue;
++        if (homes.size()>=MaxSlot) return {};
++        Home h;h.Slot=static_cast<uint32_t>(homes.size()+1);
++        const auto sep=row.Payload.find(' ');
++        if (sep==std::string::npos || row.Id!=Id(h.Slot)) return {};
++        auto owner=std::string_view(row.Payload).substr(0,sep);
++        auto parsed=std::from_chars(owner.data(),owner.data()+owner.size(),h.Owner);
++        auto root=TradeProperties::DecodeForm(std::string_view(row.Payload).substr(sep+1));
++        if (parsed.ec!=std::errc{} || parsed.ptr!=owner.data()+owner.size() || !h.Owner ||
++            !root || !root->Valid()) return {};
++        h.Root=*root;
++        if (Payload(h)!=row.Payload || std::any_of(homes.begin(),homes.end(),
++            [&](const Home& old){return old.Same(h.Owner,h.Root);})) return {};
++        homes.push_back(std::move(h));
++    }
++    return homes;
++}
++inline std::optional<Home> Find(const CampaignJournal::Journal& journal,uint64_t owner,const TradeProperties::FormKey& root)
++{
++    auto homes=Read(journal);
++    if (!homes) return {};
++    for (const auto& h:*homes) if (h.Same(owner,root)) return h;
++    return {};
++}
++inline std::optional<Home> BySlot(const CampaignJournal::Journal& journal,uint32_t slot)
++{
++    auto homes=Read(journal);
++    if (!homes || !slot || slot>homes->size()) return {};
++    return (*homes)[slot-1];
++}
++inline std::optional<Home> Register(CampaignJournal::Journal& journal,uint64_t owner,const TradeProperties::FormKey& root)
++{
++    if (!owner || !root.Valid()) return {};
++    auto homes=Read(journal);
++    if (!homes) return {};
++    for (const auto& h:*homes) if (h.Same(owner,root)) return h;
++    if (homes->size()>=MaxSlot) return {};
++    Home h{owner,root,static_cast<uint32_t>(homes->size()+1)};
++    if (journal.Append(journal.Current(),{Id(h.Slot),"home-register-v1",Payload(h)})!=CampaignJournal::Result::Committed) return {};
++    return h;
++}
++inline bool OwnsCell(const CampaignJournal::Journal& journal,uint64_t owner,uint32_t mod,uint32_t base)
++{
++    if (!Scoped(mod) || !owner) return false;
++    auto h=BySlot(journal,mod&MaxSlot);
++    return h && h->Owner==owner && h->Root.Local==base;
++}
++}
+diff --git a/Code/encoding/Structs/PartyHome.h b/Code/encoding/Structs/PartyHome.h
+--- a/Code/encoding/Structs/PartyHome.h
++++ b/Code/encoding/Structs/PartyHome.h
+@@ -1,20 +1,29 @@
+-#pragma once
+-#include <Structs/GameId.h>
+-#include <TiltedCore/Serialization.hpp>
+-struct PartyHome
+-{
+-    uint32_t House{}, Owner{};
+-    TiltedPhoques::String Visible;
+-    bool operator==(const PartyHome&) const noexcept=default;
+-    void Serialize(TiltedPhoques::Buffer::Writer& w) const noexcept
+-    {
+-        using TiltedPhoques::Serialization;
+-        Serialization::WriteVarInt(w,House); Serialization::WriteVarInt(w,Owner); Serialization::WriteString(w,Visible);
+-    }
+-    void Deserialize(TiltedPhoques::Buffer::Reader& r) noexcept
+-    {
+-        using TiltedPhoques::Serialization;
+-        House=static_cast<uint32_t>(Serialization::ReadVarInt(r));
+-        Owner=static_cast<uint32_t>(Serialization::ReadVarInt(r)); Visible=Serialization::ReadString(r);
+-    }
+-};
++#pragma once
++#include <Structs/GameId.h>
++#include <TiltedCore/Serialization.hpp>
++struct PartyHome
++{
++    uint32_t House{}, Owner{};
++    TiltedPhoques::String Visible;
++    uint64_t Campaign{}, Character{}, SaveTag{};
++    uint32_t SaveRevision{};
++    TiltedPhoques::String Profile{}, Credential{}, Root{};
++    bool operator==(const PartyHome&) const noexcept=default;
++    void Serialize(TiltedPhoques::Buffer::Writer& w) const noexcept
++    {
++        using TiltedPhoques::Serialization;
++        Serialization::WriteVarInt(w,House); Serialization::WriteVarInt(w,Owner); Serialization::WriteString(w,Visible);
++        Serialization::WriteVarInt(w,Campaign);Serialization::WriteVarInt(w,Character);
++        Serialization::WriteVarInt(w,SaveTag);Serialization::WriteVarInt(w,SaveRevision);
++        Serialization::WriteString(w,Profile);Serialization::WriteString(w,Credential);Serialization::WriteString(w,Root);
++    }
++    void Deserialize(TiltedPhoques::Buffer::Reader& r) noexcept
++    {
++        using TiltedPhoques::Serialization;
++        House=static_cast<uint32_t>(Serialization::ReadVarInt(r));
++        Owner=static_cast<uint32_t>(Serialization::ReadVarInt(r)); Visible=Serialization::ReadString(r);
++        Campaign=Serialization::ReadVarInt(r);Character=Serialization::ReadVarInt(r);
++        SaveTag=Serialization::ReadVarInt(r);SaveRevision=static_cast<uint32_t>(Serialization::ReadVarInt(r));
++        Profile=Serialization::ReadString(r);Credential=Serialization::ReadString(r);Root=Serialization::ReadString(r);
++    }
++};
+diff --git a/Code/server/Services/PartyHome.cpp b/Code/server/Services/PartyHome.cpp
+--- a/Code/server/Services/PartyHome.cpp
++++ b/Code/server/Services/PartyHome.cpp
+@@ -1,18 +1,64 @@
+-#include <GameServer.h>
+-#include <World.h>
+-#include <Game/Player.h>
+-#include <Services/OverlayService.h>
+-#include <Messages/RequestPartyHome.h>
+-#include <Messages/NotifyPartyHome.h>
+-
+-void OverlayService::OnHome(const PacketEvent<RequestPartyHome>& packet) noexcept
+-{
+-    auto* owner=packet.pPlayer;
+-    auto* party=m_world.GetPartyService().GetPlayerParty(owner);
+-    const auto& e=packet.Packet.Event;
+-    if (!party || !e.House || e.Visible.size()>16384 ||
+-        std::any_of(e.Visible.begin(),e.Visible.end(),[](char c){return c!='1' && c!='0' && c!='?';})) return;
+-    NotifyPartyHome msg;
+-    msg.Event=e; msg.Event.Owner=owner->GetId();
+-    for (auto* other:party->Members) if (other!=owner) other->Send(msg);
+-}
++#include <GameServer.h>
++#include <World.h>
++#include <Game/Player.h>
++#include <Services/OverlayService.h>
++#include <Services/CampaignAccess.h>
++#include <HomeRegistry.h>
++#include <InventoryEvidence.h>
++#include <Messages/RequestPartyHome.h>
++#include <Messages/NotifyPartyHome.h>
++
++void OverlayService::OnHome(const PacketEvent<RequestPartyHome>& packet) noexcept
++{
++    try
++    {
++        auto* owner=packet.pPlayer;
++        if (!owner) return;
++        const auto& e=packet.Packet.Event;
++        auto& link=CampaignAccess::Authority();
++        if (link.State()!=CampaignReplication::Link::Mode::Disabled)
++        {
++            // Only the authenticated character may register its observed home.
++            // This is not a guest grant or a write to an existing house snapshot.
++            if (link.State()!=CampaignReplication::Link::Mode::Ready || e.House || e.Owner ||
++                !e.Visible.empty() || !e.Campaign || !e.Character || e.Root.size()>220 ||
++                e.Profile.size()>128 || e.Credential.size()!=64) return;
++            const CampaignIdentity::Stamp stamp{e.Campaign,e.Character,{e.SaveRevision,e.SaveTag}};
++            if (!CampaignAccess::Admit(m_world,*owner,stamp,{e.Profile.data(),e.Profile.size()},
++                {e.Credential.data(),e.Credential.size()})) return;
++            auto root=TradeProperties::DecodeForm({e.Root.data(),e.Root.size()});
++            if (!root || !root->Valid()) return;
++            const auto& mods=m_world.ctx().at<ModsComponent>();
++            bool known=false;
++            for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
++                for (const auto& [name,entry]:*list)
++                {
++                    (void)entry;
++                    if (InventoryEvidence::CanonicalPlugin({name.data(),name.size()})==root->Plugin &&
++                        (list!=&mods.GetLiteMods() || root->Local<=0xFFFu)) known=true;
++                }
++            if (!known) return;
++            // Existing registration is immutable, including across stale saves
++            // and reconnects. The normal campaign replica delivers this record.
++            auto home=HomeRegistry::Register(link.Journal,CampaignAccess::Character(*owner),*root);
++            if (!home) return;
++            NotifyPartyHome accepted;
++            accepted.Event.Campaign=link.Campaign;
++            accepted.Event.Character=home->Owner;
++            accepted.Event.Owner=owner->GetId();
++            accepted.Event.House=home->Slot;
++            accepted.Event.Root=home->Root.Encode().c_str();
++            owner->Send(accepted); // Never echo the credential.
++            return;
++        }
++        if (e.Campaign || e.Character || e.SaveRevision || e.SaveTag ||
++            !e.Profile.empty() || !e.Credential.empty() || !e.Root.empty()) return;
++        auto* party=m_world.GetPartyService().GetPlayerParty(owner);
++        if (!party || !e.House || e.Visible.size()>16384 ||
++            std::any_of(e.Visible.begin(),e.Visible.end(),[](char c){return c!='1' && c!='0' && c!='?';})) return;
++        NotifyPartyHome msg;
++        msg.Event=e; msg.Event.Owner=owner->GetId();
++        for (auto* other:party->Members) if (other!=owner) other->Send(msg);
++    }
++    catch (const std::exception& e) {spdlog::error("Home registration: {}",e.what());}
++}
+diff --git a/Code/client/Services/HomeInstance.h b/Code/client/Services/HomeInstance.h
+--- a/Code/client/Services/HomeInstance.h
++++ b/Code/client/Services/HomeInstance.h
+@@ -1,10 +1,14 @@
+-#pragma once
+-#include <cstdint>
+-namespace HomeInstance
+-{
+-bool Encode(uint32_t local,uint32_t& mod,uint32_t& base) noexcept;
+-bool Tagged(uint32_t mod) noexcept;
+-bool Foreign(uint32_t mod) noexcept;
+-uint32_t Decode(uint32_t mod,uint32_t base) noexcept;
+-bool PrivateCell(uint32_t local) noexcept;
+-}
++#pragma once
++#include <cstdint>
++struct World;
++struct TESObjectCELL;
++namespace HomeInstance
++{
++// Called on the game thread before discovery encodes the current cell.
++void Prepare(World&,TESObjectCELL*) noexcept;
++bool Encode(uint32_t local,uint32_t& mod,uint32_t& base) noexcept;
++bool Tagged(uint32_t mod) noexcept;
++bool Foreign(uint32_t mod) noexcept;
++uint32_t Decode(uint32_t mod,uint32_t base) noexcept;
++bool PrivateCell(uint32_t local) noexcept;
++}
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -1,231 +1,370 @@
+-#include <TiltedOnlinePCH.h>
+-#include <World.h>
+-#include <Services/HomeInstance.h>
+-#include <Services/OverlayClient.h>
+-#include <Services/OverlayService.h>
+-#include <Services/PapyrusService.h>
+-#include <OverlayApp.hpp>
+-#include <PlayerCharacter.h>
+-#include <Games/TES.h>
+-#include <Forms/TESFaction.h>
+-#include <Forms/TESNPC.h>
+-#include <Forms/TESObjectCELL.h>
+-#include <Messages/NotifyPartyHome.h>
+-#include <Messages/RequestPartyHome.h>
+-#include <Interface/UI.h>
+-#include <atomic>
+-#include <filesystem>
+-#include <fstream>
+-#include <iomanip>
+-#include <map>
+-
+-namespace
+-{
+-using Clock=std::chrono::steady_clock;
+-using namespace std::chrono_literals;
+-struct Ref {uint32_t original, copy;};
+-struct House {uint32_t slot{},original{},copy{}; std::vector<Ref> refs;std::string visible;bool owned{};};
+-struct Door {uint32_t slot; glm::vec3 pos,rotation;};
+-struct Advert {std::string visible; Clock::time_point until;};
+-std::map<uint32_t,House> houses;
+-std::map<uint32_t,Door> doors;
+-std::map<std::pair<uint32_t,uint32_t>,Advert> ads;
+-uint32_t door{}, token{}, guestSlot{}, guestOwner{};
+-std::vector<uint32_t> options;
+-Clock::time_point refresh{}, applyAt{};
+-std::string applied;
+-bool selection{}, initialized{};
+-struct Route {uint32_t source{},copy{},slot{};std::atomic_uint32_t own{},visit{};};
+-Route routes[5];
+-std::atomic_uint32_t routeCount{},self{UINT32_MAX};
+-constexpr uint32_t invalid=UINT32_MAX;
+-
+-bool Init()
+-{
+-    if (initialized) return !houses.empty();
+-    auto* mods=ModManager::Get();
+-    if (!mods) return false;
+-    auto* p=mods->GetByName("SkyrimCoopGuestHomes.esp");
+-    if (!p || !p->IsLoaded()) {initialized=true;return false;}
+-    std::ifstream f(std::filesystem::path("Data")/"SkyrimTogetherReborn"/"config"/"CoopHomes.txt");
+-    if (!f) return false;
+-    char kind{};uint32_t original{},slot{},copy{};std::string mod;
+-    while (f>>kind)
+-    {
+-        if (kind=='H' && (f>>original>>slot))
+-        {
+-            auto& h=houses[slot];h.slot=slot;h.original=original;h.copy=p->GetFormId(slot);
+-        }
+-        else if (kind=='R' && (f>>std::quoted(mod)>>original>>copy>>slot))
+-        {
+-            auto* m=mods->GetByName(mod.c_str());
+-            houses[slot].refs.push_back({m && m->IsLoaded()?m->GetFormId(original):0,p->GetFormId(copy)});
+-        }
+-        else if (kind=='D' && (f>>std::quoted(mod)>>original>>slot))
+-        {
+-            Door d{slot};f>>d.pos.x>>d.pos.y>>d.pos.z>>d.rotation.x>>d.rotation.y>>d.rotation.z;
+-            if (auto* m=mods->GetByName(mod.c_str());m && m->IsLoaded()) doors[m->GetFormId(original)]=d;
+-        }
+-        else {houses.clear();break;}
+-    }
+-    initialized=true;
+-    if (!f.eof() || houses.empty() || houses.size()>std::size(routes)) {houses.clear();return false;}
+-    uint32_t i=0;
+-    for (const auto& [id,h]:houses)
+-    {
+-        auto& r=routes[i++];r.source=h.original;r.copy=h.copy;r.slot=id;
+-    }
+-    routeCount.store(i);return true;
+-}
+-bool Owned(World& w,TESObjectCELL* cell,PlayerCharacter* p)
+-{
+-    if (!cell || !p) return false;
+-    auto& vm=w.ctx().at<PapyrusService>();
+-    auto* a=vm.Get("Cell","GetActorOwner");
+-    auto* f=vm.Get("Cell","GetFactionOwner");
+-    if (a && PapyrusFunction<TESNPC*,TESObjectCELL>(a)(cell)==p->baseForm) return true;
+-    if (!f) return false;
+-    auto* faction=PapyrusFunction<TESFaction*,TESObjectCELL>(f)(cell);
+-    return faction && faction->formID==0xDB1; // PlayerFaction, assigned by the purchase fragment
+-}
+-void SetVisit(uint32_t slot,uint32_t owner)
+-{
+-    for (unsigned i=0;i<routeCount.load();++i) routes[i].visit.store(routes[i].slot==slot ? owner+1 : 0);
+-    guestSlot=slot;guestOwner=owner;applied.clear();applyAt={};
+-}
+-}
+-namespace HomeInstance
+-{
+-bool Tagged(uint32_t mod) noexcept {return (mod&0xFFFF0000u)==0xFFFE0000u;}
+-bool Foreign(uint32_t mod) noexcept {return Tagged(mod) && (mod&0xffff)!=self.load();}
+-bool Encode(uint32_t local,uint32_t& mod,uint32_t& base) noexcept
+-{
+-    for (uint32_t i=0;i<routeCount.load();++i)
+-    {
+-        const auto& r=routes[i];
+-        uint32_t who=local==r.source?r.own.load():local==r.copy?r.visit.load():0;
+-        if (who && who<=65535) {mod=0xFFFE0000u | (who-1);base=r.slot;return true;}
+-    }
+-    return false;
+-}
+-uint32_t Decode(uint32_t mod,uint32_t base) noexcept
+-{
+-    uint32_t who=(mod&0xffff)+1;
+-    for (uint32_t i=0;i<routeCount.load();++i)
+-        if (routes[i].slot==base)
+-        {
+-            if (routes[i].own.load()==who) return routes[i].source;
+-            if (routes[i].visit.load()==who) return routes[i].copy;
+-        }
+-    return 0;
+-}
+-bool PrivateCell(uint32_t local) noexcept
+-{
+-    for (uint32_t i=0;i<routeCount.load();++i)
+-        if (local==routes[i].copy || (local==routes[i].source && routes[i].own.load())) return true;
+-    return false;
+-}
+-}
+-void OverlayService::ClearHomes() noexcept
+-{
+-    if (selection && m_pOverlay && m_gameOverlayClient)
+-    {m_pOverlay->ExecuteAsync("hideHome");m_gameOverlayClient->SetUIVisible(false);}
+-    selection=false;door=0;options.clear();ads.clear();SetVisit(0,0);refresh={};self.store(invalid);
+-    for (unsigned i=0;i<routeCount.load();++i) routes[i].own.store(0);
+-    for (auto& [_,h]:houses){h.owned=false;h.visible.clear();}
+-}
+-void OverlayService::OnHome(const NotifyPartyHome& msg) noexcept
+-{
+-    if (!Init()) return;
+-    const auto& e=msg.Event;
+-    const auto& members=m_world.GetPartyService().GetPartyMembers();
+-    if (!houses.count(e.House) || std::find(members.begin(),members.end(),e.Owner)==members.end() ||
+-        (!e.Visible.empty() && e.Visible.size()!=houses.at(e.House).refs.size())) return;
+-    auto& a=ads[{e.House,e.Owner}];a.visible.assign(e.Visible.begin(),e.Visible.end());a.until=Clock::now()+12s;
+-}
+-bool OverlayService::TryHouseDoor(uint32_t form) noexcept
+-{
+-    if (!m_world.GetPartyService().IsInParty() || !m_inGame || m_active || !m_pOverlay || !m_gameOverlayClient ||
+-        !doors.count(form) || selection) return false;
+-    const auto slot=doors.at(form).slot;
+-    if (!houses[slot].owned) return false;
+-    options.clear();std::string labels;
+-    const auto& players=m_world.GetPartyService().GetPlayers();
+-    for (const auto& [key,a]:ads)
+-        if (key.first==slot && a.until>Clock::now() && players.count(key.second))
+-        {
+-            auto name=players.at(key.second);
+-            for(char& c:name) if (c=='\n' || c=='\r') c=' ';
+-            if (!options.empty()) labels+='\n';
+-            labels+=name.c_str();options.push_back(key.second);
+-        }
+-    if (options.empty()) return false;
+-    selection=true;door=form;if (!++token) ++token;
+-    auto args=CefListValue::Create();args->SetInt(0,token);args->SetString(1,labels);
+-    m_pOverlay->ExecuteAsync("offerHome",args);m_gameOverlayClient->SetUIVisible(true);return true;
+-}
+-void OverlayService::ChooseHome(uint32_t nonce,int choice) noexcept
+-{
+-    if (!selection || nonce!=token) return;
+-    selection=false;m_pOverlay->ExecuteAsync("hideHome");m_gameOverlayClient->SetUIVisible(false);
+-    auto* player=PlayerCharacter::Get();
+-    auto* entrance=Cast<TESObjectREFR>(TESForm::GetById(door));
+-    if (!player || !entrance || choice<0 || !doors.count(door) ||
+-        player->GetParentCellEx()!=entrance->GetParentCellEx() ||
+-        glm::distance(static_cast<const glm::vec3&>(player->position),static_cast<const glm::vec3&>(entrance->position))>350.f) return;
+-    if (!choice) {entrance->Activate(player,0,nullptr,1,0);return;}
+-    if (static_cast<size_t>(choice)>options.size()) return;
+-    const auto& d=doors.at(door);auto owner=options[choice-1];auto a=ads.find({d.slot,owner});
+-    if (a==ads.end() || Clock::now()>=a->second.until) return;
+-    auto* copy=Cast<TESObjectCELL>(TESForm::GetById(houses.at(d.slot).copy));
+-    if (!copy) return;
+-    SetVisit(d.slot,owner);player->SetRotation(d.rotation.x,d.rotation.y,d.rotation.z);
+-    player->MoveTo(copy,d.pos);
+-}
+-void OverlayService::UpdateHomes() noexcept
+-{
+-    if (!m_transport.IsConnected() || !m_world.GetPartyService().IsInParty() || !m_inGame) return;
+-    auto* p=PlayerCharacter::Get();
+-    if (!p || !p->parentCell || !Init()) return;
+-    if (selection && !GetActive()) {selection=false;m_pOverlay->ExecuteAsync("hideHome");}
+-    auto* current=p->GetParentCellEx();
+-    const auto now=Clock::now();
+-    if (now>=refresh)
+-    {
+-        refresh=now+3s;
+-        const auto id=m_transport.GetLocalPlayerId();self.store(id);
+-        unsigned i=0;
+-        for (auto& [slot,h]:houses)
+-        {
+-            auto* cell=Cast<TESObjectCELL>(TESForm::GetById(h.original));
+-            h.owned=Owned(m_world,cell,p);routes[i++].own.store(h.owned?id+1:0);
+-            if (!h.owned) continue;
+-            if (cell==current && cell->IsAttached())
+-            {
+-                h.visible.clear();h.visible.reserve(h.refs.size());
+-                for (const auto& entry:h.refs)
+-                {
+-                    auto* ref=entry.original?Cast<TESObjectREFR>(TESForm::GetById(entry.original)):nullptr;
+-                    h.visible+=ref?(ref->IsDisabled()?'0':'1'):'?';
+-                }
+-            }
+-            RequestPartyHome m;m.Event.House=slot;m.Event.Visible=h.visible.c_str();m_transport.Send(m);
+-        }
+-    }
+-    if (!guestSlot || !current || current->formID!=houses.at(guestSlot).copy || !current->IsAttached() || now<applyAt) return;
+-    applyAt=now+1s;
+-    auto a=ads.find({guestSlot,guestOwner});if (a==ads.end()) return;
+-    auto& h=houses.at(guestSlot);
+-    const auto& visible=a->second.visible;
+-    if (visible.size()!=h.refs.size()) return;
+-    if (applied.size()!=visible.size()) applied.assign(visible.size(),'?');
+-    for (size_t i=0;i<visible.size();++i)
+-    {
+-        if (visible[i]=='?' || visible[i]==applied[i]) continue;
+-        auto* ref=Cast<TESObjectREFR>(TESForm::GetById(h.refs[i].copy));
+-        if (!ref) continue;
+-        if (visible[i]=='1' && ref->IsDisabled()) ref->Enable();
+-        if (visible[i]=='0' && !ref->IsDisabled()) ref->Disable();
+-        applied[i]=visible[i];
+-    }
+-}
++#include <TiltedOnlinePCH.h>
++#include <World.h>
++#include <Services/HomeInstance.h>
++#include <Services/CampaignAccess.h>
++#include <HomeRegistry.h>
++#include <InventoryEvidence.h>
++#include <Services/OverlayClient.h>
++#include <Services/OverlayService.h>
++#include <Services/PapyrusService.h>
++#include <OverlayApp.hpp>
++#include <PlayerCharacter.h>
++#include <Games/TES.h>
++#include <Forms/TESFaction.h>
++#include <Forms/TESNPC.h>
++#include <Forms/TESObjectCELL.h>
++#include <Forms/BGSEncounterZone.h>
++#include <Messages/NotifyPartyHome.h>
++#include <Messages/RequestPartyHome.h>
++#include <Interface/UI.h>
++#include <atomic>
++#include <filesystem>
++#include <fstream>
++#include <iomanip>
++#include <map>
++
++namespace
++{
++using Clock=std::chrono::steady_clock;
++using namespace std::chrono_literals;
++struct Ref {uint32_t original, copy;};
++struct House {uint32_t slot{},original{},copy{}; std::vector<Ref> refs;std::string visible;bool owned{};};
++struct Door {uint32_t slot; glm::vec3 pos,rotation;};
++struct Advert {std::string visible; Clock::time_point until;};
++std::map<uint32_t,House> houses;
++std::map<uint32_t,Door> doors;
++std::map<std::pair<uint32_t,uint32_t>,Advert> ads;
++uint32_t door{}, token{}, guestSlot{}, guestOwner{};
++std::vector<uint32_t> options;
++Clock::time_point refresh{}, applyAt{};
++std::string applied;
++bool selection{}, initialized{};
++struct Route {uint32_t source{},copy{},slot{};std::atomic_uint32_t own{},visit{};};
++Route routes[5];
++std::atomic_uint32_t routeCount{},self{UINT32_MAX};
++constexpr uint32_t invalid=UINT32_MAX;
++// Atomic local cell + wire namespace; never retain game pointers in a route.
++std::atomic_uint64_t activeHomeRoute{};
++uint32_t RouteBase(uint32_t local,uint32_t mod)
++{
++    if (HomeRegistry::Pending(mod)) return local;
++    return local&((local>>24)==0xFE?0xFFFu:0xFFFFFFu);
++}
++
++bool Init()
++{
++    if (initialized) return !houses.empty();
++    auto* mods=ModManager::Get();
++    if (!mods) return false;
++    auto* p=mods->GetByName("SkyrimCoopGuestHomes.esp");
++    if (!p || !p->IsLoaded()) {initialized=true;return false;}
++    std::ifstream f(std::filesystem::path("Data")/"SkyrimTogetherReborn"/"config"/"CoopHomes.txt");
++    if (!f) return false;
++    char kind{};uint32_t original{},slot{},copy{};std::string mod;
++    while (f>>kind)
++    {
++        if (kind=='H' && (f>>original>>slot))
++        {
++            auto& h=houses[slot];h.slot=slot;h.original=original;h.copy=p->GetFormId(slot);
++        }
++        else if (kind=='R' && (f>>std::quoted(mod)>>original>>copy>>slot))
++        {
++            auto* m=mods->GetByName(mod.c_str());
++            houses[slot].refs.push_back({m && m->IsLoaded()?m->GetFormId(original):0,p->GetFormId(copy)});
++        }
++        else if (kind=='D' && (f>>std::quoted(mod)>>original>>slot))
++        {
++            Door d{slot};f>>d.pos.x>>d.pos.y>>d.pos.z>>d.rotation.x>>d.rotation.y>>d.rotation.z;
++            if (auto* m=mods->GetByName(mod.c_str());m && m->IsLoaded()) doors[m->GetFormId(original)]=d;
++        }
++        else {houses.clear();break;}
++    }
++    initialized=true;
++    if (!f.eof() || houses.empty() || houses.size()>std::size(routes)) {houses.clear();return false;}
++    uint32_t i=0;
++    for (const auto& [id,h]:houses)
++    {
++        auto& r=routes[i++];r.source=h.original;r.copy=h.copy;r.slot=id;
++    }
++    routeCount.store(i);return true;
++}
++bool Owned(World& w,TESObjectCELL* cell,PlayerCharacter* p)
++{
++    if (!cell || !p) return false;
++    auto& vm=w.ctx().at<PapyrusService>();
++    auto* a=vm.Get("Cell","GetActorOwner");
++    auto* f=vm.Get("Cell","GetFactionOwner");
++    if (a)
++    {
++        // Cell ownership may name Player [NPC_:00000007] even when the
++        // runtime player's appearance/base is a different object.
++        auto* owner=PapyrusFunction<TESNPC*,TESObjectCELL>(a)(cell);
++        if (owner && (owner->formID==7 || owner==p->baseForm)) return true;
++    }
++    if (!f) return false;
++    auto* faction=PapyrusFunction<TESFaction*,TESObjectCELL>(f)(cell);
++    return faction && faction->formID==0xDB1; // PlayerFaction, assigned by the purchase fragment
++}
++struct HomeAck {uint64_t campaign{},character{};uint32_t owner{},slot{};std::string root;};
++HomeAck acknowledgedHome;
++void SetVisit(uint32_t slot,uint32_t owner)
++{
++    for (unsigned i=0;i<routeCount.load();++i) routes[i].visit.store(routes[i].slot==slot ? owner+1 : 0);
++    guestSlot=slot;guestOwner=owner;applied.clear();applyAt={};
++}
++}
++namespace HomeInstance
++{
++bool Tagged(uint32_t mod) noexcept {return HomeRegistry::Scoped(mod) || HomeRegistry::Pending(mod) || (mod&0xFFFF0000u)==0xFFFE0000u;}
++bool Foreign(uint32_t mod) noexcept
++{
++    if (HomeRegistry::Scoped(mod) || HomeRegistry::Pending(mod))
++        return uint32_t(activeHomeRoute.load()>>32)!=mod;
++    return Tagged(mod) && (mod&0xffff)!=self.load();
++}
++bool Encode(uint32_t local,uint32_t& mod,uint32_t& base) noexcept
++{
++    const auto route=activeHomeRoute.load();
++    if (route && local==uint32_t(route))
++    {mod=uint32_t(route>>32);base=RouteBase(local,mod);return true;}
++    for (uint32_t i=0;i<routeCount.load();++i)
++    {
++        const auto& r=routes[i];
++        uint32_t who=local==r.source?r.own.load():local==r.copy?r.visit.load():0;
++        if (who && who<=65535) {mod=0xFFFE0000u | (who-1);base=r.slot;return true;}
++    }
++    return false;
++}
++uint32_t Decode(uint32_t mod,uint32_t base) noexcept
++{
++    if (HomeRegistry::Scoped(mod) || HomeRegistry::Pending(mod))
++    {
++        const auto route=activeHomeRoute.load();const auto local=uint32_t(route);
++        return route && uint32_t(route>>32)==mod && RouteBase(local,mod)==base?local:0;
++    }
++    uint32_t who=(mod&0xffff)+1;
++    for (uint32_t i=0;i<routeCount.load();++i)
++        if (routes[i].slot==base)
++        {
++            if (routes[i].own.load()==who) return routes[i].source;
++            if (routes[i].visit.load()==who) return routes[i].copy;
++        }
++    return 0;
++}
++bool PrivateCell(uint32_t local) noexcept
++{
++    if (local && local==uint32_t(activeHomeRoute.load())) return true;
++    for (uint32_t i=0;i<routeCount.load();++i)
++        if (local==routes[i].copy || (local==routes[i].source && routes[i].own.load())) return true;
++    return false;
++}
++}
++void OverlayService::ClearHomes() noexcept
++{
++    if (selection && m_pOverlay && m_gameOverlayClient)
++    {m_pOverlay->ExecuteAsync("hideHome");m_gameOverlayClient->SetUIVisible(false);}
++    selection=false;door=0;options.clear();ads.clear();SetVisit(0,0);refresh={};self.store(invalid);
++    activeHomeRoute.store(0);acknowledgedHome={};
++    for (unsigned i=0;i<routeCount.load();++i) routes[i].own.store(0);
++    for (auto& [_,h]:houses){h.owned=false;h.visible.clear();}
++}
++void OverlayService::OnHome(const NotifyPartyHome& msg) noexcept
++{
++    const auto& e=msg.Event;
++    if (CampaignAccess::Mode()!=CampaignReplication::Link::Mode::Disabled)
++    {
++        if (!e.Campaign || !e.Character || !e.House || e.House>HomeRegistry::MaxSlot ||
++            e.Owner!=m_transport.GetLocalPlayerId() || !e.Visible.empty() ||
++            !e.Profile.empty() || !e.Credential.empty() || e.Root.size()>220) return;
++        auto identity=CampaignAccess::Current(m_world);
++        auto root=TradeProperties::DecodeForm({e.Root.data(),e.Root.size()});
++        if (!identity || !root || !root->Valid() || e.Campaign!=identity->Save.Campaign ||
++            e.Character!=identity->Save.Character) return;
++        acknowledgedHome={e.Campaign,e.Character,e.Owner,e.House,root->Encode()};
++        return;
++    }
++    if (!Init()) return;
++    const auto& members=m_world.GetPartyService().GetPartyMembers();
++    if (!houses.count(e.House) || std::find(members.begin(),members.end(),e.Owner)==members.end() ||
++        (!e.Visible.empty() && e.Visible.size()!=houses.at(e.House).refs.size())) return;
++    auto& a=ads[{e.House,e.Owner}];a.visible.assign(e.Visible.begin(),e.Visible.end());a.until=Clock::now()+12s;
++}
++bool OverlayService::TryHouseDoor(uint32_t form) noexcept
++{
++    // Do not offer the old decorative guest cell in the campaign path.
++    // No foreign house is enterable until its state and access are implemented.
++    if (CampaignAccess::Mode()!=CampaignReplication::Link::Mode::Disabled) return false;
++    if (!m_world.GetPartyService().IsInParty() || !m_inGame || m_active || !m_pOverlay || !m_gameOverlayClient ||
++        !doors.count(form) || selection) return false;
++    const auto slot=doors.at(form).slot;
++    if (!houses[slot].owned) return false;
++    options.clear();std::string labels;
++    const auto& players=m_world.GetPartyService().GetPlayers();
++    for (const auto& [key,a]:ads)
++        if (key.first==slot && a.until>Clock::now() && players.count(key.second))
++        {
++            auto name=players.at(key.second);
++            for(char& c:name) if (c=='\n' || c=='\r') c=' ';
++            if (!options.empty()) labels+='\n';
++            labels+=name.c_str();options.push_back(key.second);
++        }
++    if (options.empty()) return false;
++    selection=true;door=form;if (!++token) ++token;
++    auto args=CefListValue::Create();args->SetInt(0,token);args->SetString(1,labels);
++    m_pOverlay->ExecuteAsync("offerHome",args);m_gameOverlayClient->SetUIVisible(true);return true;
++}
++void OverlayService::ChooseHome(uint32_t nonce,int choice) noexcept
++{
++    if (!selection || nonce!=token) return;
++    selection=false;m_pOverlay->ExecuteAsync("hideHome");m_gameOverlayClient->SetUIVisible(false);
++    auto* player=PlayerCharacter::Get();
++    auto* entrance=Cast<TESObjectREFR>(TESForm::GetById(door));
++    if (!player || !entrance || choice<0 || !doors.count(door) ||
++        player->GetParentCellEx()!=entrance->GetParentCellEx() ||
++        glm::distance(static_cast<const glm::vec3&>(player->position),static_cast<const glm::vec3&>(entrance->position))>350.f) return;
++    if (!choice) {entrance->Activate(player,0,nullptr,1,0);return;}
++    if (static_cast<size_t>(choice)>options.size()) return;
++    const auto& d=doors.at(door);auto owner=options[choice-1];auto a=ads.find({d.slot,owner});
++    if (a==ads.end() || Clock::now()>=a->second.until) return;
++    auto* copy=Cast<TESObjectCELL>(TESForm::GetById(houses.at(d.slot).copy));
++    if (!copy) return;
++    SetVisit(d.slot,owner);player->SetRotation(d.rotation.x,d.rotation.y,d.rotation.z);
++    player->MoveTo(copy,d.pos);
++}
++void OverlayService::UpdateHomes() noexcept
++{
++    if (CampaignAccess::Mode()!=CampaignReplication::Link::Mode::Disabled) return;
++    if (!m_transport.IsConnected() || !m_world.GetPartyService().IsInParty() || !m_inGame) return;
++    auto* p=PlayerCharacter::Get();
++    if (!p || !p->parentCell || !Init()) return;
++    if (selection && !GetActive()) {selection=false;m_pOverlay->ExecuteAsync("hideHome");}
++    auto* current=p->GetParentCellEx();
++    const auto now=Clock::now();
++    if (now>=refresh)
++    {
++        refresh=now+3s;
++        const auto id=m_transport.GetLocalPlayerId();self.store(id);
++        unsigned i=0;
++        for (auto& [slot,h]:houses)
++        {
++            auto* cell=Cast<TESObjectCELL>(TESForm::GetById(h.original));
++            h.owned=Owned(m_world,cell,p);routes[i++].own.store(h.owned?id+1:0);
++            if (!h.owned) continue;
++            if (cell==current && cell->IsAttached())
++            {
++                h.visible.clear();h.visible.reserve(h.refs.size());
++                for (const auto& entry:h.refs)
++                {
++                    auto* ref=entry.original?Cast<TESObjectREFR>(TESForm::GetById(entry.original)):nullptr;
++                    h.visible+=ref?(ref->IsDisabled()?'0':'1'):'?';
++                }
++            }
++            RequestPartyHome m;m.Event.House=slot;m.Event.Visible=h.visible.c_str();m_transport.Send(m);
++        }
++    }
++    if (!guestSlot || !current || current->formID!=houses.at(guestSlot).copy || !current->IsAttached() || now<applyAt) return;
++    applyAt=now+1s;
++    auto a=ads.find({guestSlot,guestOwner});if (a==ads.end()) return;
++    auto& h=houses.at(guestSlot);
++    const auto& visible=a->second.visible;
++    if (visible.size()!=h.refs.size()) return;
++    if (applied.size()!=visible.size()) applied.assign(visible.size(),'?');
++    for (size_t i=0;i<visible.size();++i)
++    {
++        if (visible[i]=='?' || visible[i]==applied[i]) continue;
++        auto* ref=Cast<TESObjectREFR>(TESForm::GetById(h.refs[i].copy));
++        if (!ref) continue;
++        if (visible[i]=='1' && ref->IsDisabled()) ref->Enable();
++        if (visible[i]=='0' && !ref->IsDisabled()) ref->Disable();
++        applied[i]=visible[i];
++    }
++}
++
++// Registration uses an actual owned interior, not the five generated copies.
++// Run before cell discovery so the first cell announcement has the right
++// namespace. Until the replicated registration exists, use a private
++// connection-local quarantine. No guest projection is enabled in this mode.
++void HomeInstance::Prepare(World& world,TESObjectCELL* cell) noexcept
++{
++    static uint32_t observed{}, observedPlayer=invalid;
++    static Clock::time_point checkAt{};
++    try
++    {
++        if (!world.GetTransport().IsOnline() || !cell)
++        {
++            activeHomeRoute.store(0);acknowledgedHome={};observed=0;checkAt={};return;
++        }
++        auto* player=PlayerCharacter::Get();
++        if (!player) return;
++        const auto id=world.GetTransport().GetLocalPlayerId();
++        const auto mode=CampaignAccess::Mode();
++        if (mode==CampaignReplication::Link::Mode::Disabled)
++        {
++            activeHomeRoute.store(0);
++            if (!world.GetPartyService().IsInParty() || !Init()) return;
++            const auto previousSelf=self.exchange(id);
++            if (previousSelf==id && observed==cell->formID && observedPlayer==id && Clock::now()<checkAt) return;
++            observed=cell->formID;observedPlayer=id;checkAt=Clock::now()+1s;
++            for (unsigned i=0;i<routeCount.load();++i)
++                if (routes[i].source==cell->formID)
++                    routes[i].own.store(Owned(world,cell,player) && id<65535?id+1:0);
++            return;
++        }
++        const auto now=Clock::now();
++        const auto old=activeHomeRoute.load();
++        const bool candidate=cell->loadedCellData && cell->loadedCellData->encounterZone &&
++            cell->loadedCellData->encounterZone->formID==0xF90B1u && cell->formID!=0xEEC55u;
++        if (observed!=cell->formID || observedPlayer!=id || (candidate && !old))
++        {
++            observed=cell->formID;observedPlayer=id;checkAt={};
++            activeHomeRoute.store(0);
++        }
++        if (now<checkAt) return;
++        checkAt=now+1s;
++        // NoResetZone is STR's existing conservative home classification;
++        // explicit ownership is required in addition. More home types will
++        // need a catalog/root-boundary mapping, not a guessed cell owner.
++        if (!candidate || id>0xFFFFu)
++        {
++            activeHomeRoute.store(0);return;
++        }
++        // Quarantine even while ownership/identity is not yet readable.
++        // Never publish the canonical shared CELL for an unready home.
++        const auto quarantine=(uint64_t(HomeRegistry::PendingPrefix|id)<<32)|cell->formID;
++        if (!activeHomeRoute.load()) activeHomeRoute.store(quarantine);
++        if (mode!=CampaignReplication::Link::Mode::Ready || !CampaignAccess::GameReady() || !Owned(world,cell,player))
++        {activeHomeRoute.store(quarantine);return;}
++        const auto identity=CampaignAccess::Current(world);
++        if (!identity) {activeHomeRoute.store(quarantine);return;}
++        std::vector<InventoryEvidence::PluginSlot> slots;
++        if (auto* mods=ModManager::Get())
++            for (const auto* mod:mods->mods)
++            {
++                if (!mod || !mod->IsLoaded()) continue;
++                const auto* end=std::find(mod->filename,mod->filename+sizeof(mod->filename),'\0');
++                if (end!=mod->filename+sizeof(mod->filename))
++                    slots.push_back({mod->GetId(),mod->IsLite(),std::string(mod->filename,end)});
++            }
++        auto key=InventoryEvidence::Resolve(cell->formID,slots);
++        if (!key) {activeHomeRoute.store(quarantine);return;}
++        TradeProperties::FormKey root{key->Plugin,key->Local};
++        if (!root.Valid()) {activeHomeRoute.store(quarantine);return;}
++        const auto encoded=root.Encode();
++        const auto slot=CampaignAccess::HomeScope(identity->Save.Campaign,identity->Save.Character,encoded);
++        if (slot && acknowledgedHome.campaign==identity->Save.Campaign &&
++            acknowledgedHome.character==identity->Save.Character && acknowledgedHome.owner==id &&
++            acknowledgedHome.slot==slot && acknowledgedHome.root==encoded)
++        {
++            activeHomeRoute.store((uint64_t(HomeRegistry::ScopePrefix|slot)<<32)|cell->formID);
++            return;
++        }
++        activeHomeRoute.store(quarantine);
++        RequestPartyHome request;
++        auto& e=request.Event;
++        e.Campaign=identity->Save.Campaign;e.Character=identity->Save.Character;
++        e.SaveTag=identity->Save.Applied.Tag;e.SaveRevision=identity->Save.Applied.Revision;
++        e.Profile=identity->Profile.c_str();e.Credential=identity->Credential.Secret.c_str();e.Root=encoded.c_str();
++        world.GetTransport().Send(request);
++    }
++    catch (const std::exception& e) {spdlog::error("Preparing home instance: {}",e.what());}
++}
+diff --git a/Code/client/Services/CampaignAccess.h b/Code/client/Services/CampaignAccess.h
+--- a/Code/client/Services/CampaignAccess.h
++++ b/Code/client/Services/CampaignAccess.h
+@@ -13,7 +13,8 @@
+ CampaignReplication::Link::Mode Mode();
+ std::optional<Identity> Current(World&);
+ bool GameReady();
+-bool TradeEnabled();
++bool TradeEnabled();
++uint32_t HomeScope(uint64_t campaign,uint64_t character,std::string_view root);
+ bool ConfirmReceipt(World&, uint64_t stream, uint64_t savedStream, uint32_t cursor, uint32_t receipt,
+                     std::string_view plugin, uint32_t base, int count,int64_t before,std::string_view variant={});
+ }
+diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
+--- a/Code/client/Services/Generic/QuestJournal.cpp
++++ b/Code/client/Services/Generic/QuestJournal.cpp
+@@ -9,7 +9,8 @@
+ #include <QuestJournalDisk.h>
+ #include <CampaignReplication.h>
+ #include <CampaignIdentity.h>
+-#include <Services/CampaignAccess.h>
++#include <Services/CampaignAccess.h>
++#include <HomeRegistry.h>
+ #include <TradeLedger.h>
+ #include <Services/PapyrusService.h>
+ #include <PlayerCharacter.h>
+@@ -85,7 +86,16 @@
+ 
+ CampaignReplication::Link::Mode CampaignAccess::Mode() { return campaignLink.Start(false); }
+ bool CampaignAccess::GameReady() { return SaveWorldReady(); }
+-bool CampaignAccess::TradeEnabled()
++uint32_t CampaignAccess::HomeScope(uint64_t campaign,uint64_t character,std::string_view root)
++{
++    if (Mode()!=CampaignReplication::Link::Mode::Ready || campaign!=campaignLink.Campaign) return 0;
++    auto key=TradeProperties::DecodeForm(root);
++    if (!key) return 0;
++    auto home=HomeRegistry::Find(campaignLink.Journal,character,*key);
++    return home?home->Slot:0;
++}
++
++bool CampaignAccess::TradeEnabled()
+ {
+     using Mode=CampaignReplication::Link::Mode;
+     const auto mode=CampaignAccess::Mode();
+diff --git a/Code/client/Services/DiscoveryService.h b/Code/client/Services/DiscoveryService.h
+--- a/Code/client/Services/DiscoveryService.h
++++ b/Code/client/Services/DiscoveryService.h
+@@ -3,7 +3,8 @@
+ #include <Events/EventDispatcher.h>
+ #include <Games/Events.h>
+ 
+-#include <Structs/GridCellCoords.h>
++#include <Structs/GridCellCoords.h>
++#include <Structs/GameId.h>
+ 
+ #include <chrono>
+ 
+@@ -108,7 +109,8 @@
+      */
+     GridCellCoords m_currentGrid{};
+     uint32_t m_worldSpaceId = 0;
+-    uint32_t m_interiorCellId = 0;
++    uint32_t m_interiorCellId = 0;
++    GameId m_interiorNetworkCell{};
+     struct TESForm* m_pLocation = nullptr;
+ 
+     entt::scoped_connection m_preUpdateConnection;
+diff --git a/Code/client/Services/Generic/DiscoveryService.cpp b/Code/client/Services/Generic/DiscoveryService.cpp
+--- a/Code/client/Services/Generic/DiscoveryService.cpp
++++ b/Code/client/Services/Generic/DiscoveryService.cpp
+@@ -1,7 +1,8 @@
+ #include <TiltedOnlinePCH.h>
+ #include <Services/OverlayService.h>
+ 
+-#include <Services/DiscoveryService.h>
++#include <Services/DiscoveryService.h>
++#include <Services/HomeInstance.h>
+ #include <Games/TES.h>
+ 
+ #include <Games/References.h>
+@@ -99,7 +100,9 @@
+     const PlayerCharacter* pPlayer = PlayerCharacter::Get();
+     const auto pWorldSpace = pPlayer->GetWorldSpace();
+ 
+-    m_interiorCellId = 0;
++    HomeInstance::Prepare(m_world,nullptr);
++    m_interiorNetworkCell={};
++    m_interiorCellId = 0;
+ 
+     const TES* pTES = TES::Get();
+     const uint32_t worldSpaceId = pWorldSpace->formID;
+@@ -146,25 +149,27 @@
+     }
+ }
+ 
+-void DiscoveryService::VisitInteriorCell(bool aForceTrigger) noexcept
+-{
+-    ResetCachedCellData();
+-
+-    const uint32_t cellId = PlayerCharacter::Get()->GetParentCellEx()->formID;
+-    if (m_interiorCellId != cellId || aForceTrigger)
+-    {
+-        CellChangeEvent cellChangeEvent{};
+-
+-        if (!m_world.GetModSystem().GetServerModId(cellId, cellChangeEvent.CellId))
+-        {
+-            spdlog::error("Failed to find cell id {:X}", cellId);
+-            return;
+-        }
+-
+-        m_dispatcher.trigger(cellChangeEvent);
+-        m_interiorCellId = cellId;
+-    }
+-}
++void DiscoveryService::VisitInteriorCell(bool aForceTrigger) noexcept
++{
++    ResetCachedCellData();
++
++    auto* cell=PlayerCharacter::Get()->GetParentCellEx();
++    HomeInstance::Prepare(m_world,cell);
++    const uint32_t cellId=cell->formID;
++    CellChangeEvent cellChangeEvent{};
++    if (!m_world.GetModSystem().GetServerModId(cellId,cellChangeEvent.CellId))
++    {
++        spdlog::error("Failed to find cell id {:X}",cellId);
++        return;
++    }
++    // A new owner scope may be confirmed without any engine CELL change.
++    if (m_interiorCellId!=cellId || m_interiorNetworkCell!=cellChangeEvent.CellId || aForceTrigger)
++    {
++        m_dispatcher.trigger(cellChangeEvent);
++        m_interiorCellId=cellId;
++        m_interiorNetworkCell=cellChangeEvent.CellId;
++    }
++}
+ 
+ void DiscoveryService::DetectGridCellChange(TESWorldSpace* aWorldSpace, bool aNewCellGrid) noexcept
+ {
+diff --git a/Code/server/Services/PlayerService.cpp b/Code/server/Services/PlayerService.cpp
+--- a/Code/server/Services/PlayerService.cpp
++++ b/Code/server/Services/PlayerService.cpp
+@@ -2,7 +2,9 @@
+ #include "Events/CharacterExteriorCellChangeEvent.h"
+ #include "Events/PlayerLeaveCellEvent.h"
+ 
+-#include <Services/PlayerService.h>
++#include <Services/PlayerService.h>
++#include <Services/CampaignAccess.h>
++#include <HomeRegistry.h>
+ #include <Services/CharacterService.h>
+ #include <GameServer.h>
+ 
+@@ -113,9 +115,21 @@
+ 
+     auto& message = acMessage.Packet;
+ 
+-    const auto oldCell = pPlayer->GetCellComponent().Cell;
+-
+-    auto cell = CellIdComponent{message.CellId, {}, {}};
++    const auto oldCell = pPlayer->GetCellComponent().Cell;
++
++    // New campaign namespace is assigned by the authoritative journal.
++    // A pending route may only identify this connection. Guests are not
++    // admitted to foreign scopes until their snapshot/access protocol exists.
++    if (HomeRegistry::Scoped(message.CellId.ModId))
++    {
++        auto& link=CampaignAccess::Authority();
++        if (link.State()!=CampaignReplication::Link::Mode::Ready ||
++            !HomeRegistry::OwnsCell(link.Journal,CampaignAccess::Character(*pPlayer),
++                message.CellId.ModId,message.CellId.BaseId)) return;
++    }
++    if (HomeRegistry::Pending(message.CellId.ModId) &&
++        (pPlayer->GetId()>0xFFFFu || (message.CellId.ModId&0xFFFFu)!=pPlayer->GetId())) return;
++    auto cell = CellIdComponent{message.CellId, {}, {}};
+     pPlayer->SetCellComponent(cell);
+ 
+     m_world.GetDispatcher().trigger(PlayerLeaveCellEvent(oldCell));
+@@ -126,7 +140,10 @@
+ 
+         if (auto pCellIdComponent = m_world.try_get<CellIdComponent>(entity); pCellIdComponent)
+         {
+-            m_world.GetDispatcher().trigger(CharacterInteriorCellChangeEvent{pPlayer, entity, message.CellId});
++            // The spawn sent by the cell-change event must already contain
++            // the new scope, not the last movement sample's old CELL.
++            *pCellIdComponent=cell;
++            m_world.GetDispatcher().trigger(CharacterInteriorCellChangeEvent{pPlayer, entity, message.CellId});
+         }
+     }
+ 
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+-#pragma once
+-// This file was autogenerated by xmake
+-#define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign10"
++#pragma once
++// This file was autogenerated by xmake
++#define BUILD_BRANCH "${GIT_BRANCH}"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign11"

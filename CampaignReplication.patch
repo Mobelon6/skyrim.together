@@ -1,0 +1,1471 @@
+diff --git a/Code/common/CampaignJournal.h b/Code/common/CampaignJournal.h
+--- a/Code/common/CampaignJournal.h
++++ b/Code/common/CampaignJournal.h
+@@ -37,6 +37,8 @@
+     // Caller authenticates source and verifies the campaign/profile handshake first.
+     Result Import(uint32_t revision, std::string_view record);
+     std::optional<std::string> Export(uint32_t revision) const;
++    // Verify the advertised revision and tag before touching the replica's disk.
++    Result ImportExpected(Head previous, Head target, std::string_view record);
+     const std::vector<Operation>& Operations() const { return m_operations; }
+     bool Ready() const { return m_ready; }
+ private:
+diff --git a/Code/common/CampaignJournal.cpp b/Code/common/CampaignJournal.cpp
+--- a/Code/common/CampaignJournal.cpp
++++ b/Code/common/CampaignJournal.cpp
+@@ -129,6 +129,13 @@
+     if (!m_ready) return Result::Invalid;
+     return Accept(revision,record,true);
+ }
++Result Journal::ImportExpected(Head previous, Head target, std::string_view record)
++{
++    if (!m_ready || previous != Current() || previous.Revision >= UINT32_MAX-1 ||
++        target.Revision != previous.Revision+1 || record.size()>4096 || target.Tag != Tag(record))
++        return Result::Conflict;
++    return Import(target.Revision,record);
++}
+ Result Journal::Accept(uint32_t revision, std::string_view record, bool persist)
+ {
+     if (!revision || revision==UINT32_MAX || record.size()>4096 || m_heads.empty()) return Result::Invalid;
+diff --git a/Code/common/CampaignReplication.h b/Code/common/CampaignReplication.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/CampaignReplication.h
+@@ -0,0 +1,45 @@
++#pragma once
++#include "CampaignJournal.h"
++#include <filesystem>
++#include <string>
++
++namespace CampaignReplication
++{
++using CampaignJournal::Head;
++enum class Status : uint8_t { Current, Record, Conflict, Unavailable };
++struct Pull
++{
++    uint64_t Campaign{}, Nonce{};
++    std::string Profile;
++    Head Base{};
++};
++struct Reply
++{
++    uint64_t Campaign{}, Nonce{};
++    Status State{Status::Unavailable};
++    Head Base{}, Target{};
++    uint32_t Total{};
++    std::string Row;
++};
++
++// Server exposes a read-only, single-record pull. It never accepts client writes.
++Reply Serve(const CampaignJournal::Journal&, uint64_t campaign, std::string_view profile, const Pull&);
++CampaignJournal::Result Receive(CampaignJournal::Journal&, const Pull&, const Reply&);
++
++// Explicit physical path, outside the replaceable mod. Disabled unless configured.
++// On the host the authority and local replica use separate directories.
++class Link
++{
++public:
++    enum class Mode { Disabled, Failed, Ready };
++    Mode Start(bool authority);
++    Mode State() const { return m_mode; }
++    void Fail() { m_mode=Mode::Failed; }
++    uint64_t Campaign{};
++    std::string Profile;
++    CampaignJournal::Journal Journal;
++private:
++    Mode m_mode{Mode::Disabled};
++    bool m_started{};
++};
++}
+diff --git a/Code/common/CampaignReplication.cpp b/Code/common/CampaignReplication.cpp
+new file mode 100644
+--- /dev/null
++++ b/Code/common/CampaignReplication.cpp
+@@ -0,0 +1,88 @@
++#include "CampaignReplication.h"
++#include <cstdlib>
++#include <fstream>
++#include <charconv>
++#include <system_error>
++
++namespace CampaignReplication
++{
++using CampaignJournal::Result;
++Reply Serve(const CampaignJournal::Journal& journal, uint64_t campaign, std::string_view profile, const Pull& request)
++{
++    Reply reply;
++    reply.Campaign=request.Campaign; reply.Nonce=request.Nonce; reply.Base=request.Base;
++    if (!request.Nonce || !request.Campaign || request.Campaign!=campaign || request.Profile!=profile || !journal.Ready())
++        return reply;
++    const auto head=journal.Current();
++    const auto known=journal.At(request.Base.Revision);
++    if (!known || *known!=request.Base)
++    {
++        reply.State=Status::Conflict; // no history or records disclosed on conflict
++        return reply;
++    }
++    reply.Total=head.Revision;
++    if (request.Base==head)
++    {
++        reply.State=Status::Current; reply.Target=head; return reply;
++    }
++    const auto next=request.Base.Revision+1;
++    auto row=journal.Export(next);
++    auto target=journal.At(next);
++    if (!row || !target) return reply;
++    reply.State=Status::Record;
++    reply.Target=*target;
++    reply.Row=std::move(*row);
++    return reply;
++}
++Result Receive(CampaignJournal::Journal& journal, const Pull& request, const Reply& reply)
++{
++    if (!journal.Ready() || !request.Nonce || request.Campaign!=reply.Campaign ||
++        request.Nonce!=reply.Nonce || request.Base!=reply.Base || request.Base!=journal.Current())
++        return Result::Conflict;
++    if (reply.State==Status::Current)
++        return reply.Row.empty() && reply.Target==request.Base && reply.Total==request.Base.Revision ? Result::Duplicate : Result::Invalid;
++    if (reply.State==Status::Conflict) return Result::Conflict;
++    if (reply.State==Status::Unavailable) return Result::StorageError;
++    if (reply.State!=Status::Record || request.Base.Revision>=UINT32_MAX-1 ||
++        reply.Target.Revision!=request.Base.Revision+1 || reply.Total<reply.Target.Revision)
++        return Result::Invalid;
++    return journal.ImportExpected(request.Base,reply.Target,reply.Row);
++}
++Link::Mode Link::Start(bool authority)
++{
++    if (m_started) return m_mode;
++    m_started=true;
++#ifdef _WIN32
++    const auto* path=_wgetenv(L"STM_CAMPAIGN_ROOT");
++#else
++    const auto* path=std::getenv("STM_CAMPAIGN_ROOT");
++#endif
++    if (!path || !*path) return m_mode;
++    m_mode=Mode::Failed;
++    try
++    {
++        const std::filesystem::path root(path);
++        if (!root.is_absolute()) return m_mode;
++        const auto config=root/"CampaignLink.txt";
++        if (!std::filesystem::is_regular_file(config) || std::filesystem::file_size(config)>512) return m_mode;
++        std::ifstream input(config);
++        std::string id, extra;
++        if (!(input>>id>>Profile) || input>>extra || input.bad()) return m_mode;
++        const auto parsed=std::from_chars(id.data(),id.data()+id.size(),Campaign);
++        if (parsed.ec!=std::errc{} || parsed.ptr!=id.data()+id.size() || !Campaign) return m_mode;
++        const auto directory=root/(authority?"authority":"replica");
++        if (!Journal.Open(directory,Campaign,Profile,false))
++        {
++            // Never recreate an existing, damaged history. Authority creation is explicit.
++            const auto* create=std::getenv("STM_CAMPAIGN_CREATE");
++            if (std::filesystem::exists(directory/std::to_string(Campaign)) ||
++                (authority && (!create || std::string_view(create)!="1")) ||
++                !Journal.Open(directory,Campaign,Profile,true))
++                return m_mode;
++        }
++        m_mode=Mode::Ready;
++    }
++    catch (...) { m_mode=Mode::Failed; }
++    return m_mode;
++}
++}
+diff --git a/Code/encoding/Opcodes.h b/Code/encoding/Opcodes.h
+--- a/Code/encoding/Opcodes.h
++++ b/Code/encoding/Opcodes.h
+@@ -61,72 +61,74 @@
+     kRequestCoopInteraction,
+     kRequestPartyTrade,
+     kRequestPartyHome,
+-    kClientOpcodeMax
+-};
+-
+-enum ServerOpcode : unsigned char
+-{
+-    kAuthenticationResponse = 0,
+-    kAssignCharacterResponse,
+-    kServerReferencesMoveRequest,
+-    kServerTimeSettings,
+-    kCharacterSpawnRequest,
+-    kNotifyFactionsChanges,
+-    kNotifyRemoveCharacter,
+-    kNotifyQuestUpdate,
+-    kNotifyPlayerList,
+-    kNotifyPartyInfo,
+-    kNotifyPartyInvite,
+-    kNotifyPartyJoined,
+-    kNotifyPartyLeft,
+-    kNotifyActorValueChanges,
+-    kNotifyActorMaxValueChanges,
+-    kNotifyHealthChangeBroadcast,
+-    kNotifyActivate,
+-    kNotifyLockChange,
+-    kAssignObjectsResponse,
+-    kNotifyDeathStateChange,
+-    kNotifyOwnershipTransfer,
+-    kNotifyObjectInventoryChanges,
+-    kNotifyInventoryChanges,
+-    kNotifyInventorySnapshot,
+-    kNotifySpellCast,
+-    kNotifyInterruptCast,
+-    kNotifyAddTarget,
+-    kNotifyRemoveSpell,
+-    kNotifyProjectileLaunch,
+-    kNotifyScriptAnimation,
+-    kNotifyDrawWeapon,
+-    kNotifyMount,
+-    kNotifyNewPackage,
+-    kNotifyRespawn,
+-    kNotifySyncExperience,
+-    kNotifyEquipmentChanges,
+-    kNotifyChatMessageBroadcast,
+-    kTeleportCommandResponse,
+-    kStringCacheUpdate,
+-    kNotifyPlayerRespawn,
+-    kNotifyDialogue,
+-    kNotifySubtitle,
+-    kNotifyPlayerDialogue,
+-    kNotifyActorTeleport,
+-    kNotifyPlayerLeft,
+-    kNotifyPlayerJoined,
+-    kNotifyPlayerLevel,
+-    kNotifyPlayerCellChanged,
+-    kNotifyTeleport,
+-    kNotifyPlayerHealthUpdate,
+-    kNotifySettingsChange,
+-    kNotifyWeatherChange,
+-    kNotifySetWaypoint,
+-    kNotifyRemoveWaypoint,
+-    kNotifySetTimeResult,
+-    kNotifyActionEvents,
+-    kNotifyPartyTravel,
+-    kNotifyNpcLifeCheck,
+-    kNotifyQuestJournal,
+-    kNotifyCoopInteraction,
+-    kNotifyPartyTrade,
+-    kNotifyPartyHome,
++    kRequestCampaignPull,
++    kClientOpcodeMax
++};
++
++enum ServerOpcode : unsigned char
++{
++    kAuthenticationResponse = 0,
++    kAssignCharacterResponse,
++    kServerReferencesMoveRequest,
++    kServerTimeSettings,
++    kCharacterSpawnRequest,
++    kNotifyFactionsChanges,
++    kNotifyRemoveCharacter,
++    kNotifyQuestUpdate,
++    kNotifyPlayerList,
++    kNotifyPartyInfo,
++    kNotifyPartyInvite,
++    kNotifyPartyJoined,
++    kNotifyPartyLeft,
++    kNotifyActorValueChanges,
++    kNotifyActorMaxValueChanges,
++    kNotifyHealthChangeBroadcast,
++    kNotifyActivate,
++    kNotifyLockChange,
++    kAssignObjectsResponse,
++    kNotifyDeathStateChange,
++    kNotifyOwnershipTransfer,
++    kNotifyObjectInventoryChanges,
++    kNotifyInventoryChanges,
++    kNotifyInventorySnapshot,
++    kNotifySpellCast,
++    kNotifyInterruptCast,
++    kNotifyAddTarget,
++    kNotifyRemoveSpell,
++    kNotifyProjectileLaunch,
++    kNotifyScriptAnimation,
++    kNotifyDrawWeapon,
++    kNotifyMount,
++    kNotifyNewPackage,
++    kNotifyRespawn,
++    kNotifySyncExperience,
++    kNotifyEquipmentChanges,
++    kNotifyChatMessageBroadcast,
++    kTeleportCommandResponse,
++    kStringCacheUpdate,
++    kNotifyPlayerRespawn,
++    kNotifyDialogue,
++    kNotifySubtitle,
++    kNotifyPlayerDialogue,
++    kNotifyActorTeleport,
++    kNotifyPlayerLeft,
++    kNotifyPlayerJoined,
++    kNotifyPlayerLevel,
++    kNotifyPlayerCellChanged,
++    kNotifyTeleport,
++    kNotifyPlayerHealthUpdate,
++    kNotifySettingsChange,
++    kNotifyWeatherChange,
++    kNotifySetWaypoint,
++    kNotifyRemoveWaypoint,
++    kNotifySetTimeResult,
++    kNotifyActionEvents,
++    kNotifyPartyTravel,
++    kNotifyNpcLifeCheck,
++    kNotifyQuestJournal,
++    kNotifyCoopInteraction,
++    kNotifyPartyTrade,
++    kNotifyPartyHome,
++    kNotifyCampaignRecord,
+     kServerOpcodeMax
+ };
+diff --git a/Code/encoding/Messages/ClientMessageFactory.h b/Code/encoding/Messages/ClientMessageFactory.h
+--- a/Code/encoding/Messages/ClientMessageFactory.h
++++ b/Code/encoding/Messages/ClientMessageFactory.h
+@@ -2,82 +2,83 @@
+ 
+ #include <Messages/Message.h>
+ #include <MetaMessage.h>
+-#include <Messages/RequestQuestJournal.h>
+-#include <Messages/RequestCoopInteraction.h>
+-#include <Messages/RequestPartyHome.h>
+-#include <Messages/RequestPartyTrade.h>
+-#include <Messages/RequestNpcLifeCheck.h>
+-#include <Messages/PartyTravelRequest.h>
+-
+-#include <Messages/AuthenticationRequest.h>
+-#include <Messages/AssignCharacterRequest.h>
+-#include <Messages/ClientReferencesMoveRequest.h>
+-#include <Messages/EnterInteriorCellRequest.h>
+-#include <Messages/RequestInventoryChanges.h>
+-#include <Messages/RequestFactionsChanges.h>
+-#include <Messages/RequestQuestUpdate.h>
+-#include <Messages/PartyInviteRequest.h>
+-#include <Messages/PartyAcceptInviteRequest.h>
+-#include <Messages/PartyLeaveRequest.h>
+-#include <Messages/PartyCreateRequest.h>
+-#include <Messages/PartyChangeLeaderRequest.h>
+-#include <Messages/PartyKickRequest.h>
+-#include <Messages/PartyInviteRequest.h>
+-#include <Messages/RequestActorValueChanges.h>
+-#include <Messages/RequestActorMaxValueChanges.h>
+-#include <Messages/RequestHealthChangeBroadcast.h>
+-#include <Messages/ActivateRequest.h>
+-#include <Messages/LockChangeRequest.h>
+-#include <Messages/AssignObjectsRequest.h>
+-#include <Messages/RequestDeathStateChange.h>
+-#include <Messages/ShiftGridCellRequest.h>
+-#include <Messages/RequestOwnershipTransfer.h>
+-#include <Messages/EnterExteriorCellRequest.h>
+-#include <Messages/RequestOwnershipClaim.h>
+-#include <Messages/RequestObjectInventoryChanges.h>
+-#include <Messages/SpellCastRequest.h>
+-#include <Messages/InterruptCastRequest.h>
+-#include <Messages/AddTargetRequest.h>
+-#include <Messages/RemoveSpellRequest.h>
+-#include <Messages/ProjectileLaunchRequest.h>
+-#include <Messages/ScriptAnimationRequest.h>
+-#include <Messages/DrawWeaponRequest.h>
+-#include <Messages/MountRequest.h>
+-#include <Messages/NewPackageRequest.h>
+-#include <Messages/RequestRespawn.h>
+-#include <Messages/SyncExperienceRequest.h>
+-#include <Messages/RequestEquipmentChanges.h>
+-#include <Messages/RequestInventorySnapshot.h>
+-#include <Messages/SendChatMessageRequest.h>
+-#include <Messages/TeleportCommandRequest.h>
+-#include <Messages/SetTimeCommandRequest.h>
+-#include <Messages/RequestActionEvents.h>
+-#include <Messages/PlayerRespawnRequest.h>
+-#include <Messages/DialogueRequest.h>
+-#include <Messages/SubtitleRequest.h>
+-#include <Messages/PlayerDialogueRequest.h>
+-#include <Messages/PlayerLevelRequest.h>
+-#include <Messages/TeleportRequest.h>
+-#include <Messages/RequestPlayerHealthUpdate.h>
+-#include <Messages/RequestWeatherChange.h>
+-#include <Messages/RequestCurrentWeather.h>
+-#include <Messages/RequestSetWaypoint.h>
+-#include <Messages/RequestRemoveWaypoint.h>
+-
+-using TiltedPhoques::UniquePtr;
+-
+-struct ClientMessageFactory
+-{
+-    UniquePtr<ClientMessage> Extract(TiltedPhoques::Buffer::Reader& aReader) const noexcept;
+-
+-    template <class T> static auto Visit(T&& func)
+-    {
+-        auto s_visitor = CreateMessageVisitor<
+-            AuthenticationRequest, AssignCharacterRequest, ClientReferencesMoveRequest, EnterInteriorCellRequest, RequestInventoryChanges, RequestInventorySnapshot, RequestFactionsChanges, RequestQuestUpdate, PartyInviteRequest, PartyAcceptInviteRequest, PartyLeaveRequest, PartyCreateRequest,
+-            PartyChangeLeaderRequest, PartyKickRequest, RequestActorValueChanges, RequestActorMaxValueChanges, EnterExteriorCellRequest, RequestHealthChangeBroadcast, ActivateRequest, LockChangeRequest, AssignObjectsRequest, RequestDeathStateChange, ShiftGridCellRequest,
+-            RequestOwnershipTransfer, RequestOwnershipClaim, RequestObjectInventoryChanges, SpellCastRequest, ProjectileLaunchRequest, InterruptCastRequest, AddTargetRequest, ScriptAnimationRequest, DrawWeaponRequest, MountRequest, NewPackageRequest, RequestRespawn, SyncExperienceRequest,
+-            RequestEquipmentChanges, SendChatMessageRequest, TeleportCommandRequest, PlayerRespawnRequest, DialogueRequest, SubtitleRequest, PlayerDialogueRequest, PlayerLevelRequest, TeleportRequest, RequestPlayerHealthUpdate, RequestWeatherChange, RequestCurrentWeather, RequestSetWaypoint,
+-            RequestRemoveWaypoint, RemoveSpellRequest, SetTimeCommandRequest, RequestActionEvents, PartyTravelRequest, RequestNpcLifeCheck, RequestQuestJournal, RequestCoopInteraction, RequestPartyTrade, RequestPartyHome>;
++#include <Messages/RequestCampaignPull.h>
++#include <Messages/RequestQuestJournal.h>
++#include <Messages/RequestCoopInteraction.h>
++#include <Messages/RequestPartyHome.h>
++#include <Messages/RequestPartyTrade.h>
++#include <Messages/RequestNpcLifeCheck.h>
++#include <Messages/PartyTravelRequest.h>
++
++#include <Messages/AuthenticationRequest.h>
++#include <Messages/AssignCharacterRequest.h>
++#include <Messages/ClientReferencesMoveRequest.h>
++#include <Messages/EnterInteriorCellRequest.h>
++#include <Messages/RequestInventoryChanges.h>
++#include <Messages/RequestFactionsChanges.h>
++#include <Messages/RequestQuestUpdate.h>
++#include <Messages/PartyInviteRequest.h>
++#include <Messages/PartyAcceptInviteRequest.h>
++#include <Messages/PartyLeaveRequest.h>
++#include <Messages/PartyCreateRequest.h>
++#include <Messages/PartyChangeLeaderRequest.h>
++#include <Messages/PartyKickRequest.h>
++#include <Messages/PartyInviteRequest.h>
++#include <Messages/RequestActorValueChanges.h>
++#include <Messages/RequestActorMaxValueChanges.h>
++#include <Messages/RequestHealthChangeBroadcast.h>
++#include <Messages/ActivateRequest.h>
++#include <Messages/LockChangeRequest.h>
++#include <Messages/AssignObjectsRequest.h>
++#include <Messages/RequestDeathStateChange.h>
++#include <Messages/ShiftGridCellRequest.h>
++#include <Messages/RequestOwnershipTransfer.h>
++#include <Messages/EnterExteriorCellRequest.h>
++#include <Messages/RequestOwnershipClaim.h>
++#include <Messages/RequestObjectInventoryChanges.h>
++#include <Messages/SpellCastRequest.h>
++#include <Messages/InterruptCastRequest.h>
++#include <Messages/AddTargetRequest.h>
++#include <Messages/RemoveSpellRequest.h>
++#include <Messages/ProjectileLaunchRequest.h>
++#include <Messages/ScriptAnimationRequest.h>
++#include <Messages/DrawWeaponRequest.h>
++#include <Messages/MountRequest.h>
++#include <Messages/NewPackageRequest.h>
++#include <Messages/RequestRespawn.h>
++#include <Messages/SyncExperienceRequest.h>
++#include <Messages/RequestEquipmentChanges.h>
++#include <Messages/RequestInventorySnapshot.h>
++#include <Messages/SendChatMessageRequest.h>
++#include <Messages/TeleportCommandRequest.h>
++#include <Messages/SetTimeCommandRequest.h>
++#include <Messages/RequestActionEvents.h>
++#include <Messages/PlayerRespawnRequest.h>
++#include <Messages/DialogueRequest.h>
++#include <Messages/SubtitleRequest.h>
++#include <Messages/PlayerDialogueRequest.h>
++#include <Messages/PlayerLevelRequest.h>
++#include <Messages/TeleportRequest.h>
++#include <Messages/RequestPlayerHealthUpdate.h>
++#include <Messages/RequestWeatherChange.h>
++#include <Messages/RequestCurrentWeather.h>
++#include <Messages/RequestSetWaypoint.h>
++#include <Messages/RequestRemoveWaypoint.h>
++
++using TiltedPhoques::UniquePtr;
++
++struct ClientMessageFactory
++{
++    UniquePtr<ClientMessage> Extract(TiltedPhoques::Buffer::Reader& aReader) const noexcept;
++
++    template <class T> static auto Visit(T&& func)
++    {
++        auto s_visitor = CreateMessageVisitor<
++            AuthenticationRequest, AssignCharacterRequest, ClientReferencesMoveRequest, EnterInteriorCellRequest, RequestInventoryChanges, RequestInventorySnapshot, RequestFactionsChanges, RequestQuestUpdate, PartyInviteRequest, PartyAcceptInviteRequest, PartyLeaveRequest, PartyCreateRequest,
++            PartyChangeLeaderRequest, PartyKickRequest, RequestActorValueChanges, RequestActorMaxValueChanges, EnterExteriorCellRequest, RequestHealthChangeBroadcast, ActivateRequest, LockChangeRequest, AssignObjectsRequest, RequestDeathStateChange, ShiftGridCellRequest,
++            RequestOwnershipTransfer, RequestOwnershipClaim, RequestObjectInventoryChanges, SpellCastRequest, ProjectileLaunchRequest, InterruptCastRequest, AddTargetRequest, ScriptAnimationRequest, DrawWeaponRequest, MountRequest, NewPackageRequest, RequestRespawn, SyncExperienceRequest,
++            RequestEquipmentChanges, SendChatMessageRequest, TeleportCommandRequest, PlayerRespawnRequest, DialogueRequest, SubtitleRequest, PlayerDialogueRequest, PlayerLevelRequest, TeleportRequest, RequestPlayerHealthUpdate, RequestWeatherChange, RequestCurrentWeather, RequestSetWaypoint,
++            RequestRemoveWaypoint, RemoveSpellRequest, SetTimeCommandRequest, RequestActionEvents, PartyTravelRequest, RequestNpcLifeCheck, RequestQuestJournal, RequestCoopInteraction, RequestPartyTrade, RequestPartyHome, RequestCampaignPull>;
+ 
+         return s_visitor(std::forward<T>(func));
+     }
+diff --git a/Code/encoding/Messages/ServerMessageFactory.h b/Code/encoding/Messages/ServerMessageFactory.h
+--- a/Code/encoding/Messages/ServerMessageFactory.h
++++ b/Code/encoding/Messages/ServerMessageFactory.h
+@@ -3,84 +3,85 @@
+ #include <TiltedCore/Stl.hpp>
+ #include <Messages/Message.h>
+ #include <MetaMessage.h>
+-#include <Messages/NotifyQuestJournal.h>
+-#include <Messages/NotifyCoopInteraction.h>
+-#include <Messages/NotifyPartyHome.h>
+-#include <Messages/NotifyPartyTrade.h>
+-#include <Messages/NotifyNpcLifeCheck.h>
+-#include <Messages/NotifyPartyTravel.h>
+-
+-#include <Messages/AuthenticationResponse.h>
+-#include <Messages/AssignCharacterResponse.h>
+-#include <Messages/ServerReferencesMoveRequest.h>
+-#include <Messages/ServerTimeSettings.h>
+-#include <Messages/CharacterSpawnRequest.h>
+-#include <Messages/NotifyInventoryChanges.h>
+-#include <Messages/NotifyFactionsChanges.h>
+-#include <Messages/NotifyRemoveCharacter.h>
+-#include <Messages/NotifyQuestUpdate.h>
+-#include <Messages/NotifyPlayerList.h>
+-#include <Messages/NotifyPartyInfo.h>
+-#include <Messages/NotifyPartyInvite.h>
+-#include <Messages/NotifyPartyJoined.h>
+-#include <Messages/NotifyPartyLeft.h>
+-#include <Messages/NotifyActorValueChanges.h>
+-#include <Messages/NotifyActorMaxValueChanges.h>
+-#include <Messages/NotifyHealthChangeBroadcast.h>
+-#include <Messages/NotifyActivate.h>
+-#include <Messages/NotifyLockChange.h>
+-#include <Messages/AssignObjectsResponse.h>
+-#include <Messages/NotifyDeathStateChange.h>
+-#include <Messages/NotifyOwnershipTransfer.h>
+-#include <Messages/NotifyObjectInventoryChanges.h>
+-#include <Messages/NotifySpellCast.h>
+-#include <Messages/NotifyInterruptCast.h>
+-#include <Messages/NotifyAddTarget.h>
+-#include <Messages/NotifyRemoveSpell.h>
+-#include <Messages/NotifyProjectileLaunch.h>
+-#include <Messages/NotifyScriptAnimation.h>
+-#include <Messages/NotifyDrawWeapon.h>
+-#include <Messages/NotifyMount.h>
+-#include <Messages/NotifyNewPackage.h>
+-#include <Messages/NotifyRespawn.h>
+-#include <Messages/NotifySyncExperience.h>
+-#include <Messages/NotifyEquipmentChanges.h>
+-#include <Messages/NotifyInventorySnapshot.h>
+-#include <Messages/NotifyChatMessageBroadcast.h>
+-#include <Messages/TeleportCommandResponse.h>
+-#include <Messages/StringCacheUpdate.h>
+-#include <Messages/NotifyPlayerRespawn.h>
+-#include <Messages/NotifyDialogue.h>
+-#include <Messages/NotifySubtitle.h>
+-#include <Messages/NotifyPlayerDialogue.h>
+-#include <Messages/NotifyActorTeleport.h>
+-#include <Messages/NotifyPlayerLeft.h>
+-#include <Messages/NotifyPlayerJoined.h>
+-#include <Messages/NotifyPlayerLevel.h>
+-#include <Messages/NotifyPlayerCellChanged.h>
+-#include <Messages/NotifyTeleport.h>
+-#include <Messages/NotifyPlayerHealthUpdate.h>
+-#include <Messages/NotifySettingsChange.h>
+-#include <Messages/NotifyWeatherChange.h>
+-#include <Messages/NotifySetWaypoint.h>
+-#include <Messages/NotifyRemoveWaypoint.h>
+-#include <Messages/NotifySetTimeResult.h>
+-#include <Messages/NotifyActionEvents.h>
+-
+-using TiltedPhoques::UniquePtr;
+-
+-struct ServerMessageFactory
+-{
+-    UniquePtr<ServerMessage> Extract(TiltedPhoques::Buffer::Reader& aReader) const noexcept;
+-
+-    template <class T> static auto Visit(T&& func)
+-    {
+-        auto s_visitor = CreateMessageVisitor<
+-            AuthenticationResponse, AssignCharacterResponse, ServerReferencesMoveRequest, ServerTimeSettings, CharacterSpawnRequest, NotifyInventoryChanges, NotifyInventorySnapshot, StringCacheUpdate, NotifyFactionsChanges, NotifyRemoveCharacter, NotifyQuestUpdate, NotifyPlayerList, NotifyPartyInfo, NotifyPartyInvite,
+-            NotifyActorValueChanges, NotifyPartyJoined, NotifyPartyLeft, NotifyActorMaxValueChanges, NotifyHealthChangeBroadcast, NotifyActivate, NotifyLockChange, AssignObjectsResponse, NotifyDeathStateChange, NotifyOwnershipTransfer, NotifyObjectInventoryChanges, NotifySpellCast,
+-            NotifyProjectileLaunch, NotifyInterruptCast, NotifyAddTarget, NotifyScriptAnimation, NotifyDrawWeapon, NotifyMount, NotifyNewPackage, NotifyRespawn, NotifySyncExperience, NotifyEquipmentChanges, NotifyChatMessageBroadcast, TeleportCommandResponse, NotifyPlayerRespawn, NotifyDialogue,
+-            NotifySubtitle, NotifyPlayerDialogue, NotifyActorTeleport, NotifyPlayerLeft, NotifyPlayerJoined, NotifyDialogue, NotifySubtitle, NotifyPlayerDialogue, NotifyPlayerLevel, NotifyPlayerCellChanged, NotifyTeleport, NotifyPlayerHealthUpdate, NotifySettingsChange,
+-            NotifyWeatherChange, NotifySetWaypoint, NotifyRemoveWaypoint, NotifySetTimeResult, NotifyRemoveSpell, NotifyActionEvents, NotifyPartyTravel, NotifyNpcLifeCheck, NotifyQuestJournal, NotifyCoopInteraction, NotifyPartyTrade, NotifyPartyHome>;
++#include <Messages/NotifyCampaignRecord.h>
++#include <Messages/NotifyQuestJournal.h>
++#include <Messages/NotifyCoopInteraction.h>
++#include <Messages/NotifyPartyHome.h>
++#include <Messages/NotifyPartyTrade.h>
++#include <Messages/NotifyNpcLifeCheck.h>
++#include <Messages/NotifyPartyTravel.h>
++
++#include <Messages/AuthenticationResponse.h>
++#include <Messages/AssignCharacterResponse.h>
++#include <Messages/ServerReferencesMoveRequest.h>
++#include <Messages/ServerTimeSettings.h>
++#include <Messages/CharacterSpawnRequest.h>
++#include <Messages/NotifyInventoryChanges.h>
++#include <Messages/NotifyFactionsChanges.h>
++#include <Messages/NotifyRemoveCharacter.h>
++#include <Messages/NotifyQuestUpdate.h>
++#include <Messages/NotifyPlayerList.h>
++#include <Messages/NotifyPartyInfo.h>
++#include <Messages/NotifyPartyInvite.h>
++#include <Messages/NotifyPartyJoined.h>
++#include <Messages/NotifyPartyLeft.h>
++#include <Messages/NotifyActorValueChanges.h>
++#include <Messages/NotifyActorMaxValueChanges.h>
++#include <Messages/NotifyHealthChangeBroadcast.h>
++#include <Messages/NotifyActivate.h>
++#include <Messages/NotifyLockChange.h>
++#include <Messages/AssignObjectsResponse.h>
++#include <Messages/NotifyDeathStateChange.h>
++#include <Messages/NotifyOwnershipTransfer.h>
++#include <Messages/NotifyObjectInventoryChanges.h>
++#include <Messages/NotifySpellCast.h>
++#include <Messages/NotifyInterruptCast.h>
++#include <Messages/NotifyAddTarget.h>
++#include <Messages/NotifyRemoveSpell.h>
++#include <Messages/NotifyProjectileLaunch.h>
++#include <Messages/NotifyScriptAnimation.h>
++#include <Messages/NotifyDrawWeapon.h>
++#include <Messages/NotifyMount.h>
++#include <Messages/NotifyNewPackage.h>
++#include <Messages/NotifyRespawn.h>
++#include <Messages/NotifySyncExperience.h>
++#include <Messages/NotifyEquipmentChanges.h>
++#include <Messages/NotifyInventorySnapshot.h>
++#include <Messages/NotifyChatMessageBroadcast.h>
++#include <Messages/TeleportCommandResponse.h>
++#include <Messages/StringCacheUpdate.h>
++#include <Messages/NotifyPlayerRespawn.h>
++#include <Messages/NotifyDialogue.h>
++#include <Messages/NotifySubtitle.h>
++#include <Messages/NotifyPlayerDialogue.h>
++#include <Messages/NotifyActorTeleport.h>
++#include <Messages/NotifyPlayerLeft.h>
++#include <Messages/NotifyPlayerJoined.h>
++#include <Messages/NotifyPlayerLevel.h>
++#include <Messages/NotifyPlayerCellChanged.h>
++#include <Messages/NotifyTeleport.h>
++#include <Messages/NotifyPlayerHealthUpdate.h>
++#include <Messages/NotifySettingsChange.h>
++#include <Messages/NotifyWeatherChange.h>
++#include <Messages/NotifySetWaypoint.h>
++#include <Messages/NotifyRemoveWaypoint.h>
++#include <Messages/NotifySetTimeResult.h>
++#include <Messages/NotifyActionEvents.h>
++
++using TiltedPhoques::UniquePtr;
++
++struct ServerMessageFactory
++{
++    UniquePtr<ServerMessage> Extract(TiltedPhoques::Buffer::Reader& aReader) const noexcept;
++
++    template <class T> static auto Visit(T&& func)
++    {
++        auto s_visitor = CreateMessageVisitor<
++            AuthenticationResponse, AssignCharacterResponse, ServerReferencesMoveRequest, ServerTimeSettings, CharacterSpawnRequest, NotifyInventoryChanges, NotifyInventorySnapshot, StringCacheUpdate, NotifyFactionsChanges, NotifyRemoveCharacter, NotifyQuestUpdate, NotifyPlayerList, NotifyPartyInfo, NotifyPartyInvite,
++            NotifyActorValueChanges, NotifyPartyJoined, NotifyPartyLeft, NotifyActorMaxValueChanges, NotifyHealthChangeBroadcast, NotifyActivate, NotifyLockChange, AssignObjectsResponse, NotifyDeathStateChange, NotifyOwnershipTransfer, NotifyObjectInventoryChanges, NotifySpellCast,
++            NotifyProjectileLaunch, NotifyInterruptCast, NotifyAddTarget, NotifyScriptAnimation, NotifyDrawWeapon, NotifyMount, NotifyNewPackage, NotifyRespawn, NotifySyncExperience, NotifyEquipmentChanges, NotifyChatMessageBroadcast, TeleportCommandResponse, NotifyPlayerRespawn, NotifyDialogue,
++            NotifySubtitle, NotifyPlayerDialogue, NotifyActorTeleport, NotifyPlayerLeft, NotifyPlayerJoined, NotifyDialogue, NotifySubtitle, NotifyPlayerDialogue, NotifyPlayerLevel, NotifyPlayerCellChanged, NotifyTeleport, NotifyPlayerHealthUpdate, NotifySettingsChange,
++            NotifyWeatherChange, NotifySetWaypoint, NotifyRemoveWaypoint, NotifySetTimeResult, NotifyRemoveSpell, NotifyActionEvents, NotifyPartyTravel, NotifyNpcLifeCheck, NotifyQuestJournal, NotifyCoopInteraction, NotifyPartyTrade, NotifyPartyHome, NotifyCampaignRecord>;
+ 
+         return s_visitor(std::forward<T>(func));
+     }
+diff --git a/Code/encoding/Messages/RequestCampaignPull.h b/Code/encoding/Messages/RequestCampaignPull.h
+new file mode 100644
+--- /dev/null
++++ b/Code/encoding/Messages/RequestCampaignPull.h
+@@ -0,0 +1,14 @@
++#pragma once
++#include "Message.h"
++struct RequestCampaignPull final : ClientMessage
++{
++    static constexpr ClientOpcode Opcode=kRequestCampaignPull;
++    RequestCampaignPull() : ClientMessage(Opcode) {}
++    void SerializeRaw(TiltedPhoques::Buffer::Writer&) const noexcept override;
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader&) noexcept override;
++    uint64_t Campaign{}, Nonce{}, Tag{};
++    uint32_t Revision{};
++    String Profile{};
++    bool operator==(const RequestCampaignPull& o) const noexcept
++    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile; }
++};
+diff --git a/Code/encoding/Messages/RequestCampaignPull.cpp b/Code/encoding/Messages/RequestCampaignPull.cpp
+new file mode 100644
+--- /dev/null
++++ b/Code/encoding/Messages/RequestCampaignPull.cpp
+@@ -0,0 +1,14 @@
++#include <Messages/RequestCampaignPull.h>
++void RequestCampaignPull::SerializeRaw(TiltedPhoques::Buffer::Writer& w) const noexcept
++{
++    Serialization::WriteVarInt(w,Campaign); Serialization::WriteVarInt(w,Nonce);
++    Serialization::WriteVarInt(w,Tag); Serialization::WriteVarInt(w,Revision);
++    Serialization::WriteString(w,Profile);
++}
++void RequestCampaignPull::DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept
++{
++    ClientMessage::DeserializeRaw(r);
++    Campaign=Serialization::ReadVarInt(r);Nonce=Serialization::ReadVarInt(r);
++    Tag=Serialization::ReadVarInt(r);Revision=Serialization::ReadVarInt(r)&0xffffffff;
++    Profile=Serialization::ReadString(r);
++}
+diff --git a/Code/encoding/Messages/NotifyCampaignRecord.h b/Code/encoding/Messages/NotifyCampaignRecord.h
+new file mode 100644
+--- /dev/null
++++ b/Code/encoding/Messages/NotifyCampaignRecord.h
+@@ -0,0 +1,15 @@
++#pragma once
++#include "Message.h"
++struct NotifyCampaignRecord final : ServerMessage
++{
++    static constexpr ServerOpcode Opcode=kNotifyCampaignRecord;
++    NotifyCampaignRecord() : ServerMessage(Opcode) {}
++    void SerializeRaw(TiltedPhoques::Buffer::Writer&) const noexcept override;
++    void DeserializeRaw(TiltedPhoques::Buffer::Reader&) noexcept override;
++    uint64_t Campaign{}, Nonce{}, BaseTag{}, TargetTag{};
++    uint32_t BaseRevision{}, TargetRevision{}, Total{}, State{};
++    String Row{};
++    bool operator==(const NotifyCampaignRecord& o) const noexcept
++    { return Campaign==o.Campaign && Nonce==o.Nonce && BaseTag==o.BaseTag && TargetTag==o.TargetTag &&
++        BaseRevision==o.BaseRevision && TargetRevision==o.TargetRevision && Total==o.Total && State==o.State && Row==o.Row; }
++};
+diff --git a/Code/encoding/Messages/NotifyCampaignRecord.cpp b/Code/encoding/Messages/NotifyCampaignRecord.cpp
+new file mode 100644
+--- /dev/null
++++ b/Code/encoding/Messages/NotifyCampaignRecord.cpp
+@@ -0,0 +1,18 @@
++#include <Messages/NotifyCampaignRecord.h>
++void NotifyCampaignRecord::SerializeRaw(TiltedPhoques::Buffer::Writer& w) const noexcept
++{
++    Serialization::WriteVarInt(w,Campaign);Serialization::WriteVarInt(w,Nonce);
++    Serialization::WriteVarInt(w,BaseTag);Serialization::WriteVarInt(w,TargetTag);
++    Serialization::WriteVarInt(w,BaseRevision);Serialization::WriteVarInt(w,TargetRevision);
++    Serialization::WriteVarInt(w,Total);Serialization::WriteVarInt(w,State);
++    Serialization::WriteString(w,Row);
++}
++void NotifyCampaignRecord::DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept
++{
++    ServerMessage::DeserializeRaw(r);
++    Campaign=Serialization::ReadVarInt(r);Nonce=Serialization::ReadVarInt(r);
++    BaseTag=Serialization::ReadVarInt(r);TargetTag=Serialization::ReadVarInt(r);
++    BaseRevision=Serialization::ReadVarInt(r)&0xffffffff;TargetRevision=Serialization::ReadVarInt(r)&0xffffffff;
++    Total=Serialization::ReadVarInt(r)&0xffffffff;State=Serialization::ReadVarInt(r)&0xffffffff;
++    Row=Serialization::ReadString(r);
++}
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction6"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign1"
+diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
+--- a/Code/client/Services/Generic/QuestJournal.cpp
++++ b/Code/client/Services/Generic/QuestJournal.cpp
+@@ -1,69 +1,123 @@
+-#include <TiltedOnlinePCH.h>
+-#include <World.h>
+-#include <Services/QuestService.h>
+-#include <Services/PartyService.h>
+-#include <Services/TransportService.h>
+-#include <Messages/RequestQuestJournal.h>
+-#include <Messages/NotifyQuestJournal.h>
+-#include <Events/UpdateEvent.h>
+-#include <QuestJournalDisk.h>
+-
+-namespace
+-{
+-std::filesystem::path Mirror()
+-{
+-    auto* local = _wgetenv(L"LOCALAPPDATA");
+-    if (!local || !*local)
+-        throw std::runtime_error("LOCALAPPDATA is unavailable");
+-    return std::filesystem::path(local) / "SkyrimTogetherReborn" / "CoopJournal";
+-}
+-}
+-
+-void QuestService::PollJournal(const UpdateEvent&) noexcept
+-{
+-    if (!m_world.GetPartyService().IsInParty() || !m_world.GetTransport().IsConnected())
+-    {
+-        m_journalStream = 0;
+-        m_journalConfirmed = 0;
+-        m_nextJournalPoll = {};
+-        return;
+-    }
+-    const auto now = std::chrono::steady_clock::now();
+-    if (now < m_nextJournalPoll)
+-        return;
+-    m_nextJournalPoll = now + std::chrono::seconds(4);
+-    RequestQuestJournal pull;
+-    pull.Stream = m_journalStream;
+-    pull.Sequence = m_journalConfirmed;
+-    m_world.GetTransport().Send(pull);
+-}
+-
+-void QuestService::OnJournalRecord(const NotifyQuestJournal& record) noexcept
+-{
+-    if (!record.Stream || !m_world.GetPartyService().IsInParty() || record.Sequence > record.Total)
+-        return;
+-    try
+-    {
+-        if (!record.Sequence)
+-        {
+-            const auto localCount = QuestJournalDisk::Contiguous(Mirror(), record.Stream);
+-            if (localCount > record.Total)
+-                return;
+-            m_journalStream = record.Stream;
+-            m_journalConfirmed = localCount;
+-            m_nextJournalPoll = {};
+-            return;
+-        }
+-        if (record.Stream != m_journalStream || record.Sequence != m_journalConfirmed + 1)
+-            return;
+-        if (!QuestJournalDisk::Store(Mirror(), record.Stream, record.Sequence, {record.Row.data(), record.Row.size()}))
+-        {
+-            spdlog::error("Cannot store co-op quest journal record {}", record.Sequence);
+-            return;
+-        }
+-        ++m_journalConfirmed;
+-        if (record.Sequence < record.Total && record.Sequence % 8 == 0)
+-            m_nextJournalPoll = {};
+-    }
+-    catch (const std::exception& e) { spdlog::error("Mirroring co-op quest journal: {}", e.what()); }
+-}
++#include <TiltedOnlinePCH.h>
++#include <World.h>
++#include <Services/QuestService.h>
++#include <Services/PartyService.h>
++#include <Services/TransportService.h>
++#include <Messages/RequestQuestJournal.h>
++#include <Messages/NotifyQuestJournal.h>
++#include <Events/UpdateEvent.h>
++#include <QuestJournalDisk.h>
++#include <CampaignReplication.h>
++#include <Messages/RequestCampaignPull.h>
++#include <Messages/NotifyCampaignRecord.h>
++
++namespace
++{
++CampaignReplication::Link campaignLink;
++CampaignReplication::Pull pending;
++uint64_t nonce{};
++std::chrono::steady_clock::time_point nextPull{};
++std::filesystem::path Mirror()
++{
++    auto* local = _wgetenv(L"LOCALAPPDATA");
++    if (!local || !*local)
++        throw std::runtime_error("LOCALAPPDATA is unavailable");
++    return std::filesystem::path(local) / "SkyrimTogetherReborn" / "CoopJournal";
++}
++}
++
++void QuestService::PollCampaign(const UpdateEvent&) noexcept
++{
++    if (!m_world.GetTransport().IsOnline())
++    {
++        pending={};
++        nextPull={};
++        return;
++    }
++    try
++    {
++        if (campaignLink.Start(false)!=CampaignReplication::Link::Mode::Ready) return;
++        auto now=std::chrono::steady_clock::now();
++        if (now<nextPull) return;
++        nextPull=now+std::chrono::seconds(2);
++        pending={campaignLink.Campaign,++nonce,campaignLink.Profile,campaignLink.Journal.Current()};
++        RequestCampaignPull request;
++        request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
++        request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
++        m_world.GetTransport().Send(request);
++    }
++    catch (...) { campaignLink.Fail();spdlog::error("Campaign replica initialization/poll failed"); }
++}
++void QuestService::OnCampaignRecord(const NotifyCampaignRecord& packet) noexcept
++{
++    if (!m_world.GetTransport().IsOnline() || campaignLink.State()!=CampaignReplication::Link::Mode::Ready ||
++        !pending.Nonce || packet.Nonce!=pending.Nonce || packet.Campaign!=pending.Campaign) return;
++    try
++    {
++        CampaignReplication::Reply reply;
++        reply.Campaign=packet.Campaign;reply.Nonce=packet.Nonce;
++        reply.Base={packet.BaseRevision,packet.BaseTag};reply.Target={packet.TargetRevision,packet.TargetTag};
++        reply.Total=packet.Total;
++        if (packet.State>3 || packet.Row.size()>4096) {campaignLink.Fail();return;}
++        reply.State=static_cast<CampaignReplication::Status>(packet.State);
++        reply.Row.assign(packet.Row.data(),packet.Row.size());
++        auto result=CampaignReplication::Receive(campaignLink.Journal,pending,reply);
++        pending={};
++        if (result==CampaignJournal::Result::Committed) nextPull={};
++        else if (result!=CampaignJournal::Result::Duplicate)
++        {
++            campaignLink.Fail();
++            spdlog::error("Campaign replica refused server history; restart after resolving configuration/history");
++        }
++    }
++    catch (...) {campaignLink.Fail();spdlog::error("Campaign replica import failed");}
++}
++
++void QuestService::PollJournal(const UpdateEvent&) noexcept
++{
++    if (!m_world.GetPartyService().IsInParty() || !m_world.GetTransport().IsConnected())
++    {
++        m_journalStream = 0;
++        m_journalConfirmed = 0;
++        m_nextJournalPoll = {};
++        return;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (now < m_nextJournalPoll)
++        return;
++    m_nextJournalPoll = now + std::chrono::seconds(4);
++    RequestQuestJournal pull;
++    pull.Stream = m_journalStream;
++    pull.Sequence = m_journalConfirmed;
++    m_world.GetTransport().Send(pull);
++}
++
++void QuestService::OnJournalRecord(const NotifyQuestJournal& record) noexcept
++{
++    if (!record.Stream || !m_world.GetPartyService().IsInParty() || record.Sequence > record.Total)
++        return;
++    try
++    {
++        if (!record.Sequence)
++        {
++            const auto localCount = QuestJournalDisk::Contiguous(Mirror(), record.Stream);
++            if (localCount > record.Total)
++                return;
++            m_journalStream = record.Stream;
++            m_journalConfirmed = localCount;
++            m_nextJournalPoll = {};
++            return;
++        }
++        if (record.Stream != m_journalStream || record.Sequence != m_journalConfirmed + 1)
++            return;
++        if (!QuestJournalDisk::Store(Mirror(), record.Stream, record.Sequence, {record.Row.data(), record.Row.size()}))
++        {
++            spdlog::error("Cannot store co-op quest journal record {}", record.Sequence);
++            return;
++        }
++        ++m_journalConfirmed;
++        if (record.Sequence < record.Total && record.Sequence % 8 == 0)
++            m_nextJournalPoll = {};
++    }
++    catch (const std::exception& e) { spdlog::error("Mirroring co-op quest journal: {}", e.what()); }
++}
+diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJournal.cpp
+--- a/Code/server/Services/QuestJournal.cpp
++++ b/Code/server/Services/QuestJournal.cpp
+@@ -1,96 +1,118 @@
+-#include <GameServer.h>
+-#include <World.h>
+-#include <Game/Player.h>
+-#include <Services/QuestService.h>
+-#include <Messages/RequestQuestJournal.h>
+-#include <Messages/NotifyQuestJournal.h>
+-#include <Messages/NotifyQuestUpdate.h>
+-#include <QuestJournalDisk.h>
+-#include <sstream>
+-#include <iomanip>
+-
+-namespace
+-{
+-const std::filesystem::path kJournal{"config/CoopJournal"};
+-
+-std::string Field(const String& value)
+-{
+-    std::string out(value.begin(), value.end());
+-    for (auto& c : out)
+-        if (static_cast<unsigned char>(c) < 32)
+-            c = ' ';
+-    return out;
+-}
+-
+-void Flush(PartyService::Party& party)
+-{
+-    if (!party.JournalStream)
+-        party.JournalStream = QuestJournalDisk::CreateStream(kJournal);
+-    if (!party.JournalStream)
+-        return;
+-    // Limit recovery work per request after a transient disk failure.
+-    for (unsigned n = 0; n < 8 && party.JournalCommitted < party.JournalRows.size(); ++n)
+-    {
+-        const auto& row = party.JournalRows[party.JournalCommitted];
+-        if (!QuestJournalDisk::Store(kJournal, party.JournalStream, party.JournalCommitted + 1, {row.data(), row.size()}))
+-        {
+-            spdlog::error("Cannot commit co-op journal stream {} record {}", party.JournalStream, party.JournalCommitted + 1);
+-            break;
+-        }
+-        ++party.JournalCommitted;
+-    }
+-}
+-}
+-
+-void QuestService::RecordQuest(Player* player, const NotifyQuestUpdate& event) noexcept
+-{
+-    auto* party = m_world.GetPartyService().GetPlayerParty(player);
+-    if (!party)
+-        return;
+-    try
+-    {
+-        const auto& mods = m_world.ctx().at<ModsComponent>();
+-        std::string plugin;
+-        for (const auto* list : {&mods.GetStandardMods(), &mods.GetLiteMods()})
+-            for (const auto& item : *list)
+-                if (item.second.id == event.Id.ModId)
+-                    plugin = Field(item.first);
+-        const char* phase = event.Status == NotifyQuestUpdate::Started ? "start" :
+-            event.Status == NotifyQuestUpdate::Stopped ? "stop" : "stage";
+-        std::ostringstream row;
+-        row << "quest-v1" << '	' << plugin << '	' << std::hex << event.Id.BaseId << std::dec << '	'
+-            << phase << '	' << event.Stage << '	' << player->GetId() << '	' << Field(player->GetUsername());
+-        const auto data = row.str();
+-        party->JournalRows.emplace_back(data.c_str());
+-        Flush(*party);
+-    }
+-    catch (const std::exception& e) { spdlog::error("Writing co-op quest journal: {}", e.what()); }
+-}
+-
+-void QuestService::OnJournalRequest(const PacketEvent<RequestQuestJournal>& event) noexcept
+-{
+-    auto* party = m_world.GetPartyService().GetPlayerParty(event.pPlayer);
+-    if (!party || party->JournalRows.empty())
+-        return;
+-    try
+-    {
+-        Flush(*party);
+-        if (!party->JournalStream || !party->JournalCommitted)
+-            return;
+-        NotifyQuestJournal reply;
+-        reply.Stream = party->JournalStream;
+-        reply.Total = party->JournalCommitted;
+-        if (event.Packet.Stream != reply.Stream)
+-        {
+-            event.pPlayer->Send(reply); // announce stream identity before the client reads its durable cursor
+-            return;
+-        }
+-        for (uint32_t index = event.Packet.Sequence, n = 0; index < reply.Total && n < 8; ++index, ++n)
+-        {
+-            reply.Sequence = index + 1;
+-            reply.Row = party->JournalRows[index];
+-            event.pPlayer->Send(reply);
+-        }
+-    }
+-    catch (const std::exception& e) { spdlog::error("Serving co-op quest journal: {}", e.what()); }
+-}
++#include <GameServer.h>
++#include <World.h>
++#include <Game/Player.h>
++#include <Services/QuestService.h>
++#include <Messages/RequestQuestJournal.h>
++#include <Messages/NotifyQuestJournal.h>
++#include <Messages/NotifyQuestUpdate.h>
++#include <QuestJournalDisk.h>
++#include <CampaignReplication.h>
++#include <Messages/RequestCampaignPull.h>
++#include <Messages/NotifyCampaignRecord.h>
++#include <sstream>
++#include <iomanip>
++
++namespace
++{
++CampaignReplication::Link campaignLink;
++const std::filesystem::path kJournal{"config/CoopJournal"};
++
++std::string Field(const String& value)
++{
++    std::string out(value.begin(), value.end());
++    for (auto& c : out)
++        if (static_cast<unsigned char>(c) < 32)
++            c = ' ';
++    return out;
++}
++
++void Flush(PartyService::Party& party)
++{
++    if (!party.JournalStream)
++        party.JournalStream = QuestJournalDisk::CreateStream(kJournal);
++    if (!party.JournalStream)
++        return;
++    // Limit recovery work per request after a transient disk failure.
++    for (unsigned n = 0; n < 8 && party.JournalCommitted < party.JournalRows.size(); ++n)
++    {
++        const auto& row = party.JournalRows[party.JournalCommitted];
++        if (!QuestJournalDisk::Store(kJournal, party.JournalStream, party.JournalCommitted + 1, {row.data(), row.size()}))
++        {
++            spdlog::error("Cannot commit co-op journal stream {} record {}", party.JournalStream, party.JournalCommitted + 1);
++            break;
++        }
++        ++party.JournalCommitted;
++    }
++}
++}
++
++void QuestService::RecordQuest(Player* player, const NotifyQuestUpdate& event) noexcept
++{
++    auto* party = m_world.GetPartyService().GetPlayerParty(player);
++    if (!party)
++        return;
++    try
++    {
++        const auto& mods = m_world.ctx().at<ModsComponent>();
++        std::string plugin;
++        for (const auto* list : {&mods.GetStandardMods(), &mods.GetLiteMods()})
++            for (const auto& item : *list)
++                if (item.second.id == event.Id.ModId)
++                    plugin = Field(item.first);
++        const char* phase = event.Status == NotifyQuestUpdate::Started ? "start" :
++            event.Status == NotifyQuestUpdate::Stopped ? "stop" : "stage";
++        std::ostringstream row;
++        row << "quest-v1" << '	' << plugin << '	' << std::hex << event.Id.BaseId << std::dec << '	'
++            << phase << '	' << event.Stage << '	' << player->GetId() << '	' << Field(player->GetUsername());
++        const auto data = row.str();
++        party->JournalRows.emplace_back(data.c_str());
++        Flush(*party);
++    }
++    catch (const std::exception& e) { spdlog::error("Writing co-op quest journal: {}", e.what()); }
++}
++
++void QuestService::OnJournalRequest(const PacketEvent<RequestQuestJournal>& event) noexcept
++{
++    auto* party = m_world.GetPartyService().GetPlayerParty(event.pPlayer);
++    if (!party || party->JournalRows.empty())
++        return;
++    try
++    {
++        Flush(*party);
++        if (!party->JournalStream || !party->JournalCommitted)
++            return;
++        NotifyQuestJournal reply;
++        reply.Stream = party->JournalStream;
++        reply.Total = party->JournalCommitted;
++        if (event.Packet.Stream != reply.Stream)
++        {
++            event.pPlayer->Send(reply); // announce stream identity before the client reads its durable cursor
++            return;
++        }
++        for (uint32_t index = event.Packet.Sequence, n = 0; index < reply.Total && n < 8; ++index, ++n)
++        {
++            reply.Sequence = index + 1;
++            reply.Row = party->JournalRows[index];
++            event.pPlayer->Send(reply);
++        }
++    }
++    catch (const std::exception& e) { spdlog::error("Serving co-op quest journal: {}", e.what()); }
++}
++
++void QuestService::OnCampaignPull(const PacketEvent<RequestCampaignPull>& event) noexcept
++{
++    try
++    {
++        const auto& p=event.Packet;
++        if (!p.Nonce || p.Profile.size()>128) return;
++        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
++        campaignLink.Start(true);
++        auto reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
++        NotifyCampaignRecord out;
++        out.Campaign=reply.Campaign;out.Nonce=reply.Nonce;out.BaseRevision=reply.Base.Revision;out.BaseTag=reply.Base.Tag;
++        out.TargetRevision=reply.Target.Revision;out.TargetTag=reply.Target.Tag;out.Total=reply.Total;
++        out.State=static_cast<uint32_t>(reply.State);out.Row=reply.Row.c_str();
++        event.pPlayer->Send(out);
++    }
++    catch (...) {spdlog::error("Campaign replication request failed");}
++}
+diff --git a/Code/client/Services/QuestService.h b/Code/client/Services/QuestService.h
+--- a/Code/client/Services/QuestService.h
++++ b/Code/client/Services/QuestService.h
+@@ -1,64 +1,68 @@
+ #pragma once
+ #include <chrono>
+ struct NotifyQuestJournal;
+-
+-#include <World.h>
+-#include <Events/EventDispatcher.h>
+-#include <Games/Events.h>
+-#include <Messages/NotifyQuestUpdate.h>
+-
+-struct DisconnectedEvent;
+-struct PartyLeftEvent;
+-struct UpdateEvent;
+-
+-struct TESQuest;
+-
+-/**
+- * @brief Syncs quest starts, stops and stages across the party
+- *
+- * Every client runs the party's quests itself (scripts, scenes, dialogue), and only starts, stops and stages are
+- * shared. Anything else a quest holds (aliases, script properties) only matches when the stage fragments produce it.
+- *
+- * Sending: TESQuestStartStopEvent and TESQuestStageEvent go out as RequestQuestUpdate, only in a party (outside one, an
+- * update may prompt the overlay to suggest one). Failed starts, quests without stages and those in
+- * kNonSyncableQuestIds are never sent, and the server drops None/Miscellaneous ones unless bEnableMiscQuestSync is set.
+- *
+- * Relaying: the server sends updates to the rest of the party as NotifyQuestUpdate. Members' scripts often reach the
+- * same stage on their own, so it relays each once, from whoever reaches it first, until the quest next starts or stops.
+- *
+- * Applying: stages go through ScriptSetStage so their fragments run (and a stopped quest restarts), skipping those
+- * already reached. Stops skip scripts. ScopedQuestOverride keeps the events this fires from being sent back.
+- *
+- * Scenes: setting a stage a playing scene waits on can end its phase early, skipping its lines and scripts and leaving
+- * the quest stuck. So the leader, whose world the party follows, holds member stages that an upcoming phase checks and
+- * queues later ones behind them. Members apply every stage right away.
+- */
+-class QuestService final : public BSTEventSink<TESQuestStartStopEvent>,
+-                           BSTEventSink<TESQuestStageEvent>,
+-                           BSTEventSink<TESQuestStageItemDoneEvent>,
+-                           BSTEventSink<TESSceneEvent>,
+-                           BSTEventSink<TESSceneActionEvent>,
+-                           BSTEventSink<TESScenePhaseEvent>,
+-                           BSTEventSink<TESTopicInfoEvent>,
+-                           BSTEventSink<TESEnterBleedoutEvent>
+-{
+-public:
+-    QuestService(World&, entt::dispatcher&);
+-    ~QuestService() = default;
+-
+-    static bool IsNonSyncableQuest(TESQuest* apQuest);
+-    static void DebugDumpQuests();
+-    static bool StopQuest(uint32_t aformId);
+-
+-    struct HeldStages
+-    {
+-        // Member stages in the order accepted by the server
+-        Vector<uint16_t> Stages{};
+-        // A stage per log entry of the applied stages whose fragment hasn't run yet
+-        Vector<uint16_t> PendingItems{};
+-    };
+-
+-private:
++struct NotifyCampaignRecord;
++
++#include <World.h>
++#include <Events/EventDispatcher.h>
++#include <Games/Events.h>
++#include <Messages/NotifyQuestUpdate.h>
++
++struct DisconnectedEvent;
++struct PartyLeftEvent;
++struct UpdateEvent;
++
++struct TESQuest;
++
++/**
++ * @brief Syncs quest starts, stops and stages across the party
++ *
++ * Every client runs the party's quests itself (scripts, scenes, dialogue), and only starts, stops and stages are
++ * shared. Anything else a quest holds (aliases, script properties) only matches when the stage fragments produce it.
++ *
++ * Sending: TESQuestStartStopEvent and TESQuestStageEvent go out as RequestQuestUpdate, only in a party (outside one, an
++ * update may prompt the overlay to suggest one). Failed starts, quests without stages and those in
++ * kNonSyncableQuestIds are never sent, and the server drops None/Miscellaneous ones unless bEnableMiscQuestSync is set.
++ *
++ * Relaying: the server sends updates to the rest of the party as NotifyQuestUpdate. Members' scripts often reach the
++ * same stage on their own, so it relays each once, from whoever reaches it first, until the quest next starts or stops.
++ *
++ * Applying: stages go through ScriptSetStage so their fragments run (and a stopped quest restarts), skipping those
++ * already reached. Stops skip scripts. ScopedQuestOverride keeps the events this fires from being sent back.
++ *
++ * Scenes: setting a stage a playing scene waits on can end its phase early, skipping its lines and scripts and leaving
++ * the quest stuck. So the leader, whose world the party follows, holds member stages that an upcoming phase checks and
++ * queues later ones behind them. Members apply every stage right away.
++ */
++class QuestService final : public BSTEventSink<TESQuestStartStopEvent>,
++                           BSTEventSink<TESQuestStageEvent>,
++                           BSTEventSink<TESQuestStageItemDoneEvent>,
++                           BSTEventSink<TESSceneEvent>,
++                           BSTEventSink<TESSceneActionEvent>,
++                           BSTEventSink<TESScenePhaseEvent>,
++                           BSTEventSink<TESTopicInfoEvent>,
++                           BSTEventSink<TESEnterBleedoutEvent>
++{
++public:
++    QuestService(World&, entt::dispatcher&);
++    ~QuestService() = default;
++
++    static bool IsNonSyncableQuest(TESQuest* apQuest);
++    static void DebugDumpQuests();
++    static bool StopQuest(uint32_t aformId);
++
++    struct HeldStages
++    {
++        // Member stages in the order accepted by the server
++        Vector<uint16_t> Stages{};
++        // A stage per log entry of the applied stages whose fragment hasn't run yet
++        Vector<uint16_t> PendingItems{};
++    };
++
++private:
++    void PollCampaign(const UpdateEvent&) noexcept;
++    void OnCampaignRecord(const NotifyCampaignRecord&) noexcept;
++    entt::scoped_connection m_campaignClock, m_campaignRecords;
+     void PollJournal(const UpdateEvent&) noexcept;
+     void OnJournalRecord(const NotifyQuestJournal&) noexcept;
+     uint64_t m_journalStream{};
+diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Services/Generic/QuestService.cpp
+--- a/Code/client/Services/Generic/QuestService.cpp
++++ b/Code/client/Services/Generic/QuestService.cpp
+@@ -23,55 +23,58 @@
+ #include <Messages/RequestQuestUpdate.h>
+ #include <Messages/NotifyQuestUpdate.h>
+ #include <Messages/NotifyQuestJournal.h>
+-
+-static TESQuest* FindQuestByNameId(const String& name)
+-{
+-    auto& questRegistry = ModManager::Get()->quests;
+-    auto it = std::find_if(questRegistry.begin(), questRegistry.end(), [name](auto* it) { return std::strcmp(it->idName.AsAscii(), name.c_str()); });
+-
+-    return it != questRegistry.end() ? *it : nullptr;
+-}
+-
+-using HeldStages = QuestService::HeldStages;
+-
+-static void ReleaseStagesForWaitingPhases(TESQuest* apQuest, HeldStages& aHeld) noexcept;
+-static void ReleaseUncheckedStages(TESQuest* apQuest, HeldStages& aHeld) noexcept;
+-
+-static bool InPlayerJournal(uint32_t form)
+-{
+-    auto* player = PlayerCharacter::Get();
+-    if (player)
+-        for (const auto& entry : player->objectives)
+-            if (entry.instance && entry.instance->quest && entry.instance->quest->formID == form) return true;
+-    return false;
+-}
+-
+-void QuestService::ReceiveQuestProgress(const NotifyQuestUpdate& update) noexcept
+-{
+-    if (!m_world.GetPartyService().IsInParty()) return;
+-    if (!update.SharedRun) { OnQuestUpdate(update); return; }
+-    auto form = m_world.GetModSystem().GetGameId(update.Id);
+-    auto* quest = Cast<TESQuest>(TESForm::GetById(form));
+-    if (!quest || IsNonSyncableQuest(quest)) return;
+-    auto needed = [form, update] {
+-        auto* current = Cast<TESQuest>(TESForm::GetById(form));
+-        if (!current) return false;
+-        if (update.Status == NotifyQuestUpdate::Stopped) return !current->IsStopped();
+-        if (update.Status == NotifyQuestUpdate::Started)
+-            return current->IsStopped() && (update.SharedRun > 1 || !current->IsStageReached(update.Stage));
+-        return update.Status == NotifyQuestUpdate::StageUpdate && !current->IsStageReached(update.Stage);
+-    };
+-    const uint32_t subject = update.Encounter ? m_world.GetModSystem().GetGameId(update.Subject) : 0;
+-    if (update.Encounter && !subject) return;
+-    auto* npc = subject ? Cast<Actor>(TESForm::GetById(subject)) : nullptr;
+-    const char* label = npc && npc->baseForm ? npc->baseForm->GetName() : quest->fullName.value.AsAscii();
+-    m_world.GetOverlayService().QueueProgress(true, form, update.Speaker, update.SharedRun, label,
+-        [this, update] { OnQuestUpdate(update); }, needed, subject, update.Encounter);
+-}
+-
+-QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
+-    : m_world(aWorld)
+-{
++#include <Messages/NotifyCampaignRecord.h>
++
++static TESQuest* FindQuestByNameId(const String& name)
++{
++    auto& questRegistry = ModManager::Get()->quests;
++    auto it = std::find_if(questRegistry.begin(), questRegistry.end(), [name](auto* it) { return std::strcmp(it->idName.AsAscii(), name.c_str()); });
++
++    return it != questRegistry.end() ? *it : nullptr;
++}
++
++using HeldStages = QuestService::HeldStages;
++
++static void ReleaseStagesForWaitingPhases(TESQuest* apQuest, HeldStages& aHeld) noexcept;
++static void ReleaseUncheckedStages(TESQuest* apQuest, HeldStages& aHeld) noexcept;
++
++static bool InPlayerJournal(uint32_t form)
++{
++    auto* player = PlayerCharacter::Get();
++    if (player)
++        for (const auto& entry : player->objectives)
++            if (entry.instance && entry.instance->quest && entry.instance->quest->formID == form) return true;
++    return false;
++}
++
++void QuestService::ReceiveQuestProgress(const NotifyQuestUpdate& update) noexcept
++{
++    if (!m_world.GetPartyService().IsInParty()) return;
++    if (!update.SharedRun) { OnQuestUpdate(update); return; }
++    auto form = m_world.GetModSystem().GetGameId(update.Id);
++    auto* quest = Cast<TESQuest>(TESForm::GetById(form));
++    if (!quest || IsNonSyncableQuest(quest)) return;
++    auto needed = [form, update] {
++        auto* current = Cast<TESQuest>(TESForm::GetById(form));
++        if (!current) return false;
++        if (update.Status == NotifyQuestUpdate::Stopped) return !current->IsStopped();
++        if (update.Status == NotifyQuestUpdate::Started)
++            return current->IsStopped() && (update.SharedRun > 1 || !current->IsStageReached(update.Stage));
++        return update.Status == NotifyQuestUpdate::StageUpdate && !current->IsStageReached(update.Stage);
++    };
++    const uint32_t subject = update.Encounter ? m_world.GetModSystem().GetGameId(update.Subject) : 0;
++    if (update.Encounter && !subject) return;
++    auto* npc = subject ? Cast<Actor>(TESForm::GetById(subject)) : nullptr;
++    const char* label = npc && npc->baseForm ? npc->baseForm->GetName() : quest->fullName.value.AsAscii();
++    m_world.GetOverlayService().QueueProgress(true, form, update.Speaker, update.SharedRun, label,
++        [this, update] { OnQuestUpdate(update); }, needed, subject, update.Encounter);
++}
++
++QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
++    : m_world(aWorld)
++{
++    m_campaignClock = aDispatcher.sink<UpdateEvent>().connect<&QuestService::PollCampaign>(this);
++    m_campaignRecords = aDispatcher.sink<NotifyCampaignRecord>().connect<&QuestService::OnCampaignRecord>(this);
+     m_journalClock = aDispatcher.sink<UpdateEvent>().connect<&QuestService::PollJournal>(this);
+     m_journalRecords = aDispatcher.sink<NotifyQuestJournal>().connect<&QuestService::OnJournalRecord>(this);
+     m_joinedConnection = aDispatcher.sink<ConnectedEvent>().connect<&QuestService::OnConnected>(this);
+diff --git a/Code/server/Services/QuestService.h b/Code/server/Services/QuestService.h
+--- a/Code/server/Services/QuestService.h
++++ b/Code/server/Services/QuestService.h
+@@ -7,21 +7,24 @@
+ struct UpdateEvent;
+ struct RequestQuestUpdate;
+ struct RequestQuestJournal;
+-struct NotifyQuestUpdate;
+-struct Player;
+-
+-/**
+- * @brief Dispatch quest sync messages.
+- *
+- * This service is currently not in use.
+- */
+-class QuestService
+-{
+-public:
+-    QuestService(World& aWorld, entt::dispatcher& aDispatcher);
+-
+-private:
+-    void RecordQuest(Player*, const NotifyQuestUpdate&) noexcept;
++struct RequestCampaignPull;
++struct NotifyQuestUpdate;
++struct Player;
++
++/**
++ * @brief Dispatch quest sync messages.
++ *
++ * This service is currently not in use.
++ */
++class QuestService
++{
++public:
++    QuestService(World& aWorld, entt::dispatcher& aDispatcher);
++
++private:
++    void RecordQuest(Player*, const NotifyQuestUpdate&) noexcept;
++    void OnCampaignPull(const PacketEvent<RequestCampaignPull>&) noexcept;
++    entt::scoped_connection m_campaignRequests;
+     void OnJournalRequest(const PacketEvent<RequestQuestJournal>&) noexcept;
+     entt::scoped_connection m_journalRequests;
+     void OnQuestChanges(const PacketEvent<RequestQuestUpdate>& aChanges) noexcept;
+diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestService.cpp
+--- a/Code/server/Services/QuestService.cpp
++++ b/Code/server/Services/QuestService.cpp
+@@ -6,18 +6,20 @@
+ 
+ #include <Messages/RequestQuestUpdate.h>
+ #include <Messages/RequestQuestJournal.h>
+-#include <Messages/NotifyQuestUpdate.h>
+-
+-#include <Setting.h>
+-namespace
+-{
+-Console::Setting bEnableMiscQuestSync{"Gameplay:bEnableMiscQuestSync", "(Experimental) Syncs miscellaneous quests when possible", false};
+-
+-}
+-
+-QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
+-    : m_world(aWorld)
+-{
++#include <Messages/RequestCampaignPull.h>
++#include <Messages/NotifyQuestUpdate.h>
++
++#include <Setting.h>
++namespace
++{
++Console::Setting bEnableMiscQuestSync{"Gameplay:bEnableMiscQuestSync", "(Experimental) Syncs miscellaneous quests when possible", false};
++
++}
++
++QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
++    : m_world(aWorld)
++{
++    m_campaignRequests = aDispatcher.sink<PacketEvent<RequestCampaignPull>>().connect<&QuestService::OnCampaignPull>(this);
+     m_journalRequests = aDispatcher.sink<PacketEvent<RequestQuestJournal>>().connect<&QuestService::OnJournalRequest>(this);
+     m_questUpdateConnection = aDispatcher.sink<PacketEvent<RequestQuestUpdate>>().connect<&QuestService::OnQuestChanges>(this);
+ }

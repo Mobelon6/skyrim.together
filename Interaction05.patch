@@ -1,0 +1,569 @@
+diff --git a/Code/client/Components/RemoteAnimationComponent.h b/Code/client/Components/RemoteAnimationComponent.h
+index 26ff80d..f364094 100644
+--- a/Code/client/Components/RemoteAnimationComponent.h
++++ b/Code/client/Components/RemoteAnimationComponent.h
+@@ -9,6 +9,6 @@ struct RemoteAnimationComponent
+     List<ActionEvent> TimePoints;
+     ActionEvent LastRanAction;
+     ActionEvent LastProcessedAction;
+-    uint32_t ReplayCount;
++    uint32_t ReplayCount{};
+     bool ResetAnimationGraphForReplay{false};
+ };
+diff --git a/Code/client/Games/ActorExtension.cpp b/Code/client/Games/ActorExtension.cpp
+index d70627f..fa0a5ce 100644
+--- a/Code/client/Games/ActorExtension.cpp
++++ b/Code/client/Games/ActorExtension.cpp
+@@ -29,6 +29,7 @@ bool ActorExtension::IsLocalPlayer() const noexcept
+ 
+ void ActorExtension::SetRemote(bool aSet) noexcept
+ {
++    if (!aSet) Pose = {};
+     if (aSet)
+         onlineFlags |= kRemote;
+     else
+diff --git a/Code/client/Games/ActorExtension.h b/Code/client/Games/ActorExtension.h
+index 83f38a6..d71973a 100644
+--- a/Code/client/Games/ActorExtension.h
++++ b/Code/client/Games/ActorExtension.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <Structs/ActionEvent.h>
++#include <Games/ReplicaPose.h>
+ 
+ struct ActorExtension
+ {
+@@ -25,6 +26,7 @@ struct ActorExtension
+     void SetRemote(bool aSet) noexcept;
+     void SetPlayer(bool aSet) noexcept;
+ 
++    ReplicaPose Pose{};
+     ActionEvent LatestAnimation{};
+     size_t GraphDescriptorHash = 0;
+     uint64_t GraphDescriptorProjectKey = 0;
+diff --git a/Code/client/Games/Animation.cpp b/Code/client/Games/Animation.cpp
+index 0714b2b..58f9a1d 100644
+--- a/Code/client/Games/Animation.cpp
++++ b/Code/client/Games/Animation.cpp
+@@ -25,6 +25,8 @@ uint8_t TP_MAKE_THISCALL(HookPerformAction, ActorMediator, TESActionData* apActi
+     auto pActor = apAction->actor;
+     const auto pExtension = pActor->GetExtension();
+ 
++    if (pExtension->IsRemote() && static_cast<Actor*>(pActor) == ScopedReplicaTransition::Current)
++        return TiltedPhoques::ThisCall(RealPerformAction, apThis, apAction);
+     if (!pExtension->IsRemote() || g_forceAnimation)
+     {
+         ActionEvent action;
+diff --git a/Code/client/Games/Memory.cpp b/Code/client/Games/Memory.cpp
+index d5553ff..ab6be9c 100644
+--- a/Code/client/Games/Memory.cpp
++++ b/Code/client/Games/Memory.cpp
+@@ -28,7 +28,8 @@ static TiltedPhoques::MimallocAllocator s_allocator;
+ 
+ void* TP_MAKE_THISCALL(HookFormAllocate, GameHeap, size_t aSize, size_t aAlignment, bool aAligned)
+ {
+-    switch (aSize)
++    const size_t requestedSize = aSize;
++    switch (requestedSize)
+     {
+     case sizeof(Actor): aSize = sizeof(ExActor); break;
+     case sizeof(PlayerCharacter): aSize = sizeof(ExPlayerCharacter); break;
+@@ -42,10 +43,11 @@ void* TP_MAKE_THISCALL(HookFormAllocate, GameHeap, size_t aSize, size_t aAlignme
+ 
+     ActorExtension* pExtension = nullptr;
+ 
+-    switch (aSize)
++    // Only initialize extensions for allocations we actually enlarged above.
++    switch (requestedSize)
+     {
+-    case sizeof(ExActor): pExtension = static_cast<ActorExtension*>(static_cast<ExActor*>(pPointer)); break;
+-    case sizeof(ExPlayerCharacter): pExtension = static_cast<ActorExtension*>(static_cast<ExPlayerCharacter*>(pPointer)); break;
++    case sizeof(Actor): pExtension = static_cast<ActorExtension*>(static_cast<ExActor*>(pPointer)); break;
++    case sizeof(PlayerCharacter): pExtension = static_cast<ActorExtension*>(static_cast<ExPlayerCharacter*>(pPointer)); break;
+     default: break;
+     }
+ 
+diff --git a/Code/client/Games/ReplicaPose.h b/Code/client/Games/ReplicaPose.h
+new file mode 100644
+index 0000000..f9202dc
+--- /dev/null
++++ b/Code/client/Games/ReplicaPose.h
+@@ -0,0 +1,54 @@
++#pragma once
++#include <cstdint>
++
++struct Actor;
++
++// Only the actor life service may change engine life state. Action history is
++// sampled before animation playback and can arrive after a newer world event.
++struct ReplicaPose
++{
++    enum Phase : uint8_t { None, Fighting, Kneeling, Standing };
++    static constexpr uint32_t LifeMask = 0xFu << 21;
++    static constexpr uint32_t KnockMask = 7u << 25;
++    // Skyrim.esm AACT records, shared by all actors using these actions.
++    static constexpr uint32_t Death = 0x489ED, DeathWait = 0x5DD59, Ragdoll = 0x9BB4E;
++    static constexpr uint32_t KnockDown = 0xD1FDC, GetUp = 0xD1FDD;
++    static constexpr uint32_t BleedStart = 0x13EC9, BleedStop = 0x13ECA;
++
++    uint64_t barrier{}, expires{};
++    Phase phase{None};
++
++    void Observe(Phase next, uint64_t tick)
++    {
++        if (next != phase || tick >= expires) barrier = tick;
++        phase = next;
++        expires = tick + (next == Standing ? 15000 : 4000);
++    }
++    Phase At(uint64_t now) const { return now < expires ? phase : None; }
++    bool Old(uint64_t tick) const { return barrier && tick <= barrier; }
++    bool AllowsVariables(uint64_t tick, uint64_t now) const { return !Old(tick) && At(now) != Kneeling; }
++    uint32_t MergeState(uint32_t local, uint32_t sample, uint64_t now) const
++    {
++        const auto native = LifeMask | (At(now) != None ? KnockMask : 0u);
++        return (local & native) | (sample & ~native);
++    }
++    bool AllowsAction(uint32_t action, uint64_t tick, uint64_t now, bool dead) const
++    {
++        if (action == Death || action == DeathWait) return dead;
++        const auto current = At(now);
++        if (action == Ragdoll || action == KnockDown) return !Old(tick) && current == None;
++        if (action == BleedStart) return !dead && !Old(tick) && current == None;
++        if (action == BleedStop || action == GetUp) return !dead && !Old(tick) && current != Kneeling;
++        return true;
++    }
++};
++
++// Native actions started by this actor's own recovery must pass the remote-AI filter.
++struct ScopedReplicaTransition
++{
++    inline static thread_local const Actor* Current{};
++    const Actor* previous;
++    explicit ScopedReplicaTransition(const Actor* actor) : previous(Current) { Current = actor; }
++    ~ScopedReplicaTransition() { Current = previous; }
++    ScopedReplicaTransition(const ScopedReplicaTransition&) = delete;
++};
+diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor.cpp
+index 1530d34..712474d 100644
+--- a/Code/client/Games/Skyrim/Actor.cpp
++++ b/Code/client/Games/Skyrim/Actor.cpp
+@@ -851,6 +851,7 @@ void Actor::Kill() noexcept
+     // TODO: these args are kind of bogus of course
+     Actor* previous = applyingCoopDeath;
+     applyingCoopDeath = this;
++    ScopedReplicaTransition transition(this);
+     KillImpl(nullptr, 100.f, true, true);
+     applyingCoopDeath = previous;
+ 
+@@ -898,6 +899,7 @@ void Actor::RestoreRemoteLife() noexcept
+         Respawn();
+         return;
+     }
++    ScopedReplicaTransition transition(this);
+     // Reset() also resets reference data. A remote visual correction must preserve inventory, outfit and packages.
+     Resurrect(false);
+     if (GetNiNode() && !IsDead())
+diff --git a/Code/client/Games/Skyrim/Events/EventDispatcher.h b/Code/client/Games/Skyrim/Events/EventDispatcher.h
+index d3da23c..6324da3 100644
+--- a/Code/client/Games/Skyrim/Events/EventDispatcher.h
++++ b/Code/client/Games/Skyrim/Events/EventDispatcher.h
+@@ -84,7 +84,9 @@ struct TESDestructionStageChangedEvent
+ 
+ struct TESEnterBleedoutEvent
+ {
++    TESObjectREFR* actor; // borrowed NiPointer, valid during event dispatch
+ };
++static_assert(sizeof(TESEnterBleedoutEvent) == 8);
+ 
+ struct TESEquipEvent
+ {
+diff --git a/Code/client/Services/Generic/CharacterService.cpp b/Code/client/Services/Generic/CharacterService.cpp
+index 8e16682..844e18b 100644
+--- a/Code/client/Services/Generic/CharacterService.cpp
++++ b/Code/client/Services/Generic/CharacterService.cpp
+@@ -2058,7 +2058,10 @@ void CharacterService::RunRemoteUpdates() noexcept
+ 
+         if (!waitingFor3D.SpawnRequest.ActionsToReplay.Actions.empty())
+         {
+-            pActor->LoadAnimationVariables(waitingFor3D.SpawnRequest.ActionsToReplay.Actions[0].Variables);
++            const auto& first = waitingFor3D.SpawnRequest.ActionsToReplay.Actions[0];
++            auto* extension = pActor->GetExtension();
++            if (!extension || extension->IsPlayer() || extension->Pose.AllowsVariables(first.Tick, m_world.GetTick()))
++                pActor->LoadAnimationVariables(first.Variables);
+         }
+ 
+         m_weaponDrawUpdates[pActor->formID] = {waitingFor3D.SpawnRequest.IsWeaponDrawn};
+diff --git a/Code/client/Services/Generic/CoopInteraction.cpp b/Code/client/Services/Generic/CoopInteraction.cpp
+index c7004ef..a4aa3c5 100644
+--- a/Code/client/Services/Generic/CoopInteraction.cpp
++++ b/Code/client/Services/Generic/CoopInteraction.cpp
+@@ -12,6 +12,7 @@
+ #include <Utils.h>
+ #include <Messages/RequestCoopInteraction.h>
+ #include <Messages/NotifyCoopInteraction.h>
++#include <Messages/RequestNpcLifeCheck.h>
+ #include <Components.h>
+ #include <Games/Overrides.h>
+ #include <atomic>
+@@ -32,8 +33,9 @@ uint32_t opponent{}, lastPose{UINT32_MAX};
+ struct PeaceSnapshot
+ {
+     uint32_t speaker{};
+-    Clock::time_point expires{}, started{}, nextAttempt{}, stableSince{};
+-    bool encounter{}, initiated{}, rebuilt{}, sawAlive{};
++    Clock::time_point expires{}, started{}, nextAttempt{}, retryStop{}, stableSince{};
++    bool encounter{}, initiated{}, rebuilt{}, sawAlive{}, stopDelivered{};
++    uint32_t session{};
+ };
+ std::map<uint32_t, PeaceSnapshot> recoveries;
+ 
+@@ -65,7 +67,12 @@ bool HorizontalTorso(Actor* npc)
+ // Called on the game thread; an authoritative end-of-fight is distinct from personal quest consent.
+ bool VerifyStanding(World& world, Actor* npc, PeaceSnapshot& state, Clock::time_point now)
+ {
+-    if (now >= state.expires) return true;
++    if (now >= state.expires)
++    {
++        if (state.encounter) spdlog::info("Co-op encounter {}: pose verification expired (actor {:X}, model loaded {}, rebuilt {})",
++            state.session, npc ? npc->formID : 0u, npc && npc->GetNiNode(), state.rebuilt);
++        return true;
++    }
+     if (!npc || !npc->GetNiNode()) return false;
+     if (npc->IsDisabled() || npc == PlayerCharacter::Get() || (npc->GetExtension() && npc->GetExtension()->IsPlayer()))
+         return true;
+@@ -78,8 +85,11 @@ bool VerifyStanding(World& world, Actor* npc, PeaceSnapshot& state, Clock::time_
+         state.nextAttempt = now + 700ms;
+         npc->RestoreRemoteLife();
+         if (npc->IsDead() || !npc->GetNiNode()) return false;
++        state.nextAttempt = now;
+     }
+     state.sawAlive = true;
++    if (!state.initiated && state.encounter && npc->GetExtension())
++        npc->GetExtension()->Pose.Observe(ReplicaPose::Standing, world.GetTick());
+     auto* target = npc->GetCombatTarget();
+     if (npc->IsInCombat() || (!state.initiated && target))
+     {
+@@ -90,18 +100,33 @@ bool VerifyStanding(World& world, Actor* npc, PeaceSnapshot& state, Clock::time_
+     // Seated, mounted, sleeping and flying actors have legitimate non-standing poses.
+     if (((npc->actorState.flags1 >> 14) & 0x7f) != 0) return true;
+     const unsigned knock = (npc->actorState.flags1 >> 25) & 7;
++    if (!npc->animationGraphHolder.IsReady()) return false;
++    ScopedReplicaTransition transition(npc);
++    static BSFixedString endKneel("bleedOutStop"), bleedVariable("IsBleedingOut");
++    // A kneeling biped can have a vertical torso and an already-normal ActorState.
++    // Give the graph its matching stop event even when neither flag detects a ragdoll.
++    if (state.encounter && !state.stopDelivered && now >= state.retryStop)
++    {
++        state.stopDelivered = npc->SendAnimationEvent(&endKneel);
++        state.retryStop = now + 850ms;
++    }
++    bool graphDown = false;
++    npc->animationGraphHolder.GetVariableBool(&bleedVariable, &graphDown);
+     const bool ragdoll = npc->IsInRagdollState();
+-    const bool stuck = knock || ragdoll || npc->actorState.IsBleedingOut() || HorizontalTorso(npc);
++    const bool stuck = graphDown || knock || ragdoll || npc->actorState.IsBleedingOut() || HorizontalTorso(npc);
+     if (!state.initiated)
+     {
+         state.initiated = true;
+         state.started = now;
+-        state.nextAttempt = now;
++        if (state.nextAttempt < now) state.nextAttempt = now;
+     }
+     if (!stuck)
+     {
+         if (state.stableSince == Clock::time_point{}) state.stableSince = now;
+-        return now - state.stableSince >= 900ms;
++        if (now - state.stableSince < 900ms) return false;
++        if (state.encounter) spdlog::info("Co-op encounter {}: actor {:X} standing; graph stop accepted {}, rebuilt {}",
++            state.session, npc->formID, state.stopDelivered, state.rebuilt);
++        return true;
+     }
+     state.stableSince = {};
+     if (now < state.nextAttempt) return false;
+@@ -117,8 +142,11 @@ bool VerifyStanding(World& world, Actor* npc, PeaceSnapshot& state, Clock::time_
+     {
+         if (ragdoll) npc->PotentiallyFixRagdollState();
+         if (knock || ragdoll) npc->InitiateGetUpPackage();
+-        static BSFixedString stand("BleedoutStop");
+-        npc->SendAnimationEvent(&stand);
++        if (graphDown && now >= state.retryStop)
++        {
++            state.stopDelivered = npc->SendAnimationEvent(&endKneel);
++            state.retryStop = now + 850ms;
++        }
+     }
+     return false;
+ }
+@@ -333,6 +361,8 @@ void OverlayService::OnInteraction(const NotifyCoopInteraction& packet) noexcept
+             m_peaceSession[form] = key;
+             PeaceSnapshot state{};
+             state.speaker = e.Speaker;
++            state.session = e.Session;
++            spdlog::info("Co-op encounter {}: received peaceful outcome for actor {:X} from {}", e.Session, form, e.Speaker);
+             state.expires = now + 15s;
+             state.encounter = true;
+             recoveries.insert_or_assign(form, state);
+@@ -344,7 +374,7 @@ void OverlayService::OnInteraction(const NotifyCoopInteraction& packet) noexcept
+         }
+         return;
+     }
+-    if (e.Kind == Interaction::OpponentState && e.Value < 2 && m_peaceSession.count(form) &&
++    if (e.Kind == Interaction::OpponentState && m_peaceSession.count(form) &&
+         m_peaceSession.at(form) == key) return;
+     if (e.Kind == Interaction::OpponentState && e.Value != 2)
+         recoveries.erase(form);
+@@ -477,8 +507,19 @@ void OverlayService::OnInteraction(const NotifyCoopInteraction& packet) noexcept
+                 confirmedOpponent.store(0);
+                 lastPose = UINT32_MAX;
+             }
+-            if (!actor->IsDead())
+-                actor->Kill();
++            // End the nonlethal contract. Only the owner/epoch-checked life channel can confirm death.
++            if (auto* extension = actor->GetExtension()) extension->Pose = {};
++            auto replicas = m_world.view<FormIdComponent, RemoteComponent>();
++            for (auto entity : replicas)
++                if (replicas.get<FormIdComponent>(entity).Id == form)
++                {
++                    const auto& remote = replicas.get<RemoteComponent>(entity);
++                    RequestNpcLifeCheck check;
++                    check.Id = remote.Id;
++                    check.OwnershipEpoch = remote.OwnershipEpoch;
++                    m_transport.Send(check);
++                    break;
++                }
+             return;
+         }
+         if (opponent != form || opponentExpires < now)
+@@ -486,6 +527,8 @@ void OverlayService::OnInteraction(const NotifyCoopInteraction& packet) noexcept
+         opponent = form;
+         PublishAlive(confirmedOpponent, confirmedUntil, form);
+         GuardReplica(actor);
++        if (auto* extension = actor->GetExtension())
++            extension->Pose.Observe(e.Value == 1 ? ReplicaPose::Kneeling : ReplicaPose::Fighting, m_world.GetTick());
+         if (lastPose != e.Value)
+             spdlog::debug("Brawl replica {:X}: session {}, state {}, local death {}", form, e.Session, e.Value, actor->IsDead());
+         opponentExpires = now + (e.Value == 2 ? 8s : 4s);
+@@ -499,10 +542,11 @@ void OverlayService::OnInteraction(const NotifyCoopInteraction& packet) noexcept
+         const uint32_t pose = e.Value == 2 ? 0 : e.Value;
+         if (pose != lastPose)
+         {
+-            static BSFixedString down("BleedoutStart"), up("BleedoutStop");
+-            if (pose == 1 || lastPose == 1 || actor->actorState.IsBleedingOut())
+-                actor->SendAnimationEvent(pose == 1 ? &down : &up);
+-            lastPose = pose;
++            static BSFixedString down("bleedOutStart"), up("bleedOutStop");
++            ScopedReplicaTransition transition(actor);
++            const bool change = pose == 1 || lastPose == 1 || actor->actorState.IsBleedingOut();
++            if (!change || (actor->animationGraphHolder.IsReady() && actor->SendAnimationEvent(pose == 1 ? &down : &up)))
++                lastPose = pose;
+         }
+         if (actor->GetCombatTarget() == PlayerCharacter::Get())
+         {
+@@ -549,6 +593,21 @@ void OverlayService::UpdateHireOffer() noexcept
+     Transmit(Interaction::PrepareHire, 0, m_prepareNonce, key, session);
+ }
+ 
++void OverlayService::BrawlBleedout(uint32_t form) noexcept
++{
++    if (!form || m_watch.Npc != form || m_watch.Settlement || !m_world.GetPartyService().IsInParty()) return;
++    auto* actor = Cast<Actor>(TESForm::GetById(form));
++    if (!actor || (Alias(0x47AE6) != actor && (!m_watch.Brawl || m_watch.State >= 2))) return;
++    const auto npc = NetworkForm(form);
++    if (!npc) return;
++    if (!m_watch.Brawl) Transmit(Interaction::Brawl, 0, m_watch.Session, npc);
++    m_watch.Brawl = true;
++    spdlog::info("Co-op encounter {}: Skyrim reported opponent {:X} entering bleedout", m_watch.Session, form);
++    m_watch.KneelingUntil = Clock::now() + 300ms;
++    m_watch.State = 1;
++    Transmit(Interaction::OpponentState, 0, m_watch.Session, npc, 1);
++}
++
+ void OverlayService::UpdateInteraction() noexcept
+ {
+     if (!m_world.GetPartyService().IsInParty() || !m_transport.IsConnected())
+@@ -595,7 +654,7 @@ void OverlayService::UpdateInteraction() noexcept
+     {
+         if (fighting)
+             m_watch.Expires = now + 15s;
+-        const uint32_t pose = actor->IsDead() ? 3u : !fighting ? 2u : actor->actorState.IsBleedingOut() ? 1u : 0u;
++        const uint32_t pose = actor->IsDead() ? 3u : !fighting ? 2u : (actor->actorState.IsBleedingOut() || now < m_watch.KneelingUntil) ? 1u : 0u;
+         if (pose <= 1 || m_watch.State != pose)
+             Transmit(Interaction::OpponentState, 0, m_watch.Session, key, pose);
+         m_watch.State = pose;
+diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Services/Generic/QuestService.cpp
+index f169919..d5383a1 100644
+--- a/Code/client/Services/Generic/QuestService.cpp
++++ b/Code/client/Services/Generic/QuestService.cpp
+@@ -96,6 +96,7 @@ QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
+     pEventList->sceneActionEvent.RegisterSink(this);
+     pEventList->scenePhaseEvent.RegisterSink(this);
+     pEventList->topicInfoEvent.RegisterSink(this);
++    pEventList->enterBleedoutEvent.RegisterSink(this);
+ }
+ 
+ void QuestService::OnConnected(const ConnectedEvent&) noexcept
+@@ -313,6 +314,13 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageItemDoneEvent* apEvent,
+     return BSTEventResult::kOk;
+ }
+ 
++BSTEventResult QuestService::OnEvent(const TESEnterBleedoutEvent* event, const EventDispatcher<TESEnterBleedoutEvent>*)
++{
++    if (event && event->actor && m_world.GetPartyService().IsInParty())
++        m_world.GetRunner().Queue([this, form = event->actor->formID] { m_world.GetOverlayService().BrawlBleedout(form); });
++    return BSTEventResult::kOk;
++}
++
+ BSTEventResult QuestService::OnEvent(const TESSceneEvent* apEvent, const EventDispatcher<TESSceneEvent>*)
+ {
+     spdlog::debug("Scene {:X} {}", apEvent->sceneFormId, apEvent->type == 0 ? "begin" : "end");
+diff --git a/Code/client/Services/OverlayService.h b/Code/client/Services/OverlayService.h
+index f966037..62f287e 100644
+--- a/Code/client/Services/OverlayService.h
++++ b/Code/client/Services/OverlayService.h
+@@ -82,6 +82,7 @@ struct OverlayService
+     static void InstallReplicaLifeGuard(Actor* actor) noexcept;
+     static bool FollowerBusy(uint32_t npc) noexcept;
+     static void CheckRevivedReplica(uint32_t form) noexcept;
++    void BrawlBleedout(uint32_t form) noexcept;
+     static bool NonlethalOpponent(uint32_t npc) noexcept;
+     bool TryJoinConversation(uint32_t form) noexcept;
+     void ConfirmMarkerTravel() noexcept;
+@@ -158,6 +159,7 @@ private:
+         bool Brawl{}, Settlement{}, FavorParticipant{};
+         uint32_t FavorSent{};
+         bool FactionReported{};
++        std::chrono::steady_clock::time_point KneelingUntil{};
+         uint32_t ReportedRank{};
+         std::chrono::steady_clock::time_point Expires{};
+     } m_watch;
+diff --git a/Code/client/Services/QuestService.h b/Code/client/Services/QuestService.h
+index 7d3811f..62289e6 100644
+--- a/Code/client/Services/QuestService.h
++++ b/Code/client/Services/QuestService.h
+@@ -39,7 +39,8 @@ class QuestService final : public BSTEventSink<TESQuestStartStopEvent>,
+                            BSTEventSink<TESSceneEvent>,
+                            BSTEventSink<TESSceneActionEvent>,
+                            BSTEventSink<TESScenePhaseEvent>,
+-                           BSTEventSink<TESTopicInfoEvent>
++                           BSTEventSink<TESTopicInfoEvent>,
++                           BSTEventSink<TESEnterBleedoutEvent>
+ {
+ public:
+     QuestService(World&, entt::dispatcher&);
+@@ -77,6 +78,8 @@ private:
+     BSTEventResult OnEvent(const TESScenePhaseEvent*, const EventDispatcher<TESScenePhaseEvent>*) override;
+     BSTEventResult OnEvent(const TESTopicInfoEvent*, const EventDispatcher<TESTopicInfoEvent>*) override;
+ 
++    BSTEventResult OnEvent(const TESEnterBleedoutEvent*, const EventDispatcher<TESEnterBleedoutEvent>*) override;
++
+     void ReceiveQuestProgress(const NotifyQuestUpdate&) noexcept;
+     void OnQuestUpdate(const NotifyQuestUpdate&) noexcept;
+     void HoldStage(TESQuest* apQuest, uint16_t aStage) noexcept;
+diff --git a/Code/client/Systems/AnimationSystem.cpp b/Code/client/Systems/AnimationSystem.cpp
+index fce3597..bcb8ea8 100644
+--- a/Code/client/Systems/AnimationSystem.cpp
++++ b/Code/client/Systems/AnimationSystem.cpp
+@@ -34,24 +34,35 @@ void AnimationSystem::Update(World& aWorld, Actor* apActor, RemoteAnimationCompo
+             // Animation graph not ready, keep the action in queue and try again later
+             return;
+         }
+-        if (aAnimationComponent.ReplayCount > 0 && aAnimationComponent.ResetAnimationGraphForReplay)
++        auto* extension = apActor->GetExtension();
++        const bool npc = extension && !extension->IsPlayer();
++        const auto now = aWorld.GetTick();
++        const auto& first = *it;
++        if (npc && !extension->Pose.AllowsAction(first.ActionId, first.Tick, now, apActor->IsDead()))
++        {
++            if (aAnimationComponent.ReplayCount) --aAnimationComponent.ReplayCount;
++            actions.pop_front();
++            return;
++        }
++        if (aAnimationComponent.ReplayCount > 0 && aAnimationComponent.ResetAnimationGraphForReplay &&
++            (!npc || (!extension->Pose.Old(first.Tick) && extension->Pose.At(now) == ReplicaPose::None)))
+         {
+             apActor->animationGraphHolder.RevertAnimationGraphManager();
+             aAnimationComponent.ResetAnimationGraphForReplay = false;
+         }
+ 
+-        const auto& first = *it;
+-
+         const auto actionId = first.ActionId;
+         const auto targetId = first.TargetId;
+ 
+         const auto pAction = Cast<BGSAction>(TESForm::GetById(actionId));
+         const auto pTarget = Cast<TESObjectREFR>(TESForm::GetById(targetId));
+ 
+-        apActor->actorState.flags1 = first.State1;
+-        apActor->actorState.flags2 = first.State2;
+-
+-        apActor->LoadAnimationVariables(first.Variables);
++        if (!npc || extension->Pose.AllowsVariables(first.Tick, now))
++        {
++            apActor->actorState.flags1 = npc ? extension->Pose.MergeState(apActor->actorState.flags1, first.State1, now) : first.State1;
++            apActor->actorState.flags2 = first.State2;
++            apActor->LoadAnimationVariables(first.Variables);
++        }
+ 
+         aAnimationComponent.LastRanAction = first;
+ 
+diff --git a/Code/client/Systems/InterpolationSystem.cpp b/Code/client/Systems/InterpolationSystem.cpp
+index 3aafd27..d6bd9a4 100644
+--- a/Code/client/Systems/InterpolationSystem.cpp
++++ b/Code/client/Systems/InterpolationSystem.cpp
+@@ -102,7 +102,9 @@ void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterp
+         glm::distance(aInterpolationComponent.Position, static_cast<const glm::vec3&>(apActor->position)) < 160.f;
+     if (!sittingInPlace)
+         apActor->ForcePosition(aInterpolationComponent.Position);
+-    apActor->LoadAnimationVariables(second.Variables);
++    const auto* extension = apActor->GetExtension();
++    if (!extension || extension->IsPlayer() || extension->Pose.AllowsVariables(second.Tick, World::Get().GetTick()))
++        apActor->LoadAnimationVariables(second.Variables);
+ 
+     if (apActor->currentProcess && apActor->currentProcess->middleProcess)
+     {
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+index 9191a6d..c823984 100644
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction4"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction5"
+diff --git a/Code/server/Services/CoopInteraction.cpp b/Code/server/Services/CoopInteraction.cpp
+index f55be15..7cae5c0 100644
+--- a/Code/server/Services/CoopInteraction.cpp
++++ b/Code/server/Services/CoopInteraction.cpp
+@@ -172,6 +172,8 @@ void OverlayService::OnInteraction(const PacketEvent<RequestCoopInteraction>& pa
+     if (e.Kind == Interaction::Brawl && it != party->Talks.end() && it->second.Expires > now &&
+         it->second.Anchor.Session == e.Session && e.Npc && it->second.Anchor.TargetForm == e.Npc)
+     {
++        if (encounter != party->Brawls.end() && encounter->second.Anchor.Session == e.Session &&
++            encounter->second.Anchor.TargetForm == e.Npc) return;
+         auto& fight = party->Brawls[id] = it->second;
+         fight.Expires = now + 5min;
+         for (auto* peer : party->Members)
+@@ -189,6 +191,8 @@ void OverlayService::OnInteraction(const PacketEvent<RequestCoopInteraction>& pa
+         return;
+     if (e.Kind == Interaction::OpponentState && e.Value <= 3 && encounter != party->Brawls.end() && source == &encounter->second)
+     {
++        if (source->OpponentFinished) return;
++        source->OpponentFinished = e.Value >= 2;
+         source->MayResume = e.Value != 3 && (source->MayResume || e.Value > 0);
+         source->Expires = now + (e.Value >= 2 ? 20s : 5min);
+         // An NPC's life state is visible to bystanders. Eligibility is personal to the enrolled listeners.
+diff --git a/Code/server/Services/PartyService.h b/Code/server/Services/PartyService.h
+index 1b516da..77f9f74 100644
+--- a/Code/server/Services/PartyService.h
++++ b/Code/server/Services/PartyService.h
+@@ -42,7 +42,7 @@ struct PartyService
+             uint32_t Encounter{}; // retained by a verified continuation with the same participant
+             std::set<uint32_t> Listeners;
+             std::chrono::steady_clock::time_point Expires{};
+-            bool Closed{}, MayResume{}, Settlement{};
++            bool Closed{}, MayResume{}, Settlement{}, OpponentFinished{};
+             std::chrono::steady_clock::time_point ChoiceExpires{};
+             std::set<uint32_t> ChoiceListeners; // capture who had joined when that actual option was selected
+             bool SharesQuest(const GameId& quest, std::chrono::steady_clock::time_point now) const noexcept

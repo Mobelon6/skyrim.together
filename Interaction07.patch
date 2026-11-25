@@ -1,0 +1,1944 @@
+diff --git a/Code/client/Services/Generic/DialogueMarker.cpp b/Code/client/Services/Generic/DialogueMarker.cpp
+--- a/Code/client/Services/Generic/DialogueMarker.cpp
++++ b/Code/client/Services/Generic/DialogueMarker.cpp
+@@ -8,71 +8,80 @@
+ 
+ void OverlayService::DrawDialogueMarker() noexcept
+ {
+-    DialogueMarker frame;
+-    {
+-        std::lock_guard guard(m_markerMutex);
+-        if (!m_marker.Active)
+-            return;
+-        frame = m_marker;
+-    }
+-    const auto* ui = UI::Get();
+-    if (!ui || ui->BlocksPartyHud())
+-        return;
+-    const auto screen = ImGui::GetIO().DisplaySize;
+-    if (screen.x < 4.f || screen.y < 4.f)
+-        return;
+-    using namespace DialogueMarkerLayout;
+-    const auto project = [screen, &frame](glm::vec3 position, bool mirrorBehind = false) -> Projection {
+-        NiPoint3 uv{};
+-        bool front = HUDMenuUtils::ProjectForOverlay(position, uv) && uv.z >= 0.f;
+-        if (!front)
+-        {
+-            if (!mirrorBehind)
+-                return {};
+-            if (HUDMenuUtils::ProjectForOverlay(frame.Eye + (frame.Eye - position), uv))
+-            {
+-                uv.x = 1.f - uv.x;
+-                uv.y = 1.f - uv.y;
+-            }
+-            else
+-                return {{screen.x * .5f, screen.y}, false};
+-        }
+-        if (!std::isfinite(uv.x) || !std::isfinite(uv.y))
+-            return {{screen.x * .5f, screen.y}, false};
+-        return {{uv.x * screen.x, (1.f - uv.y) * screen.y}, front};
+-    };
+-    const float scale = std::clamp(screen.y / 720.f, .75f, 3.f);
+-    const Projection anchor = project(frame.Anchor, true);
+-    const Projection npc = frame.HasNpc ? project(frame.Npc) : Projection{};
+-    const Projection speaker = frame.HasSpeaker ? project(frame.Speaker) : Projection{};
+-    const Layout layout = Place(screen.x, screen.y, scale, anchor, npc, speaker);
+-    const ImVec2 center{layout.center.x, layout.center.y};
+-    const auto at = [center, scale](float x, float y) { return ImVec2(center.x + x * scale, center.y + y * scale); };
+-    auto* draw = ImGui::GetBackgroundDrawList();
+-    constexpr ImU32 ink = IM_COL32(19, 20, 23, 238), light = IM_COL32(249, 248, 239, 255);
+-    const auto line = [&](Point tip) {
+-        const ImVec2 end{tip.x, tip.y};
+-        draw->AddLine(center, end, ink, 3.1f * scale);
+-        draw->AddLine(center, end, light, 1.15f * scale);
+-    };
+-    if (layout.npcLine || layout.speakerLine)
+-    {
+-        // Use the same camera matrix as the pixel anchors. Put the leaders behind both actors.
+-        float a{}, b{}, farther{};
+-        const auto point = layout.npcLine ? frame.Npc : frame.Speaker;
+-        if (HUDMenuUtils::SceneDepth(point, a) &&
+-            HUDMenuUtils::SceneDepth(point + (point - frame.Eye), farther))
+-        {
+-            const bool reversed = farther < a;
+-            float depth = a;
+-            if (layout.speakerLine && HUDMenuUtils::SceneDepth(frame.Speaker, b))
+-                depth = reversed ? std::min(depth,b) : std::max(depth,b);
+-            if (MarkerDepth::Begin(draw,screen.x,screen.y,depth,reversed))
+-            {
+-                if (layout.npcLine) line(npc.p);
+-                if (layout.speakerLine) line(speaker.p);
+-                MarkerDepth::End(draw);
+-            }
++    if (ObservingDialogue()) return;
++    DialogueMarker frame;
++    {
++        std::lock_guard guard(m_markerMutex);
++        if (!m_marker.Active)
++            return;
++        frame = m_marker;
++    }
++    const auto* ui = UI::Get();
++    if (!ui || ui->BlocksPartyHud())
++        return;
++    const auto screen = ImGui::GetIO().DisplaySize;
++    if (screen.x < 4.f || screen.y < 4.f)
++        return;
++    using namespace DialogueMarkerLayout;
++    const auto project = [screen, &frame](glm::vec3 position, bool mirrorBehind = false) -> Projection {
++        NiPoint3 uv{};
++        bool front = HUDMenuUtils::ProjectForOverlay(position, uv) && uv.z >= 0.f;
++        if (!front)
++        {
++            if (!mirrorBehind)
++                return {};
++            if (HUDMenuUtils::ProjectForOverlay(frame.Eye + (frame.Eye - position), uv))
++            {
++                uv.x = 1.f - uv.x;
++                uv.y = 1.f - uv.y;
++            }
++            else
++                return {{screen.x * .5f, screen.y}, false};
++        }
++        if (!std::isfinite(uv.x) || !std::isfinite(uv.y))
++            return {{screen.x * .5f, screen.y}, false};
++        return {{uv.x * screen.x, (1.f - uv.y) * screen.y}, front};
++    };
++    const float scale = std::clamp(screen.y / 720.f, .75f, 3.f);
++    const Projection anchor = project(frame.Anchor, true);
++    const Projection npc = frame.HasNpc ? project(frame.Npc) : Projection{};
++    const Projection speaker = frame.HasSpeaker ? project(frame.Speaker) : Projection{};
++    const Layout layout = Place(screen.x, screen.y, scale, anchor, npc, speaker);
++    const ImVec2 center{layout.center.x, layout.center.y};
++    const auto at = [center, scale](float x, float y) { return ImVec2(center.x + x * scale, center.y + y * scale); };
++    auto* draw = ImGui::GetBackgroundDrawList();
++    constexpr ImU32 ink = IM_COL32(19, 20, 23, 238), light = IM_COL32(249, 248, 239, 255);
++    const auto line = [&](Point tip) {
++        const ImVec2 end{tip.x, tip.y};
++        draw->AddLine(center, end, ink, 3.1f * scale);
++        draw->AddLine(center, end, light, 1.15f * scale);
++    };
++    if (layout.npcLine || layout.speakerLine)
++    {
++        // Use the same camera matrix as the pixel anchors. Put the leaders behind both actors.
++        bool drawn = false;
++        float a{}, b{}, farther{};
++        const auto point = layout.npcLine ? frame.Npc : frame.Speaker;
++        if (HUDMenuUtils::SceneDepth(point, a) &&
++            HUDMenuUtils::SceneDepth(point + (point - frame.Eye), farther) && std::abs(farther-a)>1e-8f)
++        {
++            const bool reversed = farther < a;
++            float depth = a;
++            if (layout.speakerLine && HUDMenuUtils::SceneDepth(frame.Speaker, b))
++                depth = reversed ? std::min(depth,b) : std::max(depth,b);
++            if (MarkerDepth::Begin(draw,screen.x,screen.y,depth,reversed))
++            {
++                if (layout.npcLine) line(npc.p);
++                if (layout.speakerLine) line(speaker.p);
++                MarkerDepth::End(draw);
++                drawn = true;
++            }
++        }
++        // Never lose the leaders solely because this renderer has no sampleable depth.
++        if (!drawn)
++        {
++            if (layout.npcLine) line(npc.p);
++            if (layout.speakerLine) line(speaker.p);
+         }
+     }
+     // A rounded speech balloon with a cut-out mouth and three dots.
+diff --git a/Code/client/Services/Generic/DialogueObserver.cpp b/Code/client/Services/Generic/DialogueObserver.cpp
+--- a/Code/client/Services/Generic/DialogueObserver.cpp
++++ b/Code/client/Services/Generic/DialogueObserver.cpp
+@@ -133,8 +133,9 @@
+         return;
+     }
+     auto* view = static_cast<FreeView*>(m_observerCamera);
+-    m_offsetPitch = std::clamp(m_offsetPitch + AngleDelta(view->rotation.x, m_appliedPitch), -.35f, .35f);
+-    m_offsetYaw = std::clamp(m_offsetYaw + AngleDelta(view->rotation.y, m_appliedYaw), -.55f, .55f);
++    constexpr float lookScale = .30f;
++    m_offsetPitch = std::clamp(m_offsetPitch + lookScale * AngleDelta(view->rotation.x, m_appliedPitch), -.35f, .35f);
++    m_offsetYaw = std::clamp(m_offsetYaw + lookScale * AngleDelta(view->rotation.y, m_appliedYaw), -.55f, .55f);
+     m_appliedPitch = std::clamp(-std::atan2(direction.z, horizontal) + m_offsetPitch, -1.52f, 1.52f);
+     m_appliedYaw = std::atan2(direction.x, direction.y) + m_offsetYaw;
+     view->translation = m_observerEye;
+diff --git a/Code/client/Services/Generic/MarkerDepth.cpp b/Code/client/Services/Generic/MarkerDepth.cpp
+--- a/Code/client/Services/Generic/MarkerDepth.cpp
++++ b/Code/client/Services/Generic/MarkerDepth.cpp
+@@ -19,68 +19,95 @@
+ Parameters parameters;
+ BSGraphics::RendererData* renderer{};
+ ID3D11ShaderResourceView* depthView{};
+-
+-bool Prepare(ID3D11Device* device)
+-{
+-    if (lastDevice == device) return shader && constants;
+-    lastDevice = device;
+-    shader.Reset();
+-    constants.Reset();
+-    constexpr char source[] = R"(
+-        Texture2D font : register(t0); SamplerState fontSampler : register(s0);
+-        Texture2D<float> scene : register(t1);
+-        cbuffer Frame : register(b1) { float2 display; float z; float signZ; }
+-        float4 main(float4 pos: SV_POSITION, float4 color: COLOR0,float2 uv: TEXCOORD0) : SV_Target {
+-            uint w,h; scene.GetDimensions(w,h);
+-            int2 pixel = clamp(int2(pos.xy/display*float2(w,h)),int2(0,0),int2(w-1,h-1));
+-            clip((scene.Load(int3(pixel,0))-z)*signZ);
+-            return color*font.Sample(fontSampler,uv);
+-        })";
+-    ComPtr<ID3DBlob> compiled;
+-    if (FAILED(D3DCompile(source, sizeof(source)-1, nullptr, nullptr, nullptr, "main", "ps_4_0", 0,0,&compiled,nullptr)) ||
+-        FAILED(device->CreatePixelShader(compiled->GetBufferPointer(),compiled->GetBufferSize(),nullptr,&shader))) return false;
+-    D3D11_BUFFER_DESC desc{};
+-    desc.ByteWidth = sizeof(Parameters);
+-    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+-    return SUCCEEDED(device->CreateBuffer(&desc,nullptr,&constants));
+-}
+-void Bind(const ImDrawList*, const ImDrawCmd*)
+-{
+-    auto* ctx = renderer->pContext;
+-    ctx->PSGetShaderResources(1,1,previousDepth.ReleaseAndGetAddressOf());
+-    ctx->PSGetConstantBuffers(1,1,previousConstants.ReleaseAndGetAddressOf());
+-    ctx->UpdateSubresource(constants.Get(),0,nullptr,&parameters,0,0);
+-    ctx->PSSetConstantBuffers(1,1,constants.GetAddressOf());
+-    ctx->PSSetShaderResources(1,1,&depthView);
+-    ctx->PSSetShader(shader.Get(),nullptr,0);
+-}
+-void Restore(const ImDrawList*, const ImDrawCmd*)
+-{
+-    auto* ctx = renderer->pContext;
+-    ctx->PSSetShaderResources(1,1,previousDepth.GetAddressOf());
+-    ctx->PSSetConstantBuffers(1,1,previousConstants.GetAddressOf());
+-    previousConstants.Reset();
+-    previousDepth.Reset();
+-}
+-}
+-bool Begin(ImDrawList* draw, float width, float height, float depth, bool reversed)
+-{
+-    renderer = BSGraphics::GetRendererData();
+-    if (!renderer || !renderer->pDepthStencilTargetsA[0].pSRViewDepth || !std::isfinite(depth) || depth < 0 || depth > 1)
+-        return false;
+-    depthView=renderer->pDepthStencilTargetsA[0].pSRViewDepth;
+-    ComPtr<ID3D11DepthStencilView> bound;
+-    renderer->pContext->OMGetRenderTargets(0,nullptr,&bound);
+-    if (bound)
+-    {
+-        ComPtr<ID3D11Resource> resource; bound->GetResource(&resource);
+-        if (resource.Get()==renderer->pDepthStencilTargetsA[0].pTexture)
+-            depthView=renderer->pDepthStencilTargetsA[1].pSRViewDepth;
+-    }
+-    if (!depthView) return false;
+-    D3D11_SHADER_RESOURCE_VIEW_DESC view{};
+-    depthView->GetDesc(&view);
+-    if (view.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || !Prepare(renderer->pForwarder)) return false;
++ComPtr<ID3D11Resource> copySource;
++ComPtr<ID3D11Texture2D> depthCopy;
++ComPtr<ID3D11ShaderResourceView> depthCopyView;
++D3D11_TEXTURE2D_DESC copyDesc{};
++
++bool Prepare(ID3D11Device* device)
++{
++    if (lastDevice == device) return shader && constants;
++    lastDevice = device;
++    shader.Reset();
++    constants.Reset();
++    copySource.Reset();
++    depthCopy.Reset();
++    depthCopyView.Reset();
++    copyDesc = {};
++    constexpr char source[] = R"(
++        Texture2D font : register(t0); SamplerState fontSampler : register(s0);
++        Texture2D<float> scene : register(t1);
++        cbuffer Frame : register(b1) { float2 display; float z; float signZ; }
++        float4 main(float4 pos: SV_POSITION, float4 color: COLOR0,float2 uv: TEXCOORD0) : SV_Target {
++            uint w,h; scene.GetDimensions(w,h);
++            int2 pixel = clamp(int2(pos.xy/display*float2(w,h)),int2(0,0),int2(w-1,h-1));
++            clip((scene.Load(int3(pixel,0))-z)*signZ);
++            return color*font.Sample(fontSampler,uv);
++        })";
++    ComPtr<ID3DBlob> compiled;
++    if (FAILED(D3DCompile(source, sizeof(source)-1, nullptr, nullptr, nullptr, "main", "ps_4_0", 0,0,&compiled,nullptr)) ||
++        FAILED(device->CreatePixelShader(compiled->GetBufferPointer(),compiled->GetBufferSize(),nullptr,&shader))) return false;
++    D3D11_BUFFER_DESC desc{};
++    desc.ByteWidth = sizeof(Parameters);
++    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++    return SUCCEEDED(device->CreateBuffer(&desc,nullptr,&constants));
++}
++void Bind(const ImDrawList*, const ImDrawCmd*)
++{
++    auto* ctx = renderer->pContext;
++    ctx->PSGetShaderResources(1,1,previousDepth.ReleaseAndGetAddressOf());
++    if (copySource && depthCopy) ctx->CopyResource(depthCopy.Get(),copySource.Get());
++    ctx->PSGetConstantBuffers(1,1,previousConstants.ReleaseAndGetAddressOf());
++    ctx->UpdateSubresource(constants.Get(),0,nullptr,&parameters,0,0);
++    ctx->PSSetConstantBuffers(1,1,constants.GetAddressOf());
++    ctx->PSSetShaderResources(1,1,&depthView);
++    ctx->PSSetShader(shader.Get(),nullptr,0);
++}
++void Restore(const ImDrawList*, const ImDrawCmd*)
++{
++    auto* ctx = renderer->pContext;
++    ctx->PSSetShaderResources(1,1,previousDepth.GetAddressOf());
++    ctx->PSSetConstantBuffers(1,1,previousConstants.GetAddressOf());
++    previousConstants.Reset();
++    previousDepth.Reset();
++    copySource.Reset();
++}
++}
++bool Begin(ImDrawList* draw, float width, float height, float depth, bool reversed)
++{
++    renderer = BSGraphics::GetRendererData();
++    if (!renderer || !renderer->pDepthStencilTargetsA[0].pSRViewDepth || !std::isfinite(depth) || depth < 0 || depth > 1)
++        return false;
++    if (!renderer->pContext || !renderer->pForwarder || !Prepare(renderer->pForwarder)) return false;
++    auto* sourceView = renderer->pDepthStencilTargetsA[0].pSRViewDepth;
++    D3D11_SHADER_RESOURCE_VIEW_DESC view{};
++    sourceView->GetDesc(&view);
++    if (view.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D) return false;
++    ComPtr<ID3D11Resource> source;
++    sourceView->GetResource(&source);
++    ComPtr<ID3D11Texture2D> texture;
++    if (FAILED(source.As(&texture))) return false;
++    D3D11_TEXTURE2D_DESC desc{};
++    texture->GetDesc(&desc);
++    if (desc.SampleDesc.Count != 1 || desc.ArraySize != 1) return false;
++    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++    desc.Usage = D3D11_USAGE_DEFAULT;
++    desc.CPUAccessFlags = 0;
++    desc.MiscFlags = 0;
++    if (!depthCopy || desc.Width != copyDesc.Width || desc.Height != copyDesc.Height ||
++        desc.Format != copyDesc.Format || desc.MipLevels != copyDesc.MipLevels)
++    {
++        depthCopyView.Reset();
++        depthCopy.Reset();
++        if (FAILED(renderer->pForwarder->CreateTexture2D(&desc,nullptr,&depthCopy))) return false;
++        copyDesc = desc;
++    }
++    // Copy the actual primary depth instead of sampling an unrelated secondary target.
++    // The copy has no writable depth binding, so it cannot conflict with the game DSV.
++    if (FAILED(renderer->pForwarder->CreateShaderResourceView(depthCopy.Get(),&view,depthCopyView.ReleaseAndGetAddressOf())))
++        return false;
++    copySource = source;
++    depthView = depthCopyView.Get();
+     parameters = {width,height,depth,reversed ? -1.f : 1.f};
+     draw->AddCallback(Bind,nullptr);
+     return true;
+diff --git a/Code/server/Services/CoopInteraction.cpp b/Code/server/Services/CoopInteraction.cpp
+--- a/Code/server/Services/CoopInteraction.cpp
++++ b/Code/server/Services/CoopInteraction.cpp
+@@ -33,112 +33,116 @@
+     const auto& e = packet.Packet.Event;
+     auto& player = *packet.pPlayer;
+     auto* party = m_world.GetPartyService().GetPlayerParty(&player);
+-    if (!party)
+-        return;
+-    const auto now = Clock::now();
+-    const auto id = player.GetId();
+-    const auto member = [&](uint32_t candidate) -> Player* {
+-        auto* p = m_world.GetPlayerManager().GetById(candidate);
+-        return p && p->GetParty().JoinedPartyId == player.GetParty().JoinedPartyId ? p : nullptr;
+-    };
+-    const auto announce = [&](Interaction k, uint32_t holder, GameId npc) {
+-        for (auto* peer : party->Members)
+-            if (peer->GetId() != holder)
+-                Send(*peer, k, holder, 0, npc);
+-    };
+-    if (e.Kind == Interaction::CancelHire && e.Npc)
+-    {
+-        auto i = party->Followers.find(e.Npc.LogFormat());
+-        if (i != party->Followers.end() && !i->second.Confirmed && i->second.Owner == id && i->second.Nonce == e.Session)
+-        {
+-            if (!i->second.Prepared) announce(Interaction::FollowerReleased, id, e.Npc);
+-            party->Followers.erase(i);
+-        }
+-        return;
+-    }
+-    const bool prepare = e.Kind == Interaction::PrepareHire;
+-    if (e.Kind == Interaction::CommitHire && e.Npc)
+-    {
+-        auto i = party->Followers.find(e.Npc.LogFormat());
+-        if (i != party->Followers.end() && i->second.Prepared && i->second.Owner == id &&
+-            i->second.Session == e.Value && i->second.Nonce == e.Session && now < i->second.Expires)
+-        {
+-            i->second.Prepared = false;
+-            i->second.Expires = now + 8s;
+-            announce(Interaction::FollowerReserved, id, e.Npc);
+-        }
+-        return;
+-    }
+-    if (e.Kind == Interaction::FollowerReport || e.Kind == Interaction::Hire || prepare)
+-    {
+-        for (auto i = party->Followers.begin(); i != party->Followers.end(); )
+-        {
+-            const auto& f = i->second;
+-            if (!member(f.Owner) || (!f.Confirmed && now >= f.Expires) ||
+-                (e.Kind == Interaction::FollowerReport && f.Owner == id && f.Confirmed && e.Npc != f.Npc))
+-            {
+-                if (!f.Prepared) announce(Interaction::FollowerReleased, f.Owner, f.Npc);
+-                i = party->Followers.erase(i);
+-            }
+-            else
+-                ++i;
+-        }
+-        if (e.Npc)
+-        {
+-            auto i = party->Followers.find(e.Npc.LogFormat());
+-            bool free = i == party->Followers.end();
+-            if (e.Kind == Interaction::Hire || prepare)
+-            {
+-                const auto scene = party->Talks.find(id);
+-                const bool valid = scene != party->Talks.end() && !scene->second.Closed && now < scene->second.Expires &&
+-                    scene->second.Anchor.Session == e.Value && scene->second.Anchor.TargetForm == e.Npc;
+-                bool competing = false;
+-                if (prepare)
+-                    for (const auto& [who, talk] : party->Talks)
+-                        if (who != id && !talk.Closed && talk.Expires > now && talk.Anchor.TargetForm == e.Npc)
+-                            competing = true;
+-                bool own = !free && i->second.Owner == id && i->second.Session == e.Value && !i->second.Confirmed;
+-                if (valid && !competing && (free || own))
+-                {
+-                    for (const auto& [key, f] : party->Followers)
+-                        if (f.Owner == id && f.Npc != e.Npc)
+-                            free = own = false;
+-                    if (free || (own && (i->second.Prepared || (!prepare && i->second.Nonce == e.Session))))
+-                    {
+-                        auto& f = party->Followers[e.Npc.LogFormat()];
+-                        bool announceClaim = !prepare && (free || f.Prepared);
+-                        f = {e.Npc, id, now + (prepare ? 2s : 8s), false, e.Session, prepare, e.Value};
+-                        if (announceClaim) announce(Interaction::FollowerReserved, id, e.Npc);
+-                        Send(player, prepare ? Interaction::HireReady : Interaction::Granted, id, e.Session, e.Npc, e.Value);
+-                        return;
+-                    }
+-                }
+-                if (!prepare)
+-                    Send(player, Interaction::Denied, id, e.Session, e.Npc);
+-                return;
+-            }
+-            if (free || i->second.Owner == id)
+-            {
+-                if (free || i->second.Prepared)
+-                    announce(Interaction::FollowerReserved, id, e.Npc);
+-                auto& entry = party->Followers[e.Npc.LogFormat()];
+-                const bool checkSimulation = !entry.Confirmed || now >= entry.Expires;
+-                entry.Npc = e.Npc;
+-                entry.Owner = id;
+-                entry.Confirmed = true;
+-                entry.Prepared = false;
+-                if (checkSimulation)
+-                {
+-                    entry.Expires = now + 4s;
+-                    m_world.GetCharacterService().AssignInteractionOwner(&player, e.Npc);
+-                }
+-            }
+-        }
+-        for (const auto& [key, f] : party->Followers)
+-            if (f.Owner != id && !f.Prepared)
+-                Send(player, Interaction::FollowerReserved, f.Owner, 0, f.Npc);
+-        return;
+-    }
++    auto& followers = m_world.GetPartyService().Followers();
++    auto& hireTalks = m_world.GetPartyService().HireTalks();
++    const auto now = Clock::now();
++    const auto id = player.GetId();
++    const auto member = [&](uint32_t candidate) -> Player* {
++        auto* p = m_world.GetPlayerManager().GetById(candidate);
++        return p && p->GetParty().JoinedPartyId == player.GetParty().JoinedPartyId ? p : nullptr;
++    };
++    const auto announce = [&](Interaction k, uint32_t holder, GameId npc) {
++        m_world.GetPlayerManager().ForEach([&](Player* peer) {
++            if (peer->GetId() != holder)
++                Send(*peer, k, holder, 0, npc);
++        });
++    };
++    if (e.Kind == Interaction::CancelHire && e.Npc)
++    {
++        auto i = followers.find(e.Npc.LogFormat());
++        if (i != followers.end() && !i->second.Confirmed && i->second.Owner == id && i->second.Nonce == e.Session)
++        {
++            if (!i->second.Prepared) announce(Interaction::FollowerReleased, id, e.Npc);
++            followers.erase(i);
++        }
++        return;
++    }
++    const bool prepare = e.Kind == Interaction::PrepareHire;
++    if (e.Kind == Interaction::CommitHire && e.Npc)
++    {
++        auto i = followers.find(e.Npc.LogFormat());
++        if (i != followers.end() && i->second.Prepared && i->second.Owner == id &&
++            i->second.Session == e.Value && i->second.Nonce == e.Session && now < i->second.Expires)
++        {
++            i->second.Prepared = false;
++            i->second.Expires = now + 8s;
++            announce(Interaction::FollowerReserved, id, e.Npc);
++        }
++        return;
++    }
++    if (e.Kind == Interaction::FollowerReport || e.Kind == Interaction::Hire || prepare)
++    {
++        for (auto i = followers.begin(); i != followers.end(); )
++        {
++            const auto& f = i->second;
++            if (!m_world.GetPlayerManager().GetById(f.Owner) || (!f.Confirmed && now >= f.Expires) ||
++                (e.Kind == Interaction::FollowerReport && f.Owner == id && f.Confirmed && e.Npc != f.Npc))
++            {
++                if (!f.Prepared) announce(Interaction::FollowerReleased, f.Owner, f.Npc);
++                i = followers.erase(i);
++            }
++            else
++                ++i;
++        }
++        if (e.Npc)
++        {
++            auto i = followers.find(e.Npc.LogFormat());
++            bool free = i == followers.end();
++            if (e.Kind == Interaction::Hire || prepare)
++            {
++                const auto scene = hireTalks.find(id);
++                const bool valid = scene != hireTalks.end() && !scene->second.Closed && now < scene->second.Expires &&
++                    scene->second.Anchor.Session == e.Value && scene->second.Anchor.TargetForm == e.Npc &&
++                    InScene(m_world, player, scene->second.Anchor);
++                bool competing = false;
++                if (prepare)
++                    for (const auto& [who, talk] : hireTalks)
++                        if (who != id && !talk.Closed && talk.Expires > now && talk.Anchor.TargetForm == e.Npc)
++                            competing = true;
++                bool own = !free && i->second.Owner == id && i->second.Session == e.Value && !i->second.Confirmed;
++                if (valid && !competing && (free || own))
++                {
++                    for (const auto& [key, f] : followers)
++                        if (f.Owner == id && f.Npc != e.Npc)
++                            free = own = false;
++                    if (free || (own && (i->second.Prepared || (!prepare && i->second.Nonce == e.Session))))
++                    {
++                        auto& f = followers[e.Npc.LogFormat()];
++                        bool announceClaim = !prepare && (free || f.Prepared);
++                        f = {e.Npc, id, now + (prepare ? 2s : 8s), false, e.Session, prepare, e.Value};
++                        if (announceClaim) announce(Interaction::FollowerReserved, id, e.Npc);
++                        Send(player, prepare ? Interaction::HireReady : Interaction::Granted, id, e.Session, e.Npc, e.Value);
++                        return;
++                    }
++                }
++                if (!prepare)
++                    Send(player, Interaction::Denied, id, e.Session, e.Npc);
++                return;
++            }
++            if (free || i->second.Owner == id)
++            {
++                if (free || i->second.Prepared)
++                    announce(Interaction::FollowerReserved, id, e.Npc);
++                auto& entry = followers[e.Npc.LogFormat()];
++                const bool checkSimulation = !entry.Confirmed || now >= entry.Expires;
++                entry.Npc = e.Npc;
++                entry.Owner = id;
++                entry.Confirmed = true;
++                entry.Prepared = false;
++                if (checkSimulation)
++                {
++                    entry.Expires = now + 4s;
++                    m_world.GetCharacterService().AssignInteractionOwner(&player, e.Npc);
++                }
++            }
++        }
++        for (const auto& [key, f] : followers)
++            if (f.Owner != id && !f.Prepared)
++                Send(player, Interaction::FollowerReserved, f.Owner, 0, f.Npc);
++        return;
++    }
++    if (!party)
++        return;
+     if (e.Kind == Interaction::Join || e.Kind == Interaction::Leave)
+     {
+         auto it = party->Talks.find(e.Speaker);
+diff --git a/Code/server/Services/PartyService.h b/Code/server/Services/PartyService.h
+--- a/Code/server/Services/PartyService.h
++++ b/Code/server/Services/PartyService.h
+@@ -63,40 +63,45 @@
+         };
+         std::map<uint32_t, Conversation> Talks;
+         std::map<uint32_t, Conversation> Brawls;
+-        std::map<uint64_t, Follower> Followers;
+-        Map<GameId, QuestRun> QuestRuns{};
+-        uint64_t JournalStream{};
+-        uint32_t JournalCommitted{};
+-        Vector<String> JournalRows;
+-    };
+-
+-    PartyService(World& aWorld, entt::dispatcher& aDispatcher) noexcept;
+-    ~PartyService() noexcept = default;
+-
+-    TP_NOCOPYMOVE(PartyService);
+-
+-    static bool WithinSyncRange(World&, Player&, Player&) noexcept;
+-    const Party* GetById(uint32_t aId) const noexcept;
+-    bool IsPlayerInParty(Player* const apPlayer) const noexcept;
+-    bool IsPlayerLeader(const Player* const apPlayer) const noexcept;
+-    Party* GetPlayerParty(Player* const apPlayer) noexcept;
+-
+-protected:
+-    void OnUpdate(const UpdateEvent& acEvent) noexcept;
+-    void OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept;
+-    void OnPlayerLeave(const PlayerLeaveEvent& acEvent) noexcept;
+-    void OnPartyInvite(const PacketEvent<PartyInviteRequest>& acPacket) noexcept;
+-    void OnPartyAcceptInvite(const PacketEvent<PartyAcceptInviteRequest>& acPacket) noexcept;
+-    void OnPartyLeave(const PacketEvent<PartyLeaveRequest>& acPacket) noexcept;
+-    void OnPartyCreate(const PacketEvent<PartyCreateRequest>& acPacket) noexcept;
+-    void OnPartyChangeLeader(const PacketEvent<PartyChangeLeaderRequest>& acPacket) noexcept;
+-    void OnPartyKick(const PacketEvent<PartyKickRequest>& acPacket) noexcept;
+-    void RemovePlayerFromParty(Player* apPlayer) noexcept;
+-
+-    void BroadcastPlayerList(Player* apPlayer = nullptr) const noexcept;
+-    void BroadcastPartyInfo(uint32_t aPartyId) const noexcept;
+-
+-private:
++        Map<GameId, QuestRun> QuestRuns{};
++        uint64_t JournalStream{};
++        uint32_t JournalCommitted{};
++        Vector<String> JournalRows;
++    };
++
++    auto& Followers() noexcept { return m_followers; }
++    auto& HireTalks() noexcept { return m_hireTalks; }
++
++    PartyService(World& aWorld, entt::dispatcher& aDispatcher) noexcept;
++    ~PartyService() noexcept = default;
++
++    TP_NOCOPYMOVE(PartyService);
++
++    static bool WithinSyncRange(World&, Player&, Player&) noexcept;
++    const Party* GetById(uint32_t aId) const noexcept;
++    bool IsPlayerInParty(Player* const apPlayer) const noexcept;
++    bool IsPlayerLeader(const Player* const apPlayer) const noexcept;
++    Party* GetPlayerParty(Player* const apPlayer) noexcept;
++
++protected:
++    void OnUpdate(const UpdateEvent& acEvent) noexcept;
++    void OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept;
++    void OnPlayerLeave(const PlayerLeaveEvent& acEvent) noexcept;
++    void OnPartyInvite(const PacketEvent<PartyInviteRequest>& acPacket) noexcept;
++    void OnPartyAcceptInvite(const PacketEvent<PartyAcceptInviteRequest>& acPacket) noexcept;
++    void OnPartyLeave(const PacketEvent<PartyLeaveRequest>& acPacket) noexcept;
++    void OnPartyCreate(const PacketEvent<PartyCreateRequest>& acPacket) noexcept;
++    void OnPartyChangeLeader(const PacketEvent<PartyChangeLeaderRequest>& acPacket) noexcept;
++    void OnPartyKick(const PacketEvent<PartyKickRequest>& acPacket) noexcept;
++    void RemovePlayerFromParty(Player* apPlayer) noexcept;
++
++    void BroadcastPlayerList(Player* apPlayer = nullptr) const noexcept;
++    void BroadcastPartyInfo(uint32_t aPartyId) const noexcept;
++
++private:
++    // Session-scoped hire leases are independent of party membership and simulation ownership.
++    std::map<uint64_t, Party::Follower> m_followers;
++    std::map<uint32_t, Party::Conversation> m_hireTalks;
+     World& m_world;
+ 
+     TiltedPhoques::Map<uint32_t, Party> m_parties;
+diff --git a/Code/server/Services/PartyService.cpp b/Code/server/Services/PartyService.cpp
+--- a/Code/server/Services/PartyService.cpp
++++ b/Code/server/Services/PartyService.cpp
+@@ -381,33 +381,47 @@
+ 
+ void PartyService::OnPlayerLeave(const PlayerLeaveEvent& acEvent) noexcept
+ {
+-    RemovePlayerFromParty(acEvent.pPlayer);
+-    BroadcastPlayerList(acEvent.pPlayer);
+-}
+-
+-void PartyService::RemovePlayerFromParty(Player* apPlayer) noexcept
+-{
+-    auto* pPartyComponent = &apPlayer->GetParty();
+-    spdlog::debug("[PartyService]: Removing player from party.");
+-
+-    if (pPartyComponent->JoinedPartyId)
+-    {
+-        auto id = *pPartyComponent->JoinedPartyId;
+-
+-        Party& party = m_parties[id];
+-        auto& members = party.Members;
+-
+-        const auto departing = apPlayer->GetId();
+-        party.Talks.erase(departing);
+-        party.Brawls.erase(departing);
+-        for (auto& [id, talk] : party.Talks)
+-        {
+-            talk.Listeners.erase(departing);
+-            talk.ChoiceListeners.erase(departing);
+-        }
+-        for (auto& [id, fight] : party.Brawls)
+-            fight.Listeners.erase(departing);
+-        std::erase_if(party.Followers, [departing](const auto& row) { return row.second.Owner == departing; });
++    const auto leaving = acEvent.pPlayer->GetId();
++    m_hireTalks.erase(leaving);
++    for (auto i = m_followers.begin(); i != m_followers.end(); )
++    {
++        if (i->second.Owner != leaving) { ++i; continue; }
++        if (!i->second.Prepared)
++        {
++            NotifyCoopInteraction notice;
++            notice.Event = {Interaction::FollowerReleased, leaving, 0, 0, i->second.Npc};
++            m_world.GetPlayerManager().ForEach([&](Player* peer) {
++                if (peer != acEvent.pPlayer) peer->Send(notice);
++            });
++        }
++        i = m_followers.erase(i);
++    }
++    RemovePlayerFromParty(acEvent.pPlayer);
++    BroadcastPlayerList(acEvent.pPlayer);
++}
++
++void PartyService::RemovePlayerFromParty(Player* apPlayer) noexcept
++{
++    auto* pPartyComponent = &apPlayer->GetParty();
++    spdlog::debug("[PartyService]: Removing player from party.");
++
++    if (pPartyComponent->JoinedPartyId)
++    {
++        auto id = *pPartyComponent->JoinedPartyId;
++
++        Party& party = m_parties[id];
++        auto& members = party.Members;
++
++        const auto departing = apPlayer->GetId();
++        party.Talks.erase(departing);
++        party.Brawls.erase(departing);
++        for (auto& [id, talk] : party.Talks)
++        {
++            talk.Listeners.erase(departing);
++            talk.ChoiceListeners.erase(departing);
++        }
++        for (auto& [id, fight] : party.Brawls)
++            fight.Listeners.erase(departing);
+         members.erase(std::find(std::begin(members), std::end(members), apPlayer));
+ 
+         if (members.empty())
+diff --git a/Code/server/Services/OverlayService.cpp b/Code/server/Services/OverlayService.cpp
+--- a/Code/server/Services/OverlayService.cpp
++++ b/Code/server/Services/OverlayService.cpp
+@@ -83,10 +83,23 @@
+ void OverlayService::OnPlayerDialogue(const PacketEvent<PlayerDialogueRequest>& acMessage) const noexcept
+ {
+     auto* pSpeaker = acMessage.pPlayer;
+-    if (!pSpeaker->GetParty().JoinedPartyId)
+-        return;
+-    NotifyPlayerDialogue message;
+-    message.Anchor = acMessage.Packet.Anchor;
++    NotifyPlayerDialogue message;
++    message.Anchor = acMessage.Packet.Anchor;
++    if (!message.Anchor.Session)
++        return;
++    // Keep a private session anchor for hire validation even without a party.
++    // Only party conversations below are relayed or used for quest outcomes.
++    auto& hire = m_world.GetPartyService().HireTalks()[pSpeaker->GetId()];
++    if (message.Anchor.Cell)
++    {
++        hire.Anchor = message.Anchor;
++        hire.Closed = false;
++        hire.Expires = std::chrono::steady_clock::now() + std::chrono::seconds(4);
++    }
++    else if (hire.Anchor.Session == message.Anchor.Session)
++        hire.Closed = true;
++    if (!pSpeaker->GetParty().JoinedPartyId)
++        return;
+     auto* party = m_world.GetPartyService().GetPlayerParty(pSpeaker);
+     if (!party || !message.Anchor.Session)
+         return;
+diff --git a/Code/server/Services/CharacterService.cpp b/Code/server/Services/CharacterService.cpp
+--- a/Code/server/Services/CharacterService.cpp
++++ b/Code/server/Services/CharacterService.cpp
+@@ -838,19 +838,20 @@
+         return reject("the actor is out of range");
+ 
+     auto& partyService = m_world.GetPartyService();
+-    if (!partyService.IsPlayerInParty(apPlayer))
+-        return reject("the player is not the party leader");
+-
+-    PartyService::Party* const pParty = partyService.GetPlayerParty(apPlayer);
+-    if (!pParty || std::find(pParty->Members.begin(), pParty->Members.end(), pCurrentOwner) == pParty->Members.end())
+-        return reject("the current owner is not in the party");
+-
+-    const auto key = view.get<FormIdComponent>(*it).Id.LogFormat();
+-    std::optional<uint32_t> preferredOwner;
+-    const auto follower = pParty->Followers.find(key);
+-    if (follower != pParty->Followers.end() &&
+-        (follower->second.Confirmed || follower->second.Expires > std::chrono::steady_clock::now()))
+-        preferredOwner = follower->second.Owner;
++    const auto key = view.get<FormIdComponent>(*it).Id.LogFormat();
++    const auto& followers = partyService.Followers();
++    const auto follower = followers.find(key);
++    if (follower != followers.end() &&
++        (follower->second.Confirmed || follower->second.Expires > std::chrono::steady_clock::now()))
++        return follower->second.Owner == apPlayer->GetId();
++
++    if (!partyService.IsPlayerInParty(apPlayer))
++        return reject("the player is not in a party");
++    PartyService::Party* const pParty = partyService.GetPlayerParty(apPlayer);
++    if (!pParty || std::find(pParty->Members.begin(), pParty->Members.end(), pCurrentOwner) == pParty->Members.end())
++        return reject("the current owner is not in the party");
++
++    std::optional<uint32_t> preferredOwner;
+     if (!preferredOwner)
+         for (const auto& [challenger, fight] : pParty->Brawls)
+             if (fight.Anchor.TargetForm.LogFormat() == key && fight.Expires > std::chrono::steady_clock::now())
+diff --git a/Code/client/Services/Generic/CoopInteraction.cpp b/Code/client/Services/Generic/CoopInteraction.cpp
+--- a/Code/client/Services/Generic/CoopInteraction.cpp
++++ b/Code/client/Services/Generic/CoopInteraction.cpp
+@@ -276,367 +276,377 @@
+ 
+ bool OverlayService::BeginHire(uint32_t npc, uint32_t info, int32_t index) noexcept
+ {
+-    if (!m_world.GetPartyService().IsInParty())
+-        return false;
+-    const GameId key = NetworkForm(npc);
+-    if (!key)
+-        return false;
+-    if (m_pendingForm && Clock::now() < m_pendingUntil)
+-        return true;
+-    m_pendingSession = m_world.ctx().at<PlayerService>().ActiveDialogueSession(npc);
+-    if (!m_pendingSession)
+-    {
+-        Utils::ShowHudMessage("Разговор ещё открывается. Выберите реплику снова.");
+-        return true;
+-    }
+-    if (m_hireReady && m_prepareForm == npc && m_prepareSession == m_pendingSession && Clock::now() < m_prepareSent + 1100ms)
+-    {
+-        Transmit(Interaction::CommitHire, 0, m_prepareNonce, key, m_pendingSession);
+-        m_dispatchedNonce = m_prepareNonce;
+-        m_prepareForm = 0;
+-        m_hireReady = false;
+-        m_prepareAt = Clock::now() + 2s;
+-        return false; // pass the original click to Skyrim, on its original call stack
+-    }
+-    m_pendingForm = npc;
+-    m_pendingInfo = info;
+-    m_pendingIndex = index;
+-    m_pendingNonce = ++m_nonce;
+-    m_pendingUntil = Clock::now() + 4s;
+-    Transmit(Interaction::Hire, 0, m_nonce, key, m_pendingSession);
+-    return true;
+-}
+-
+-void OverlayService::ClearInteraction() noexcept
+-{
+-    { std::lock_guard guard(rightsMutex); occupied.clear(); occupiedCount.store(0); }
+-    m_activated = m_pendingForm = m_prepareForm = m_dispatchedNonce = opponent = 0;
+-    m_hireReady = false;
+-    confirmedOpponent.store(0);
+-    localOpponent.store(0);
+-    m_pendingJoin = m_requestedTalk = 0;
+-    recoveries.clear();
+-    ClearCombatSettlements();
+-    ClearTrade();
+-    ClearHomes();
+-    m_rejoinKey = 0;
+-    ClearProgress();
+-    m_watch = {};
+-    lastPose = UINT32_MAX;
+-    m_pollAt = {};
+-}
+-
+-void OverlayService::OnInteraction(const NotifyCoopInteraction& packet) noexcept
+-{
+-    if (!m_world.GetPartyService().IsInParty())
+-        return;
+-    const auto& e = packet.Event;
+-    const auto now = Clock::now();
+-    uint32_t form = e.Npc ? m_world.GetModSystem().GetGameId(e.Npc) : 0;
+-    const uint64_t key = (uint64_t(e.Speaker) << 32) | e.Session;
+-    if (e.Kind == Interaction::Joined || e.Kind == Interaction::Rejoin)
+-    {
+-        if ((e.Kind == Interaction::Joined && m_pendingJoin != key) ||
+-            (!m_conversations.count(e.Speaker)) || m_conversations.at(e.Speaker).Last.Anchor.Session != e.Session)
+-            return;
+-        if (m_dismissedTalk == key && e.Kind == Interaction::Rejoin)
+-            return;
+-        m_pendingJoin = 0;
+-        m_requestedTalk = key;
+-        m_rejoinKey = e.Kind == Interaction::Rejoin ? key : 0;
+-        m_rejoinUntil = e.Kind == Interaction::Rejoin ? now + 8s : Clock::time_point{};
+-        m_dismissedTalk = 0;
+-        return;
+-    }
+-    if (e.Kind == Interaction::SyncRange)
+-    {
+-        SetPeerRange(e.Speaker, e.Value != 0);
+-        return;
+-    }
+-    if (!form)
+-        return;
+-    if (e.Kind == Interaction::OpponentState && e.Value == 2)
+-    {
+-        // Repeated settlement messages must not restart recovery or override a later assault.
+-        if (!m_peaceSession.count(form) || m_peaceSession[form] != key)
+-        {
+-            m_peaceSession[form] = key;
+-            PeaceSnapshot state{};
+-            state.speaker = e.Speaker;
+-            state.session = e.Session;
+-            spdlog::info("Co-op encounter {}: received peaceful outcome for actor {:X} from {}", e.Session, form, e.Speaker);
+-            state.expires = now + 15s;
+-            state.encounter = true;
+-            BeginCombatSettlement(form);
+-            recoveries.insert_or_assign(form, state);
+-            opponent = form;
+-            opponentExpires = now + 3s;
+-            PublishAlive(confirmedOpponent, confirmedUntil, form);
+-            lastPose = UINT32_MAX;
+-            ApplyPeace(m_world);
+-        }
+-        return;
+-    }
+-    if (e.Kind == Interaction::OpponentState && m_peaceSession.count(form) &&
+-        m_peaceSession.at(form) == key) return;
+-    if (e.Kind == Interaction::OpponentState && e.Value != 2)
+-    {
+-        recoveries.erase(form);
+-        CancelCombatSettlement(form);
+-    }
+-    if (e.Kind == Interaction::FollowerReserved || e.Kind == Interaction::FollowerReleased)
+-    {
+-        bool newlyReserved = false;
+-        {
+-            std::lock_guard guard(rightsMutex);
+-            if (e.Kind == Interaction::FollowerReserved)
+-            {
+-                auto& until = occupied[form];
+-                newlyReserved = until <= now;
+-                until = now + 10s;
+-            }
+-            else
+-                occupied.erase(form);
+-            occupiedCount.store(static_cast<uint32_t>(occupied.size()), std::memory_order_relaxed);
+-        }
+-        if (newlyReserved)
+-        {
+-            // Repair a rank copied by previous STR builds, while preserving a pre-existing personal follower.
+-            auto* quest = Cast<TESQuest>(TESForm::GetById(0x750BA));
+-            auto* actor = Cast<Actor>(TESForm::GetById(form));
+-            auto* faction = Cast<TESFaction>(TESForm::GetById(0x5C84E));
+-            auto* method = m_world.ctx().at<PapyrusService>().Get("Actor", "GetFactionRank");
+-            if (actor && quest && quest->GetAliasedRef(0) != actor && faction && method)
+-            {
+-                PapyrusFunction<int32_t, Actor, TESFaction*> rank(method);
+-                if (rank(actor, faction) >= 0)
+-                    actor->SetFactionRank(faction, -1);
+-            }
+-        }
+-        return;
+-    }
+-    if (e.Kind == Interaction::HireReady)
+-    {
+-        if (form == m_prepareForm && e.Session == m_prepareNonce && e.Value == m_prepareSession)
+-            m_hireReady = now < m_prepareSent + 1100ms;
+-        return;
+-    }
+-    if (e.Kind == Interaction::Granted || e.Kind == Interaction::Denied)
+-    {
+-        if (form != m_pendingForm || e.Session != m_pendingNonce || now >= m_pendingUntil)
+-        {
+-            if (e.Kind == Interaction::Granted && e.Session != m_dispatchedNonce)
+-                Transmit(Interaction::CancelHire, 0, e.Session, e.Npc);
+-            return;
+-        }
+-        m_pendingForm = 0;
+-        if (e.Kind == Interaction::Granted)
+-        {
+-            m_dispatchedNonce = e.Session;
+-            auto* menu = MenuTopicManager::Get();
+-            if (m_world.ctx().at<PlayerService>().ActiveDialogueSession(form) != m_pendingSession || !menu ||
+-                !menu->ResumeHire(m_pendingIndex, form, m_pendingInfo))
+-            {
+-                Transmit(Interaction::CancelHire, 0, e.Session, e.Npc);
+-                Utils::ShowHudMessage("Реплика найма больше недоступна.");
+-            }
+-        }
+-        else
+-            Utils::ShowHudMessage("Нанять спутника сейчас не удалось.");
+-        return;
+-    }
+-    auto* actor = Cast<Actor>(TESForm::GetById(form));
+-    if (!actor)
+-        return;
+-    if (e.Kind == Interaction::WatchOutcomes)
+-    {
+-        if (m_watch.Npc == form && m_watch.Session == e.Session)
+-            return;
+-        auto rank = Relationship(actor);
+-        bool settlement = e.Value == 1;
+-        // Retain the subject captured before the engine clears the radiant quest aliases.
+-        auto* favor = Cast<TESQuest>(TESForm::GetById(0xCA210));
+-        bool matchingFavor = (favor && !favor->IsStopped() && favor->GetAliasedRef(17) == actor) ||
+-                             (settlement && m_watch.Npc == form && m_watch.FavorParticipant);
+-        m_watch = {};
+-        m_watch.Settlement = settlement;
+-        m_watch.FavorParticipant = matchingFavor;
+-        m_watch.Npc = form;
+-        m_watch.Session = e.Session;
+-        m_watch.Rank = rank ? static_cast<uint32_t>(*rank + 4) : UINT32_MAX;
+-        m_watch.Expires = now + 6s;
+-    }
+-    else if (e.Kind == Interaction::BrawlFactionEnded)
+-    {
+-        auto* faction = Cast<TESFaction>(TESForm::GetById(0x4CFA6));
+-        const auto rank = BrawlFactionRank(actor, faction);
+-        if (rank && *rank >= 0) actor->SetFactionRank(faction, -1);
+-    }
+-    else if (e.Kind == Interaction::FavorResult && e.Value && !(e.Value & ~3u))
+-    {
+-        QueueProgress(false, form, e.Speaker, e.Session, actor->baseForm ? actor->baseForm->GetName() : "", [this, form, stages = e.Value] {
+-            auto& pending = m_favorSettlements[form];
+-            pending.Npc = form;
+-            pending.Stages |= stages;
+-            pending.Expires = Clock::now() + 20s;
+-        }, [form, stages = e.Value] {
+-            auto* quest = Cast<TESQuest>(TESForm::GetById(0xCA210));
+-            if (!quest || quest->IsStopped()) return false;
+-            auto* subject = quest->GetAliasedRef(17);
+-            return subject && subject->formID == form && (((stages & 1) && !quest->IsStageReached(20)) ||
+-                ((stages & 2) && !quest->IsStageReached(200)));
+-        });
+-    }
+-    else if (e.Kind == Interaction::Outcome && e.Value >= 1 && e.Value <= 4)
+-    {
+-        QueueProgress(false, form, e.Speaker, e.Session, actor->baseForm ? actor->baseForm->GetName() : "", [this, form, rank = e.Value] {
+-            auto* npc = Cast<Actor>(TESForm::GetById(form));
+-            const auto current = Relationship(npc);
+-            auto* method = m_world.ctx().at<PapyrusService>().Get("Actor", "SetRelationshipRank");
+-            if (current && *current < static_cast<int32_t>(rank) && method)
+-            {
+-                PapyrusFunction<void, Actor, Actor*, int32_t> set(method);
+-                set(npc, PlayerCharacter::Get(), static_cast<int32_t>(rank));
+-            }
+-        }, [form, rank = e.Value] {
+-            const auto current = Relationship(Cast<Actor>(TESForm::GetById(form)));
+-            return current && *current < static_cast<int32_t>(rank);
+-        });
+-    }
+-    else if (e.Kind == Interaction::OpponentState && e.Value <= 3)
+-    {
+-        if (e.Value == 3)
+-        {
+-            if (opponent == form)
+-            {
+-                opponent = 0;
+-                confirmedOpponent.store(0);
+-                lastPose = UINT32_MAX;
+-            }
+-            // End the nonlethal contract. Only the owner/epoch-checked life channel can confirm death.
+-            if (auto* extension = actor->GetExtension()) extension->Pose = {};
+-            auto replicas = m_world.view<FormIdComponent, RemoteComponent>();
+-            for (auto entity : replicas)
+-                if (replicas.get<FormIdComponent>(entity).Id == form)
+-                {
+-                    const auto& remote = replicas.get<RemoteComponent>(entity);
+-                    RequestNpcLifeCheck check;
+-                    check.Id = remote.Id;
+-                    check.OwnershipEpoch = remote.OwnershipEpoch;
+-                    m_transport.Send(check);
+-                    break;
+-                }
+-            return;
+-        }
+-        if (opponent != form || opponentExpires < now)
+-            lastPose = UINT32_MAX;
+-        opponent = form;
+-        PublishAlive(confirmedOpponent, confirmedUntil, form);
+-        GuardReplica(actor);
+-        if (auto* extension = actor->GetExtension())
+-            extension->Pose.Observe(e.Value == 1 ? ReplicaPose::Kneeling : ReplicaPose::Fighting, m_world.GetTick());
+-        if (lastPose != e.Value)
+-            spdlog::debug("Brawl replica {:X}: session {}, state {}, local death {}", form, e.Session, e.Value, actor->IsDead());
+-        opponentExpires = now + (e.Value == 2 ? 8s : 4s);
+-        confirmedUntil.store(opponentExpires.time_since_epoch().count());
+-        if (!actor->GetNiNode())
+-            return;
+-        if (actor->IsDead())
+-            actor->RestoreRemoteLife();
+-        if (actor->IsDead())
+-            return;
+-        const uint32_t pose = e.Value == 2 ? 0 : e.Value;
+-        if (pose != lastPose)
+-        {
+-            static BSFixedString down("bleedOutStart"), up("bleedOutStop");
+-            ScopedReplicaTransition transition(actor);
+-            const bool change = pose == 1 || lastPose == 1 || actor->actorState.IsBleedingOut();
+-            if (!change || (actor->animationGraphHolder.IsReady() && actor->SendAnimationEvent(pose == 1 ? &down : &up)))
+-                lastPose = pose;
+-        }
+-        ObservePartyCombat(form);
+-        if (actor->GetCombatTarget() == PlayerCharacter::Get())
+-        {
+-            auto players = m_world.view<PlayerComponent, FormIdComponent>();
+-            for (auto entity : players)
+-                if (players.get<PlayerComponent>(entity).Id == e.Speaker)
+-                    if (auto* challenger = Cast<Actor>(TESForm::GetById(players.get<FormIdComponent>(entity).Id)))
+-                        actor->SetCombatTargetEx(challenger);
+-        }
+-    }
+-}
+-
+-void OverlayService::UpdateHireOffer() noexcept
+-{
+-    const auto now = Clock::now();
+-    if (m_pendingForm && now < m_pendingUntil)
+-        return;
+-    auto* menu = MenuTopicManager::Get();
+-    auto* npc = menu && menu->speaker && menu->OffersHire() ? TESObjectREFR::GetByHandle(menu->speaker.handle.iBits) : nullptr;
+-    const uint32_t form = npc ? npc->formID : 0;
+-    if (m_prepareForm && form != m_prepareForm)
+-    {
+-        Transmit(Interaction::CancelHire, 0, m_prepareNonce, NetworkForm(m_prepareForm));
+-        m_prepareForm = 0;
+-        m_hireReady = false;
+-        m_prepareAt = {};
+-    }
+-    if (!form || now < m_prepareAt)
+-        return;
+-    auto session = m_world.ctx().at<PlayerService>().ActiveDialogueSession(form);
+-    auto key = NetworkForm(form);
+-    if (!key || !session)
+-        return;
+-    if (m_prepareForm != form || session != m_prepareSession)
+-    {
+-        m_prepareForm = form;
+-        m_prepareSession = session;
+-        m_prepareNonce = ++m_nonce;
+-    }
+-    // Until the matching reply arrives, a click goes through the normal explicit request.
+-    m_hireReady = false;
+-    m_prepareSent = now;
+-    m_prepareAt = now + 800ms;
+-    Transmit(Interaction::PrepareHire, 0, m_prepareNonce, key, session);
+-}
+-
+-void OverlayService::BrawlBleedout(uint32_t form) noexcept
+-{
+-    if (!form || m_watch.Npc != form || m_watch.Settlement || !m_world.GetPartyService().IsInParty()) return;
+-    auto* actor = Cast<Actor>(TESForm::GetById(form));
+-    if (!actor || (Alias(0x47AE6) != actor && (!m_watch.Brawl || m_watch.State >= 2))) return;
+-    const auto npc = NetworkForm(form);
+-    if (!npc) return;
+-    if (!m_watch.Brawl) Transmit(Interaction::Brawl, 0, m_watch.Session, npc);
+-    m_watch.Brawl = true;
+-    spdlog::info("Co-op encounter {}: Skyrim reported opponent {:X} entering bleedout", m_watch.Session, form);
+-    m_watch.KneelingUntil = Clock::now() + 300ms;
+-    m_watch.State = 1;
+-    Transmit(Interaction::OpponentState, 0, m_watch.Session, npc, 1);
+-}
+-
+-void OverlayService::UpdateInteraction() noexcept
+-{
+-    if (!m_world.GetPartyService().IsInParty() || !m_transport.IsConnected())
+-        return;
+-    const auto now = Clock::now();
+-    if (now < m_pollAt)
+-        return;
+-    m_pollAt = now + 100ms;
+-    auto* local = PlayerCharacter::Get();
+-    if (!local || !local->parentCell || !local->GetNiNode())
+-        return; // a load screen cannot confirm dismissal
+-    auto* followerQuest = Cast<TESQuest>(TESForm::GetById(0x750BA)); // DialogueFollower, human follower alias
+-    if (followerQuest && now >= m_followerPoll)
+-    {
+-        m_followerPoll = now + 500ms;
+-        auto* follower = followerQuest->GetAliasedRef(0);
+-        Transmit(Interaction::FollowerReport, 0, 0, follower ? NetworkForm(follower->formID) : GameId{});
+-    }
+-    UpdateCombatSettlements(m_world);
+-    ApplyPeace(m_world);
+-    ApplyFavorSettlements();
+-    UpdateHireOffer();
++    if (!m_transport.IsOnline())
++        return false;
++    if (FollowerBusy(npc))
++    {
++        Utils::ShowHudMessage("Этот спутник уже сопровождает другого игрока.");
++        return true;
++    }
++    const GameId key = NetworkForm(npc);
++    if (!key)
++        return false;
++    if (m_pendingForm && Clock::now() < m_pendingUntil)
++        return true;
++    m_pendingSession = m_world.ctx().at<PlayerService>().ActiveDialogueSession(npc);
++    if (!m_pendingSession)
++    {
++        Utils::ShowHudMessage("Разговор ещё открывается. Выберите реплику снова.");
++        return true;
++    }
++    if (m_hireReady && m_prepareForm == npc && m_prepareSession == m_pendingSession && Clock::now() < m_prepareSent + 1100ms)
++    {
++        Transmit(Interaction::CommitHire, 0, m_prepareNonce, key, m_pendingSession);
++        m_dispatchedNonce = m_prepareNonce;
++        m_prepareForm = 0;
++        m_hireReady = false;
++        m_prepareAt = Clock::now() + 2s;
++        return false; // pass the original click to Skyrim, on its original call stack
++    }
++    m_pendingForm = npc;
++    m_pendingInfo = info;
++    m_pendingIndex = index;
++    m_pendingNonce = ++m_nonce;
++    m_pendingUntil = Clock::now() + 4s;
++    Transmit(Interaction::Hire, 0, m_nonce, key, m_pendingSession);
++    return true;
++}
++
++void OverlayService::ClearInteraction() noexcept
++{
++    if (!m_transport.IsOnline())
++    { std::lock_guard guard(rightsMutex); occupied.clear(); occupiedCount.store(0); }
++    m_activated = m_pendingForm = m_prepareForm = m_dispatchedNonce = opponent = 0;
++    m_hireReady = false;
++    confirmedOpponent.store(0);
++    localOpponent.store(0);
++    m_pendingJoin = m_requestedTalk = 0;
++    recoveries.clear();
++    ClearCombatSettlements();
++    ClearTrade();
++    ClearHomes();
++    m_rejoinKey = 0;
++    ClearProgress();
++    m_watch = {};
++    lastPose = UINT32_MAX;
++    m_pollAt = {};
++}
++
++void OverlayService::OnInteraction(const NotifyCoopInteraction& packet) noexcept
++{
++    const auto& e = packet.Event;
++    const bool hireNotice = e.Kind == Interaction::FollowerReserved || e.Kind == Interaction::FollowerReleased ||
++        e.Kind == Interaction::HireReady || e.Kind == Interaction::Granted || e.Kind == Interaction::Denied;
++    if (!hireNotice && !m_world.GetPartyService().IsInParty())
++        return;
++    const auto now = Clock::now();
++    uint32_t form = e.Npc ? m_world.GetModSystem().GetGameId(e.Npc) : 0;
++    const uint64_t key = (uint64_t(e.Speaker) << 32) | e.Session;
++    if (e.Kind == Interaction::Joined || e.Kind == Interaction::Rejoin)
++    {
++        if ((e.Kind == Interaction::Joined && m_pendingJoin != key) ||
++            (!m_conversations.count(e.Speaker)) || m_conversations.at(e.Speaker).Last.Anchor.Session != e.Session)
++            return;
++        if (m_dismissedTalk == key && e.Kind == Interaction::Rejoin)
++            return;
++        m_pendingJoin = 0;
++        m_requestedTalk = key;
++        m_rejoinKey = e.Kind == Interaction::Rejoin ? key : 0;
++        m_rejoinUntil = e.Kind == Interaction::Rejoin ? now + 8s : Clock::time_point{};
++        m_dismissedTalk = 0;
++        return;
++    }
++    if (e.Kind == Interaction::SyncRange)
++    {
++        SetPeerRange(e.Speaker, e.Value != 0);
++        return;
++    }
++    if (!form)
++        return;
++    if (e.Kind == Interaction::OpponentState && e.Value == 2)
++    {
++        // Repeated settlement messages must not restart recovery or override a later assault.
++        if (!m_peaceSession.count(form) || m_peaceSession[form] != key)
++        {
++            m_peaceSession[form] = key;
++            PeaceSnapshot state{};
++            state.speaker = e.Speaker;
++            state.session = e.Session;
++            spdlog::info("Co-op encounter {}: received peaceful outcome for actor {:X} from {}", e.Session, form, e.Speaker);
++            state.expires = now + 15s;
++            state.encounter = true;
++            BeginCombatSettlement(form);
++            recoveries.insert_or_assign(form, state);
++            opponent = form;
++            opponentExpires = now + 3s;
++            PublishAlive(confirmedOpponent, confirmedUntil, form);
++            lastPose = UINT32_MAX;
++            ApplyPeace(m_world);
++        }
++        return;
++    }
++    if (e.Kind == Interaction::OpponentState && m_peaceSession.count(form) &&
++        m_peaceSession.at(form) == key) return;
++    if (e.Kind == Interaction::OpponentState && e.Value != 2)
++    {
++        recoveries.erase(form);
++        CancelCombatSettlement(form);
++    }
++    if (e.Kind == Interaction::FollowerReserved || e.Kind == Interaction::FollowerReleased)
++    {
++        bool newlyReserved = false;
++        {
++            std::lock_guard guard(rightsMutex);
++            if (e.Kind == Interaction::FollowerReserved)
++            {
++                auto& until = occupied[form];
++                newlyReserved = until <= now;
++                until = now + 10s;
++            }
++            else
++                occupied.erase(form);
++            occupiedCount.store(static_cast<uint32_t>(occupied.size()), std::memory_order_relaxed);
++        }
++        if (newlyReserved)
++        {
++            // Repair a rank copied by previous STR builds, while preserving a pre-existing personal follower.
++            auto* quest = Cast<TESQuest>(TESForm::GetById(0x750BA));
++            auto* actor = Cast<Actor>(TESForm::GetById(form));
++            auto* faction = Cast<TESFaction>(TESForm::GetById(0x5C84E));
++            auto* method = m_world.ctx().at<PapyrusService>().Get("Actor", "GetFactionRank");
++            if (actor && quest && quest->GetAliasedRef(0) != actor && faction && method)
++            {
++                PapyrusFunction<int32_t, Actor, TESFaction*> rank(method);
++                if (rank(actor, faction) >= 0)
++                    actor->SetFactionRank(faction, -1);
++            }
++        }
++        return;
++    }
++    if (e.Kind == Interaction::HireReady)
++    {
++        if (form == m_prepareForm && e.Session == m_prepareNonce && e.Value == m_prepareSession)
++            m_hireReady = now < m_prepareSent + 1100ms;
++        return;
++    }
++    if (e.Kind == Interaction::Granted || e.Kind == Interaction::Denied)
++    {
++        if (form != m_pendingForm || e.Session != m_pendingNonce || now >= m_pendingUntil)
++        {
++            if (e.Kind == Interaction::Granted && e.Session != m_dispatchedNonce)
++                Transmit(Interaction::CancelHire, 0, e.Session, e.Npc);
++            return;
++        }
++        m_pendingForm = 0;
++        if (e.Kind == Interaction::Granted)
++        {
++            m_dispatchedNonce = e.Session;
++            auto* menu = MenuTopicManager::Get();
++            if (m_world.ctx().at<PlayerService>().ActiveDialogueSession(form) != m_pendingSession || !menu ||
++                !menu->ResumeHire(m_pendingIndex, form, m_pendingInfo))
++            {
++                Transmit(Interaction::CancelHire, 0, e.Session, e.Npc);
++                Utils::ShowHudMessage("Реплика найма больше недоступна.");
++            }
++        }
++        else
++            Utils::ShowHudMessage("Нанять спутника сейчас не удалось.");
++        return;
++    }
++    auto* actor = Cast<Actor>(TESForm::GetById(form));
++    if (!actor)
++        return;
++    if (e.Kind == Interaction::WatchOutcomes)
++    {
++        if (m_watch.Npc == form && m_watch.Session == e.Session)
++            return;
++        auto rank = Relationship(actor);
++        bool settlement = e.Value == 1;
++        // Retain the subject captured before the engine clears the radiant quest aliases.
++        auto* favor = Cast<TESQuest>(TESForm::GetById(0xCA210));
++        bool matchingFavor = (favor && !favor->IsStopped() && favor->GetAliasedRef(17) == actor) ||
++                             (settlement && m_watch.Npc == form && m_watch.FavorParticipant);
++        m_watch = {};
++        m_watch.Settlement = settlement;
++        m_watch.FavorParticipant = matchingFavor;
++        m_watch.Npc = form;
++        m_watch.Session = e.Session;
++        m_watch.Rank = rank ? static_cast<uint32_t>(*rank + 4) : UINT32_MAX;
++        m_watch.Expires = now + 6s;
++    }
++    else if (e.Kind == Interaction::BrawlFactionEnded)
++    {
++        auto* faction = Cast<TESFaction>(TESForm::GetById(0x4CFA6));
++        const auto rank = BrawlFactionRank(actor, faction);
++        if (rank && *rank >= 0) actor->SetFactionRank(faction, -1);
++    }
++    else if (e.Kind == Interaction::FavorResult && e.Value && !(e.Value & ~3u))
++    {
++        QueueProgress(false, form, e.Speaker, e.Session, actor->baseForm ? actor->baseForm->GetName() : "", [this, form, stages = e.Value] {
++            auto& pending = m_favorSettlements[form];
++            pending.Npc = form;
++            pending.Stages |= stages;
++            pending.Expires = Clock::now() + 20s;
++        }, [form, stages = e.Value] {
++            auto* quest = Cast<TESQuest>(TESForm::GetById(0xCA210));
++            if (!quest || quest->IsStopped()) return false;
++            auto* subject = quest->GetAliasedRef(17);
++            return subject && subject->formID == form && (((stages & 1) && !quest->IsStageReached(20)) ||
++                ((stages & 2) && !quest->IsStageReached(200)));
++        });
++    }
++    else if (e.Kind == Interaction::Outcome && e.Value >= 1 && e.Value <= 4)
++    {
++        QueueProgress(false, form, e.Speaker, e.Session, actor->baseForm ? actor->baseForm->GetName() : "", [this, form, rank = e.Value] {
++            auto* npc = Cast<Actor>(TESForm::GetById(form));
++            const auto current = Relationship(npc);
++            auto* method = m_world.ctx().at<PapyrusService>().Get("Actor", "SetRelationshipRank");
++            if (current && *current < static_cast<int32_t>(rank) && method)
++            {
++                PapyrusFunction<void, Actor, Actor*, int32_t> set(method);
++                set(npc, PlayerCharacter::Get(), static_cast<int32_t>(rank));
++            }
++        }, [form, rank = e.Value] {
++            const auto current = Relationship(Cast<Actor>(TESForm::GetById(form)));
++            return current && *current < static_cast<int32_t>(rank);
++        });
++    }
++    else if (e.Kind == Interaction::OpponentState && e.Value <= 3)
++    {
++        if (e.Value == 3)
++        {
++            if (opponent == form)
++            {
++                opponent = 0;
++                confirmedOpponent.store(0);
++                lastPose = UINT32_MAX;
++            }
++            // End the nonlethal contract. Only the owner/epoch-checked life channel can confirm death.
++            if (auto* extension = actor->GetExtension()) extension->Pose = {};
++            auto replicas = m_world.view<FormIdComponent, RemoteComponent>();
++            for (auto entity : replicas)
++                if (replicas.get<FormIdComponent>(entity).Id == form)
++                {
++                    const auto& remote = replicas.get<RemoteComponent>(entity);
++                    RequestNpcLifeCheck check;
++                    check.Id = remote.Id;
++                    check.OwnershipEpoch = remote.OwnershipEpoch;
++                    m_transport.Send(check);
++                    break;
++                }
++            return;
++        }
++        if (opponent != form || opponentExpires < now)
++            lastPose = UINT32_MAX;
++        opponent = form;
++        PublishAlive(confirmedOpponent, confirmedUntil, form);
++        GuardReplica(actor);
++        if (auto* extension = actor->GetExtension())
++            extension->Pose.Observe(e.Value == 1 ? ReplicaPose::Kneeling : ReplicaPose::Fighting, m_world.GetTick());
++        if (lastPose != e.Value)
++            spdlog::debug("Brawl replica {:X}: session {}, state {}, local death {}", form, e.Session, e.Value, actor->IsDead());
++        opponentExpires = now + (e.Value == 2 ? 8s : 4s);
++        confirmedUntil.store(opponentExpires.time_since_epoch().count());
++        if (!actor->GetNiNode())
++            return;
++        if (actor->IsDead())
++            actor->RestoreRemoteLife();
++        if (actor->IsDead())
++            return;
++        const uint32_t pose = e.Value == 2 ? 0 : e.Value;
++        if (pose != lastPose)
++        {
++            static BSFixedString down("bleedOutStart"), up("bleedOutStop");
++            ScopedReplicaTransition transition(actor);
++            const bool change = pose == 1 || lastPose == 1 || actor->actorState.IsBleedingOut();
++            if (!change || (actor->animationGraphHolder.IsReady() && actor->SendAnimationEvent(pose == 1 ? &down : &up)))
++                lastPose = pose;
++        }
++        ObservePartyCombat(form);
++        if (actor->GetCombatTarget() == PlayerCharacter::Get())
++        {
++            auto players = m_world.view<PlayerComponent, FormIdComponent>();
++            for (auto entity : players)
++                if (players.get<PlayerComponent>(entity).Id == e.Speaker)
++                    if (auto* challenger = Cast<Actor>(TESForm::GetById(players.get<FormIdComponent>(entity).Id)))
++                        actor->SetCombatTargetEx(challenger);
++        }
++    }
++}
++
++void OverlayService::UpdateHireOffer() noexcept
++{
++    const auto now = Clock::now();
++    if (m_pendingForm && now < m_pendingUntil)
++        return;
++    auto* menu = MenuTopicManager::Get();
++    auto* npc = menu && menu->speaker && menu->OffersHire() ? TESObjectREFR::GetByHandle(menu->speaker.handle.iBits) : nullptr;
++    const uint32_t form = npc ? npc->formID : 0;
++    if (m_prepareForm && form != m_prepareForm)
++    {
++        Transmit(Interaction::CancelHire, 0, m_prepareNonce, NetworkForm(m_prepareForm));
++        m_prepareForm = 0;
++        m_hireReady = false;
++        m_prepareAt = {};
++    }
++    if (!form || now < m_prepareAt)
++        return;
++    auto session = m_world.ctx().at<PlayerService>().ActiveDialogueSession(form);
++    auto key = NetworkForm(form);
++    if (!key || !session)
++        return;
++    if (m_prepareForm != form || session != m_prepareSession)
++    {
++        m_prepareForm = form;
++        m_prepareSession = session;
++        m_prepareNonce = ++m_nonce;
++    }
++    // Until the matching reply arrives, a click goes through the normal explicit request.
++    m_hireReady = false;
++    m_prepareSent = now;
++    m_prepareAt = now + 800ms;
++    Transmit(Interaction::PrepareHire, 0, m_prepareNonce, key, session);
++}
++
++void OverlayService::BrawlBleedout(uint32_t form) noexcept
++{
++    if (!form || m_watch.Npc != form || m_watch.Settlement || !m_world.GetPartyService().IsInParty()) return;
++    auto* actor = Cast<Actor>(TESForm::GetById(form));
++    if (!actor || (Alias(0x47AE6) != actor && (!m_watch.Brawl || m_watch.State >= 2))) return;
++    const auto npc = NetworkForm(form);
++    if (!npc) return;
++    if (!m_watch.Brawl) Transmit(Interaction::Brawl, 0, m_watch.Session, npc);
++    m_watch.Brawl = true;
++    spdlog::info("Co-op encounter {}: Skyrim reported opponent {:X} entering bleedout", m_watch.Session, form);
++    m_watch.KneelingUntil = Clock::now() + 300ms;
++    m_watch.State = 1;
++    Transmit(Interaction::OpponentState, 0, m_watch.Session, npc, 1);
++}
++
++void OverlayService::UpdateInteraction() noexcept
++{
++    if (!m_transport.IsOnline())
++        return;
++    const auto now = Clock::now();
++    if (now < m_pollAt)
++        return;
++    m_pollAt = now + 100ms;
++    auto* local = PlayerCharacter::Get();
++    if (!local || !local->parentCell || !local->GetNiNode())
++        return; // a load screen cannot confirm dismissal
++    auto* followerQuest = Cast<TESQuest>(TESForm::GetById(0x750BA)); // DialogueFollower, human follower alias
++    if (followerQuest && now >= m_followerPoll)
++    {
++        m_followerPoll = now + 500ms;
++        auto* follower = followerQuest->GetAliasedRef(0);
++        Transmit(Interaction::FollowerReport, 0, 0, follower ? NetworkForm(follower->formID) : GameId{});
++    }
++    UpdateHireOffer();
++    if (!m_world.GetPartyService().IsInParty())
++        return;
++    UpdateCombatSettlements(m_world);
++    ApplyPeace(m_world);
++    ApplyFavorSettlements();
+     if (!m_watch.Npc)
+         return;
+     auto* actor = Cast<Actor>(TESForm::GetById(m_watch.Npc));
+diff --git a/Code/client/Services/Generic/PlayerService.cpp b/Code/client/Services/Generic/PlayerService.cpp
+--- a/Code/client/Services/Generic/PlayerService.cpp
++++ b/Code/client/Services/Generic/PlayerService.cpp
+@@ -168,7 +168,7 @@
+ 
+ void PlayerService::UpdateDialogue(const PlayerDialogueEvent* apChoice) noexcept
+ {
+-    if (!m_transport.IsConnected() || !m_world.GetPartyService().IsInParty())
++    if (!m_transport.IsOnline())
+     {
+         m_dialogueHandle = m_closedSpeaker = 0;
+         m_dialogueText.clear();
+diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor.cpp
+--- a/Code/client/Games/Skyrim/Actor.cpp
++++ b/Code/client/Games/Skyrim/Actor.cpp
+@@ -757,7 +757,8 @@
+             continue;
+         const auto local = modSystem.GetGameId(id);
+         // Personal follower and favor quest fragments own these ranks, including when a guest declines a result.
+-        if ((local == 0x5C84E || local == 0x71860 || local == 0xCA213) && World::Get().GetPartyService().IsInParty())
++        if ((local == 0x5C84E && World::Get().GetTransport().IsOnline()) ||
++            ((local == 0x71860 || local == 0xCA213) && World::Get().GetPartyService().IsInParty()))
+             continue;
+         if (auto* pFaction = Cast<TESFaction>(GetById(local)))
+             SetFactionRank(pFaction, rank);
+diff --git a/Code/common/QuestJournalDisk.h b/Code/common/QuestJournalDisk.h
+--- a/Code/common/QuestJournalDisk.h
++++ b/Code/common/QuestJournalDisk.h
+@@ -9,6 +9,10 @@
+ {
+ // Each party session gets an immutable stream. A record is published only after flushing its contents.
+ uint64_t CreateStream(const std::filesystem::path& root);
++// Reads and validates the exact sequence prefix and complete bounded row.
++bool Read(const std::filesystem::path& root, uint64_t stream, uint32_t sequence, std::string& row);
++// Strictly reject gaps, malformed published rows, and noncanonical sequence filenames.
++bool Inspect(const std::filesystem::path& root, uint64_t stream, uint32_t& total);
+ uint32_t Contiguous(const std::filesystem::path& root, uint64_t stream);
+ bool Store(const std::filesystem::path& root, uint64_t stream, uint32_t sequence, std::string_view row);
+ }
+diff --git a/Code/common/QuestJournalDisk.cpp b/Code/common/QuestJournalDisk.cpp
+--- a/Code/common/QuestJournalDisk.cpp
++++ b/Code/common/QuestJournalDisk.cpp
+@@ -4,56 +4,112 @@
+ #include <fstream>
+ #include <random>
+ #include <iterator>
+-#ifdef _WIN32
+-#include <windows.h>
+-#include <io.h>
+-#else
+-#include <unistd.h>
+-#include <fcntl.h>
+-#endif
+-
+-namespace QuestJournalDisk
+-{
+-namespace fs = std::filesystem;
+-namespace
+-{
+-fs::path Directory(const fs::path& root, uint64_t stream)
+-{
+-    return root / std::to_string(stream);
+-}
+-
+-fs::path Record(const fs::path& directory, uint32_t sequence)
+-{
+-    return directory / (std::to_string(sequence) + ".tsv");
+-}
+-
+-bool Same(const fs::path& path, const std::string& data)
+-{
+-    std::ifstream file(path, std::ios::binary);
+-    if (!file || fs::file_size(path) != data.size())
+-        return false;
+-    return data == std::string(std::istreambuf_iterator<char>(file), {});
+-}
+-}
+-
+-uint64_t CreateStream(const fs::path& root)
+-{
+-    fs::create_directories(root);
+-    std::random_device random;
+-    for (int attempt = 0; attempt < 16; ++attempt)
+-    {
+-        uint64_t id = (uint64_t(random()) << 32) | random();
+-        if (id && fs::create_directory(Directory(root, id)))
+-            return id;
+-    }
+-    return 0;
+-}
+-
+-uint32_t Contiguous(const fs::path& root, uint64_t stream)
+-{
+-    const auto dir = Directory(root, stream);
+-    uint32_t last{};
+-    while (last < UINT32_MAX && fs::is_regular_file(Record(dir, last + 1)))
++#include <charconv>
++#include <limits>
++#ifdef _WIN32
++#include <windows.h>
++#include <io.h>
++#else
++#include <unistd.h>
++#include <fcntl.h>
++#endif
++
++namespace QuestJournalDisk
++{
++namespace fs = std::filesystem;
++namespace
++{
++fs::path Directory(const fs::path& root, uint64_t stream)
++{
++    return root / std::to_string(stream);
++}
++
++fs::path Record(const fs::path& directory, uint32_t sequence)
++{
++    return directory / (std::to_string(sequence) + ".tsv");
++}
++
++bool Same(const fs::path& path, const std::string& data)
++{
++    std::ifstream file(path, std::ios::binary);
++    if (!file || fs::file_size(path) != data.size())
++        return false;
++    return data == std::string(std::istreambuf_iterator<char>(file), {});
++}
++}
++
++uint64_t CreateStream(const fs::path& root)
++{
++    fs::create_directories(root);
++    std::random_device random;
++    for (int attempt = 0; attempt < 16; ++attempt)
++    {
++        uint64_t id = (uint64_t(random()) << 32) | random();
++        if (id && fs::create_directory(Directory(root, id)))
++            return id;
++    }
++    return 0;
++}
++
++bool Read(const fs::path& root, uint64_t stream, uint32_t sequence, std::string& row)
++{
++    row.clear();
++    if (!stream || !sequence)
++        return false;
++    const auto path = Record(Directory(root, stream), sequence);
++    std::error_code ec;
++    if (!fs::is_regular_file(path, ec) || ec || fs::file_size(path, ec) > 4110 || ec)
++        return false;
++    std::ifstream file(path, std::ios::binary);
++    if (!file) return false;
++    std::string data;
++    char c;
++    while (file.get(c))
++    {
++        if (data.size() == 4110) return false;
++        data.push_back(c);
++    }
++    const auto prefix = std::to_string(sequence) + "\t";
++    if (file.bad() || !data.starts_with(prefix) || data.size() <= prefix.size() + 1 || data.back() != '\n')
++        return false;
++    auto value = data.substr(prefix.size(), data.size() - prefix.size() - 1);
++    if (value.size() > 4096 || value.find_first_of("\r\n") != std::string::npos)
++        return false;
++    row = std::move(value);
++    return true;
++}
++
++bool Inspect(const fs::path& root, uint64_t stream, uint32_t& total)
++{
++    total = 0;
++    if (!stream) return false;
++    const auto dir = Directory(root, stream);
++    std::error_code ec;
++    if (!fs::is_directory(dir, ec) || ec) return false;
++    uint32_t count{}, largest{};
++    for (const auto& entry : fs::directory_iterator(dir))
++    {
++        if (entry.path().extension() != ".tsv") continue;
++        const auto stem = entry.path().stem().string();
++        uint32_t seq{};
++        const auto parsed = std::from_chars(stem.data(), stem.data()+stem.size(), seq);
++        std::string row;
++        if (parsed.ec != std::errc{} || parsed.ptr != stem.data()+stem.size() || !seq ||
++            stem != std::to_string(seq) || count == UINT32_MAX || !Read(root, stream, seq, row))
++            return false;
++        ++count;
++        if (seq > largest) largest = seq;
++    }
++    if (count != largest) return false;
++    total = count;
++    return true;
++}
++
++uint32_t Contiguous(const fs::path& root, uint64_t stream)
++{
++    uint32_t last{};
++    std::string row;
++    while (last < UINT32_MAX && Read(root, stream, last + 1, row))
+         ++last;
+     return last;
+ }
+diff --git a/Code/common/CampaignJournal.h b/Code/common/CampaignJournal.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/CampaignJournal.h
+@@ -0,0 +1,52 @@
++#pragma once
++#include <cstdint>
++#include <filesystem>
++#include <map>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++// One authoritative writer on the server; replicas accept only its ordered records.
++// The storage layer does not apply effects to a Skyrim save. The caller must bind
++// campaign and character identities, authenticate peers, and reconcile save receipts.
++namespace CampaignJournal
++{
++struct Head
++{
++    uint32_t Revision{};
++    uint64_t Tag{};
++    bool operator==(const Head&) const = default;
++};
++struct Operation
++{
++    std::string Id;
++    std::string Kind;
++    std::string Payload;
++    bool operator==(const Operation&) const = default;
++};
++enum class Result { Committed, Duplicate, Conflict, Invalid, StorageError };
++class Journal
++{
++public:
++    // Explicit creation only. Opening a missing or corrupted existing history fails.
++    bool Open(const std::filesystem::path& root, uint64_t campaign, std::string_view profile, bool create);
++    Head Current() const;
++    std::optional<Head> At(uint32_t revision) const;
++    Result Append(Head expected, const Operation& op);
++    // Caller authenticates source and verifies the campaign/profile handshake first.
++    Result Import(uint32_t revision, std::string_view record);
++    std::optional<std::string> Export(uint32_t revision) const;
++    const std::vector<Operation>& Operations() const { return m_operations; }
++    bool Ready() const { return m_ready; }
++private:
++    Result Accept(uint32_t revision, std::string_view record, bool persist);
++    std::filesystem::path m_root;
++    uint64_t m_campaign{};
++    std::vector<Operation> m_operations;
++    std::vector<std::string> m_records;
++    std::vector<Head> m_heads;
++    std::map<std::string, uint32_t> m_ids;
++    bool m_ready{};
++};
++}
+diff --git a/Code/common/CampaignJournal.cpp b/Code/common/CampaignJournal.cpp
+new file mode 100644
+--- /dev/null
++++ b/Code/common/CampaignJournal.cpp
+@@ -0,0 +1,155 @@
++#include "CampaignJournal.h"
++#include "QuestJournalDisk.h"
++#include <charconv>
++#include <array>
++#include <limits>
++#include <stdexcept>
++
++namespace CampaignJournal
++{
++namespace
++{
++// Noncryptographic chained checksum for corruption/divergence detection, NOT authentication.
++uint64_t Tag(std::string_view text)
++{
++    uint64_t hash = 14695981039346656037ull;
++    for (unsigned char c : text) { hash ^= c; hash *= 1099511628211ull; }
++    return hash;
++}
++bool Token(std::string_view value, size_t limit)
++{
++    if (value.empty() || value.size() > limit) return false;
++    for (unsigned char c : value)
++        if (!(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z') &&
++            !(c >= '0' && c <= '9') && c != '-' && c != '_' && c != '.') return false;
++    return true;
++}
++std::string Hex(std::string_view value)
++{
++    constexpr char digits[]="0123456789abcdef";
++    std::string out;
++    out.reserve(value.size()*2);
++    for (unsigned char c : value) { out+=digits[c>>4]; out+=digits[c&15]; }
++    return out;
++}
++int Digit(char c) { return c>='0'&&c<='9' ? c-'0' : c>='a'&&c<='f' ? c-'a'+10 : -1; }
++bool Unhex(std::string_view v, std::string& out)
++{
++    if (v.size()%2 || v.size()>3600) return false;
++    out.clear();
++    for (size_t i=0;i<v.size();i+=2)
++    {
++        int a=Digit(v[i]), b=Digit(v[i+1]);
++        if (a<0||b<0) return false;
++        out+=static_cast<char>(a*16+b);
++    }
++    return true;
++}
++bool Valid(const Operation& op)
++{
++    return Token(op.Id,128) && Token(op.Kind,48) && op.Payload.size()<=1800;
++}
++std::string Encode(const Operation& op, Head parent)
++{
++    auto body = "op-v1\t"+std::to_string(parent.Revision)+"\t"+std::to_string(parent.Tag)+"\t"+
++        op.Id+"\t"+op.Kind+"\t"+Hex(op.Payload);
++    return body+"\t"+std::to_string(Tag(body));
++}
++bool Decode(std::string_view row, Head parent, Operation& op)
++{
++    std::array<std::string_view,7> f{};
++    for (size_t i=0;i+1<f.size();++i)
++    {
++        auto pos=row.find('\t');
++        if (pos==row.npos) return false;
++        f[i]=row.substr(0,pos); row.remove_prefix(pos+1);
++    }
++    f.back()=row;
++    if (f[0]!="op-v1" || f[1]!=std::to_string(parent.Revision) || f[2]!=std::to_string(parent.Tag)) return false;
++    op.Id=f[3];op.Kind=f[4];
++    return Unhex(f[5],op.Payload) && Valid(op);
++}
++}
++bool Journal::Open(const std::filesystem::path& root, uint64_t campaign, std::string_view profile, bool create)
++{
++    *this=Journal{};
++    if (!campaign || !Token(profile,128)) return false;
++    try
++    {
++        m_root=root; m_campaign=campaign;
++        const auto manifest="campaign-v1\t"+std::to_string(campaign)+"\t"+std::string(profile);
++        const auto dir=root/std::to_string(campaign);
++        if (create)
++        {
++            // Never initialize over an existing directory, even one left incomplete by a crash.
++            std::filesystem::create_directories(root);
++            if (!std::filesystem::create_directory(dir) || !QuestJournalDisk::Store(root,campaign,1,manifest))
++                return false;
++        }
++        uint32_t total{};
++        std::string row;
++        if (!QuestJournalDisk::Inspect(root,campaign,total) || !total ||
++            !QuestJournalDisk::Read(root,campaign,1,row) || row!=manifest) return false;
++        m_heads.push_back({0,Tag(manifest)});
++        for (uint64_t seq=2;seq<=total;++seq)
++        {
++            if (!QuestJournalDisk::Read(root,campaign,static_cast<uint32_t>(seq),row) ||
++                Accept(static_cast<uint32_t>(seq-1),row,false)!=Result::Committed)
++            {
++                *this=Journal{};
++                return false;
++            }
++        }
++        m_ready=true;
++        return true;
++    }
++    catch (...) { *this=Journal{};return false; }
++}
++Head Journal::Current() const { return m_ready ? m_heads.back() : Head{}; }
++std::optional<Head> Journal::At(uint32_t revision) const
++{
++    if (!m_ready || revision>=m_heads.size()) return {};
++    return m_heads[revision];
++}
++std::optional<std::string> Journal::Export(uint32_t revision) const
++{
++    if (!m_ready || !revision || revision>m_records.size()) return {};
++    return m_records[revision-1];
++}
++Result Journal::Append(Head expected, const Operation& op)
++{
++    if (!m_ready || !Valid(op)) return Result::Invalid;
++    auto it=m_ids.find(op.Id);
++    if (it!=m_ids.end()) return m_operations[it->second-1]==op ? Result::Duplicate : Result::Conflict;
++    if (expected!=Current() || expected.Revision>=UINT32_MAX-1) return Result::Conflict;
++    return Accept(expected.Revision+1,Encode(op,expected),true);
++}
++Result Journal::Import(uint32_t revision, std::string_view record)
++{
++    if (!m_ready) return Result::Invalid;
++    return Accept(revision,record,true);
++}
++Result Journal::Accept(uint32_t revision, std::string_view record, bool persist)
++{
++    if (!revision || revision==UINT32_MAX || record.size()>4096 || m_heads.empty()) return Result::Invalid;
++    if (revision<=m_records.size())
++        return m_records[revision-1]==record ? Result::Duplicate : Result::Conflict;
++    if (revision!=m_heads.size()) return Result::Conflict;
++    try
++    {
++        const auto parent=m_heads.back();
++        Operation op;
++        // Re-encoding checks canonical fields AND the checksum, including the parent tag.
++        if (!Decode(record,parent,op) || Encode(op,parent)!=record) return Result::Invalid;
++        if (m_ids.contains(op.Id)) return Result::Conflict;
++        if (persist && !QuestJournalDisk::Store(m_root,m_campaign,revision+1,record))
++            return Result::StorageError;
++        m_ids.emplace(op.Id,revision);
++        m_operations.push_back(std::move(op));
++        m_records.emplace_back(record);
++        m_heads.push_back({revision,Tag(record)});
++        return Result::Committed;
++    }
++    catch (...) { m_ready=false;return Result::StorageError; } // reopen, never use partially updated RAM
++}
++}

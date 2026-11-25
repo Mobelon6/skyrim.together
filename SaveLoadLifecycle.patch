@@ -1,0 +1,796 @@
+diff --git a/Code/client/World.cpp b/Code/client/World.cpp
+--- a/Code/client/World.cpp
++++ b/Code/client/World.cpp
+@@ -33,6 +33,7 @@
+     , m_modSystem(m_dispatcher)
+     , m_lastFrameTime{std::chrono::high_resolution_clock::now()}
+ {
++    m_gameThreadId=GetCurrentThreadId();
+     ctx().emplace<ImguiService>();
+     ctx().emplace<DiscoveryService>(*this, m_dispatcher);
+     ctx().emplace<OverlayService>(*this, m_transport, m_dispatcher);
+@@ -60,8 +61,93 @@
+ 
+ World::~World() = default;
+ 
++bool World::BeginSaveLoad() noexcept
++{
++    // Never wait on a frame that might itself be waiting for the loading thread.
++    std::unique_lock lock(m_saveLoadMutex,std::try_to_lock);
++    if (!lock.owns_lock() || m_inWorldFrame || m_preparingLoad)
++    {
++        m_disconnectBeforeLoad.store(true,std::memory_order_release);
++        spdlog::warn("STM save load deferred: world update/teardown in progress; retry after disconnect");
++        return false;
++    }
++    if (IsLoadingSave())
++    {
++        // Load_Impl can invoke the lower load routine, including on a worker.
++        m_saveLoadDepth.fetch_add(1,std::memory_order_acq_rel);
++        return true;
++    }
++    const bool gameThread=GetCurrentThreadId()==m_gameThreadId;
++    if (!gameThread && m_transport.HasWorldSession())
++    {
++        m_disconnectBeforeLoad.store(true,std::memory_order_release);
++        spdlog::warn("STM save load deferred: active session must disconnect on game thread; retry load");
++        return false;
++    }
++    m_loadedWorld=m_loadFailed=m_successfulLoadPending=false;
++    m_saveLoadDepth.store(1,std::memory_order_release);
++    m_transport.SuspendForSaveLoad();
++    if (gameThread)
++    {
++        m_preparingLoad=true;
++        // Client::Close synchronously delivers the authenticated disconnect
++        // while the old forms still exist. DNS cancellation is asynchronous.
++        m_transport.CloseWorld();
++        ResetWorldTracking();
++        m_preparingLoad=false;
++    }
++    else
++    {
++        // No authenticated session: do not touch the registry/engine on a worker.
++        // The next game frame discards only tracking state, before discovery.
++        m_resetAfterLoad=true;
++    }
++    spdlog::info("STM save load begin (game thread={})",gameThread);
++    return true;
++}
++
++void World::EndSaveLoad(bool success,bool actualWorldLoad) noexcept
++{
++    // Serialize the zero-depth transition with BeginSaveLoad.
++    std::lock_guard lock(m_saveLoadMutex);
++    if (!success) m_loadFailed=true;
++    if (success && actualWorldLoad) m_loadedWorld=true;
++    const auto previous=m_saveLoadDepth.fetch_sub(1,std::memory_order_acq_rel);
++    if (previous==1)
++    {
++        m_successfulLoadPending=m_loadedWorld && !m_loadFailed;
++        spdlog::info("STM save load returned; completed world load={}",m_successfulLoadPending);
++    }
++}
++
++void World::ResetWorldTracking() noexcept
++{
++    // This is tracking state, not a request to resolve/delete TESForms.
++    // AtTitle suppresses component-removal observers that query live actors.
++    m_dispatcher.clear();
++    clear<LocalComponent>();
++    clear();
++    ctx().at<DiscoveryService>().ResetWorldTracking();
++    ctx().at<CharacterService>().ResetWorldTracking();
++    ctx().at<MagicService>().ResetWorldTracking();
++    ctx().at<PlayerService>().ResetWorldTracking();
++    m_dispatcher.clear();
++}
++
+ void World::Update() noexcept
+ {
++    std::unique_lock lock(m_saveLoadMutex,std::try_to_lock);
++    if (!lock.owns_lock() || IsLoadingSave() || m_inWorldFrame) return;
++    m_inWorldFrame=true;
++    struct FrameGuard { bool& Active; ~FrameGuard(){ Active=false; } } frame{m_inWorldFrame};
++    m_gameThreadId=GetCurrentThreadId();
++    if (m_disconnectBeforeLoad.exchange(false,std::memory_order_acq_rel) && m_transport.HasWorldSession())
++        m_transport.CloseWorld();
++    if (m_resetAfterLoad)
++    {
++        ResetWorldTracking();
++        m_resetAfterLoad=false;
++    }
+     const auto cNow = std::chrono::high_resolution_clock::now();
+     const auto cDelta = cNow - m_lastFrameTime;
+     m_lastFrameTime = cNow;
+@@ -70,11 +156,18 @@
+ 
+     // Check the title boundary BEFORE discovery or queued game operations.
+     // Keep pumping transport so a cancelled DNS/connection can finish closing.
++    const bool wasSuspended=m_transport.AtTitle();
+     if (!m_transport.PrepareWorldFrame())
+     {
++        if (!wasSuspended && m_transport.AtTitle()) ResetWorldTracking();
+         m_runner.OnUpdate(UpdateEvent(cDeltaSeconds)); // suspended tickets are discarded
+         m_transport.Update();
+         return;
+     }
++    if (m_successfulLoadPending)
++    {
++        GetOverlayService().RecheckTradeAfterLoad();
++        m_successfulLoadPending=false;
++    }
+     m_dispatcher.trigger(PreUpdateEvent(cDeltaSeconds));
+ 
+@@ -111,6 +204,11 @@
+     }
+ }
+ 
++bool World::Exists() noexcept
++{
++    return entt::locator<World>::has_value();
++}
++
+ World& World::Get() noexcept
+ {
+     return entt::locator<World>::value();
+diff --git a/Code/client/World.h b/Code/client/World.h
+--- a/Code/client/World.h
++++ b/Code/client/World.h
+@@ -20,6 +20,13 @@
+ 
+     void Update() noexcept;
+ 
++    // Native save-load entry points. Only the game-update thread can tear
++    // down an authenticated session; an offline load may run on a worker.
++    bool BeginSaveLoad() noexcept;
++    void EndSaveLoad(bool success,bool actualWorldLoad) noexcept;
++    bool IsLoadingSave() const noexcept { return m_saveLoadDepth.load(std::memory_order_acquire)!=0; }
++    static bool Exists() noexcept;
++
+     RunnerService& GetRunner() noexcept;
+     TransportService& GetTransport() noexcept;
+     ModSystem& GetModSystem() noexcept;
+@@ -46,6 +53,15 @@
+     [[nodiscard]] static World& Get() noexcept;
+ 
+ private:
++    void ResetWorldTracking() noexcept;
++    std::recursive_mutex m_saveLoadMutex;
++    std::atomic<unsigned> m_saveLoadDepth{};
++    std::atomic<bool> m_disconnectBeforeLoad{};
++    uint32_t m_gameThreadId{};
++    bool m_inWorldFrame{};
++    bool m_preparingLoad{};
++    bool m_resetAfterLoad{};
++    bool m_loadedWorld{},m_loadFailed{},m_successfulLoadPending{};
+     entt::dispatcher m_dispatcher;
+     RunnerService m_runner;
+     TransportService m_transport;
+diff --git a/Code/client/Services/TransportService.h b/Code/client/Services/TransportService.h
+--- a/Code/client/Services/TransportService.h
++++ b/Code/client/Services/TransportService.h
+@@ -36,6 +36,9 @@
+     // Main-thread entry points for world and connection lifecycle.
+     bool ConnectWorld(const std::string& endpoint,const std::string& password) noexcept;
+     void CloseWorld() noexcept;
++    // Called under World's load/frame exclusion; only atomic gates are changed.
++    void SuspendForSaveLoad() noexcept;
++    bool HasWorldSession() const noexcept { return m_connected || m_connectionRequested; }
+     bool PrepareWorldFrame() noexcept;
+     bool AtTitle() const noexcept {return m_title.load(std::memory_order_acquire);}
+     [[nodiscard]] bool IsOnline() const noexcept { return m_connected && !AtTitle(); }
+diff --git a/Code/client/Services/Generic/TransportService.cpp b/Code/client/Services/Generic/TransportService.cpp
+--- a/Code/client/Services/Generic/TransportService.cpp
++++ b/Code/client/Services/Generic/TransportService.cpp
+@@ -103,6 +103,12 @@
+     m_serverPassword.clear();
+     Client::Close(); // also cancels outstanding DNS, even before IsConnected is true
+ }
++void TransportService::SuspendForSaveLoad() noexcept
++{
++    m_title.store(true,std::memory_order_release);
++    m_world.GetRunner().SuspendWorld();
++}
++
+ bool TransportService::PrepareWorldFrame() noexcept
+ {
+     const bool title=TitleOpen();
+diff --git a/Code/client/Services/DiscoveryService.h b/Code/client/Services/DiscoveryService.h
+--- a/Code/client/Services/DiscoveryService.h
++++ b/Code/client/Services/DiscoveryService.h
+@@ -27,6 +27,7 @@
+     ~DiscoveryService() noexcept = default;
+ 
+     TP_NOCOPYMOVE(DiscoveryService);
++    void ResetWorldTracking() noexcept;
+ 
+     bool IsDeferringFollowerRemoval(uint32_t aFormId) const noexcept
+     {
+@@ -94,6 +95,7 @@
+ 
+     //! @brief Cached actor forms detected in the previous frame.
+     Set<uint32_t> m_forms;
++    std::atomic<bool> m_loadEventPending{};
+     Map<uint32_t, std::chrono::steady_clock::time_point> m_followerRemovalDeadlines;
+     /**
+      * The center grid coordinates are the coordinates of the cell in the cell grid
+diff --git a/Code/client/Services/Generic/DiscoveryService.cpp b/Code/client/Services/Generic/DiscoveryService.cpp
+--- a/Code/client/Services/Generic/DiscoveryService.cpp
++++ b/Code/client/Services/Generic/DiscoveryService.cpp
+@@ -227,10 +227,9 @@
+ 
+ void DiscoveryService::VisitForms() noexcept
+ {
++    auto previousForms=m_forms;
+-    static Set<uint32_t> s_previousForms;
+-    s_previousForms = m_forms;
+ 
++    const auto visitor = [this,&previousForms](TESObjectREFR* apReference)
+-    const auto visitor = [this](TESObjectREFR* apReference)
+     {
+         const auto formId = apReference->formID;
+         m_followerRemovalDeadlines.erase(formId);
+@@ -242,7 +241,7 @@
+             m_dispatcher.enqueue(ActorAddedEvent(formId));
+         }
+         else
++            previousForms.erase(formId);
+-            s_previousForms.erase(formId);
+     };
+ 
+     ProcessLists* const pProcessLists = ProcessLists::Get();
+@@ -269,7 +268,7 @@
+     const auto locallyOwnedActors = m_world.view<FormIdComponent, LocalComponent>();
+ 
+     // We dispatch removal events first to prevent needless reallocations
++    for (uint32_t formId : previousForms)
+-    for (uint32_t formId : s_previousForms)
+     {
+         // A conform can remove both the 3D and the high-process handle. Keep the
+         // existing discovery entry so rebuilding it does not cancel its assignment.
+@@ -329,8 +328,16 @@
+ void DiscoveryService::OnUpdate(const PreUpdateEvent& acUpdateEvent) noexcept
+ {
+     TP_UNUSED(acUpdateEvent);
++    const bool loaded=m_loadEventPending.exchange(false,std::memory_order_acq_rel);
++#if (IS_MASTER)
++    if (loaded && !IsDefaultModlist(ModManager::Get()->mods))
++    {
++        ConnectionErrorEvent errorEvent{};
++        errorEvent.ErrorDetail = "{\"error\": \"non_default_install\"}";
++        m_world.GetRunner().Trigger(errorEvent);
++    }
++#endif
++    VisitCell(loaded);
+-
+-    VisitCell();
+     VisitForms();
+ }
+ 
+@@ -353,23 +360,20 @@
+ 
+ BSTEventResult DiscoveryService::OnEvent(const TESLoadGameEvent*, const EventDispatcher<TESLoadGameEvent>*)
+ {
++    // The engine may send this while loading is still in progress. It is a
++    // discovery hint, NOT a safe time to delete old actors or mutate the world.
++    m_loadEventPending.store(true,std::memory_order_release);
++    return BSTEventResult::kOk;
++}
++
++void DiscoveryService::ResetWorldTracking() noexcept
++{
++    m_forms.clear();
+     m_followerRemovalDeadlines.clear();
++    ResetCachedCellData();
++    m_interiorCellId=0;
++    m_pLocation=nullptr;
++    m_loadEventPending.store(true,std::memory_order_release);
+-    m_world.GetOverlayService().ResetSessionProgress();
+-    spdlog::info("Finished loading, triggering visit cell");
+-
+-#if (IS_MASTER)
+-    if (!IsDefaultModlist(ModManager::Get()->mods))
+-    {
+-        ConnectionErrorEvent errorEvent{};
+-        errorEvent.ErrorDetail = "{\"error\": \"non_default_install\"}";
+-
+-        m_world.GetRunner().Trigger(errorEvent);
+-    }
+-#endif
+-
+-    VisitCell(true);
+-
+-    return BSTEventResult::kOk;
+ }
+ 
+ void DiscoveryService::ResetCachedCellData() noexcept
+diff --git a/Code/client/Games/SaveLoad.cpp b/Code/client/Games/SaveLoad.cpp
+--- a/Code/client/Games/SaveLoad.cpp
++++ b/Code/client/Games/SaveLoad.cpp
+@@ -6,6 +6,7 @@
+ #include <Forms/TESForm.h>
+ 
+ #include <World.h>
++#include <VersionDb.h>
+ 
+ #include <TiltedCore/Serialization.hpp>
+ #include <TiltedCore/Buffer.hpp>
+@@ -132,3 +133,81 @@
+         TP_HOOK(&RealBGSSaveFormBuffer_WriteFormId, BGSSaveFormBuffer_WriteFormId);
+         TP_HOOK(&RealBGSSaveFormBuffer_WriteId, BGSSaveFormBuffer_WriteId);
+     });
++
++namespace
++{
++// Steam 1.6.1170: SKSE v2.2.8 GameData.h gives Load_Internal at 0x610480
++// and LoadGame_HookTarget at 0x605F90. CommonLibSSE-NG maps the former
++// to Address Library AE ID 35728. SKSE hooks the CALL to the latter,
++// not its entry; retain SKSE's own pre/post notifications.
++using LoadRequest=bool(BGSSaveLoadManager*,const char*,int32_t,uint32_t,uint32_t);
++using LoadWorld=bool(BGSSaveLoadManager*,uint64_t*,uint32_t,uint32_t,void*);
++LoadRequest* realLoadRequest{};
++LoadWorld* realLoadWorld{};
++
++template <class Fn,class... Args>
++bool WithSaveLoadBoundary(bool actualWorldLoad,Fn* original,Args... args)
++{
++    World* world=World::Exists()? &World::Get():nullptr;
++    if (world && !world->BeginSaveLoad()) return false;
++    struct Scope
++    {
++        World* Instance;
++        bool ActualWorldLoad;
++        bool Success{};
++        ~Scope(){ if (Instance) Instance->EndSaveLoad(Success,ActualWorldLoad); }
++    } scope{world,actualWorldLoad};
++    scope.Success=original(args...);
++    return scope.Success;
++}
++
++bool HookLoadRequest(BGSSaveLoadManager* manager,const char* name,int32_t device,uint32_t stats,uint32_t check)
++{
++    return WithSaveLoadBoundary(false,realLoadRequest,manager,name,device,stats,check);
++}
++
++bool HookLoadWorld(BGSSaveLoadManager* manager,uint64_t* data,uint32_t flags,uint32_t mode,void* context)
++{
++    return WithSaveLoadBoundary(true,realLoadWorld,manager,data,flags,mode,context);
++}
++
++bool ExecutableAddress(const void* address)
++{
++    MEMORY_BASIC_INFORMATION info{};
++    if (!address || !VirtualQuery(address,&info,sizeof(info)) || info.State!=MEM_COMMIT ||
++        (info.Protect & (PAGE_GUARD|PAGE_NOACCESS))) return false;
++    const auto protection=info.Protect & 0xff;
++    return protection==PAGE_EXECUTE || protection==PAGE_EXECUTE_READ ||
++        protection==PAGE_EXECUTE_READWRITE || protection==PAGE_EXECUTE_WRITECOPY;
++}
++
++TiltedPhoques::Initializer s_worldSaveLoadHooks([]()
++{
++    auto& db=VersionDb::Get();
++    if (db.GetLoadedVersionString()!="1.6.1170.0")
++    {
++        spdlog::warn("STM early save load hooks unavailable on this runtime");
++        return;
++    }
++    unsigned long long offset{};
++    if (!db.FindOffsetById(35728,offset) || offset!=0x610480)
++    {
++        spdlog::error("STM save load hooks skipped: Load_Internal address mismatch");
++        return;
++    }
++    auto* base=reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
++    if (!base) return;
++    auto* request=db.FindAddressById(35728);
++    auto* load=base+0x605F90;
++    if (request!=base+offset || !ExecutableAddress(request) || !ExecutableAddress(load))
++    {
++        spdlog::error("STM save load hooks skipped: invalid executable address");
++        return;
++    }
++    realLoadRequest=reinterpret_cast<LoadRequest*>(request);
++    realLoadWorld=reinterpret_cast<LoadWorld*>(load);
++    TP_HOOK(&realLoadRequest,HookLoadRequest);
++    TP_HOOK(&realLoadWorld,HookLoadWorld);
++    spdlog::info("STM registered early save load hooks for Steam 1.6.1170");
++});
++}
+diff --git a/Code/client/Services/CharacterService.h b/Code/client/Services/CharacterService.h
+--- a/Code/client/Services/CharacterService.h
++++ b/Code/client/Services/CharacterService.h
+@@ -56,6 +56,13 @@
+ 
+     TP_NOCOPYMOVE(CharacterService);
+ 
++    void ResetWorldTracking() noexcept
++    {
++        m_weaponDrawUpdates.clear();
++        m_pendingLeveledConforms.clear();
++        m_cachedExperience=0.f;
++    }
++
+     static void DeleteTempActor(const uint32_t aFormId) noexcept;
+ 
+     bool RequestOwnership(uint32_t aFormId, uint32_t aServerId, entt::entity aEntity) const noexcept;
+diff --git a/Code/client/Services/MagicService.h b/Code/client/Services/MagicService.h
+--- a/Code/client/Services/MagicService.h
++++ b/Code/client/Services/MagicService.h
+@@ -13,6 +13,7 @@
+ struct TransportService;
+ 
+ struct UpdateEvent;
++struct DisconnectedEvent;
+ struct SpellCastEvent;
+ struct InterruptCastEvent;
+ struct AddTargetEvent;
+@@ -38,6 +39,13 @@
+ 
+     TP_NOCOPYMOVE(MagicService);
+ 
++    void ResetWorldTracking() noexcept
++    {
++        while (!m_queuedEffects.empty()) m_queuedEffects.pop();
++        while (!m_queuedRemoteEffects.empty()) m_queuedRemoteEffects.pop();
++        m_revealingOtherPlayers=false;
++    }
++
+     /**
+      * @brief Starts revealing remote players for a few seconds
+      * @see UpdateRevealOtherPlayersEffect
+@@ -49,6 +57,7 @@
+      * @brief Checks to apply queued effects on each frame.
+      */
+     void OnUpdate(const UpdateEvent& acEvent) noexcept;
++    void OnDisconnected(const DisconnectedEvent&) noexcept;
+     /**
+      * @brief Sends local spell cast to the server.
+      */
+@@ -102,6 +111,7 @@
+     bool m_revealingOtherPlayers = false;
+ 
+     entt::scoped_connection m_updateConnection;
++    entt::scoped_connection m_disconnectedConnection;
+     entt::scoped_connection m_spellCastEventConnection;
+     entt::scoped_connection m_notifySpellCastConnection;
+     entt::scoped_connection m_interruptCastEventConnection;
+diff --git a/Code/client/Services/Generic/OverlayService.cpp b/Code/client/Services/Generic/OverlayService.cpp
+--- a/Code/client/Services/Generic/OverlayService.cpp
++++ b/Code/client/Services/Generic/OverlayService.cpp
+@@ -368,15 +368,17 @@
+ void OverlayService::OnWaitingFor3DRemoved(entt::registry& aRegistry, entt::entity aEntity) const noexcept
+ {
++    if (m_transport.AtTitle() || !m_pOverlay) return;
+     const auto* pPlayerComponent = m_world.try_get<PlayerComponent>(aEntity);
+     if (!pPlayerComponent)
+         return;
+ 
+-    const auto& formIdComponent = m_world.get<FormIdComponent>(aEntity);
++    const auto* formIdComponent = m_world.try_get<FormIdComponent>(aEntity);
++    if (!formIdComponent) return;
+ 
+-    Actor* pActor = Cast<Actor>(TESForm::GetById(formIdComponent.Id));
++    Actor* pActor = Cast<Actor>(TESForm::GetById(formIdComponent->Id));
+     if (!pActor)
+     {
+-        spdlog::error("{}: cannot find actor for form id {:X}", __FUNCTION__, formIdComponent.Id);
++        spdlog::error("{}: cannot find actor for form id {:X}", __FUNCTION__, formIdComponent->Id);
+         return;
+     }
+ 
+@@ -390,9 +392,10 @@
+ }
+ 
+ void OverlayService::OnPlayerComponentRemoved(entt::registry& aRegistry, entt::entity aEntity) const noexcept
+ {
++    if (m_transport.AtTitle() || !m_pOverlay) return;
+     const auto& playerComponent = m_world.get<PlayerComponent>(aEntity);
+ 
+     auto pArguments = CefListValue::Create();
+     pArguments->SetInt(0, playerComponent.Id);
+ 
+diff --git a/Code/client/Services/PlayerService.h b/Code/client/Services/PlayerService.h
+--- a/Code/client/Services/PlayerService.h
++++ b/Code/client/Services/PlayerService.h
+@@ -24,7 +24,20 @@
+     PlayerService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept;
+     ~PlayerService() noexcept = default;
+ 
+     TP_NOCOPYMOVE(PlayerService);
++    void ResetWorldTracking() noexcept
++    {
++        m_respawnTimerStarted=m_knockdownStart=m_godmodeStart=false;
++        m_respawnDeadline=m_knockdownDeadline=m_godmodeDeadline={};
++        m_cachedMainSpellId=m_cachedSecondarySpellId=m_cachedPowerId=0;
++        m_dialogueInfo=m_dialogueQuest=m_closedSpeaker=m_dialogueHandle=0;
++        m_dialogueSession=m_dialogueChoice=0;
++        m_gameInitiated=false;
++        m_dialogueText.clear();
++        m_npcSubtitle.clear();
++        m_closedUntil=m_nextDialogueUpdate=m_dialogueTextUntil={};
++    }
++
+     uint32_t ActiveDialogueSession(uint32_t form) noexcept;
+ 
+ protected:
+@@ -73,8 +86,9 @@
+     std::chrono::steady_clock::time_point m_respawnDeadline;
++    bool m_respawnTimerStarted=false;
+     int32_t m_serverDifficulty = 6;
+     int32_t m_previousDifficulty = 6;
+ 
+-    bool m_isDeathSystemEnabled = true;
++    bool m_isDeathSystemEnabled = false;
+ 
+     bool m_knockdownStart = false;
+     std::chrono::steady_clock::time_point m_knockdownDeadline;
+diff --git a/Code/client/Services/Generic/PlayerService.cpp b/Code/client/Services/Generic/PlayerService.cpp
+--- a/Code/client/Services/Generic/PlayerService.cpp
++++ b/Code/client/Services/Generic/PlayerService.cpp
+@@ -76,17 +76,22 @@
+ void PlayerService::OnDisconnected(const DisconnectedEvent& acEvent) noexcept
+ {
+-    PlayerCharacter::Get()->SetDifficulty(m_previousDifficulty);
++    if (auto* player=PlayerCharacter::Get())
++    {
++        player->SetDifficulty(m_previousDifficulty);
++        ToggleDeathSystem(false);
++        if (m_godmodeStart) PlayerCharacter::SetGodMode(false);
++    }
++    else m_isDeathSystemEnabled=false;
+     m_serverDifficulty = m_previousDifficulty = 6;
+-
+-    ToggleDeathSystem(false);
++    ResetWorldTracking();
+ 
+     TESGlobal* pKillMove = Cast<TESGlobal>(TESForm::GetById(0x100F19));
+-    pKillMove->f = 1.f;
++    if (pKillMove) pKillMove->f = 1.f;
+ 
+     // Restore to the default value (150 in skyrim, 175 in fallout 4)
+     float* greetDistance = Settings::GetGreetDistance();
+-    *greetDistance = 150.f;
++    if (greetDistance) *greetDistance = 150.f;
+ 
+     TESGlobal* pWorldEncountersEnabled = Cast<TESGlobal>(TESForm::GetById(0xB8EC1));
+-    pWorldEncountersEnabled->f = 1.f;
++    if (pWorldEncountersEnabled) pWorldEncountersEnabled->f = 1.f;
+ }
+@@ -298,27 +303,25 @@
+ void PlayerService::RunRespawnUpdates() noexcept
+ {
+     if (!m_isDeathSystemEnabled)
+         return;
+ 
+-    static bool s_startTimer = false;
+-
+     PlayerCharacter* pPlayer = PlayerCharacter::Get();
+     if (!pPlayer->actorState.IsBleedingOut())
+     {
+         m_cachedMainSpellId = pPlayer->magicItems[0] ? pPlayer->magicItems[0]->formID : 0;
+         m_cachedSecondarySpellId = pPlayer->magicItems[1] ? pPlayer->magicItems[1]->formID : 0;
+         m_cachedPowerId = pPlayer->equippedShout ? pPlayer->equippedShout->formID : 0;
+ 
+-        s_startTimer = false;
++        m_respawnTimerStarted = false;
+         return;
+     }
+ 
+-    if (!s_startTimer)
++    if (!m_respawnTimerStarted)
+     {
+-        s_startTimer = true;
++        m_respawnTimerStarted = true;
+         m_respawnDeadline = std::chrono::steady_clock::now() + 5s;
+         FadeOutGame(true, true, 3.0f, true, 2.0f);
+ 
+         // If a player dies not by its health reaching 0, getting it up from its bleedout state isn't possible
+         // just by setting its health back to max. Therefore, put it to 0.
+         if (pPlayer->GetActorValue(ActorValueInfo::kHealth) > 0.f)
+@@ -333,8 +336,8 @@
+         pPlayer->RespawnPlayer();
+ 
+         m_transport.Send(PlayerRespawnRequest());
+ 
+-        s_startTimer = false;
++        m_respawnTimerStarted = false;
+ 
+         auto* pEquipManager = EquipManager::Get();
+         TESForm* pSpell = TESForm::GetById(m_cachedMainSpellId);
+diff --git a/Code/client/Services/Generic/WeatherService.cpp b/Code/client/Services/Generic/WeatherService.cpp
+--- a/Code/client/Services/Generic/WeatherService.cpp
++++ b/Code/client/Services/Generic/WeatherService.cpp
+@@ -95,6 +95,7 @@
+ // TODO: OnPlayerComponentAdded() instead? Does PlayerComponent exist already by then?
+ void WeatherService::OnWaitingFor3DRemoved(entt::registry& aRegistry, entt::entity aEntity) noexcept
+ {
++    if (!m_transport.IsOnline()) return;
+     const auto* pPlayerComponent = m_world.try_get<PlayerComponent>(aEntity);
+     if (!pPlayerComponent)
+         return;
+@@ -109,6 +110,7 @@
+ 
+ void WeatherService::OnPlayerComponentRemoved(entt::registry& aRegistry, entt::entity aEntity) noexcept
+ {
++    if (!m_transport.IsOnline()) return;
+     const auto& playerComponent = m_world.get<PlayerComponent>(aEntity);
+ 
+     const auto& partyService = m_world.GetPartyService();
+@@ -131,13 +133,16 @@
+         return;
+     }
+ 
++    if (auto* sky=Sky::Get())
++    {
++        sky->ForceWeather(pWeather);
++        m_cachedWeatherId = weatherId;
++    }
+-    Sky::Get()->ForceWeather(pWeather);
+-
+-    m_cachedWeatherId = weatherId;
+ }
+ 
+ void WeatherService::RunWeatherUpdates(const double acDelta) noexcept
+ {
++    if (!m_transport.IsOnline() || !m_world.GetPartyService().IsInParty()) return;
+     Sky* pSky = Sky::Get();
+     if (!pSky)
+         return;
+@@ -185,7 +190,9 @@
+ void WeatherService::ToggleGameWeatherSystem(bool aToggle) noexcept
+ {
+     if (aToggle)
++    {
++        if (auto* sky=Sky::Get()) sky->ReleaseWeatherOverride();
++    }
+-        Sky::Get()->ReleaseWeatherOverride();
+     else
+         m_transport.Send(RequestCurrentWeather());
+ 
+@@ -205,5 +212,5 @@
+         return;
+     }
+ 
++    if (auto* sky=Sky::Get()) sky->ForceWeather(pWeather);
+-    Sky::Get()->ForceWeather(pWeather);
+ }
+diff --git a/Code/client/Services/Generic/CalendarService.cpp b/Code/client/Services/Generic/CalendarService.cpp
+--- a/Code/client/Services/Generic/CalendarService.cpp
++++ b/Code/client/Services/Generic/CalendarService.cpp
+@@ -49,9 +49,11 @@
+ 
+ void CalendarService::OnDisconnected(const DisconnectedEvent&) noexcept
+ {
++    // Never read old world globals while the engine is tearing them down.
++    s_gameClockLocked = false;
+-    // signal a time transition
+     m_fadeTimer = 0.f;
++    m_lastTick = 0;
++    m_lastLogTick = 0;
+-    ToggleGameClock(true);
+ }
+ 
+ float CalendarService::TimeInterpolate(const TimeModel& aFrom, TimeModel& aTo) const
+@@ -72,6 +74,12 @@
+ void CalendarService::ToggleGameClock(bool aEnable)
+ {
+     auto* pGameTime = TimeData::Get();
++    if (!pGameTime || !pGameTime->GameDay || !pGameTime->GameMonth ||
++        !pGameTime->GameYear || !pGameTime->GameHour || !pGameTime->TimeScale)
++    {
++        s_gameClockLocked = false;
++        return;
++    }
+     m_offlineTime.m_timeModel.Day = pGameTime->GameDay->f;
+     m_offlineTime.m_timeModel.Month = pGameTime->GameMonth->f;
+     m_offlineTime.m_timeModel.Year = pGameTime->GameYear->f;
+@@ -87,6 +95,13 @@
+     {
+         const auto updateDelta = static_cast<float>(aEvent.Delta);
+         auto* pGameTime = TimeData::Get();
++        if (!pGameTime || !pGameTime->GameDay || !pGameTime->GameMonth ||
++            !pGameTime->GameYear || !pGameTime->GameHour || !pGameTime->GameDaysPassed ||
++            !pGameTime->TimeScale)
++        {
++            m_lastTick=0;
++            return;
++        }
+ 
+         if (!m_lastTick)
+             m_lastTick = m_world.GetTick();
+@@ -95,7 +110,10 @@
+ 
+         // we got disconnected or the client got ahead of us
+         if (now < m_lastTick)
++        {
++            m_lastTick=now;
+             return;
++        }
+ 
+         const auto delta = now - m_lastTick;
+         m_lastTick = now;
+diff --git a/Code/client/Services/Generic/MagicService.cpp b/Code/client/Services/Generic/MagicService.cpp
+--- a/Code/client/Services/Generic/MagicService.cpp
++++ b/Code/client/Services/Generic/MagicService.cpp
+@@ -3,6 +3,7 @@
+ #include <World.h>
+ 
+ #include <Events/UpdateEvent.h>
++#include <Events/DisconnectedEvent.h>
+ #include <Events/SpellCastEvent.h>
+ #include <Events/InterruptCastEvent.h>
+ #include <Events/AddTargetEvent.h>
+@@ -37,6 +38,7 @@
+     , m_transport(aTransport)
+ {
+     m_updateConnection = m_dispatcher.sink<UpdateEvent>().connect<&MagicService::OnUpdate>(this);
++    m_disconnectedConnection = m_dispatcher.sink<DisconnectedEvent>().connect<&MagicService::OnDisconnected>(this);
+     m_spellCastEventConnection = m_dispatcher.sink<SpellCastEvent>().connect<&MagicService::OnSpellCastEvent>(this);
+     m_notifySpellCastConnection = m_dispatcher.sink<NotifySpellCast>().connect<&MagicService::OnNotifySpellCast>(this);
+     m_interruptCastEventConnection = m_dispatcher.sink<InterruptCastEvent>().connect<&MagicService::OnInterruptCastEvent>(this);
+@@ -47,9 +49,14 @@
+     m_notifyRemoveSpell = m_dispatcher.sink<NotifyRemoveSpell>().connect<&MagicService::OnNotifyRemoveSpell>(this);
+ }
+ 
++void MagicService::OnDisconnected(const DisconnectedEvent&) noexcept
++{
++    ResetWorldTracking();
++}
++
+ void MagicService::OnUpdate(const UpdateEvent& acEvent) noexcept
+ {
++    if (!m_transport.IsOnline())
+-    if (!m_transport.IsConnected())
+         return;
+ 
+     ApplyQueuedEffects();
+@@ -59,7 +66,7 @@
+ 
+ void MagicService::OnSpellCastEvent(const SpellCastEvent& acEvent) const noexcept
+ {
++    if (!m_transport.IsOnline())
+-    if (!m_transport.IsConnected())
+         return;
+ 
+     if (!acEvent.pCaster->pCasterActor || !acEvent.pCaster->pCasterActor->GetNiNode())
+@@ -236,7 +243,7 @@
+ 
+ void MagicService::OnInterruptCastEvent(const InterruptCastEvent& acEvent) const noexcept
+ {
++    if (!m_transport.IsOnline())
+-    if (!m_transport.IsConnected())
+         return;
+ 
+     uint32_t formId = acEvent.CasterFormID;
+@@ -299,7 +306,7 @@
+ 
+ void MagicService::OnAddTargetEvent(const AddTargetEvent& acEvent) noexcept
+ {
++    if (!m_transport.IsOnline())
+-    if (!m_transport.IsConnected())
+         return;
+ 
+     // These effects are applied through spell cast sync
+@@ -452,7 +459,7 @@
+ 
+ void MagicService::OnRemoveSpellEvent(const RemoveSpellEvent& acEvent) noexcept
+ {
++    if (!m_transport.IsOnline())
+-    if (!m_transport.IsConnected())
+         return;
+ 
+     RemoveSpellRequest request{};
+diff --git a/Code/client/Services/OverlayService.h b/Code/client/Services/OverlayService.h
+--- a/Code/client/Services/OverlayService.h
++++ b/Code/client/Services/OverlayService.h
+@@ -84,7 +84,8 @@
+     void UpdateHomes() noexcept;
+     void ClearHomes() noexcept;
+     void UpdateTrade() noexcept;
+     void ClearTrade() noexcept;
++    void RecheckTradeAfterLoad() noexcept;
+     bool WasActivated(uint32_t form) const noexcept;
+     static void RequestObserverExit() noexcept;
+     static bool ObservingDialogue() noexcept;

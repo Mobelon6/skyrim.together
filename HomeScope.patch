@@ -1,0 +1,456 @@
+diff --git a/Code/common/HomeScope.h b/Code/common/HomeScope.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/HomeScope.h
+@@ -0,0 +1,30 @@
++#pragma once
++#include <cstdint>
++
++namespace HomeScope
++{
++// Canonical plugin/form keys remain unchanged; the cell namespace is an
++// additional discriminator for reference entities, not for base forms.
++inline constexpr uint32_t Registered=0xFFFD0000u;
++inline constexpr uint32_t Pending=0xFFFC0000u;
++inline constexpr bool Private(uint32_t mod) noexcept
++{
++    const auto prefix=mod&0xFFFF0000u;
++    return prefix==Registered || prefix==Pending;
++}
++template<class Id>
++bool Compatible(const Id& a,const Id& b) noexcept
++{
++    return (!Private(a.ModId) && !Private(b.ModId)) || a==b;
++}
++template<class Id>
++bool ReferenceMatches(const Id& reference,const Id& cell,const Id& requested,const Id& requestedCell) noexcept
++{
++    return reference==requested && Compatible(cell,requestedCell);
++}
++template<class Id>
++bool AdmittedCell(const Id& sender,const Id& cell,const Id& world) noexcept
++{
++    return Compatible(sender,cell) && (!Private(cell.ModId) || !world);
++}
++}
+diff --git a/Code/common/HomeRegistry.h b/Code/common/HomeRegistry.h
+--- a/Code/common/HomeRegistry.h
++++ b/Code/common/HomeRegistry.h
+@@ -1,5 +1,6 @@
+ #pragma once
+-#include "CampaignJournal.h"
++#include "CampaignJournal.h"
++#include "HomeScope.h"
+ #include "TradeProperties.h"
+ #include <algorithm>
+ #include <charconv>
+@@ -14,8 +15,8 @@
+ // exterior boundaries must be explicitly associated with that root later.
+ namespace HomeRegistry
+ {
+-inline constexpr uint32_t ScopePrefix=0xFFFD0000u;
+-inline constexpr uint32_t PendingPrefix=0xFFFC0000u;
++inline constexpr uint32_t ScopePrefix=HomeScope::Registered;
++inline constexpr uint32_t PendingPrefix=HomeScope::Pending;
+ inline constexpr uint32_t MaxSlot=0xFFFFu;
+ inline bool Scoped(uint32_t mod) {return (mod&0xFFFF0000u)==ScopePrefix;}
+ inline bool Pending(uint32_t mod) {return (mod&0xFFFF0000u)==PendingPrefix;}
+diff --git a/Code/server/Components/CellIdComponent.h b/Code/server/Components/CellIdComponent.h
+--- a/Code/server/Components/CellIdComponent.h
++++ b/Code/server/Components/CellIdComponent.h
+@@ -4,7 +4,8 @@
+ #error Include Components.h instead
+ #endif
+ 
+-#include <Structs/GridCellCoords.h>
++#include <Structs/GridCellCoords.h>
++#include <HomeScope.h>
+ 
+ struct CellIdComponent
+ {
+@@ -32,8 +33,10 @@
+ 
+     bool IsInRange(const CellIdComponent& acRhs, bool aIsDragon) const noexcept
+     {
+-        if (IsInInteriorCell())
+-            return Cell == acRhs.Cell;
++        if (HomeScope::Private(Cell.ModId) || HomeScope::Private(acRhs.Cell.ModId))
++            return !WorldSpaceId && !acRhs.WorldSpaceId && Cell==acRhs.Cell;
++        if (IsInInteriorCell())
++            return Cell == acRhs.Cell;
+ 
+         if (WorldSpaceId != acRhs.WorldSpaceId)
+             return false;
+diff --git a/Code/server/Services/CharacterService.cpp b/Code/server/Services/CharacterService.cpp
+--- a/Code/server/Services/CharacterService.cpp
++++ b/Code/server/Services/CharacterService.cpp
+@@ -191,7 +191,8 @@
+     const auto& refId = message.ReferenceId;
+ 
+     const auto isPlayer = (refId.ModId == 0 && refId.BaseId == 0x14);
+-    const auto isCustom = isPlayer || refId.ModId == std::numeric_limits<uint32_t>::max();
++    const auto isCustom = isPlayer || refId.ModId == std::numeric_limits<uint32_t>::max();
++    if (!HomeScope::AdmittedCell(acMessage.pPlayer->GetCellComponent().Cell,message.CellId,message.WorldSpaceId)) return;
+ 
+     // Check if id is the player
+     if (!isCustom)
+@@ -201,12 +202,12 @@
+ 
+         const auto itor = std::find_if(
+             std::begin(view), std::end(view),
+-            [view, refId](auto entity)
+-            {
+-                const auto& formIdComponent = view.get<FormIdComponent>(entity);
+-
+-                return formIdComponent.Id == refId;
+-            });
++            [view, refId, cell=message.CellId](auto entity)
++            {
++                const auto& formIdComponent = view.get<FormIdComponent>(entity);
++                const auto& location=view.get<CellIdComponent>(entity);
++                return HomeScope::ReferenceMatches(formIdComponent.Id,location.Cell,refId,cell);
++            });
+ 
+         if (itor != std::end(view))
+         {
+@@ -283,7 +284,10 @@
+         return;
+     }
+ 
+-    if (message.Reason == OwnershipReleaseReason::Relinquish && (message.WorldSpaceId || message.CellId))
++    // Raw form teleport cannot distinguish two incarnations of the same NPC.
++    // Scoped actors keep their namespace until an explicit reassignment.
++    if (message.Reason == OwnershipReleaseReason::Relinquish && (message.WorldSpaceId || message.CellId) &&
++        !HomeScope::Private(view.get<CellIdComponent>(*it).Cell.ModId) && !HomeScope::Private(message.CellId.ModId))
+     {
+         const auto* pFormIdComponent = m_world.try_get<FormIdComponent>(cEntity);
+         if (pFormIdComponent)
+@@ -359,8 +363,10 @@
+         if (it == view.end())
+             return;
+ 
+-        const auto& ownerComponent = view.get<OwnerComponent>(*it);
+-        Player* const pOwner = ownerComponent.GetOwner();
++        const auto* cell=m_world.try_get<CellIdComponent>(cEntity);
++        if (cell && !HomeScope::Compatible(acMessage.pPlayer->GetCellComponent().Cell,cell->Cell)) return;
++        const auto& ownerComponent = view.get<OwnerComponent>(*it);
++        Player* const pOwner = ownerComponent.GetOwner();
+         if (!pOwner || pOwner == acMessage.pPlayer || message.ExpectedOwnershipEpoch >= ownerComponent.OwnershipEpoch)
+             return;
+ 
+@@ -398,7 +404,8 @@
+ 
+     // Relayed as soon as it arrives, with the owner's capture tick, so receivers can schedule it on the owner's timeline.
+     // Snapshots can arrive out of order, receivers sort them out.
+-    Map<Player*, ServerReferencesMoveRequest> messages;
++    Map<Player*, ServerReferencesMoveRequest> messages;
++    Vector<uint32_t> reassign;
+ 
+     for (auto& [id, movement] : message.Updates)
+     {
+@@ -415,7 +422,24 @@
+         auto& cellIdComponent = view.get<CellIdComponent>(*itor);
+         const auto& characterComponent = view.get<CharacterComponent>(*itor);
+ 
+-        movementComponent.Tick = message.Tick;
++        const auto& senderCell=acMessage.pPlayer->GetCellComponent().Cell;
++        const bool scoped=HomeScope::Private(senderCell.ModId) || HomeScope::Private(cellIdComponent.Cell.ModId) || HomeScope::Private(movement.CellId.ModId);
++        if (scoped)
++        {
++            if (!HomeScope::AdmittedCell(senderCell,movement.CellId,movement.WorldSpaceId)) continue;
++            if (characterComponent.IsPlayer())
++            {
++                // Reliable cell enter, not an old unreliable movement sample.
++                if (movement.CellId!=senderCell || cellIdComponent.Cell!=senderCell) continue;
++            }
++            else if (!HomeScope::Compatible(cellIdComponent.Cell,movement.CellId))
++            {
++                // Discover the actor again instead of moving the old instance ID.
++                reassign.push_back(id);
++                continue;
++            }
++        }
++        movementComponent.Tick = message.Tick;
+         movementComponent.Position = movement.Position;
+         movementComponent.Rotation = glm::vec3(movement.Rotation.x, 0.f, movement.Rotation.y);
+         movementComponent.Variables = movement.Variables;
+@@ -438,8 +462,10 @@
+ 
+     // Sent right away, Nagle would hold every relay back by up to 5 ms waiting for more to share the packet with
+     for (auto& [pPlayer, relay] : messages)
+-        pPlayer->Send(relay, TiltedPhoques::kUnreliableNoNagle);
+-}
++        pPlayer->Send(relay, TiltedPhoques::kUnreliableNoNagle);
++    for (auto id:reassign)
++        m_world.GetDispatcher().trigger(CharacterRemoveEvent(id));
++}
+ 
+ void CharacterService::OnActionEventsRequest(const PacketEvent<RequestActionEvents>& acMessage) const noexcept
+ {
+@@ -569,7 +595,9 @@
+ 
+     auto& ownerComponent = view.get<OwnerComponent>(*it);
+ 
+-    // Replay cache needs to be cleared when a character respawns
++    const auto* cell=m_world.try_get<CellIdComponent>(*it);
++    if (cell && !HomeScope::Compatible(acMessage.pPlayer->GetCellComponent().Cell,cell->Cell)) return;
++    // Replay cache needs to be cleared when a character respawns
+     if (auto* pAnimationComponent = m_world.try_get<AnimationComponent>(*it))
+         pAnimationComponent->ActionsReplayCache.Clear();
+ 
+@@ -865,11 +893,12 @@
+ {
+     if (!player || !npc)
+         return;
+-    auto view = m_world.view<FormIdComponent, OwnerComponent>();
+-    for (auto entity : view)
+-    {
+-        if (view.get<FormIdComponent>(entity).Id != npc)
+-            continue;
++    auto view = m_world.view<FormIdComponent, OwnerComponent, CellIdComponent>();
++    for (auto entity : view)
++    {
++        if (!HomeScope::ReferenceMatches(view.get<FormIdComponent>(entity).Id,
++            view.get<CellIdComponent>(entity).Cell,npc,player->GetCellComponent().Cell))
++            continue;
+         const auto& owner = view.get<OwnerComponent>(entity);
+         // A deliberately relinquished, unloaded actor must not bounce between clients.
+         if (owner.GetOwner() != player &&
+diff --git a/Code/server/Services/ObjectService.cpp b/Code/server/Services/ObjectService.cpp
+--- a/Code/server/Services/ObjectService.cpp
++++ b/Code/server/Services/ObjectService.cpp
+@@ -59,19 +59,20 @@
+ // This is fine for containers and doors, but if this system is expanded, think of temporaries.
+ void ObjectService::OnAssignObjectsRequest(const PacketEvent<AssignObjectsRequest>& acMessage) noexcept
+ {
+-    auto view = m_world.view<FormIdComponent, ObjectComponent, InventoryComponent>();
++    auto view = m_world.view<FormIdComponent, ObjectComponent, InventoryComponent, CellIdComponent>();
+ 
+     AssignObjectsResponse response;
+ 
+-    for (const ObjectData& object : acMessage.Packet.Objects)
+-    {
+-        const auto iter = std::find_if(
+-            std::begin(view), std::end(view),
+-            [view, id = object.Id](auto entity)
+-            {
+-                const auto& formIdComponent = view.get<FormIdComponent>(entity);
+-                return formIdComponent.Id == id;
+-            });
++    for (const ObjectData& object : acMessage.Packet.Objects)
++    {
++        if (!HomeScope::AdmittedCell(acMessage.pPlayer->GetCellComponent().Cell,object.CellId,object.WorldSpaceId)) continue;
++        const auto iter = std::find_if(
++            std::begin(view), std::end(view),
++            [view, id = object.Id, cell=object.CellId](auto entity)
++            {
++                const auto& formIdComponent = view.get<FormIdComponent>(entity);
++                return HomeScope::ReferenceMatches(formIdComponent.Id,view.get<CellIdComponent>(entity).Cell,id,cell);
++            });
+ 
+         if (iter != std::end(view))
+         {
+@@ -119,7 +120,11 @@
+ 
+ void ObjectService::OnActivate(const PacketEvent<ActivateRequest>& acMessage) const noexcept
+ {
+-    NotifyActivate notifyActivate;
++    // Legacy notify contains only a canonical reference ID; suppress it
++    // for homes until scoped object application is implemented.
++    if (HomeScope::Private(acMessage.Packet.CellId.ModId) ||
++        HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)) return;
++    NotifyActivate notifyActivate;
+     notifyActivate.Id = acMessage.Packet.Id;
+     notifyActivate.ActivatorId = acMessage.Packet.ActivatorId;
+     notifyActivate.PreActivationOpenState = acMessage.Packet.PreActivationOpenState;
+@@ -135,20 +140,22 @@
+ 
+ void ObjectService::OnLockChange(const PacketEvent<LockChangeRequest>& acMessage) const noexcept
+ {
+-    NotifyLockChange notifyLockChange;
++    if (HomeScope::Private(acMessage.Packet.CellId.ModId) ||
++        HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)) return;
++    NotifyLockChange notifyLockChange;
+     notifyLockChange.Id = acMessage.Packet.Id;
+     notifyLockChange.IsLocked = acMessage.Packet.IsLocked;
+     notifyLockChange.LockLevel = acMessage.Packet.LockLevel;
+ 
+-    auto objectView = m_world.view<FormIdComponent, ObjectComponent>();
+-
+-    const auto iter = std::find_if(
+-        std::begin(objectView), std::end(objectView),
+-        [objectView, id = acMessage.Packet.Id](auto entity)
+-        {
+-            const auto& formIdComponent = objectView.get<FormIdComponent>(entity);
+-            return formIdComponent.Id == id;
+-        });
++    auto objectView = m_world.view<FormIdComponent, ObjectComponent, CellIdComponent>();
++
++    const auto iter = std::find_if(
++        std::begin(objectView), std::end(objectView),
++        [objectView, id = acMessage.Packet.Id, cell=acMessage.Packet.CellId](auto entity)
++        {
++            const auto& formIdComponent = objectView.get<FormIdComponent>(entity);
++            return HomeScope::ReferenceMatches(formIdComponent.Id,objectView.get<CellIdComponent>(entity).Cell,id,cell);
++        });
+ 
+     if (iter != std::end(objectView))
+     {
+@@ -176,8 +183,10 @@
+     message.Animation = packet.Animation;
+     message.EventName = packet.EventName;
+ 
+-    for (Player* pPlayer : m_world.GetPlayerManager())
+-    {
+-        pPlayer->Send(message);
+-    }
++    // ScriptAnimation carries a raw local FormID and no target cell.
++    if (HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)) return;
++    for (Player* pPlayer : m_world.GetPlayerManager())
++    {
++        if (!HomeScope::Private(pPlayer->GetCellComponent().Cell.ModId)) pPlayer->Send(message);
++    }
+ }
+diff --git a/Code/server/Services/InventoryService.cpp b/Code/server/Services/InventoryService.cpp
+--- a/Code/server/Services/InventoryService.cpp
++++ b/Code/server/Services/InventoryService.cpp
+@@ -28,16 +28,19 @@
+     m_drawWeaponConnection = aDispatcher.sink<PacketEvent<DrawWeaponRequest>>().connect<&InventoryService::OnWeaponDrawnRequest>(this);
+ }
+ 
+-void InventoryService::OnInventoryChanges(const PacketEvent<RequestInventoryChanges>& acMessage) noexcept
+-{
+-    auto& message = acMessage.Packet;
+-
+-    auto view = m_world.view<InventoryComponent>();
+-
+-    const auto it = view.find(static_cast<entt::entity>(message.ServerId));
+-
+-    if (it == view.end())
+-        return;
++void InventoryService::OnInventoryChanges(const PacketEvent<RequestInventoryChanges>& acMessage) noexcept
++{
++    auto& message = acMessage.Packet;
++
++    auto view = m_world.view<InventoryComponent>();
++
++    const auto it = view.find(static_cast<entt::entity>(message.ServerId));
++
++    if (it == view.end())
++        return;
++
++    if (const auto* cell=m_world.try_get<CellIdComponent>(*it);
++        cell && !HomeScope::Compatible(acMessage.pPlayer->GetCellComponent().Cell,cell->Cell)) return;
+ 
+     bool isRemoteNpcInteraction = false;
+ 
+@@ -99,16 +102,19 @@
+         spdlog::error("{}: SendToPlayersInRange failed", __FUNCTION__);
+ }
+ 
+-void InventoryService::OnInventorySnapshot(const PacketEvent<RequestInventorySnapshot>& acMessage) noexcept
+-{
+-    auto& message = acMessage.Packet;
+-
+-    auto view = m_world.view<InventoryComponent, OwnerComponent>();
+-
+-    const auto it = view.find(static_cast<entt::entity>(message.ServerId));
+-
+-    if (it == view.end())
+-        return;
++void InventoryService::OnInventorySnapshot(const PacketEvent<RequestInventorySnapshot>& acMessage) noexcept
++{
++    auto& message = acMessage.Packet;
++
++    auto view = m_world.view<InventoryComponent, OwnerComponent>();
++
++    const auto it = view.find(static_cast<entt::entity>(message.ServerId));
++
++    if (it == view.end())
++        return;
++
++    if (const auto* cell=m_world.try_get<CellIdComponent>(*it);
++        cell && !HomeScope::Compatible(acMessage.pPlayer->GetCellComponent().Cell,cell->Cell)) return;
+ 
+     const auto& ownerComponent = view.get<OwnerComponent>(*it);
+     if (!ownerComponent.IsCurrentOwner(acMessage.pPlayer, message.OwnershipEpoch))
+@@ -131,16 +137,19 @@
+         spdlog::error("{}: SendToPlayersInRange failed", __FUNCTION__);
+ }
+ 
+-void InventoryService::OnEquipmentChanges(const PacketEvent<RequestEquipmentChanges>& acMessage) noexcept
+-{
+-    auto& message = acMessage.Packet;
+-
+-    auto view = m_world.view<InventoryComponent>();
+-
+-    const auto it = view.find(static_cast<entt::entity>(message.ServerId));
+-
+-    if (it == view.end())
+-        return;
++void InventoryService::OnEquipmentChanges(const PacketEvent<RequestEquipmentChanges>& acMessage) noexcept
++{
++    auto& message = acMessage.Packet;
++
++    auto view = m_world.view<InventoryComponent>();
++
++    const auto it = view.find(static_cast<entt::entity>(message.ServerId));
++
++    if (it == view.end())
++        return;
++
++    if (const auto* cell=m_world.try_get<CellIdComponent>(*it);
++        cell && !HomeScope::Compatible(acMessage.pPlayer->GetCellComponent().Cell,cell->Cell)) return;
+ 
+     const auto* pOwnerComponent = m_world.try_get<OwnerComponent>(*it);
+     if (pOwnerComponent)
+diff --git a/Code/server/Services/PlayerService.cpp b/Code/server/Services/PlayerService.cpp
+--- a/Code/server/Services/PlayerService.cpp
++++ b/Code/server/Services/PlayerService.cpp
+@@ -52,9 +52,10 @@
+ {
+     auto* pPlayer = acMessage.pPlayer;
+ 
+-    auto& message = acMessage.Packet;
+-
+-    const GameId oldCell = pPlayer->GetCellComponent().Cell;
++    auto& message = acMessage.Packet;
++    if (HomeScope::Private(message.PlayerCell.ModId) || HomeScope::Private(message.WorldSpaceId.ModId)) return;
++
++    const GameId oldCell = pPlayer->GetCellComponent().Cell;
+ 
+     CellIdComponent cell = CellIdComponent{message.PlayerCell, message.WorldSpaceId, message.CenterCoords};
+     pPlayer->SetCellComponent(cell);
+@@ -89,10 +90,11 @@
+ 
+ void PlayerService::HandleExteriorCellEnter(const PacketEvent<EnterExteriorCellRequest>& acMessage) const noexcept
+ {
+-    auto& message = acMessage.Packet;
+-    auto* pPlayer = acMessage.pPlayer;
+-
+-    if (pPlayer->GetCharacter())
++    auto& message = acMessage.Packet;
++    auto* pPlayer = acMessage.pPlayer;
++    if (HomeScope::Private(message.CellId.ModId) || HomeScope::Private(message.WorldSpaceId.ModId)) return;
++
++    if (pPlayer->GetCharacter())
+     {
+         auto entity = *pPlayer->GetCharacter();
+ 
+@@ -100,12 +102,13 @@
+         auto cell = CellIdComponent{message.CellId, message.WorldSpaceId, message.CurrentCoords};
+ 
+-        if (pPlayer->GetCellComponent())
++        const bool hadCell=bool(pPlayer->GetCellComponent());
++        pPlayer->SetCellComponent(cell);
++        if (auto* location=m_world.try_get<CellIdComponent>(entity)) *location=cell;
++        if (hadCell)
+         {
+             m_world.GetDispatcher().trigger(CharacterExteriorCellChangeEvent{pPlayer, entity, message.WorldSpaceId, message.CurrentCoords});
+         }
+ 
+-        pPlayer->SetCellComponent(cell);
+-
+         SendPlayerCellChanged(pPlayer);
+     }
+ }

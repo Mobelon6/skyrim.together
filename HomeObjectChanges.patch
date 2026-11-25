@@ -1,0 +1,514 @@
+diff --git a/Code/common/HomeObjects.h b/Code/common/HomeObjects.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/HomeObjects.h
+@@ -0,0 +1,124 @@
++#pragma once
++#include "HomeSnapshot.h"
++
++namespace HomeObjects
++{
++// Changes to presentation do not create or replenish an inventory account.
++struct State
++{
++    uint32_t Disabled{},Open{}; // 0 unknown, 1 open, 3 closed
++    std::array<uint32_t,6> Transform{};
++    bool Valid() const
++    {
++        if (Disabled>1 || (Open!=0 && Open!=1 && Open!=3)) return false;
++        for (auto x:Transform) if (!std::isfinite(std::bit_cast<float>(x))) return false;
++        return true;
++    }
++    std::string Encode() const
++    {
++        auto s=std::to_string(Disabled)+" "+std::to_string(Open);
++        for (auto x:Transform) s+=" "+std::to_string(x);
++        return s;
++    }
++    bool Significant(const State& other) const
++    {
++        if (Disabled!=other.Disabled || Open!=other.Open) return true;
++        for (size_t i=0;i<Transform.size();++i)
++            if (std::abs(std::bit_cast<float>(Transform[i])-std::bit_cast<float>(other.Transform[i]))>
++                (i<3?1.f:0.02f)) return true;
++        return false;
++    }
++};
++struct Record
++{
++    uint32_t Revision{},SaveRevision{},Type{},Inventory{};
++    State Value;
++};
++using Records=std::map<std::string,Record>;
++struct Change
++{
++    uint32_t Slot{},Revision{},SaveRevision{};
++    std::string Key;
++    State Value;
++    std::string Encode() const
++    {
++        return std::to_string(Slot)+" "+std::to_string(Revision)+" "+std::to_string(SaveRevision)+" "+Key+" "+Value.Encode();
++    }
++};
++inline std::optional<Change> Decode(std::string_view bytes)
++{
++    Change c;std::string extra;
++    std::istringstream in{std::string(bytes)};
++    if (!(in>>c.Slot>>c.Revision>>c.SaveRevision>>c.Key>>c.Value.Disabled>>c.Value.Open)) return {};
++    for (auto& v:c.Value.Transform) if (!(in>>v)) return {};
++    const auto key=TradeProperties::DecodeForm(c.Key);
++    if (in>>extra || !c.Slot || !c.Revision || !key || !key->Valid() || key->Encode()!=c.Key ||
++        !c.Value.Valid() || c.Encode()!=bytes) return {};
++    return c;
++}
++inline bool Eligible(const HomeSnapshot::Ref& ref)
++{
++    return !(ref.Flags&2u) && ref.Inventory!=2 &&
++        (!HomeSnapshot::LooseType(ref.Type) || ref.Inventory==3);
++}
++inline bool Allowed(const Record& previous,const State& state)
++{
++    return state.Valid() && (previous.Type==29 || !state.Open) &&
++        (!previous.Value.Open || state.Open) &&
++        (previous.Inventory!=3 || state.Disabled==previous.Value.Disabled);
++}
++inline std::optional<Records> Read(const CampaignJournal::Journal& journal,uint32_t slot)
++{
++    const auto baseline=HomeSnapshot::Read(journal,slot);
++    if (baseline.State!=HomeSnapshot::Status::Ready) return {};
++    const auto state=HomeSnapshot::Decode(baseline.Bytes);
++    if (!state) return {};
++    Records records;
++    for (const auto& r:state->Refs)
++        if (Eligible(r)) records.emplace(r.Key.Encode(),Record{0,0,r.Type,r.Inventory,{r.Flags&1u,0,r.Transform}});
++    bool published=false;size_t position=0;
++    for (const auto& row:journal.Operations())
++    {
++        ++position;
++        if (row.Id==HomeSnapshot::Marker(slot) && row.Kind=="home-static-v1") published=true;
++        if (row.Kind!="home-object-v1") continue;
++        const auto c=Decode(row.Payload);
++        if (!c || row.Id!="home-object-"+std::to_string(position) || c->SaveRevision>=position) return {};
++        if (c->Slot!=slot) continue;
++        auto it=records.find(c->Key);
++        if (!published || it==records.end() || it->second.Revision==UINT32_MAX ||
++            c->Revision!=it->second.Revision+1 || c->SaveRevision<it->second.SaveRevision ||
++            !Allowed(it->second,c->Value) || !c->Value.Significant(it->second.Value)) return {};
++        it->second.Revision=c->Revision;it->second.SaveRevision=c->SaveRevision;it->second.Value=c->Value;
++    }
++    return records;
++}
++inline bool Set(CampaignJournal::Journal& journal,uint64_t owner,const Change& change,uint32_t expected)
++{
++    const auto home=HomeRegistry::BySlot(journal,change.Slot);
++    if (!home || !owner || home->Owner!=owner || expected==UINT32_MAX || change.Revision!=expected+1 ||
++        change.SaveRevision>journal.Current().Revision) return false;
++    auto view=Read(journal,change.Slot);
++    if (!view) return false;
++    const auto it=view->find(change.Key);
++    if (it==view->end() || expected!=it->second.Revision ||
++        change.SaveRevision<it->second.SaveRevision || !Allowed(it->second,change.Value)) return false;
++    if (!change.Value.Significant(it->second.Value)) return true;
++    if (journal.Current().Revision==UINT32_MAX) return false;
++    return journal.Append(journal.Current(),{"home-object-"+std::to_string(journal.Current().Revision+1),
++        "home-object-v1",change.Encode()})==CampaignJournal::Result::Committed;
++}
++inline bool Apply(const CampaignJournal::Journal& journal,uint32_t slot,HomeSnapshot::State& state)
++{
++    const auto records=Read(journal,slot);
++    if (!records) return false;
++    for (auto& r:state.Refs)
++    {
++        const auto it=records->find(r.Key.Encode());
++        if (it==records->end() || !it->second.Revision) continue;
++        r.Transform=it->second.Value.Transform;
++        if (r.Inventory!=3) r.Flags=(r.Flags&~1u)|it->second.Value.Disabled;
++    }
++    return state.Valid();
++}
++}
+diff --git a/Code/client/Services/CampaignAccess.h b/Code/client/Services/CampaignAccess.h
+--- a/Code/client/Services/CampaignAccess.h
++++ b/Code/client/Services/CampaignAccess.h
+@@ -3,5 +3,6 @@
+ #include <CampaignReplication.h>
+ #include <array>
+ #include <map>
+-#include <HomeResidents.h>
++#include <HomeResidents.h>
++#include <HomeObjects.h>
+ struct World;
+@@ -27,7 +28,8 @@
+ std::optional<std::string> HomeBaseline(uint64_t campaign,uint32_t slot);
+ // Canonical ref -> state, level and per-reference revision.
+ std::optional<std::map<std::string,std::array<uint32_t,3>>> HomeLockView(uint64_t campaign,uint32_t slot);
+-std::optional<HomeResidents::Residents> HomeResidentView(uint64_t campaign,uint32_t slot);
++std::optional<HomeResidents::Residents> HomeResidentView(uint64_t campaign,uint32_t slot);
++std::optional<HomeObjects::Records> HomeObjectView(uint64_t campaign,uint32_t slot);
+ bool ConfirmReceipt(World&, uint64_t stream, uint64_t savedStream, uint32_t cursor, uint32_t receipt,
+                     std::string_view plugin, uint32_t base, int count,int64_t before,std::string_view variant={});
+ }
+diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
+--- a/Code/client/Services/Generic/QuestJournal.cpp
++++ b/Code/client/Services/Generic/QuestJournal.cpp
+@@ -135,8 +135,13 @@
+     return {};
+ }
+ 
+-std::optional<HomeResidents::Residents> CampaignAccess::HomeResidentView(uint64_t campaign,uint32_t slot)
+-{
++std::optional<HomeObjects::Records> CampaignAccess::HomeObjectView(uint64_t campaign,uint32_t slot)
++{
++    if (Mode()!=CampaignReplication::Link::Mode::Ready || campaign!=campaignLink.Campaign) return {};
++    return HomeObjects::Read(campaignLink.Journal,slot);
++}
++std::optional<HomeResidents::Residents> CampaignAccess::HomeResidentView(uint64_t campaign,uint32_t slot)
++{
+     if (Mode()!=CampaignReplication::Link::Mode::Ready || campaign!=campaignLink.Campaign) return {};
+     return HomeResidents::Read(campaignLink.Journal,slot);
+ }
+diff --git a/Code/common/TradeLedger.h b/Code/common/TradeLedger.h
+--- a/Code/common/TradeLedger.h
++++ b/Code/common/TradeLedger.h
+@@ -3,7 +3,8 @@
+ #include "CampaignJournal.h"
+ #include "TradeProperties.h"
+ #include "HomeSnapshot.h"
+-#include "HomeLocks.h"
++#include "HomeLocks.h"
++#include "HomeObjects.h"
+ #include "HomePermissions.h"
+ #include <tuple>
+ #include <algorithm>
+@@ -190,7 +191,8 @@
+             std::sort(ref.Items.begin(),ref.Items.end(),[](const auto& a,const auto& b)
+             {return std::pair{a.Base.Encode(),a.Variant}<std::pair{b.Base.Encode(),b.Variant};});
+         }
+-        if (!HomeLocks::Apply(*authority,slot,*state) || state->Encode().size()>HomeSnapshot::MaxBytes) return {};
++        if (!HomeLocks::Apply(*authority,slot,*state) || !HomeObjects::Apply(*authority,slot,*state) ||
++            state->Encode().size()>HomeSnapshot::MaxBytes) return {};
+         return state;
+     }
+     bool Commit(const Row& r,uint32_t cursor)
+diff --git a/Code/server/Services/PartyHome.cpp b/Code/server/Services/PartyHome.cpp
+--- a/Code/server/Services/PartyHome.cpp
++++ b/Code/server/Services/PartyHome.cpp
+@@ -7,7 +7,8 @@
+ #include <HomeSnapshot.h>
+ #include <HomePermissions.h>
+ #include <HomeLocks.h>
+-#include <HomeResidents.h>
++#include <HomeResidents.h>
++#include <HomeObjects.h>
+ #include <Services/HomeVisit.h>
+ #include <chrono>
+ #include <map>
+@@ -60,7 +61,21 @@
+                 {e.Credential.data(),e.Credential.size()})) return;
+             auto root=TradeProperties::DecodeForm({e.Root.data(),e.Root.size()});
+             if (!root || !root->Valid()) return;
+-            if (e.AccessOp==5)
++            if (e.AccessOp==6)
++            {
++                if (!e.House || e.AccessGuest || e.AccessRight || e.SnapshotDigest ||
++                    e.SnapshotPart || e.SnapshotParts || e.Visible.empty()) return;
++                const auto character=CampaignAccess::Character(*owner);
++                const auto home=HomeRegistry::BySlot(link.Journal,e.House);
++                const auto& cell=owner->GetCellComponent().Cell;
++                if (!home || !home->Same(character,*root) || cell.ModId!=(HomeRegistry::ScopePrefix|e.House) ||
++                    !HomeRegistry::OwnsCell(link.Journal,character,cell.ModId,cell.BaseId)) return;
++                const auto change=HomeObjects::Decode({e.Visible.data(),e.Visible.size()});
++                if (change && change->Slot==e.House && change->SaveRevision==e.SaveRevision)
++                    HomeObjects::Set(link.Journal,character,*change,e.AccessRevision);
++                return;
++            }
++            if (e.AccessOp==5)
+             {
+                 if (!e.House || e.AccessGuest || e.AccessRight || e.SnapshotDigest ||
+                     e.SnapshotPart || e.SnapshotParts || e.Visible.empty()) return;
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -257,7 +257,68 @@
+     }
+     return true;
+ }
+-Clock::time_point residentDisplayNext{};
++bool IsExit(const HomeCatalog::Cell& catalog,const HomeCatalog::Ref& binding)
++{
++    for (const auto& e:catalog.Entrances) if (e.Exit.Encode()==binding.Target.Encode()) return true;
++    return false;
++}
++HomeObjects::State ObjectPose(TESObjectREFR& ref,uint32_t open)
++{
++    return {ref.IsDisabled()?1u:0u,open,
++        {std::bit_cast<uint32_t>(ref.position.x),std::bit_cast<uint32_t>(ref.position.y),
++         std::bit_cast<uint32_t>(ref.position.z),std::bit_cast<uint32_t>(ref.rotation.x),
++         std::bit_cast<uint32_t>(ref.rotation.y),std::bit_cast<uint32_t>(ref.rotation.z)}};
++}
++bool ApplyObjectChanges(World& world,TESObjectCELL& cell,const HomeCatalog::Cell& copy,
++                        const HomeSnapshot::State& state,uint64_t campaign,uint32_t slot)
++{
++    const auto view=CampaignAccess::HomeObjectView(campaign,slot);
++    if (!view) return false;
++    for (const auto& row:state.Refs)
++    {
++        const auto found=view->find(row.Key.Encode());
++        if (found==view->end() || !found->second.Revision) continue;
++        const auto binding=std::find_if(copy.Refs.begin(),copy.Refs.end(),
++            [&](const auto& r){return r.Source.Encode()==row.Key.Encode();});
++        if (binding==copy.Refs.end()) return false;
++        if (IsExit(copy,*binding)) continue;
++        auto* object=Cast<TESObjectREFR>(TESForm::GetById(CatalogForm(binding->Target)));
++        if (!object || !object->baseForm || object->baseForm->formID!=CatalogForm(binding->TargetBase) ||
++            object->GetParentCellEx()!=&cell || object->IsDeleted() || Cast<Actor>(object)) return false;
++        const auto& v=found->second.Value;
++        const bool disabled=(row.Flags&1u)!=0;
++        if (object->IsDisabled()!=disabled)
++        {if (disabled) object->Disable();else object->Enable();}
++        if (object->IsDisabled()!=disabled) return false;
++        if (disabled) continue;
++        auto observed=ObjectPose(*object,v.Open);
++        if (!observed.Valid()) return false;
++        if (observed.Significant(v))
++        {
++            const auto pos=[&](size_t i){return std::bit_cast<float>(v.Transform[i]);};
++            object->SetRotation(pos(3),pos(4),pos(5));
++            object->MoveTo(&cell,glm::vec3{pos(0),pos(1),pos(2)});
++            if (object->GetParentCellEx()!=&cell) return false;
++        }
++        if (row.Type==29 && v.Open)
++        {
++            auto& vm=world.ctx().at<PapyrusService>();
++            const auto* get=vm.Get("ObjectReference","GetOpenState");
++            const auto* set=vm.Get("ObjectReference","SetOpen");
++            if (!get || !set) return false;
++            const auto local=static_cast<uint32_t>(PapyrusFunction<TESObjectREFR::OpenState,TESObjectREFR>(get)(object));
++            if (local==2 || local==4) continue; // animation in progress
++            if (local!=1 && local!=3) return false;
++            if (local!=v.Open)
++            {
++                const PapyrusFunction<void,TESObjectREFR,bool> setOpen{set};
++                setOpen(object,v.Open==1);
++            }
++        }
++    }
++    return true;
++}
++Clock::time_point residentDisplayNext{};
+ void AddVisits(const CampaignAccess::Identity& id,const HomeCatalog::Cell& cell,std::string& labels)
+ {
+     accessMenu.Visits.clear();
+@@ -455,8 +516,91 @@
+     }
+ }
+ 
+-struct BaselineUpload
+-{
++struct ObjectTrack
++{
++    uint32_t Revision{};
++    std::optional<HomeObjects::State> Pending;
++    Clock::time_point Retry{};
++};
++struct ObjectContext
++{
++    uint64_t Campaign{},Character{},SaveTag{};
++    uint32_t Slot{},Cell{},SaveRevision{};
++    size_t NextRef{};
++    Clock::time_point Next{};
++    std::map<std::string,ObjectTrack> Tracks;
++};
++ObjectContext objectContext;
++void SyncObjects(World& world,TESObjectCELL& cell,const CampaignAccess::Identity& identity,
++                 uint32_t slot,const std::string& root)
++{
++    auto& ctx=objectContext;
++    if (ctx.Campaign!=identity.Save.Campaign || ctx.Character!=identity.Save.Character ||
++        ctx.Slot!=slot || ctx.Cell!=cell.formID || ctx.SaveRevision!=identity.Save.Applied.Revision ||
++        ctx.SaveTag!=identity.Save.Applied.Tag)
++    {
++        ctx={};ctx.Campaign=identity.Save.Campaign;ctx.Character=identity.Save.Character;
++        ctx.Slot=slot;ctx.Cell=cell.formID;ctx.SaveRevision=identity.Save.Applied.Revision;ctx.SaveTag=identity.Save.Applied.Tag;
++    }
++    const auto now=Clock::now();
++    if (now<ctx.Next || !cell.IsAttached()) return;
++    ctx.Next=now+1s;
++    const auto* catalog=CatalogCell(cell.formID);
++    if (!catalog || catalog->Refs.empty()) return;
++    const auto view=CampaignAccess::HomeObjectView(ctx.Campaign,slot);
++    if (!view) {ctx.Tracks.clear();return;}
++    const auto& refs=catalog->Refs;
++    unsigned sent=0;
++    for (size_t i=0;i<std::min<size_t>(refs.size(),128) && sent<8;++i)
++    {
++        const auto& binding=refs[ctx.NextRef++%refs.size()];
++        if (IsExit(*catalog,binding)) continue;
++        const auto key=binding.Source.Encode();
++        const auto it=view->find(key);
++        if (it==view->end()) continue;
++        const auto& old=it->second;
++        auto* object=Cast<TESObjectREFR>(TESForm::GetById(CatalogForm(binding.Source)));
++        if (!object || object->IsTemporary() || object->IsDeleted() || !object->baseForm ||
++            object->GetParentCellEx()!=&cell || object->baseForm->formID!=CatalogForm(binding.Base) ||
++            static_cast<uint32_t>(object->baseForm->formType)!=old.Type || Cast<Actor>(object) ||
++            (old.Inventory==3 && object->IsDisabled())) {ctx.Tracks.erase(key);continue;}
++        uint32_t open=old.Value.Open;
++        if (old.Type==29 && !object->IsDisabled())
++        {
++            auto& vm=world.ctx().at<PapyrusService>();
++            const auto* get=vm.Get("ObjectReference","GetOpenState");
++            if (!get) continue;
++            const auto n=static_cast<uint32_t>(PapyrusFunction<TESObjectREFR::OpenState,TESObjectREFR>(get)(object));
++            if (n!=1 && n!=3) continue;
++            open=n;
++        }
++        auto state=ObjectPose(*object,open);
++        if (!HomeObjects::Allowed(old,state)) continue;
++        auto tracked=ctx.Tracks.find(key);
++        if (tracked==ctx.Tracks.end())
++        {
++            if (old.Revision && (ctx.SaveRevision<old.SaveRevision || state.Significant(old.Value))) continue;
++            tracked=ctx.Tracks.emplace(key,ObjectTrack{old.Revision,{},{}}).first;
++        }
++        auto& t=tracked->second;
++        if (t.Pending && t.Revision!=UINT32_MAX && old.Revision==t.Revision+1 &&
++            old.Value.Encode()==t.Pending->Encode())
++        {t.Revision=old.Revision;t.Pending.reset();}
++        if (old.Revision!=t.Revision || ctx.SaveRevision<old.SaveRevision)
++        {ctx.Tracks.erase(tracked);continue;}
++        if (now<t.Retry || old.Revision==UINT32_MAX || !state.Significant(old.Value)) continue;
++        HomeObjects::Change c{slot,old.Revision+1,ctx.SaveRevision,key,state};
++        RequestPartyHome req;auto& e=req.Event;
++        e.House=slot;e.Campaign=ctx.Campaign;e.Character=ctx.Character;e.SaveRevision=ctx.SaveRevision;e.SaveTag=ctx.SaveTag;
++        e.Profile=identity.Profile.c_str();e.Credential=identity.Credential.Secret.c_str();e.Root=root.c_str();
++        e.AccessOp=6;e.AccessRevision=old.Revision;e.Visible=c.Encode().c_str();
++        t.Retry=now+5s;
++        if (world.GetTransport().Send(req)) {t.Pending=state;++sent;}
++    }
++}
++
++struct BaselineUpload
++{
+     uint32_t Slot{},Next{};
+     uint64_t Campaign{},Character{};
+     std::string Bytes;
+@@ -622,7 +766,7 @@
+     if (selection && m_pOverlay && m_gameOverlayClient)
+     {m_pOverlay->ExecuteAsync("hideHome");m_gameOverlayClient->SetUIVisible(false);}
+     selection=false;door=0;options.clear();accessMenu={};visit={};lockContext={};projectedRoot.store(0);ads.clear();SetVisit(0,0);refresh={};self.store(invalid);
+-    activeHomeRoute.store(0);acknowledgedHome={};baselineUpload={};residentContext={};
++    activeHomeRoute.store(0);acknowledgedHome={};baselineUpload={};residentContext={};objectContext={};
+     for (unsigned i=0;i<routeCount.load();++i) routes[i].own.store(0);
+     for (auto& [_,h]:houses){h.owned=false;h.visible.clear();}
+ }
+@@ -717,11 +861,13 @@
+                         ClearTrade();LeaveCopy(*player,*copy,CatalogForm(e.Door));return true;
+                     }
+             }
+-            // Only the managed container proxy is interactive in this
+-            // static projection. No cloned loot, furniture or scripts run.
+-            auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
+-            if (visit.Ready && object && object->baseForm &&
+-                object->baseForm->formType==FormType::Container && HomeInstance::ProjectionForm(form)) return false;
++            // Exits are handled above; property uses the durable trade path.
++            auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
++            if (visit.Ready && object && object->baseForm && object->GetParentCellEx()==current &&
++                HomeInstance::ProjectionForm(form) &&
++                (object->baseForm->formType==FormType::Container ||
++                 HomeSnapshot::LooseType(static_cast<uint32_t>(object->baseForm->formType))))
++                TryTrade(form); // Always consume activation, even when the trade gate refuses.
+             return true;
+         }
+         if (!m_inGame || m_active || !m_pOverlay || !m_gameOverlayClient || selection ||
+@@ -838,8 +984,9 @@
+                 const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
+                 const auto bindings=state?HomeCatalog::Bind(*copy,*state):std::nullopt;
+                 if (!bindings || !ResidentPlan(*copy,*state,visit.Campaign,visit.Slot) ||
+-                    !HomeProjection::Apply(*current,*state,*bindings) ||
+-                    !ApplyResidents(m_world,*current,*copy,*state,visit.Campaign,visit.Slot))
++                    !HomeProjection::Apply(*current,*state,*bindings) ||
++                    !ApplyObjectChanges(m_world,*current,*copy,*state,visit.Campaign,visit.Slot) ||
++                    !ApplyResidents(m_world,*current,*copy,*state,visit.Campaign,visit.Slot))
+                 {ClearTrade();LeaveCopy(*p,*copy,visit.Door);return;}
+                 projectedRoot.store((uint64_t(visit.Base)<<32)|visit.Copy);
+                 visit.Ready=true;
+@@ -852,8 +999,9 @@
+                     residentDisplayNext=now+1s;
+                     const auto bytes=CampaignAccess::HomeBaseline(visit.Campaign,visit.Slot);
+                     const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
+-                    if (!state || !ApplyLoose(*current,*state,copy) ||
+-                        !ApplyResidents(m_world,*current,*copy,*state,visit.Campaign,visit.Slot))
++                    if (!state || !ApplyLoose(*current,*state,copy) ||
++                        !ApplyObjectChanges(m_world,*current,*copy,*state,visit.Campaign,visit.Slot) ||
++                        !ApplyResidents(m_world,*current,*copy,*state,visit.Campaign,visit.Slot))
+                     {ClearTrade();LeaveCopy(*p,*copy,visit.Door);return;}
+                 }
+             }
+@@ -995,7 +1143,7 @@
+     {
+         if (!world.GetTransport().IsOnline() || !cell)
+         {
+-            activeHomeRoute.store(0);acknowledgedHome={};baselineUpload={};residentContext={};observed=0;checkAt={};return;
++            activeHomeRoute.store(0);acknowledgedHome={};baselineUpload={};residentContext={};objectContext={};observed=0;checkAt={};return;
+         }
+         auto* player=PlayerCharacter::Get();
+         if (!player) return;
+@@ -1003,7 +1151,7 @@
+         const auto mode=CampaignAccess::Mode();
+         if (HomeInstance::ProjectionForm(cell->formID))
+         {
+-            residentContext={};
++            residentContext={};objectContext={};
+             if (id>0xFFFFu) {activeHomeRoute.store(0);return;}
+             const bool ready=visit.Ready && visit.Granted && visit.Copy==cell->formID &&
+                 Clock::now()<visit.Until && mode==CampaignReplication::Link::Mode::Ready;
+@@ -1012,7 +1160,7 @@
+         }
+         if (mode==CampaignReplication::Link::Mode::Disabled)
+         {
+-            residentContext={};
++            residentContext={};objectContext={};
+             activeHomeRoute.store(0);
+             if (!world.GetPartyService().IsInParty() || !Init()) return;
+             const auto previousSelf=self.exchange(id);
+@@ -1029,7 +1177,7 @@
+             cell->loadedCellData->encounterZone->formID==0xF90B1u && cell->formID!=0xEEC55u);
+         if (observed!=cell->formID || observedPlayer!=id || (candidate && !old))
+         {
+-            observed=cell->formID;observedPlayer=id;checkAt={};baselineUpload={};residentContext={};
++            observed=cell->formID;observedPlayer=id;checkAt={};baselineUpload={};residentContext={};objectContext={};
+             activeHomeRoute.store(0);
+         }
+         if (now<checkAt) return;
+@@ -1046,9 +1194,9 @@
+         const auto quarantine=(uint64_t(HomeRegistry::PendingPrefix|id)<<32)|cell->formID;
+         if (!activeHomeRoute.load()) activeHomeRoute.store(quarantine);
+         if (mode!=CampaignReplication::Link::Mode::Ready || !CampaignAccess::GameReady() || !Owned(world,cell,player))
+-        {residentContext={};activeHomeRoute.store(quarantine);return;}
++        {residentContext={};objectContext={};activeHomeRoute.store(quarantine);return;}
+         const auto identity=CampaignAccess::Current(world);
+-        if (!identity) {residentContext={};activeHomeRoute.store(quarantine);return;}
++        if (!identity) {residentContext={};objectContext={};activeHomeRoute.store(quarantine);return;}
+         std::vector<InventoryEvidence::PluginSlot> slots;
+         if (auto* mods=ModManager::Get())
+             for (const auto* mod:mods->mods)
+@@ -1071,7 +1219,8 @@
+             activeHomeRoute.store((uint64_t(HomeRegistry::ScopePrefix|slot)<<32)|cell->formID);
+             UploadBaseline(world,*cell,*identity,slot,encoded,slots);
+             SyncLocks(*cell,*identity,slot,encoded,nullptr);
+-            SyncResidents(world,*cell,*identity,slot,encoded,slots);
++            SyncResidents(world,*cell,*identity,slot,encoded,slots);
++            SyncObjects(world,*cell,*identity,slot,encoded);
+             static Clock::time_point looseNext{};
+             if (Clock::now()>=looseNext && cell->IsAttached())
+             {
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign18"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign19"

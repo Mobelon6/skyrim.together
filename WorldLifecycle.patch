@@ -1,0 +1,1194 @@
+diff --git a/Code/common/WorldTaskEpoch.h b/Code/common/WorldTaskEpoch.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/WorldTaskEpoch.h
+@@ -0,0 +1,30 @@
++#pragma once
++#include <atomic>
++#include <cstdint>
++
++// The low bit blocks submission and execution during title-screen teardown.
++// A generation changes on both sides of the boundary, so an old queued task
++// cannot become valid again when a new world is entered.
++class WorldTaskEpoch
++{
++public:
++    uint64_t Ticket() const noexcept {return m_epoch.load(std::memory_order_acquire);}
++    bool Allows(uint64_t ticket) const noexcept {return !(ticket&1) && Ticket()==ticket;}
++    bool Suspend() noexcept
++    {
++        auto value=Ticket();
++        while (!(value&1))
++            if (m_epoch.compare_exchange_weak(value,value+1,std::memory_order_acq_rel)) return true;
++        return false;
++    }
++    bool Resume() noexcept
++    {
++        auto value=Ticket();
++        while (value&1)
++            if (m_epoch.compare_exchange_weak(value,value+1,std::memory_order_acq_rel)) return true;
++        return false;
++    }
++    void Invalidate() noexcept {m_epoch.fetch_add(2,std::memory_order_acq_rel);}
++private:
++    std::atomic<uint64_t> m_epoch{};
++};
+diff --git a/Code/client/Services/RunnerService.h b/Code/client/Services/RunnerService.h
+--- a/Code/client/Services/RunnerService.h
++++ b/Code/client/Services/RunnerService.h
+@@ -1,38 +1,47 @@
+ #pragma once
+ 
+ #include <TiltedCore/TaskQueue.hpp>
+-
+-struct UpdateEvent;
+-
+-/**
+- * @brief Dispatches events.
+- */
+-struct RunnerService
+-{
+-    RunnerService(entt::dispatcher& aDispatcher) noexcept;
+-    ~RunnerService() noexcept = default;
+-
+-    TP_NOCOPYMOVE(RunnerService);
+-
+-    /**
+-     * @brief Executes all queued events every frame.
+-     */
+-    void OnUpdate(const UpdateEvent& acUpdateEvent) noexcept;
+-
+-    /**
+-     * @brief Queues an event for OnUpdate() to execute.
+-     */
+-    template <class T> void Trigger(T acEvent)
+-    {
+-        m_runner.Add([event = std::move(acEvent), this]() { m_dispatcher.trigger(std::move(event)); });
+-    }
+-
+-    /**
+-     * @brief Queues a lambda for OnUpdate() to execute.
+-     */
+-    void Queue(std::function<void()> aFunctor) noexcept;
+-
+-private:
+-    entt::dispatcher& m_dispatcher;
+-    TiltedPhoques::TaskQueue m_runner;
++#include <WorldTaskEpoch.h>
++
++struct UpdateEvent;
++
++/**
++ * @brief Dispatches events.
++ */
++struct RunnerService
++{
++    RunnerService(entt::dispatcher& aDispatcher) noexcept;
++    ~RunnerService() noexcept = default;
++
++    TP_NOCOPYMOVE(RunnerService);
++
++    /**
++     * @brief Executes all queued events every frame.
++     */
++    void OnUpdate(const UpdateEvent& acUpdateEvent) noexcept;
++
++    /**
++     * @brief Queues an event for OnUpdate() to execute.
++     */
++    template <class T> void Trigger(T acEvent)
++    {
++        const auto ticket=m_epoch.Ticket();
++        if (!m_epoch.Allows(ticket)) return;
++        m_runner.Add([event = std::move(acEvent), this, ticket]() {
++            if (m_epoch.Allows(ticket)) m_dispatcher.trigger(std::move(event));
++        });
++    }
++
++    /**
++     * @brief Queues a lambda for OnUpdate() to execute.
++     */
++    void Queue(std::function<void()> aFunctor) noexcept;
++    bool SuspendWorld() noexcept {return m_epoch.Suspend();}
++    bool ResumeWorld() noexcept {return m_epoch.Resume();}
++    void InvalidateWorld() noexcept {m_epoch.Invalidate();}
++
++private:
++    entt::dispatcher& m_dispatcher;
++    TiltedPhoques::TaskQueue m_runner;
++    WorldTaskEpoch m_epoch;
+ };
+diff --git a/Code/client/Services/Generic/RunnerService.cpp b/Code/client/Services/Generic/RunnerService.cpp
+--- a/Code/client/Services/Generic/RunnerService.cpp
++++ b/Code/client/Services/Generic/RunnerService.cpp
+@@ -11,7 +11,11 @@
+ 
+ void RunnerService::Queue(std::function<void()> aFunctor) noexcept
+ {
+-    m_runner.Add(std::move(aFunctor));
++    const auto ticket=m_epoch.Ticket();
++    if (!m_epoch.Allows(ticket)) return;
++    m_runner.Add([this,ticket,fn=std::move(aFunctor)]() {
++        if (m_epoch.Allows(ticket)) fn();
++    });
+ }
+ 
+ void RunnerService::OnUpdate(const UpdateEvent& acUpdateEvent) noexcept
+diff --git a/Code/client/Services/TransportService.h b/Code/client/Services/TransportService.h
+--- a/Code/client/Services/TransportService.h
++++ b/Code/client/Services/TransportService.h
+@@ -33,32 +33,39 @@
+     void OnDisconnected(EDisconnectReason aReason) override;
+     void OnUpdate() override;
+ 
+-    [[nodiscard]] bool IsOnline() const noexcept { return m_connected; }
+-    void SetServerPassword(const std::string& acPassword) noexcept { m_serverPassword = acPassword; }
+-    const uint32_t& GetLocalPlayerId() const noexcept { return m_localPlayerId; }
+-
+-    // Times below are in ms on the networking library's local clock, which keeps running while the game thread is stalled
+-
+-    // When the message being handled arrived from the network, it may have waited out a long frame since.
+-    // Only meaningful while a received message is being handled.
+-    [[nodiscard]] double GetMessageReceiveTime() const noexcept;
+-    // When received messages were last picked up, everything that arrived before then has been handled
+-    [[nodiscard]] double GetLastPollTime() const noexcept { return m_lastPollTime; }
+-
+-protected:
+-    // Event handlers
+-    void HandleUpdate(const UpdateEvent& acEvent) noexcept;
+-    void HandleConnected(const ConnectedEvent& acEvent) noexcept;
+-    void HandleDisconnected(const DisconnectedEvent& acEvent) noexcept;
+-
+-    // Packet handlers
+-    void HandleAuthenticationResponse(const AuthenticationResponse& acMessage) noexcept;
+-    void HandleNotifySettingsChange(const NotifySettingsChange& acMessage) noexcept;
+-
+-private:
+-    World& m_world;
+-    entt::dispatcher& m_dispatcher;
+-    bool m_connected;
++    // Main-thread entry points for world and connection lifecycle.
++    bool ConnectWorld(const std::string& endpoint,const std::string& password) noexcept;
++    void CloseWorld() noexcept;
++    bool PrepareWorldFrame() noexcept;
++    bool AtTitle() const noexcept {return m_title.load(std::memory_order_acquire);}
++    [[nodiscard]] bool IsOnline() const noexcept { return m_connected && !AtTitle(); }
++    void SetServerPassword(const std::string& acPassword) noexcept { m_serverPassword = acPassword; }
++    const uint32_t& GetLocalPlayerId() const noexcept { return m_localPlayerId; }
++
++    // Times below are in ms on the networking library's local clock, which keeps running while the game thread is stalled
++
++    // When the message being handled arrived from the network, it may have waited out a long frame since.
++    // Only meaningful while a received message is being handled.
++    [[nodiscard]] double GetMessageReceiveTime() const noexcept;
++    // When received messages were last picked up, everything that arrived before then has been handled
++    [[nodiscard]] double GetLastPollTime() const noexcept { return m_lastPollTime; }
++
++protected:
++    // Event handlers
++    void HandleUpdate(const UpdateEvent& acEvent) noexcept;
++    void HandleConnected(const ConnectedEvent& acEvent) noexcept;
++    void HandleDisconnected(const DisconnectedEvent& acEvent) noexcept;
++
++    // Packet handlers
++    void HandleAuthenticationResponse(const AuthenticationResponse& acMessage) noexcept;
++    void HandleNotifySettingsChange(const NotifySettingsChange& acMessage) noexcept;
++
++private:
++    World& m_world;
++    entt::dispatcher& m_dispatcher;
++    bool m_connected;
++    std::atomic<bool> m_title{};
++    bool m_connectionRequested{};
+     String m_serverPassword{};
+     uint32_t m_localPlayerId;
+     double m_lastPollTime{};
+diff --git a/Code/client/Services/Generic/TransportService.cpp b/Code/client/Services/Generic/TransportService.cpp
+--- a/Code/client/Services/Generic/TransportService.cpp
++++ b/Code/client/Services/Generic/TransportService.cpp
+@@ -16,269 +16,340 @@
+ #include <Forms/TESNPC.h>
+ #include <TiltedOnlinePCH.h>
+ #include <World.h>
+-
+-#include <Messages/AuthenticationRequest.h>
+-#include <Messages/ServerMessageFactory.h>
+-#include <Messages/NotifySettingsChange.h>
+-#include <Packet.hpp>
+-#include <steam/isteamnetworkingutils.h>
+-
+-#include <ScriptExtender.h>
+-#include <Services/DiscordService.h>
+-
+-// #include <imgui_internal.h>
+-
+-static constexpr wchar_t kMO2DllName[] = L"usvfs_x64.dll";
+-
+-using TiltedPhoques::Packet;
+-
+-TransportService::TransportService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
+-    : m_world(aWorld)
+-    , m_dispatcher(aDispatcher)
+-{
+-    m_updateConnection = m_dispatcher.sink<UpdateEvent>().connect<&TransportService::HandleUpdate>(this);
+-    m_settingsChangeConnection = m_dispatcher.sink<NotifySettingsChange>().connect<&TransportService::HandleNotifySettingsChange>(this);
+-    m_connectedConnection = m_dispatcher.sink<ConnectedEvent>().connect<&TransportService::HandleConnected>(this);
+-    m_disconnectedConnection = m_dispatcher.sink<DisconnectedEvent>().connect<&TransportService::HandleDisconnected>(this);
+-
+-    m_connected = false;
+-
+-    auto handlerGenerator = [this](auto& x)
+-    {
+-        using T = typename std::remove_reference_t<decltype(x)>::Type;
+-
+-        m_messageHandlers[T::Opcode] = [this](UniquePtr<ServerMessage>& apMessage)
+-        {
+-            const auto pRealMessage = TiltedPhoques::CastUnique<T>(std::move(apMessage));
+-            m_dispatcher.trigger(*pRealMessage);
+-        };
+-
+-        return false;
+-    };
+-
+-    ServerMessageFactory::Visit(handlerGenerator);
+-
+-    // Override authentication response
+-    m_messageHandlers[AuthenticationResponse::Opcode] = [this](UniquePtr<ServerMessage>& apMessage)
+-    {
+-        const auto pRealMessage = TiltedPhoques::CastUnique<AuthenticationResponse>(std::move(apMessage));
+-        HandleAuthenticationResponse(*pRealMessage);
+-    };
+-}
+-
+-bool TransportService::Send(const ClientMessage& acMessage, const TiltedPhoques::EPacketFlags aPacketFlags) const noexcept
+-{
+-    static thread_local ScratchAllocator s_allocator(1 << 18);
+-
+-    struct ScopedReset
+-    {
+-        ~ScopedReset() { s_allocator.Reset(); }
+-    } allocatorGuard;
+-
+-    if (IsConnected())
+-    {
+-        ScopedAllocator _{s_allocator};
+-
+-        Buffer buffer(1 << 16);
+-        Buffer::Writer writer(&buffer);
+-        writer.WriteBits(0, 8); // Write first byte as packet needs it
+-
+-        acMessage.Serialize(writer);
+-        TiltedPhoques::PacketView packet(reinterpret_cast<char*>(buffer.GetWriteData()), writer.Size());
+-
+-        Client::Send(&packet, aPacketFlags);
+-
+-        return true;
+-    }
+-
+-    return false;
+-}
+-
+-void TransportService::OnConsume(const void* apData, uint32_t aSize)
+-{
+-    ServerMessageFactory factory;
+-    TiltedPhoques::ViewBuffer buf((uint8_t*)apData, aSize);
+-    Buffer::Reader reader(&buf);
+-
+-    auto pMessage = factory.Extract(reader);
+-    if (!pMessage)
+-    {
+-        spdlog::error("Couldn't parse packet from server");
+-        return;
+-    }
+-
+-    m_messageHandlers[pMessage->GetOpcode()](pMessage);
+-}
+-
+-void TransportService::OnConnected()
+-{
+-    AuthenticationRequest request{};
+-    request.Version = BUILD_COMMIT;
+-    request.SKSEActive = IsScriptExtenderLoaded();
+-    request.MO2Active = GetModuleHandleW(kMO2DllName);
+-
+-    request.Token = m_serverPassword;
+-    m_serverPassword = "";
+-
+-    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+-
+-    // null if discord is not active
+-    // TODO: think about user opt out
+-    request.DiscordId = m_world.ctx().at<DiscordService>().GetUser().id;
+-    auto* pNpc = Cast<TESNPC>(pPlayer->baseForm);
+-    if (pNpc)
+-    {
+-        request.Username = pNpc->fullName.value.AsAscii();
+-    }
+-    else
+-    {
+-        request.Username = "Some dragon boi";
+-    }
+-
+-    auto* const cpModManager = ModManager::Get();
+-
+-    for (auto* pMod : cpModManager->mods)
+-    {
+-        if (!pMod->IsLoaded())
+-            continue;
+-
+-        auto& entry = request.UserMods.ModList.emplace_back();
+-        entry.Id = pMod->GetId();
+-        entry.IsLite = pMod->IsLite();
+-        entry.Filename = pMod->filename;
+-    }
+-
+-    auto& modSystem = m_world.GetModSystem();
+-    if (pPlayer->GetWorldSpace())
+-        modSystem.GetServerModId(pPlayer->GetWorldSpace()->formID, request.WorldSpaceId);
+-
+-    modSystem.GetServerModId(pPlayer->parentCell->formID, request.CellId);
+-
+-    request.Level = pPlayer->GetLevel();
+-
+-    auto* pGameTime = TimeData::Get();
+-    request.PlayerTime.TimeScale = pGameTime->TimeScale->f;
+-    request.PlayerTime.Time = pGameTime->GameHour->f;
+-    request.PlayerTime.Year = pGameTime->GameYear->f;
+-    request.PlayerTime.Month = pGameTime->GameMonth->f;
+-    request.PlayerTime.Day = pGameTime->GameDay->f;
+-
+-    Send(request);
+-}
+-
+-void TransportService::OnDisconnected(EDisconnectReason aReason)
+-{
+-    m_connected = false;
+-
+-    spdlog::warn("Disconnected from server {}", aReason);
+-
+-    m_dispatcher.trigger(DisconnectedEvent());
+-}
+-
+-void TransportService::OnUpdate()
+-{
+-}
+-
+-double TransportService::GetMessageReceiveTime() const noexcept
+-{
+-    return static_cast<double>(GetCurrentMessageReceiveTime()) / 1000.0;
+-}
+-
+-void TransportService::HandleUpdate(const UpdateEvent& acEvent) noexcept
+-{
+-    // Taken before polling, so that every message that arrived before this time gets handled by this update
+-    m_lastPollTime = static_cast<double>(SteamNetworkingUtils()->GetLocalTimestamp()) / 1000.0;
+-
+-    Update();
+-}
+-
+-void TransportService::HandleConnected(const ConnectedEvent& acEvent) noexcept
+-{
+-    m_localPlayerId = acEvent.PlayerId;
+-}
+-
+-void TransportService::HandleDisconnected(const DisconnectedEvent& acEvent) noexcept
+-{
+-    m_localPlayerId = NULL;
+-}
+-
+-void TransportService::HandleAuthenticationResponse(const AuthenticationResponse& acMessage) noexcept
+-{
+-    using AR = AuthenticationResponse::ResponseType;
+-    if (acMessage.Type == AR::kAccepted)
+-    {
+-        m_connected = true;
+-
+-        m_world.SetServerSettings(acMessage.Settings);
+-
+-        m_dispatcher.trigger(acMessage.UserMods);
+-        m_dispatcher.trigger(acMessage.Settings);
+-        m_dispatcher.trigger(ConnectedEvent(acMessage.PlayerId));
+-        return; // quit the function here.
+-    }
+-
+-    // error finding
+-
+-    TiltedPhoques::String ErrorInfo;
+-
+-    ErrorInfo = "{";
+-
+-    switch (acMessage.Type)
+-    {
+-    case AR::kWrongVersion:
+-        ErrorInfo += "\"error\": \"wrong_version\", \"data\": {";
+-        ErrorInfo += fmt::format("\"expectedVersion\": \"{}\", \"version\": \"{}\"", acMessage.Version, BUILD_COMMIT);
+-        ErrorInfo += "}";
+-        break;
+-    case AR::kModsMismatch:
+-    {
+-        ErrorInfo += "\"error\": \"mods_mismatch\", \"data\": {\"mods\": [";
+-        bool first = true;
+-        for (const auto& m : acMessage.UserMods.ModList)
+-        {
+-            if (!first)
+-                ErrorInfo += ",";
+-            ErrorInfo += fmt::format("[\"{}\",\"{}\"]", m.Filename.c_str(), m.Id);
+-            first = false;
+-        }
+-        ErrorInfo += "]}";
+-        break;
+-    }
+-    case AR::kClientModsDisallowed:
+-    {
+-        ErrorInfo += "\"error\": \"client_mods_disallowed\", \"data\": { \"mods\": [";
+-        if (acMessage.SKSEActive)
+-            ErrorInfo += "\"SKSE\"";
+-        if (acMessage.MO2Active)
+-            if (acMessage.SKSEActive)
+-                ErrorInfo += ",";
+-        ErrorInfo += "\"MO2\"";
+-        ErrorInfo += "]}";
+-        break;
+-    }
+-    case AR::kWrongPassword:
+-    {
+-        ErrorInfo += "\"error\": \"wrong_password\"";
+-        break;
+-    }
+-    case AR::kServerFull:
+-    {
+-        ErrorInfo += "\"error\": \"server_full\"";
+-        break;
+-    }
+-    default: ErrorInfo += "\"error\": \"no_reason\""; break;
+-    }
+-
+-    ErrorInfo += "}";
+-
+-    ConnectionErrorEvent errorEvent;
+-    if (!ErrorInfo.empty())
+-    {
+-        spdlog::error(ErrorInfo.c_str());
+-        errorEvent.ErrorDetail = std::move(ErrorInfo);
+-    }
+-
+-    m_dispatcher.trigger(errorEvent);
++#include <Games/Skyrim/Interface/UI.h>
++#include <PlayerCharacter.h>
++
++#include <Messages/AuthenticationRequest.h>
++#include <Messages/ServerMessageFactory.h>
++#include <Messages/NotifySettingsChange.h>
++#include <Packet.hpp>
++#include <steam/isteamnetworkingutils.h>
++
++#include <ScriptExtender.h>
++#include <Services/DiscordService.h>
++
++// #include <imgui_internal.h>
++
++static constexpr wchar_t kMO2DllName[] = L"usvfs_x64.dll";
++
++using TiltedPhoques::Packet;
++
++TransportService::TransportService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
++    : m_world(aWorld)
++    , m_dispatcher(aDispatcher)
++{
++    m_updateConnection = m_dispatcher.sink<UpdateEvent>().connect<&TransportService::HandleUpdate>(this);
++    m_settingsChangeConnection = m_dispatcher.sink<NotifySettingsChange>().connect<&TransportService::HandleNotifySettingsChange>(this);
++    m_connectedConnection = m_dispatcher.sink<ConnectedEvent>().connect<&TransportService::HandleConnected>(this);
++    m_disconnectedConnection = m_dispatcher.sink<DisconnectedEvent>().connect<&TransportService::HandleDisconnected>(this);
++
++    m_connected = false;
++
++    auto handlerGenerator = [this](auto& x)
++    {
++        using T = typename std::remove_reference_t<decltype(x)>::Type;
++
++        m_messageHandlers[T::Opcode] = [this](UniquePtr<ServerMessage>& apMessage)
++        {
++            const auto pRealMessage = TiltedPhoques::CastUnique<T>(std::move(apMessage));
++            m_dispatcher.trigger(*pRealMessage);
++        };
++
++        return false;
++    };
++
++    ServerMessageFactory::Visit(handlerGenerator);
++
++    // Override authentication response
++    m_messageHandlers[AuthenticationResponse::Opcode] = [this](UniquePtr<ServerMessage>& apMessage)
++    {
++        const auto pRealMessage = TiltedPhoques::CastUnique<AuthenticationResponse>(std::move(apMessage));
++        HandleAuthenticationResponse(*pRealMessage);
++    };
++}
++
++namespace
++{
++bool TitleOpen()
++{
++    auto* ui=UI::Get();
++    static const BSFixedString title("Main Menu");
++    return ui && ui->GetMenuOpen(title);
++}
++bool ReadyToConnect()
++{
++    auto* ui=UI::Get();
++    static const BSFixedString loading("Loading Menu");
++    if (!ui || TitleOpen() || ui->GetMenuOpen(loading)) return false;
++    auto* player=PlayerCharacter::Get();
++    return player && player->parentCell && player->GetNiNode();
++}
++}
++
++bool TransportService::ConnectWorld(const std::string& endpoint,const std::string& password) noexcept
++{
++    if (AtTitle() || !ReadyToConnect() || m_connectionRequested || IsConnected()) return false;
++    SetServerPassword(password);
++    m_connectionRequested=true;
++    if (Client::Connect(endpoint)) return true;
++    m_connectionRequested=false;
++    return false;
++}
++void TransportService::CloseWorld() noexcept
++{
++    m_connectionRequested=false;
++    m_serverPassword.clear();
++    Client::Close(); // also cancels outstanding DNS, even before IsConnected is true
++}
++bool TransportService::PrepareWorldFrame() noexcept
++{
++    const bool title=TitleOpen();
++    if (title)
++    {
++        if (!m_title.exchange(true,std::memory_order_acq_rel))
++        {
++            m_world.GetRunner().SuspendWorld();
++            spdlog::info("STM world boundary: entering main menu, invalidating queued work");
++            CloseWorld();
++        }
++        return false;
++    }
++    if (AtTitle())
++    {
++        // Do not resume queued work during the new game's initial loading.
++        if (!ReadyToConnect()) return false;
++        m_world.GetRunner().ResumeWorld();
++        m_title.store(false,std::memory_order_release);
++        spdlog::info("STM world boundary: gameplay world ready");
++    }
++    return true;
++}
++
++bool TransportService::Send(const ClientMessage& acMessage, const TiltedPhoques::EPacketFlags aPacketFlags) const noexcept
++{
++    static thread_local ScratchAllocator s_allocator(1 << 18);
++
++    struct ScopedReset
++    {
++        ~ScopedReset() { s_allocator.Reset(); }
++    } allocatorGuard;
++
++    if (!AtTitle() && IsConnected())
++    {
++        ScopedAllocator _{s_allocator};
++
++        Buffer buffer(1 << 16);
++        Buffer::Writer writer(&buffer);
++        writer.WriteBits(0, 8); // Write first byte as packet needs it
++
++        acMessage.Serialize(writer);
++        TiltedPhoques::PacketView packet(reinterpret_cast<char*>(buffer.GetWriteData()), writer.Size());
++
++        Client::Send(&packet, aPacketFlags);
++
++        return true;
++    }
++
++    return false;
++}
++
++void TransportService::OnConsume(const void* apData, uint32_t aSize)
++{
++    if (AtTitle() || !m_connectionRequested) return;
++    ServerMessageFactory factory;
++    TiltedPhoques::ViewBuffer buf((uint8_t*)apData, aSize);
++    Buffer::Reader reader(&buf);
++
++    auto pMessage = factory.Extract(reader);
++    if (!pMessage)
++    {
++        spdlog::error("Couldn't parse packet from server");
++        return;
++    }
++
++    if (!m_connected && pMessage->GetOpcode()!=AuthenticationResponse::Opcode) return;
++    m_messageHandlers[pMessage->GetOpcode()](pMessage);
++}
++
++void TransportService::OnConnected()
++{
++    if (!m_connectionRequested || AtTitle() || !ReadyToConnect())
++    {
++        CloseWorld();
++        return;
++    }
++    AuthenticationRequest request{};
++    request.Version = BUILD_COMMIT;
++    request.SKSEActive = IsScriptExtenderLoaded();
++    request.MO2Active = GetModuleHandleW(kMO2DllName);
++
++    request.Token = m_serverPassword;
++    m_serverPassword = "";
++
++    PlayerCharacter* pPlayer = PlayerCharacter::Get();
++
++    // null if discord is not active
++    // TODO: think about user opt out
++    request.DiscordId = m_world.ctx().at<DiscordService>().GetUser().id;
++    auto* pNpc = Cast<TESNPC>(pPlayer->baseForm);
++    if (pNpc)
++    {
++        request.Username = pNpc->fullName.value.AsAscii();
++    }
++    else
++    {
++        request.Username = "Some dragon boi";
++    }
++
++    auto* const cpModManager = ModManager::Get();
++
++    for (auto* pMod : cpModManager->mods)
++    {
++        if (!pMod->IsLoaded())
++            continue;
++
++        auto& entry = request.UserMods.ModList.emplace_back();
++        entry.Id = pMod->GetId();
++        entry.IsLite = pMod->IsLite();
++        entry.Filename = pMod->filename;
++    }
++
++    auto& modSystem = m_world.GetModSystem();
++    if (pPlayer->GetWorldSpace())
++        modSystem.GetServerModId(pPlayer->GetWorldSpace()->formID, request.WorldSpaceId);
++
++    modSystem.GetServerModId(pPlayer->parentCell->formID, request.CellId);
++
++    request.Level = pPlayer->GetLevel();
++
++    auto* pGameTime = TimeData::Get();
++    request.PlayerTime.TimeScale = pGameTime->TimeScale->f;
++    request.PlayerTime.Time = pGameTime->GameHour->f;
++    request.PlayerTime.Year = pGameTime->GameYear->f;
++    request.PlayerTime.Month = pGameTime->GameMonth->f;
++    request.PlayerTime.Day = pGameTime->GameDay->f;
++
++    Send(request);
++}
++
++void TransportService::OnDisconnected(EDisconnectReason aReason)
++{
++    m_connected = false;
++    m_connectionRequested=false;
++    m_world.GetRunner().InvalidateWorld();
++
++    spdlog::warn("Disconnected from server {}", aReason);
++
++    m_dispatcher.trigger(DisconnectedEvent());
++}
++
++void TransportService::OnUpdate()
++{
++}
++
++double TransportService::GetMessageReceiveTime() const noexcept
++{
++    return static_cast<double>(GetCurrentMessageReceiveTime()) / 1000.0;
++}
++
++void TransportService::HandleUpdate(const UpdateEvent& acEvent) noexcept
++{
++    // Taken before polling, so that every message that arrived before this time gets handled by this update
++    m_lastPollTime = static_cast<double>(SteamNetworkingUtils()->GetLocalTimestamp()) / 1000.0;
++
++    Update();
++}
++
++void TransportService::HandleConnected(const ConnectedEvent& acEvent) noexcept
++{
++    m_localPlayerId = acEvent.PlayerId;
++}
++
++void TransportService::HandleDisconnected(const DisconnectedEvent& acEvent) noexcept
++{
++    m_localPlayerId = NULL;
++}
++
++void TransportService::HandleAuthenticationResponse(const AuthenticationResponse& acMessage) noexcept
++{
++    using AR = AuthenticationResponse::ResponseType;
++    if (acMessage.Type == AR::kAccepted)
++    {
++        if (!m_connectionRequested || AtTitle() || !ReadyToConnect())
++        { CloseWorld(); return; }
++        m_connected = true;
++
++        m_world.SetServerSettings(acMessage.Settings);
++
++        m_dispatcher.trigger(acMessage.UserMods);
++        m_dispatcher.trigger(acMessage.Settings);
++        m_dispatcher.trigger(ConnectedEvent(acMessage.PlayerId));
++        return; // quit the function here.
++    }
++
++    // error finding
++
++    TiltedPhoques::String ErrorInfo;
++
++    ErrorInfo = "{";
++
++    switch (acMessage.Type)
++    {
++    case AR::kWrongVersion:
++        ErrorInfo += "\"error\": \"wrong_version\", \"data\": {";
++        ErrorInfo += fmt::format("\"expectedVersion\": \"{}\", \"version\": \"{}\"", acMessage.Version, BUILD_COMMIT);
++        ErrorInfo += "}";
++        break;
++    case AR::kModsMismatch:
++    {
++        ErrorInfo += "\"error\": \"mods_mismatch\", \"data\": {\"mods\": [";
++        bool first = true;
++        for (const auto& m : acMessage.UserMods.ModList)
++        {
++            if (!first)
++                ErrorInfo += ",";
++            ErrorInfo += fmt::format("[\"{}\",\"{}\"]", m.Filename.c_str(), m.Id);
++            first = false;
++        }
++        ErrorInfo += "]}";
++        break;
++    }
++    case AR::kClientModsDisallowed:
++    {
++        ErrorInfo += "\"error\": \"client_mods_disallowed\", \"data\": { \"mods\": [";
++        if (acMessage.SKSEActive)
++            ErrorInfo += "\"SKSE\"";
++        if (acMessage.MO2Active)
++            if (acMessage.SKSEActive)
++                ErrorInfo += ",";
++        ErrorInfo += "\"MO2\"";
++        ErrorInfo += "]}";
++        break;
++    }
++    case AR::kWrongPassword:
++    {
++        ErrorInfo += "\"error\": \"wrong_password\"";
++        break;
++    }
++    case AR::kServerFull:
++    {
++        ErrorInfo += "\"error\": \"server_full\"";
++        break;
++    }
++    default: ErrorInfo += "\"error\": \"no_reason\""; break;
++    }
++
++    ErrorInfo += "}";
++
++    ConnectionErrorEvent errorEvent;
++    if (!ErrorInfo.empty())
++    {
++        spdlog::error(ErrorInfo.c_str());
++        errorEvent.ErrorDetail = std::move(ErrorInfo);
++    }
++
++    m_dispatcher.trigger(errorEvent);
++    CloseWorld();
+ }
+ 
+ void TransportService::HandleNotifySettingsChange(const NotifySettingsChange& acMessage) noexcept
+diff --git a/Code/client/World.cpp b/Code/client/World.cpp
+--- a/Code/client/World.cpp
++++ b/Code/client/World.cpp
+@@ -68,6 +68,14 @@
+ 
+     const auto cDeltaSeconds = std::chrono::duration_cast<std::chrono::duration<double>>(cDelta).count();
+ 
++    // Check the title boundary BEFORE discovery or queued game operations.
++    // Keep pumping transport so a cancelled DNS/connection can finish closing.
++    if (!m_transport.PrepareWorldFrame())
++    {
++        m_runner.OnUpdate(UpdateEvent(cDeltaSeconds)); // suspended tickets are discarded
++        m_transport.Update();
++        return;
++    }
+     m_dispatcher.trigger(PreUpdateEvent(cDeltaSeconds));
+ 
+     // Force run this before so we get the tasks scheduled to run
+diff --git a/Code/client/Services/Generic/OverlayClient.cpp b/Code/client/Services/Generic/OverlayClient.cpp
+--- a/Code/client/Services/Generic/OverlayClient.cpp
++++ b/Code/client/Services/Generic/OverlayClient.cpp
+@@ -128,16 +128,16 @@
+     }
+ 
+     uint16_t port = aEventArgs->GetInt(1) ? aEventArgs->GetInt(1) : 10578;
+-    World::Get().GetTransport().SetServerPassword(aEventArgs->GetString(2));
+-
+-    std::string endpoint = baseIp + ":" + std::to_string(port);
+-
+-    World::Get().GetRunner().Queue([endpoint] { World::Get().GetTransport().Connect(endpoint); });
+-}
+-
+-void OverlayClient::ProcessDisconnectMessage()
+-{
+-    World::Get().GetRunner().Queue([]() { World::Get().GetTransport().Close(); });
++    const std::string password=aEventArgs->GetString(2);
++    std::string endpoint = baseIp + ":" + std::to_string(port);
++    World::Get().GetRunner().Queue([endpoint,password] {
++        World::Get().GetTransport().ConnectWorld(endpoint,password);
++    });
++}
++
++void OverlayClient::ProcessDisconnectMessage()
++{
++    World::Get().GetRunner().Queue([]() { World::Get().GetTransport().CloseWorld(); });
+ }
+ 
+ void OverlayClient::ProcessRevealPlayersMessage()
+diff --git a/Code/client/Services/Generic/ObjectService.cpp b/Code/client/Services/Generic/ObjectService.cpp
+--- a/Code/client/Services/Generic/ObjectService.cpp
++++ b/Code/client/Services/Generic/ObjectService.cpp
+@@ -112,18 +112,23 @@
+ 
+ void ObjectService::OnDisconnected(const DisconnectedEvent&) noexcept
+ {
+-    // TODO(cosideci): clear object components
+-}
+-
+-void ObjectService::OnCellChange(const CellChangeEvent& acEvent) noexcept
+-{
+-    if (!m_transport.IsConnected())
+-        return;
+-
+-    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+-    TESObjectCELL* pCell = pPlayer->parentCell;
+-
+-    if (pCell && HomeInstance::PrivateCell(pCell->formID)) return;
++    // Server object IDs are connection-scoped. Remove the entire entities
++    // rather than leaving doors/containers in the actor discovery view.
++    const auto view=m_world.view<ObjectComponent>();
++    Vector<entt::entity> objects(view.begin(),view.end());
++    for (auto entity:objects) if (m_world.valid(entity)) m_world.destroy(entity);
++}
++
++void ObjectService::OnCellChange(const CellChangeEvent& acEvent) noexcept
++{
++    if (!m_transport.IsConnected())
++        return;
++
++    PlayerCharacter* pPlayer = PlayerCharacter::Get();
++    TESObjectCELL* pCell = pPlayer?pPlayer->parentCell:nullptr;
++    if (!pCell) return;
++
++    if (HomeInstance::PrivateCell(pCell->formID)) return;
+     // Player homes should not be synced, so that chest contents,
+     // which are often used as storage, are never accidentally wiped.
+     if (!World::Get().GetServerSettings().SyncPlayerHomes && IsPlayerHome(pCell))
+diff --git a/Code/client/Services/Generic/DiscoveryService.cpp b/Code/client/Services/Generic/DiscoveryService.cpp
+--- a/Code/client/Services/Generic/DiscoveryService.cpp
++++ b/Code/client/Services/Generic/DiscoveryService.cpp
+@@ -131,136 +131,138 @@
+         if (!pCell)
+             pCell = ModManager::Get()->GetCellFromCoordinates(gameCurrentGrid.X, gameCurrentGrid.Y, pWorldSpace, false);
+ 
+-        if (!m_world.GetModSystem().GetServerModId(pCell->formID, cellChangeEvent.CellId))
+-        {
+-            spdlog::error("Failed to find cell id for form id {:X}", pCell->formID);
+-            return;
+-        }
+-
+-        cellChangeEvent.CurrentCoords = gameCurrentGrid;
+-
+-        m_dispatcher.trigger(cellChangeEvent);
+-
+-        m_currentGrid = gameCurrentGrid;
+-    }
+-}
+-
+-void DiscoveryService::VisitInteriorCell(bool aForceTrigger) noexcept
+-{
+-    ResetCachedCellData();
+-
+-    const uint32_t cellId = PlayerCharacter::Get()->GetParentCellEx()->formID;
+-    if (m_interiorCellId != cellId || aForceTrigger)
+-    {
+-        CellChangeEvent cellChangeEvent{};
+-
+-        if (!m_world.GetModSystem().GetServerModId(cellId, cellChangeEvent.CellId))
+-        {
+-            spdlog::error("Failed to find cell id {:X}", cellId);
+-            return;
+-        }
+-
+-        m_dispatcher.trigger(cellChangeEvent);
+-        m_interiorCellId = cellId;
+-    }
+-}
+-
+-void DiscoveryService::DetectGridCellChange(TESWorldSpace* aWorldSpace, bool aNewCellGrid) noexcept
+-{
+-    GridCellChangeEvent changeEvent{};
+-
+-    const uint32_t worldSpaceId = aWorldSpace->formID;
+-    changeEvent.WorldSpaceId = worldSpaceId;
+-
+-    const TES* pTES = TES::Get();
+-    const int32_t startGridX = pTES->centerGridX - GridCellCoords::m_gridsToLoad / 2;
+-    const int32_t startGridY = pTES->centerGridY - GridCellCoords::m_gridsToLoad / 2;
+-
+-    for (int32_t i = 0; i < GridCellCoords::m_gridsToLoad; ++i)
+-    {
+-        for (int32_t j = 0; j < GridCellCoords::m_gridsToLoad; ++j)
+-        {
+-            // If it is a new cell grid, don't check for previously loaded cells.
+-            if (!aNewCellGrid)
+-            {
+-                if (GridCellCoords::IsCellInGridCell(m_centerGrid, {startGridX + i, startGridY + j}, false))
+-                    continue;
+-            }
+-
+-            const TESObjectCELL* pCell = ModManager::Get()->GetCellFromCoordinates(startGridX + i, startGridY + j, aWorldSpace, 0);
+-
+-            if (!pCell)
+-            {
+-                spdlog::warn("Cell not found at coordinates ({}, {}) in worldspace {:X}", startGridX + i, startGridY + j, aWorldSpace->formID);
+-                continue;
+-            }
+-
+-            GameId cellId{};
+-            if (!m_world.GetModSystem().GetServerModId(pCell->formID, cellId))
+-            {
+-                spdlog::error("Failed to find cell id for form id {:X}", pCell->formID);
+-                continue;
+-            }
+-
+-            changeEvent.Cells.push_back(cellId);
+-        }
+-    }
+-
+-    TESObjectCELL* pCell = PlayerCharacter::Get()->GetParentCellEx();
+-    if (!pCell)
+-        pCell = ModManager::Get()->GetCellFromCoordinates(pTES->currentGridX, pTES->currentGridY, aWorldSpace, false);
+-
+-    if (!m_world.GetModSystem().GetServerModId(pCell->formID, changeEvent.PlayerCell))
+-    {
+-        spdlog::error("Failed to find cell id for form id {:X}", pCell->formID);
+-        return;
+-    }
+-
+-    changeEvent.CenterCoords = m_centerGrid = {pTES->centerGridX, pTES->centerGridY};
+-
+-    m_dispatcher.trigger(changeEvent);
+-
+-    m_worldSpaceId = worldSpaceId;
+-}
+-
+-void DiscoveryService::VisitForms() noexcept
+-{
+-    static Set<uint32_t> s_previousForms;
+-    s_previousForms = m_forms;
+-
+-    const auto visitor = [this](TESObjectREFR* apReference)
+-    {
+-        const auto formId = apReference->formID;
+-        m_followerRemovalDeadlines.erase(formId);
+-
+-        if (!m_forms.count(formId))
+-        {
+-            m_forms.insert(formId);
+-
+-            m_dispatcher.enqueue(ActorAddedEvent(formId));
+-        }
+-        else
+-            s_previousForms.erase(formId);
+-    };
+-
+-    ProcessLists* const pProcessLists = ProcessLists::Get();
+-    if (!pProcessLists)
+-        return;
+-
+-    for (uint32_t i = 0; i < pProcessLists->highActorHandleArray.length; ++i)
+-    {
+-        TESObjectREFR* const pRefr = TESObjectREFR::GetByHandle(pProcessLists->highActorHandleArray[i]);
+-        if (pRefr)
+-        {
+-            if (pRefr->GetNiNode())
+-            {
+-                visitor(pRefr);
+-            }
+-        }
+-    }
+-
+-    // Not in actor holder
+-    visitor(PlayerCharacter::Get());
++        if (!pCell) return;
++        if (!m_world.GetModSystem().GetServerModId(pCell->formID, cellChangeEvent.CellId))
++        {
++            spdlog::error("Failed to find cell id for form id {:X}", pCell->formID);
++            return;
++        }
++
++        cellChangeEvent.CurrentCoords = gameCurrentGrid;
++
++        m_dispatcher.trigger(cellChangeEvent);
++
++        m_currentGrid = gameCurrentGrid;
++    }
++}
++
++void DiscoveryService::VisitInteriorCell(bool aForceTrigger) noexcept
++{
++    ResetCachedCellData();
++
++    const uint32_t cellId = PlayerCharacter::Get()->GetParentCellEx()->formID;
++    if (m_interiorCellId != cellId || aForceTrigger)
++    {
++        CellChangeEvent cellChangeEvent{};
++
++        if (!m_world.GetModSystem().GetServerModId(cellId, cellChangeEvent.CellId))
++        {
++            spdlog::error("Failed to find cell id {:X}", cellId);
++            return;
++        }
++
++        m_dispatcher.trigger(cellChangeEvent);
++        m_interiorCellId = cellId;
++    }
++}
++
++void DiscoveryService::DetectGridCellChange(TESWorldSpace* aWorldSpace, bool aNewCellGrid) noexcept
++{
++    GridCellChangeEvent changeEvent{};
++
++    const uint32_t worldSpaceId = aWorldSpace->formID;
++    changeEvent.WorldSpaceId = worldSpaceId;
++
++    const TES* pTES = TES::Get();
++    const int32_t startGridX = pTES->centerGridX - GridCellCoords::m_gridsToLoad / 2;
++    const int32_t startGridY = pTES->centerGridY - GridCellCoords::m_gridsToLoad / 2;
++
++    for (int32_t i = 0; i < GridCellCoords::m_gridsToLoad; ++i)
++    {
++        for (int32_t j = 0; j < GridCellCoords::m_gridsToLoad; ++j)
++        {
++            // If it is a new cell grid, don't check for previously loaded cells.
++            if (!aNewCellGrid)
++            {
++                if (GridCellCoords::IsCellInGridCell(m_centerGrid, {startGridX + i, startGridY + j}, false))
++                    continue;
++            }
++
++            const TESObjectCELL* pCell = ModManager::Get()->GetCellFromCoordinates(startGridX + i, startGridY + j, aWorldSpace, 0);
++
++            if (!pCell)
++            {
++                spdlog::warn("Cell not found at coordinates ({}, {}) in worldspace {:X}", startGridX + i, startGridY + j, aWorldSpace->formID);
++                continue;
++            }
++
++            GameId cellId{};
++            if (!m_world.GetModSystem().GetServerModId(pCell->formID, cellId))
++            {
++                spdlog::error("Failed to find cell id for form id {:X}", pCell->formID);
++                continue;
++            }
++
++            changeEvent.Cells.push_back(cellId);
++        }
++    }
++
++    TESObjectCELL* pCell = PlayerCharacter::Get()->GetParentCellEx();
++    if (!pCell)
++        pCell = ModManager::Get()->GetCellFromCoordinates(pTES->currentGridX, pTES->currentGridY, aWorldSpace, false);
++
++    if (!pCell) return;
++    if (!m_world.GetModSystem().GetServerModId(pCell->formID, changeEvent.PlayerCell))
++    {
++        spdlog::error("Failed to find cell id for form id {:X}", pCell->formID);
++        return;
++    }
++
++    changeEvent.CenterCoords = m_centerGrid = {pTES->centerGridX, pTES->centerGridY};
++
++    m_dispatcher.trigger(changeEvent);
++
++    m_worldSpaceId = worldSpaceId;
++}
++
++void DiscoveryService::VisitForms() noexcept
++{
++    static Set<uint32_t> s_previousForms;
++    s_previousForms = m_forms;
++
++    const auto visitor = [this](TESObjectREFR* apReference)
++    {
++        const auto formId = apReference->formID;
++        m_followerRemovalDeadlines.erase(formId);
++
++        if (!m_forms.count(formId))
++        {
++            m_forms.insert(formId);
++
++            m_dispatcher.enqueue(ActorAddedEvent(formId));
++        }
++        else
++            s_previousForms.erase(formId);
++    };
++
++    ProcessLists* const pProcessLists = ProcessLists::Get();
++    if (!pProcessLists)
++        return;
++
++    for (uint32_t i = 0; i < pProcessLists->highActorHandleArray.length; ++i)
++    {
++        TESObjectREFR* const pRefr = TESObjectREFR::GetByHandle(pProcessLists->highActorHandleArray[i]);
++        if (pRefr)
++        {
++            if (pRefr->GetNiNode())
++            {
++                visitor(pRefr);
++            }
++        }
++    }
++
++    // Not in actor holder
++    if (auto* player=PlayerCharacter::Get()) visitor(player);
+ 
+     constexpr auto cFollowerLoadGrace = std::chrono::milliseconds(1500);
+     const auto cNow = std::chrono::steady_clock::now();
+diff --git a/Code/client/Services/Generic/PartyService.cpp b/Code/client/Services/Generic/PartyService.cpp
+--- a/Code/client/Services/Generic/PartyService.cpp
++++ b/Code/client/Services/Generic/PartyService.cpp
+@@ -103,6 +103,7 @@
+ {
+     DestroyParty();
+     m_invitations.clear();
++    m_players.clear();
+     m_nextUpdate = 0;
+ }
+ 
+diff --git a/Code/client/Services/Generic/OverlayService.cpp b/Code/client/Services/Generic/OverlayService.cpp
+--- a/Code/client/Services/Generic/OverlayService.cpp
++++ b/Code/client/Services/Generic/OverlayService.cpp
+@@ -362,7 +362,7 @@
+     m_dismissedTalk = 0;
+     m_conversations.clear();
+     ClearDialogueHud();
+-    m_pOverlay->ExecuteAsync("disconnect");
++    if (m_pOverlay) m_pOverlay->ExecuteAsync("disconnect");
+ }
+ 
+ void OverlayService::OnWaitingFor3DRemoved(entt::registry& aRegistry, entt::entity aEntity) const noexcept

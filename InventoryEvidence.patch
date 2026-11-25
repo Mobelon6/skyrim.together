@@ -1,0 +1,502 @@
+diff --git a/Code/client/Services/Generic/InventoryService.cpp b/Code/client/Services/Generic/InventoryService.cpp
+--- a/Code/client/Services/Generic/InventoryService.cpp
++++ b/Code/client/Services/Generic/InventoryService.cpp
+@@ -11,6 +11,13 @@
+ #include <Messages/NotifyDrawWeapon.h>
+ 
+ #include <Events/UpdateEvent.h>
++#include <Events/DisconnectedEvent.h>
++#include <Services/CampaignAccess.h>
++#include <Components/TESContainer.h>
++#include <ExtraData/ExtraContainerChanges.h>
++#include <cstdlib>
++#include <algorithm>
++#include <set>
+ #include <Events/InventoryChangeEvent.h>
+ #include <Events/EquipmentChangeEvent.h>
+ 
+@@ -40,13 +47,196 @@
+     m_inventoryChangeConnection = m_dispatcher.sink<NotifyInventoryChanges>().connect<&InventoryService::OnNotifyInventoryChanges>(this);
+     m_equipmentChangeConnection = m_dispatcher.sink<NotifyEquipmentChanges>().connect<&InventoryService::OnNotifyEquipmentChanges>(this);
+     m_inventorySnapshotConnection = m_dispatcher.sink<NotifyInventorySnapshot>().connect<&InventoryService::OnNotifyInventorySnapshot>(this);
++    const auto* evidence=std::getenv("STM_INVENTORY_EVIDENCE");
++    if (evidence && std::string_view(evidence)=="1")
++    {
++        if (auto* events=EventDispatcherManager::Get())
++        {
++            m_evidenceEnabled=true;
++            m_evidenceDisconnect=m_dispatcher.sink<DisconnectedEvent>().connect<&InventoryService::OnEvidenceDisconnected>(this);
++            events->containerChangedEvent.RegisterSink(this);
++            spdlog::info("STM inventory evidence enabled: diagnostic only, not campaign history");
++        }
++    }
+ }
+ 
+ void InventoryService::OnUpdate(const UpdateEvent& acUpdateEvent) noexcept
+ {
+     RunWeaponStateUpdates();
++    if (m_evidenceEnabled) ObserveInventory();
+ }
+ 
++namespace
++{
++std::optional<InventoryEvidence::Counts> ReadCounts(TESObjectREFR& object)
++{
++    // Same base + runtime count representation used by STR inventory sync.
++    // Do not dereference the extra-data lists or try to identify unique items.
++    InventoryEvidence::Counts result;
++    const auto* base=object.GetContainer();
++    const auto* changes=object.GetContainerChanges();
++    if (!base || (base->count && !base->entries) || (changes && !changes->entries)) return {};
++    for (uint32_t i=0;i<base->count;++i)
++    {
++        const auto* entry=base->entries[i];
++        if (!entry || !entry->form) continue;
++        if (!InventoryEvidence::Accumulate(result,entry->form->formID,static_cast<int32_t>(entry->count))) return {};
++    }
++    if (changes)
++        for (const auto* entry:*changes->entries)
++        {
++            if (!entry || !entry->form) continue;
++            if (!InventoryEvidence::Accumulate(result,entry->form->formID,entry->count)) return {};
++        }
++    for (const auto& [id,count]:result)
++        if (count<0 || count>INT32_MAX) return {};
++    return result;
++}
++
++// Resolve names on the game thread, without relying on the transient server mod IDs.
++std::vector<InventoryEvidence::PluginSlot> ReadPluginSlots()
++{
++    std::vector<InventoryEvidence::PluginSlot> result;
++    if (auto* manager=ModManager::Get())
++        for (const auto* mod:manager->mods)
++        {
++            if (!mod || !mod->IsLoaded()) continue;
++            const auto* end=std::find(mod->filename,mod->filename+sizeof(mod->filename),'\0');
++            if (end==mod->filename+sizeof(mod->filename)) continue;
++            result.push_back({mod->GetId(),mod->IsLite(),std::string(mod->filename,end)});
++        }
++    return result;
++}
++
++std::string KeyLabel(uint32_t form,const std::vector<InventoryEvidence::PluginSlot>& slots)
++{
++    if (form==InventoryEvidence::Player) return "local-player";
++    if (!form) return "no-endpoint";
++    auto key=InventoryEvidence::Resolve(form,slots);
++    return key ? fmt::format("{}:{:X}",key->Plugin,key->Local) : "unresolved";
++}
++
++InventoryEvidence::Endpoints ReadEndpoints(World& world,PlayerCharacter& player,
++    const std::vector<InventoryEvidence::Transfer>& events,const InventoryEvidence::Endpoints& previous)
++{
++    // Only inspect loaded, registered static containers in the player's current cell.
++    // Do not resolve arbitrary event handles or read remote actor inventories.
++    std::set<uint32_t> preferred;
++    for (const auto& e:events)
++    {
++        if (e.Source!=InventoryEvidence::Player && e.Source) preferred.insert(e.Source);
++        if (e.Destination!=InventoryEvidence::Player && e.Destination) preferred.insert(e.Destination);
++    }
++    struct Candidate { uint32_t Form,Server; entt::entity Entity; int Priority; };
++    std::vector<Candidate> candidates;
++    auto view=world.view<FormIdComponent,ObjectComponent>();
++    for (auto entity:view)
++    {
++        const auto id=view.get<FormIdComponent>(entity).Id;
++        if (!id || (id>>24)==0xFF) continue;
++        const auto server=view.get<ObjectComponent>(entity).Id;
++        const int priority=preferred.count(id)?0:previous.count(id)?1:2;
++        candidates.push_back({id,server,entity,priority});
++    }
++    std::sort(candidates.begin(),candidates.end(),[](const auto& a,const auto& b)
++    {
++        if (a.Priority!=b.Priority) return a.Priority<b.Priority;
++        return a.Form<b.Form;
++    });
++    InventoryEvidence::Endpoints result;
++    for (const auto& candidate:candidates)
++    {
++        if (result.size()>=InventoryEvidence::MaxEndpoints) break;
++        auto* object=Cast<TESObjectREFR>(TESForm::GetById(candidate.Form));
++        if (!object || !object->baseForm || object->baseForm->formType!=FormType::Container ||
++            object->IsDeleted() || object->IsDisabled() || object->IsStillLoading() ||
++            object->parentCell!=player.parentCell || !object->GetNiNode()) continue;
++        auto counts=ReadCounts(*object);
++        if (!counts) continue;
++        result.emplace(candidate.Form,InventoryEvidence::Endpoint{
++            candidate.Server,static_cast<uint32_t>(candidate.Entity),std::move(*counts)});
++    }
++    return result;
++}
++}
++
++BSTEventResult InventoryService::OnEvent(const TESContainerChangedEvent* event,const EventDispatcher<TESContainerChangedEvent>*)
++{
++    // The engine may dispatch on job threads. Copy scalar evidence only;
++    // Runner drops callbacks belonging to the previous world/session.
++    if (!event || (event->oldContainerID!=InventoryEvidence::Player && event->newContainerID!=InventoryEvidence::Player))
++        return BSTEventResult::kOk;
++    const InventoryEvidence::Transfer copy{event->oldContainerID,event->newContainerID,event->baseObjectID,
++        event->itemCount,event->referenceHandle,event->uniqueID,ScopedInventoryOverride::IsOverriden()};
++    m_world.GetRunner().Queue([this,copy]()
++    {
++        if (!m_transport.IsOnline()) return;
++        if (m_evidenceEvents.size()>=InventoryEvidence::MaxEvents)
++            m_evidenceOverflow=true;
++        else m_evidenceEvents.push_back(copy);
++    });
++    return BSTEventResult::kOk;
++}
++
++void InventoryService::ResetEvidence() noexcept
++{
++    if (m_evidenceBaseline || !m_evidenceEvents.empty() || m_evidenceOverflow)
++        spdlog::info("STM inventory evidence gap/reset: discarded events={}",m_evidenceEvents.size());
++    m_evidenceBaseline.reset();
++    m_evidenceEndpoints.clear();
++    m_evidenceEvents.clear();
++    m_evidenceOverflow=false;
++    m_evidenceNext={};
++}
++
++void InventoryService::OnEvidenceDisconnected(const DisconnectedEvent&) noexcept
++{
++    ResetEvidence();
++}
++
++void InventoryService::ObserveInventory() noexcept
++{
++    if (!m_transport.IsOnline() || !CampaignAccess::GameReady())
++    {
++        ResetEvidence();
++        return;
++    }
++    const auto now=std::chrono::steady_clock::now();
++    if (now<m_evidenceNext) return;
++    m_evidenceNext=now+std::chrono::seconds(1);
++    auto* player=PlayerCharacter::Get();
++    auto current=player ? ReadCounts(*player) : std::nullopt;
++    if (!current)
++    {
++        ResetEvidence();
++        return;
++    }
++    auto endpoints=ReadEndpoints(m_world,*player,m_evidenceEvents,m_evidenceEndpoints);
++    if (m_evidenceBaseline && !m_evidenceOverflow)
++    {
++        const auto result=InventoryEvidence::Compare(*m_evidenceBaseline,*current,m_evidenceEvents);
++        const auto slots=ReadPluginSlots();
++        for (const auto& e:m_evidenceEvents)
++            spdlog::info("STM inventory event src={:X} dst={:X} base={:X} count={} handle={:X} unique={} override={} srcKey={} dstKey={} itemKey={}",
++                e.Source,e.Destination,e.Item,e.Count,e.Reference,e.Unique,e.Override,
++                KeyLabel(e.Source,slots),KeyLabel(e.Destination,slots),KeyLabel(e.Item,slots));
++        for (const auto& row:result.Rows)
++            spdlog::info("STM inventory net base={:X} before={} after={} eventNet={} status={}",
++                row.Item,row.Before,row.After,row.Expected,InventoryEvidence::Label(row.State));
++        for (const auto& row:InventoryEvidence::CompareEndpoints(m_evidenceEndpoints,endpoints,m_evidenceEvents,result))
++            spdlog::info("STM inventory counterpart ref={} item={} playerNet={} counterpartNet={} status={}",
++                KeyLabel(row.Container,slots),KeyLabel(row.Item,slots),row.PlayerNet,row.OtherNet,
++                InventoryEvidence::PairLabel(row.State));
++        if (!result.Valid) spdlog::warn("STM inventory evidence batch invalid; no transaction inferred");
++    }
++    else if (!m_evidenceEvents.empty() || m_evidenceOverflow)
++        spdlog::warn("STM inventory evidence gap: no baseline or overflow, events={}",m_evidenceEvents.size());
++    m_evidenceBaseline=std::move(current);
++    m_evidenceEndpoints=std::move(endpoints);
++    m_evidenceEvents.clear();
++    m_evidenceOverflow=false;
++}
++
+ void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEvent) noexcept
+ {
+     if (!m_transport.IsConnected())
+diff --git a/Code/client/Services/InventoryService.h b/Code/client/Services/InventoryService.h
+--- a/Code/client/Services/InventoryService.h
++++ b/Code/client/Services/InventoryService.h
+@@ -1,9 +1,15 @@
+ #pragma once
+ 
++#include <Games/Events.h>
++#include <InventoryEvidence.h>
++#include <chrono>
++#include <optional>
++
+ struct World;
+ struct TransportService;
+ 
+ struct UpdateEvent;
++struct DisconnectedEvent;
+ struct NotifyObjectInventoryChanges;
+ struct NotifyInventoryChanges;
+ struct InventoryChangeEvent;
+@@ -23,7 +29,7 @@
+  * The InventoryService manages any changes to both the current equipment of actors,
+  * and the contents of both actor and object inventories.
+  */
++struct InventoryService : BSTEventSink<TESContainerChangedEvent>
+-struct InventoryService
+ {
+     InventoryService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept;
+     ~InventoryService() noexcept = default;
+@@ -67,6 +73,18 @@
+     static void ApplyEquipmentChange(Actor* apActor, const NotifyEquipmentChanges& acMessage) noexcept;
+ 
+ private:
++    BSTEventResult OnEvent(const TESContainerChangedEvent*, const EventDispatcher<TESContainerChangedEvent>*) override;
++    void OnEvidenceDisconnected(const DisconnectedEvent&) noexcept;
++    void ObserveInventory() noexcept;
++    void ResetEvidence() noexcept;
++    bool m_evidenceEnabled{};
++    bool m_evidenceOverflow{};
++    std::optional<InventoryEvidence::Counts> m_evidenceBaseline;
++    InventoryEvidence::Endpoints m_evidenceEndpoints;
++    std::vector<InventoryEvidence::Transfer> m_evidenceEvents;
++    std::chrono::steady_clock::time_point m_evidenceNext{};
++    entt::scoped_connection m_evidenceDisconnect;
++
+     /**
+      * Checks whether local actors their weapon draw states have changed,
+      * and if so, send the new states to the server.
+diff --git a/Code/client/Games/Skyrim/Events/EventDispatcher.h b/Code/client/Games/Skyrim/Events/EventDispatcher.h
+--- a/Code/client/Games/Skyrim/Events/EventDispatcher.h
++++ b/Code/client/Games/Skyrim/Events/EventDispatcher.h
+@@ -68,8 +68,15 @@
+ {
+     uint32_t oldContainerID;
+     uint32_t newContainerID;
++    uint32_t baseObjectID;
++    int32_t itemCount;
++    uint32_t referenceHandle;
++    uint16_t uniqueID;
++    uint16_t pad16;
+-    uint8_t pad8[0xC];
+ };
++static_assert(sizeof(TESContainerChangedEvent) == 0x18);
++static_assert(offsetof(TESContainerChangedEvent, baseObjectID) == 0x8);
++static_assert(offsetof(TESContainerChangedEvent, referenceHandle) == 0x10);
+ 
+ struct TESDeathEvent
+ {
+diff --git a/Code/client/Games/Skyrim/Components/TESContainer.cpp b/Code/client/Games/Skyrim/Components/TESContainer.cpp
+--- a/Code/client/Games/Skyrim/Components/TESContainer.cpp
++++ b/Code/client/Games/Skyrim/Components/TESContainer.cpp
+@@ -2,9 +2,10 @@
+ 
+ int64_t TESContainer::GetItemCount(TESForm* apItem) const noexcept
+ {
++    int64_t total=0;
++    if (!apItem || !entries) return total;
++    for (uint32_t i=0;i<count;++i)
++        if (const auto* entry=entries[i]; entry && entry->form==apItem)
++            total+=static_cast<int32_t>(entry->count);
++    return total;
+-    TP_THIS_FUNCTION(TGetItemCount, int64_t, const TESContainer);
+-
+-    POINTER_SKYRIMSE(TGetItemCount, s_getItemCount, 14529);
+-
+-    return TiltedPhoques::ThisCall(s_getItemCount, this);
+ }
+diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyrim/TESObjectREFR.cpp
+--- a/Code/client/Games/Skyrim/TESObjectREFR.cpp
++++ b/Code/client/Games/Skyrim/TESObjectREFR.cpp
+@@ -476,20 +476,15 @@
+ 
+ int64_t TESObjectREFR::GetItemCountInInventory(TESForm* apItem) const noexcept
+ {
++    if (!apItem) return 0;
++    const auto* base=GetContainer();
++    int64_t count=base ? base->GetItemCount(apItem) : 0;
+-    int64_t count = GetContainer()->GetItemCount(apItem);
+ 
++    const auto* changes=GetContainerChanges();
++    if (changes && changes->entries)
++        for (const auto* change:*changes->entries)
++            if (change && change->form && change->form->formID==apItem->formID)
++                count+=change->count;
+-    auto* pContainerChanges = GetContainerChanges()->entries;
+-    for (auto pChange : *pContainerChanges)
+-    {
+-        if (pChange && pChange->form)
+-        {
+-            if (pChange->form->formID == apItem->formID)
+-            {
+-                count += pChange->count;
+-                break;
+-            }
+-        }
+-    }
+ 
+     return count;
+ }
+diff --git a/Code/common/InventoryEvidence.h b/Code/common/InventoryEvidence.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/InventoryEvidence.h
+@@ -0,0 +1,165 @@
++#pragma once
++#include <cstdint>
++#include <cstddef>
++#include <limits>
++#include <map>
++#include <vector>
++#include <optional>
++#include <string>
++#include <utility>
++
++namespace InventoryEvidence
++{
++inline constexpr uint32_t Player=0x14;
++inline constexpr std::size_t MaxEvents=4096;
++using Counts=std::map<uint32_t,int64_t>;
++struct Transfer
++{
++    uint32_t Source{},Destination{},Item{};
++    int32_t Count{};
++    uint32_t Reference{};
++    uint16_t Unique{};
++    bool Override{};
++};
++enum class Status { MatchedNet, Unexplained, Mismatch, Invalid };
++struct Row { uint32_t Item; int64_t Before,After,Expected; Status State; };
++struct Batch { bool Valid=true; std::vector<Row> Rows; };
++inline const char* Label(enum Status status)
++{
++    switch(status)
++    {
++        case Status::MatchedNet:return "matched-net-only";
++        case Status::Unexplained:return "unexplained";
++        case Status::Mismatch:return "mismatch";
++        default:return "invalid";
++    }
++}
++inline bool Accumulate(Counts& counts,uint32_t id,int64_t delta)
++{
++    if (!id) return false;
++    auto& value=counts[id];
++    if ((delta>0 && value>std::numeric_limits<int64_t>::max()-delta) ||
++        (delta<0 && value<std::numeric_limits<int64_t>::min()-delta)) return false;
++    value+=delta;
++    return true;
++}
++inline Batch Compare(const Counts& before,const Counts& after,const std::vector<Transfer>& events)
++{
++    Batch result;
++    Counts expected,keys;
++    for (const auto& [id,n]:before) { keys[id]=0; if (!id || n<0 || n>INT32_MAX) result.Valid=false; }
++    for (const auto& [id,n]:after) { keys[id]=0; if (!id || n<0 || n>INT32_MAX) result.Valid=false; }
++    if (events.size()>MaxEvents) result.Valid=false;
++    for (const auto& event:events)
++    {
++        const bool from=event.Source==Player,to=event.Destination==Player;
++        if (!event.Item || event.Count<=0 || (!from && !to))
++        { result.Valid=false; continue; }
++        keys[event.Item]=0;
++        if (!Accumulate(expected,event.Item,(to?int64_t(event.Count):0)-(from?int64_t(event.Count):0)))
++            result.Valid=false;
++    }
++    const auto value=[](const Counts& counts,uint32_t id){ auto i=counts.find(id);return i==counts.end()?int64_t(0):i->second; };
++    for (const auto& [id,unused]:keys)
++    {
++        const auto old=value(before,id),now=value(after,id),delta=value(expected,id);
++        const bool observed=expected.count(id)!=0;
++        if (!observed && old==now) continue;
++        // Agreement is aggregate count evidence, never proof of a unique item,
++        // the other endpoint, ordering, or an authoritative operation.
++        const auto status=!result.Valid ? Status::Invalid : !observed ? Status::Unexplained :
++            now-old==delta ? Status::MatchedNet : Status::Mismatch;
++        result.Rows.push_back({id,old,now,delta,status});
++    }
++    return result;
++}
++
++inline constexpr std::size_t MaxEndpoints=16;
++struct PluginSlot { uint16_t Index; bool Light; std::string Name; };
++struct FormKey { std::string Plugin; uint32_t Local; };
++inline std::string CanonicalPlugin(std::string name)
++{
++    for (auto& ch:name) if (ch>='A' && ch<='Z') ch=static_cast<char>(ch-'A'+'a');
++    return name;
++}
++inline std::optional<FormKey> Resolve(uint32_t form,const std::vector<PluginSlot>& slots)
++{
++    if (!form || (form>>24)==0xFF) return {};
++    const bool light=(form>>24)==0xFE;
++    const auto index=static_cast<uint16_t>(light ? ((form>>12)&0xFFF) : (form>>24));
++    const auto local=form&(light?0xFFFu:0xFFFFFFu);
++    if (!local) return {};
++    const PluginSlot* found=nullptr;
++    for (const auto& slot:slots)
++        if (slot.Light==light && slot.Index==index)
++        {
++            if (found || slot.Name.empty()) return {};
++            found=&slot;
++        }
++    if (!found) return {};
++    const auto name=CanonicalPlugin(found->Name);
++    // A duplicate filename in the effective table is ambiguous even if the slot is unique.
++    for (const auto& slot:slots)
++        if (&slot!=found && CanonicalPlugin(slot.Name)==name) return {};
++    return FormKey{name,local};
++}
++
++struct Endpoint { uint32_t Server,Entity; Counts Items; };
++using Endpoints=std::map<uint32_t,Endpoint>;
++enum class PairStatus { MatchedBothNets, MissingSnapshot, ChangedEndpoint, PlayerMismatch, OtherMismatch, Invalid };
++struct PairRow { uint32_t Container,Item; int64_t PlayerNet,OtherNet; PairStatus State; };
++inline const char* PairLabel(PairStatus s)
++{
++    switch(s)
++    {
++        case PairStatus::MatchedBothNets:return "matched-both-nets-only";
++        case PairStatus::MissingSnapshot:return "missing-counterpart-snapshot";
++        case PairStatus::ChangedEndpoint:return "changed-counterpart-entity";
++        case PairStatus::PlayerMismatch:return "player-net-unverified";
++        case PairStatus::OtherMismatch:return "counterpart-net-mismatch";
++        default:return "invalid";
++    }
++}
++inline std::vector<PairRow> CompareEndpoints(const Endpoints& before,const Endpoints& after,
++    const std::vector<Transfer>& events,const Batch& player)
++{
++    std::map<std::pair<uint32_t,uint32_t>,int64_t> expected;
++    for (const auto& e:events)
++    {
++        if (!e.Item || e.Count<=0) continue;
++        const bool from=e.Source==Player,to=e.Destination==Player;
++        if (from==to) continue;
++        const auto counterpart=from?e.Destination:e.Source;
++        if (!counterpart || (counterpart>>24)==0xFF) continue;
++        expected[{counterpart,e.Item}]+=from?-int64_t(e.Count):int64_t(e.Count);
++    }
++    std::vector<PairRow> result;
++    const auto value=[](const Counts& counts,uint32_t id)
++    {
++        auto it=counts.find(id);return it==counts.end()?int64_t(0):it->second;
++    };
++    for (const auto& [key,net]:expected)
++    {
++        const auto [container,item]=key;
++        PairRow row{container,item,net,0,PairStatus::MissingSnapshot};
++        const auto old=before.find(container),now=after.find(container);
++        bool playerMatched=false;
++        for (const auto& p:player.Rows)
++            if (p.Item==item) playerMatched=p.State==Status::MatchedNet;
++        if (!player.Valid) row.State=PairStatus::Invalid;
++        else if (!playerMatched) row.State=PairStatus::PlayerMismatch;
++        else if (old!=before.end() && now!=after.end())
++        {
++            if (old->second.Server!=now->second.Server || old->second.Entity!=now->second.Entity)
++                row.State=PairStatus::ChangedEndpoint;
++            else
++            {
++                row.OtherNet=value(now->second.Items,item)-value(old->second.Items,item);
++                row.State=row.OtherNet==-net?PairStatus::MatchedBothNets:PairStatus::OtherMismatch;
++            }
++        }
++        result.push_back(row);
++    }
++    return result;
++}
++}

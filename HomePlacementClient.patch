@@ -1,0 +1,695 @@
+diff --git a/Code/client/Services/HomePlacementClient.h b/Code/client/Services/HomePlacementClient.h
+new file mode 100644
+--- /dev/null
++++ b/Code/client/Services/HomePlacementClient.h
+@@ -0,0 +1,20 @@
++#pragma once
++#include <HomeSnapshot.h>
++#include <cstdint>
++struct World;
++struct TESObjectREFR;
++struct TESBoundObject;
++struct ExtraDataList;
++struct NiPoint3;
++namespace HomePlacementClient
++{
++bool Tracked(const TESObjectREFR*) noexcept;
++bool LegacyBlocked(const TESObjectREFR*) noexcept;
++std::optional<HomeSnapshot::LegacyStack> CaptureLegacy(TESObjectREFR&);
++bool Scoped(const TESObjectREFR*) noexcept;
++bool InterceptDrop(const TESObjectREFR*,const TESBoundObject*,ExtraDataList*,int32_t,
++                   const NiPoint3*,const NiPoint3*) noexcept;
++void Update(World&) noexcept;
++void Clear() noexcept;
++void Forget() noexcept;
++}
+diff --git a/Code/client/Services/Generic/PartyTrade.cpp b/Code/client/Services/Generic/PartyTrade.cpp
+--- a/Code/client/Services/Generic/PartyTrade.cpp
++++ b/Code/client/Services/Generic/PartyTrade.cpp
+@@ -23,7 +23,9 @@
+ #include <Services/HomeInventory.h>
+ #include <Services/HomeProjection.h>
+ #include <Services/HomeInstance.h>
+-#include <Services/HomeActorProtection.h>
++#include <Services/HomeActorProtection.h>
++#include <Services/HomePlacementClient.h>
++#include <mutex>
+ #include <Forms/TESObjectCELL.h>
+ #include <ExtraData/ExtraCount.h>
+ #include <ExtraData/ExtraHealth.h>
+@@ -257,7 +259,9 @@
+     TESBoundObject* item,int32_t count,ITEM_REMOVE_REASON reason,ExtraDataList* extra,TESObjectREFR* to,
+     const NiPoint3* drop,const NiPoint3* rotate)
+ {
+-    if (NativeTrade::BlockRemove(from,to,item,count,extra))
++    if ((!to && reason==ITEM_REMOVE_REASON::kDropping &&
++         HomePlacementClient::InterceptDrop(from,item,extra,count,drop,rotate)) ||
++        NativeTrade::BlockRemove(from,to,item,count,extra))
+     {
+         if (result) result->handle.iBits=0;
+         return result;
+@@ -1194,7 +1198,156 @@
+ 
+ namespace
+ {
+-struct ManagedContainer {uint32_t Slot{};TradeProperties::FormKey Ref;bool Ready{};};
++// Projection identity is transient; only the ledger account is persistent.
++struct PlacementDisplay
++{
++    uint32_t Ref{},Handle{},Base{},Cell{},Revision{};
++    HomePlacement::Pose Committed{};
++    std::optional<HomePlacement::Pose> Pending;
++    Clock::time_point Retry{},ObserveUntil{};
++    bool Grabbed{};
++};
++std::map<std::string,PlacementDisplay> placedDisplays;
++std::mutex placementGuard;
++std::map<uint32_t,const TESObjectREFR*> protectedPlacements;
++std::set<uint32_t> legacySources;
++std::atomic_uint32_t legacyCheckedCell{};
++std::set<uint32_t> reportedLegacyConflicts;
++uint64_t displayCampaign{},displayCharacter{};
++uint32_t displaySlot{},displayCell{};
++std::atomic_uint64_t placementEpoch{1};
++Clock::time_point placementAt{};
++TESObjectREFR* DisplayRef(const PlacementDisplay& d) noexcept
++{
++    if (!d.Ref) return nullptr;
++    const TESObjectREFR* expected{};
++    {
++        std::scoped_lock lock(placementGuard);
++        const auto it=protectedPlacements.find(d.Ref);
++        if (it==protectedPlacements.end()) return nullptr;
++        expected=it->second;
++    }
++    // A detached cell may invalidate the old handle. Resolve only the
++    // exact previously registered object, not a new object of the same base.
++    auto* r=d.Handle?TESObjectREFR::GetByHandle(d.Handle):nullptr;
++    if (r!=expected) r=Cast<TESObjectREFR>(TESForm::GetById(d.Ref));
++    if (!r || r!=expected || r->formID!=d.Ref || !r->IsTemporary() ||
++        r->IsDeleted() || !r->baseForm || r->baseForm->formID!=d.Base) return nullptr;
++    return r;
++}
++auto FindPlacement(const TESObjectREFR* r)
++{
++    return std::find_if(placedDisplays.begin(),placedDisplays.end(),[&](const auto& entry)
++    {return r && entry.second.Ref==r->formID && DisplayRef(entry.second)==r;});
++}
++void ForgetGuard(uint32_t form)
++{
++    std::scoped_lock lock(placementGuard);protectedPlacements.erase(form);
++}
++void ErasePlacement(std::map<std::string,PlacementDisplay>::iterator it)
++{
++    auto* r=DisplayRef(it->second);
++    const auto form=it->second.Ref;
++    // Keep the pickup guard until the physical reference is disabled.
++    if (r) {r->Disable();r->Delete();}
++    ForgetGuard(form);
++    placedDisplays.erase(it);
++}
++HomePlacement::Pose PlacementPose(const NiPoint3& p,const NiPoint3& r)
++{
++    return {std::bit_cast<uint32_t>(p.x),std::bit_cast<uint32_t>(p.y),std::bit_cast<uint32_t>(p.z),
++            std::bit_cast<uint32_t>(r.x),std::bit_cast<uint32_t>(r.y),std::bit_cast<uint32_t>(r.z)};
++}
++NiPoint3 PlacementPoint(const HomePlacement::Pose& pose,size_t i)
++{return glm::vec3{std::bit_cast<float>(pose[i]),std::bit_cast<float>(pose[i+1]),std::bit_cast<float>(pose[i+2])};}
++uint32_t ScopedSlot(const TESObjectREFR* r) noexcept
++{
++    const auto* cell=r?r->GetParentCellEx():nullptr;
++    uint32_t mod{},base{};
++    return cell && HomeInstance::Encode(cell->formID,mod,base) && HomeRegistry::Scoped(mod)?
++        mod&HomeRegistry::MaxSlot:0;
++}
++bool SameLegacyItem(const HomeSnapshot::LegacyStack& a,const HomeSnapshot::LegacyStack& b)
++{
++    return a.Source==b.Source && a.Value.Base.Encode()==b.Value.Base.Encode() &&
++        a.Value.Count==b.Value.Count && a.Value.Variant==b.Value.Variant;
++}
++bool SetDisplayCount(ExtraDataList& extra,uint32_t count)
++{
++    if (!count || count>9999 || VersionDb::Get().GetLoadedVersionString()!="1.6.1170.0") return false;
++    if (auto* data=extra.GetByType(ExtraDataType::Count))
++        static_cast<ExtraCount*>(data)->count=static_cast<int16_t>(count);
++    else if (count!=1)
++    {
++        // CommonLibSSE-NG ExtraCount constructor, AE vtable ID 186679.
++        auto** table=Address<void*>(186679);
++        MEMORY_BASIC_INFORMATION info{};
++        if (!table || !VirtualQuery(table,&info,sizeof(info)) || info.State!=MEM_COMMIT ||
++            (info.Protect&(PAGE_GUARD|PAGE_NOACCESS)) ||
++            reinterpret_cast<uintptr_t>(table)+3*sizeof(void*)>reinterpret_cast<uintptr_t>(info.BaseAddress)+info.RegionSize ||
++            !table[0] || !table[1] || !table[2]) return false;
++        auto* data=Memory::Allocate<ExtraCount>();
++        if (!data) return false;
++        std::memset(static_cast<void*>(data),0,sizeof(*data));
++        *reinterpret_cast<void***>(data)=table;
++        data->count=static_cast<int16_t>(count);
++        if (!extra.Add(ExtraDataType::Count,data)) {Memory::Free(data);return false;}
++    }
++    const auto* stored=extra.GetByType(ExtraDataType::Count);
++    return stored?static_cast<const ExtraCount*>(stored)->count==static_cast<int>(count):count==1;
++}
++bool ApplyDisplayProperties(TESObjectREFR& ref,const HomeSnapshot::Item& item)
++{
++    auto props=TradeProperties::Decode(item.Variant);
++    auto* list=ref.GetExtraDataList();
++    if (!props || !list || !PropertiesAvailable(*props) || !SetDisplayCount(*list,item.Count)) return false;
++    auto* enchant=(props->Mask&props->HasEnchant)?(props->Created?RecreateEnchant(*props->Created):
++        PropertyForm<EnchantmentItem>(props->Enchant)):nullptr;
++    auto* poison=(props->Mask&props->HasPoison)?PropertyForm<AlchemyItem>(props->Poison):nullptr;
++    if (((props->Mask&props->HasEnchant)&&!enchant) || ((props->Mask&props->HasPoison)&&!poison)) return false;
++    if (props->Mask&props->HasHealth) list->SetHealth(std::bit_cast<float>(props->Health));
++    if (props->Mask&props->HasCharge) list->SetChargeData(std::bit_cast<float>(props->Charge));
++    if (props->Mask&props->HasSoul) list->SetSoulData(static_cast<SOUL_LEVEL>(props->Soul));
++    if (enchant) list->SetEnchantmentData(enchant,static_cast<uint16_t>(props->EnchantCharge),props->RemoveOnUnequip!=0);
++    if (poison) list->SetPoison(poison,props->PoisonCount);
++    if ((props->Mask&props->HasName) && !SetCustomName(*list,props->Name)) return false;
++    if ((props->Mask&props->HasOwnership) && !SetTradeOwner(*list,props->Owner)) return false;
++    return true;
++}
++bool SpawnPlacement(TESObjectCELL& cell,const HomePlacement::Stack& stack,PlacementDisplay& display)
++{
++    auto* base=ResolvePropertyForm(stack.Item.Base);
++    auto* mods=ModManager::Get();
++    if (!mods || !base || base->IsTemporary() || !Cast<TESBoundObject>(base) ||
++        !HomeSnapshot::LooseType(static_cast<uint32_t>(base->formType))) return false;
++    auto p=PlacementPoint(stack.Position,0),r=PlacementPoint(stack.Position,3);
++    const auto handle=mods->SpawnObject(p,r,&cell,base);
++    auto* ref=handle?TESObjectREFR::GetByHandle(handle):nullptr;
++    if (!ref || !ref->IsTemporary() || ref->baseForm!=base) return false;
++    ref->SetSkipSaveFlag(true);
++    const auto form=ref->formID;
++    {std::scoped_lock lock(placementGuard);protectedPlacements[form]=ref;}
++    if (ref->GetParentCellEx()!=&cell || ref->GetHandle().handle.iBits!=handle || !ApplyDisplayProperties(*ref,stack.Item))
++    {ref->Disable();ref->Delete();ForgetGuard(form);return false;}
++    display.Ref=form;display.Handle=handle;display.Base=base->formID;display.Cell=cell.formID;
++    display.Revision=stack.Revision;display.Committed=stack.Position;
++    return true;
++}
++void ApplyPlacementPose(TESObjectREFR& ref,TESObjectCELL& cell,const HomePlacement::Pose& pose)
++{
++    const auto r=PlacementPoint(pose,3);
++    ref.SetRotation(r.x,r.y,r.z);
++    ref.MoveTo(&cell,PlacementPoint(pose,0));
++}
++uint32_t GrabbedHandle(const PlayerCharacter& player) noexcept
++{
++    // CommonLibSSE-NG GetGrabbedRef: ObjectRefHandle at 0x8D0 for 1.6.629+.
++    if (VersionDb::Get().GetLoadedVersionString()!="1.6.1170.0") return 0;
++    uint32_t handle{};
++    std::memcpy(&handle,reinterpret_cast<const uint8_t*>(&player)+0x8D0,sizeof(handle));
++    return handle;
++}
++struct ManagedContainer {uint32_t Slot{};TradeProperties::FormKey Ref;bool Ready{};};
+ std::optional<ManagedContainer> ManagedHome(const TESObjectREFR* object)
+ {
+     if (!object || !object->baseForm) return {};
+@@ -1225,12 +1378,241 @@
+ }
+ bool ProtectHome(const TESObjectREFR* object) noexcept
+ {
+-    if (object && HomeInstance::ProjectionForm(object->formID)) return true;
++    if (object && (HomeInstance::ProjectionForm(object->formID) || HomePlacementClient::Tracked(object) ||
++        HomePlacementClient::LegacyBlocked(object))) return true;
+     try {return ManagedHome(object).has_value();}
+     catch (...) {return false;}
+ }
+ }
+-bool NativeTrade::IsProxy(const TESObjectREFR* object) noexcept
++bool HomePlacementClient::Tracked(const TESObjectREFR* object) noexcept
++{
++    if (!object || !object->IsTemporary()) return false;
++    std::scoped_lock lock(placementGuard);
++    const auto it=protectedPlacements.find(object->formID);
++    return it!=protectedPlacements.end() && it->second==object;
++}
++std::optional<HomeSnapshot::LegacyStack> HomePlacementClient::CaptureLegacy(TESObjectREFR& object)
++{
++    if (!object.IsTemporary() || object.IsDeleted() || object.scale!=100 ||
++        !object.baseForm || object.baseForm->IsTemporary() || Cast<Actor>(&object) ||
++        !HomeSnapshot::LooseType(static_cast<uint32_t>(object.baseForm->formType)) ||
++        NativeTrade::IsProxy(&object) || Tracked(&object)) return {};
++    auto base=PropertyKey(object.baseForm->formID);
++    auto* extra=object.GetExtraDataList();
++    if (extra && extra->HasQuestObjectAlias()) return {};
++    auto observed=ReadExtra(extra);
++    if (!base || !observed || observed->Count<=0 || observed->Count>9999) return {};
++    auto props=TradeProperties::Decode(observed->Variant);
++    if (!props || !PropertiesAvailable(*props)) return {};
++    HomeSnapshot::LegacyStack result{object.formID,
++        {*base,static_cast<uint32_t>(observed->Count),observed->Variant},
++        PlacementPose(object.position,object.rotation)};
++    return result.Valid()?std::optional<HomeSnapshot::LegacyStack>(result):std::nullopt;
++}
++bool HomePlacementClient::LegacyBlocked(const TESObjectREFR* object) noexcept
++{
++    if (!object || !object->IsTemporary() || !object->baseForm || !Scoped(object) ||
++        !HomeSnapshot::LooseType(static_cast<uint32_t>(object->baseForm->formType))) return false;
++    {
++        std::scoped_lock lock(placementGuard);
++        if (legacySources.count(object->formID)) return true;
++    }
++    const auto* cell=object->GetParentCellEx();
++    if (!cell || Tracked(object) || HomeInstance::ProjectionForm(cell->formID) ||
++        legacyCheckedCell.load()==cell->formID) return false;
++    // Until the initial snapshot is reconciled, do not allow native pickup
++    // to race its publication. Capture/ExtraData reads stay on the game thread.
++    return true;
++}
++bool HomePlacementClient::Scoped(const TESObjectREFR* object) noexcept
++{
++    const auto* cell=object?object->GetParentCellEx():nullptr;
++    uint32_t mod{},base{};
++    return cell && (HomeInstance::ProjectionForm(cell->formID) ||
++        (HomeInstance::Encode(cell->formID,mod,base) && (HomeRegistry::Scoped(mod)||HomeRegistry::Pending(mod))));
++}
++void HomePlacementClient::Forget() noexcept
++{
++    // After a confirmed world replacement, never dereference prior-world handles.
++    placedDisplays.clear();
++    {std::scoped_lock lock(placementGuard);protectedPlacements.clear();legacySources.clear();}
++    legacyCheckedCell.store(0);reportedLegacyConflicts.clear();
++    displayCampaign=displayCharacter=0;displaySlot=displayCell=0;
++    placementAt={};++placementEpoch;
++}
++void HomePlacementClient::Clear() noexcept
++{
++    // Transient Loading Menu is not a new world; keep the guard until safe.
++    if (!CampaignAccess::GameReady()) return;
++    while (!placedDisplays.empty()) ErasePlacement(placedDisplays.begin());
++    Forget();
++}
++bool HomePlacementClient::InterceptDrop(const TESObjectREFR* from,const TESBoundObject* item,ExtraDataList* extra,
++                                        int32_t count,const NiPoint3* drop,const NiPoint3* rotate) noexcept
++{
++    if (!from || from->formID!=0x14 || !Scoped(from)) return false;
++    // Never let an ordinary native debit happen alongside the receipt.
++    if (ScopedInventoryOverride::IsOverriden()) return true;
++    try
++    {
++        const auto slot=ScopedSlot(from);
++        const auto* cell=from->GetParentCellEx();
++        if (!slot || !cell || !item || item->IsTemporary() || count<=0 || count>9999 ||
++            !HomeSnapshot::LooseType(static_cast<uint32_t>(item->formType))) return true;
++        const auto selected=ReadExtra(extra);
++        if (!selected || (extra && extra->HasQuestObjectAlias()) ||
++            (!selected->Variant.empty() && count>selected->Count)) return true;
++        const auto form=item->formID,cellId=cell->formID;
++        auto position=from->position;
++        if (drop) position=*drop;
++        else {position.x+=60.f*std::sin(from->rotation.z);position.y+=60.f*std::cos(from->rotation.z);position.z+=40.f;}
++        NiPoint3 rotation{};if (rotate) rotation=*rotate;
++        const auto pose=PlacementPose(position,rotation);
++        if (!HomePlacement::Valid(pose)) return true;
++        const auto epoch=placementEpoch.load();
++        World::Get().GetRunner().Queue([slot,cellId,form,count,selected,pose,epoch]()
++        {
++            auto& world=World::Get();auto* player=PlayerCharacter::Get();
++            if (placementEpoch.load()!=epoch || !player || !player->GetParentCellEx() ||
++                player->GetParentCellEx()->formID!=cellId || ScopedSlot(player)!=slot ||
++                !CampaignAccess::GameReady() || !CampaignAccess::TradeEnabled()) return;
++            const auto id=CampaignAccess::Current(world);
++            Wallet w;
++            if (!id || !GuardPlayer(player) ||
++                !CampaignAccess::HomeCanModify(id->Save.Campaign,slot,id->Save.Character) ||
++                !CampaignAccess::HomePlacements(id->Save.Campaign,slot) ||
++                session || !w.Load(world) || !Ready(w))
++            {pollAt={};Utils::ShowHudMessage("Размещение предмета: ожидается доступ к имуществу дома.");return;}
++            const LocalItem key{form,selected->Variant};
++            auto props=TradeProperties::Decode(key.second);
++            const auto before=ReceiptCount(world,*player,key,false);
++            if (!props || !PropertiesAvailable(*props) || !before || *before<count) return;
++            if (props->Created && !RecreateEnchant(*props->Created)) return;
++            PartyTrade request{TradeOp::HomePlace,slot,0,w.Cursor(),static_cast<uint32_t>(count),w.Stream()};
++            request.Text=HomePlacement::EncodePose(pose).c_str();request.Variant=key.second.c_str();
++            request.BeforePlusOne=static_cast<uint32_t>(*before+1);
++            if (world.GetModSystem().GetServerModId(form,request.Item) && Send(request))
++            {walletReady=false;pollAt={};}
++        });
++    }
++    catch (...) {spdlog::error("STM: failed to queue residential drop");}
++    return true;
++}
++void HomePlacementClient::Update(World& world) noexcept
++{
++    try
++    {
++        if (!CampaignAccess::GameReady()) return;
++        auto* player=PlayerCharacter::Get();
++        auto* cell=player?player->GetParentCellEx():nullptr;
++        const auto slot=ScopedSlot(player);
++        const auto id=slot?CampaignAccess::Current(world):std::nullopt;
++        if (!id || !cell || !slot)
++        {
++            if (displaySlot) Clear();
++            return;
++        }
++        if (displayCampaign!=id->Save.Campaign || displayCharacter!=id->Save.Character ||
++            displaySlot!=slot || displayCell!=cell->formID)
++        {
++            Clear();displayCampaign=id->Save.Campaign;displayCharacter=id->Save.Character;
++            displaySlot=slot;displayCell=cell->formID;
++        }
++        GuardPlayer(player);
++        const auto now=Clock::now();
++        if (!cell->IsAttached() || now<placementAt) return;
++        placementAt=now+200ms;
++        const auto bytes=CampaignAccess::HomeBaseline(displayCampaign,slot);
++        const auto baseline=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
++        const auto stacks=CampaignAccess::HomePlacements(displayCampaign,slot);
++        if (!baseline || !stacks) return;
++        std::set<uint32_t> conflicts;
++        if (!HomeInstance::ProjectionForm(cell->formID))
++        {
++            // Reserve the original even after its ledger balance is zero.
++            for (const auto& source:baseline->Legacy)
++            {
++                {std::scoped_lock lock(placementGuard);legacySources.insert(source.Source);}
++                auto* native=Cast<TESObjectREFR>(TESForm::GetById(source.Source));
++                if (!native || native->IsDeleted()) continue;
++                if (native->GetParentCellEx()!=cell || Tracked(native))
++                {conflicts.insert(source.Source);continue;}
++                const auto actual=CaptureLegacy(*native);
++                if (!actual || !SameLegacyItem(*actual,source))
++                {conflicts.insert(source.Source);continue;}
++                if (!native->IsDisabled()) native->Disable();
++                if (!native->IsDisabled()) conflicts.insert(source.Source);
++            }
++        }
++        for (auto source:conflicts)
++            if (reportedLegacyConflicts.insert(source).second)
++                Utils::ShowHudMessage("Не удалось сопоставить прежний предмет дома. Исходный объект сохранён.");
++        legacyCheckedCell.store(cell->formID);
++        const bool modify=CampaignAccess::TradeEnabled() &&
++            CampaignAccess::HomeCanModify(displayCampaign,slot,displayCharacter);
++        const auto grabbed=GrabbedHandle(*player);
++        std::set<std::string> seen;
++        for (const auto& stack:*stacks)
++        {
++            const auto account=stack.Id.Encode();
++            if (stack.Id.LegacySource && conflicts.count(stack.Id.LegacySource)) continue;
++            seen.insert(account);
++            auto it=placedDisplays.try_emplace(account).first;
++            auto& d=it->second;
++            auto* object=DisplayRef(d);
++            if (!object)
++            {
++                ForgetGuard(d.Ref);d={};
++                if (!SpawnPlacement(*cell,stack,d))
++                {placedDisplays.erase(it);continue;}
++                object=DisplayRef(d);
++                if (!object) {ForgetGuard(d.Ref);placedDisplays.erase(it);continue;}
++                if (!stack.Id.LegacySource && stack.Id.Creator==displayCharacter && !stack.Revision) d.ObserveUntil=now+4s;
++            }
++            if (object->GetParentCellEx()!=cell)
++            {
++                ApplyPlacementPose(*object,*cell,stack.Position);
++                if (object->GetParentCellEx()!=cell) {ErasePlacement(it);continue;}
++            }
++            if (stack.Revision!=d.Revision)
++            {
++                const bool acknowledged=d.Pending && *d.Pending==stack.Position;
++                d.Revision=stack.Revision;d.Committed=stack.Position;d.Pending.reset();
++                if (!acknowledged) {ApplyPlacementPose(*object,*cell,stack.Position);d.ObserveUntil={};}
++            }
++            d.Handle=object->GetHandle().handle.iBits;
++            const bool holding=grabbed && grabbed==d.Handle;
++            if (d.Grabbed && !holding) d.ObserveUntil=now+4s;
++            d.Grabbed=holding;
++            const auto pose=PlacementPose(object->position,object->rotation);
++            if (!HomePlacement::Valid(pose)) continue;
++            const bool observing=modify && (holding || now<d.ObserveUntil);
++            if (!observing)
++            {
++                // Observer physics is not an authoritative move.
++                if (now<d.Retry) continue;
++                d.Pending.reset();
++                if (HomePlacement::Different(pose,d.Committed))
++                    {ApplyPlacementPose(*object,*cell,d.Committed);d.Retry=now+1s;}
++                continue;
++            }
++            if (now<d.Retry || d.Revision==UINT32_MAX ||
++                !HomePlacement::Different(pose,d.Committed)) continue;
++            Wallet w;
++            if (session || !w.Load(world) || !Ready(w)) continue;
++            HomePlacement::Move move{account,d.Revision+1,pose};
++            PartyTrade request{TradeOp::HomeMove,slot,0,w.Cursor(),0,w.Stream()};
++            request.Text=move.Encode().c_str();
++            d.Retry=now+2s;
++            if (Send(request)) d.Pending=pose;
++        }
++        for (auto it=placedDisplays.begin();it!=placedDisplays.end();)
++            if (!seen.count(it->first)) {auto stale=it++;ErasePlacement(stale);}
++            else ++it;
++    }
++    catch (...) {spdlog::error("STM: residential placement projection update failed");}
++}
++bool NativeTrade::IsProxy(const TESObjectREFR* object) noexcept
+ {
+     const auto id=proxyId.load();
+     return id && object && object->formID==id;
+@@ -1291,9 +1673,40 @@
+ bool OverlayService::TryTrade(uint32_t form) noexcept
+ {
+     auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
+-    if (auto home=ManagedHome(object))
+-    {
+-        Wallet w;
++    if (object && !HomePlacementClient::Tracked(object) && HomePlacementClient::LegacyBlocked(object)) return true;
++    if (object && HomePlacementClient::Tracked(object))
++    {
++        const auto found=FindPlacement(object);
++        const auto id=CampaignAccess::Current(m_world);
++        auto* player=PlayerCharacter::Get();
++        const auto slot=ScopedSlot(player);
++        Wallet w;
++        if (found==placedDisplays.end() || !id || !player || !slot || slot!=displaySlot ||
++            object->GetParentCellEx()!=player->GetParentCellEx() ||
++            !CampaignAccess::TradeEnabled() || session || m_active || !w.Load(m_world) || !Ready(w) ||
++            !CampaignAccess::HomeCanModify(id->Save.Campaign,slot,id->Save.Character))
++        {pollAt={};return true;}
++        const auto stacks=CampaignAccess::HomePlacements(id->Save.Campaign,slot);
++        if (!stacks) return true;
++        const auto stack=std::find_if(stacks->begin(),stacks->end(),[&](const auto& x){return x.Id.Encode()==found->first;});
++        if (stack==stacks->end()) return true;
++        auto* base=ResolvePropertyForm(stack->Item.Base);
++        const auto props=TradeProperties::Decode(stack->Item.Variant);
++        if (!base || base!=object->baseForm || !props || !PropertiesAvailable(*props)) return true;
++        if (props->Created && !RecreateEnchant(*props->Created)) return true;
++        const LocalItem key{base->formID,stack->Item.Variant};
++        const auto before=ReceiptCount(m_world,*player,key,true);
++        if (!before || *before+stack->Item.Count>INT32_MAX) return true;
++        PartyTrade request{TradeOp::HomeTake,slot,0,w.Cursor(),stack->Item.Count,w.Stream()};
++        request.Text=found->first.c_str();request.Variant=key.second.c_str();
++        request.BeforePlusOne=static_cast<uint32_t>(*before+1);
++        if (m_world.GetModSystem().GetServerModId(base->formID,request.Item) && Send(request))
++        {walletReady=false;pollAt={};}
++        return true;
++    }
++    if (auto home=ManagedHome(object))
++    {
++        Wallet w;
+         if (object && object->baseForm && HomeSnapshot::LooseType(static_cast<uint32_t>(object->baseForm->formType)))
+         {
+             // Normal activation, no second physical pickup or scratch menu.
+@@ -1364,8 +1777,9 @@
+     session=peer=0; tradeOpen=ownsUI=dirty=false; buffer.clear(); partner.clear(); pollAt={};
+     walletReady=false;readyStream=0;readyCursor=0;
+ }
+-void OverlayService::RecheckTradeAfterLoad() noexcept
+-{
++void OverlayService::RecheckTradeAfterLoad() noexcept
++{
++    HomePlacementClient::Forget();
+     ResetNativeIntents();
+     shadowCleanupPending=true;cleanupRetry={};
+     // A confirmed world replacement permits a new receipt check, not automatic acceptance.
+@@ -1477,9 +1891,10 @@
+         bool changed=true;
+         if (key.second.empty()) p->AddOrRemoveItem(item,true);
+         else changed=ChangeVariant(*p,key,count);
+-        if (nativeRequested && NativeMenuOpen())
+-        {
+-            using Refresh=void(TESObjectREFR*,const TESBoundObject*);
++        static const BSFixedString inventoryMenu("InventoryMenu");
++        if ((nativeRequested && NativeMenuOpen()) || (UI::Get() && UI::Get()->GetMenuOpen(inventoryMenu)))
++        {
++            using Refresh=void(TESObjectREFR*,const TESBoundObject*);
+             if (auto* refresh=Address<Refresh>(52849)) refresh(p,Cast<TESBoundObject>(form));
+         }
+         const auto after=ReceiptCount(m_world,*p,key,count>0);
+@@ -1553,8 +1968,9 @@
+ }
+ void OverlayService::UpdateTrade() noexcept
+ {
+-    MaintainShadow();
+-    if (receiptFailure || !m_transport.IsOnline() || !m_inGame || !CampaignAccess::GameReady())
++    MaintainShadow();
++    HomePlacementClient::Update(m_world);
++    if (receiptFailure || !m_transport.IsOnline() || !m_inGame || !CampaignAccess::GameReady())
+     {
+         walletReady=false;pollAt={};return;
+     }
+diff --git a/Code/client/Games/TES.h b/Code/client/Games/TES.h
+--- a/Code/client/Games/TES.h
++++ b/Code/client/Games/TES.h
+@@ -107,7 +107,8 @@
+     static ModManager* Get() noexcept;
+ 
+     uint32_t Spawn(NiPoint3& aPosition, NiPoint3& aRotation, TESObjectCELL* apParentCell, TESWorldSpace* apWorldSpace, Actor* apCharacter) noexcept;
+-    Mod* GetByName(const char* acpName) const noexcept;
++    uint32_t SpawnObject(NiPoint3&,NiPoint3&,TESObjectCELL*,TESForm*) noexcept;
++    Mod* GetByName(const char* acpName) const noexcept;
+     TESObjectCELL* GetCellFromCoordinates(int32_t aX, int32_t aY, TESWorldSpace* aWorldSpace, bool aSpawnCell) noexcept;
+ 
+     // Form arrays start at 0x10 and are indexed by FormType, 0x18 bytes each.
+diff --git a/Code/client/Games/ModManager.cpp b/Code/client/Games/ModManager.cpp
+--- a/Code/client/Games/ModManager.cpp
++++ b/Code/client/Games/ModManager.cpp
+@@ -47,7 +47,19 @@
+     return refrHandle;
+ }
+ 
+-Mod* ModManager::GetByName(const char* acpName) const noexcept
++uint32_t ModManager::SpawnObject(NiPoint3& position,NiPoint3& rotation,TESObjectCELL* cell,TESForm* base) noexcept
++{
++    // Pinned STR SpawnNewREFR / TESDataHandler::CreateReferenceAtLocation.
++    if (!cell || !base || !RealSpawnNewREFR) return 0;
++    uint32_t handle{},linkedRoom{};
++    // CreateReferenceAtLocation takes const ObjectRefHandle& for linked room.
++    TiltedPhoques::ThisCall(RealSpawnNewREFR,this,handle,base,&position,&rotation,cell,nullptr,
++        static_cast<Actor*>(nullptr),uintptr_t{0},reinterpret_cast<uintptr_t>(&linkedRoom),
++        static_cast<char>(0),static_cast<char>(1));
++    return handle;
++}
++
++Mod* ModManager::GetByName(const char* acpName) const noexcept
+ {
+     auto pEntry = &mods.entry;
+ 
+diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor.cpp
+--- a/Code/client/Games/Skyrim/Actor.cpp
++++ b/Code/client/Games/Skyrim/Actor.cpp
+@@ -24,6 +24,7 @@
+ #include <Games/TES.h>
+ #include <World.h>
+ #include <Services/HomeActorProtection.h>
++#include <Services/HomePlacementClient.h>
+ #include <Services/NativeTrade.h>
+ #include <Services/PapyrusService.h>
+ 
+@@ -1163,7 +1164,8 @@
+ 
+ void* TP_MAKE_THISCALL(HookDropObject, Actor, void* apResult, TESBoundObject* apObject, ExtraDataList* apExtraData, int32_t aCount, NiPoint3* apLocation, NiPoint3* apRotation)
+ {
+-    if (HomeActorProtection::Resident(apThis))
++    if (HomeActorProtection::Resident(apThis) ||
++        HomePlacementClient::InterceptDrop(apThis,apObject,apExtraData,aCount,apLocation,apRotation))
+     {
+         if (apResult) static_cast<BSPointerHandle<TESObjectREFR>*>(apResult)->handle.iBits=0;
+         return apResult;
+@@ -1205,7 +1207,7 @@
+ 
+ void Actor::DropObject(TESBoundObject* apObject, ExtraDataList* apExtraData, int32_t aCount, NiPoint3* apLocation, NiPoint3* apRotation) noexcept
+ {
+-    if (HomeActorProtection::Resident(this)) return;
++    if (HomeActorProtection::Resident(this) || HomePlacementClient::Scoped(this)) return;
+     spdlog::debug("Dropping object, form id: {:X}, count: {}, actor: {:X}", apObject->formID, aCount, formID);
+     BSPointerHandle<TESObjectREFR> result{};
+     TiltedPhoques::ThisCall(RealDropObject, this, &result, apObject, apExtraData, aCount, apLocation, apRotation);
+diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyrim/TESObjectREFR.cpp
+--- a/Code/client/Games/Skyrim/TESObjectREFR.cpp
++++ b/Code/client/Games/Skyrim/TESObjectREFR.cpp
+@@ -6,7 +6,8 @@
+ #include <World.h>
+ #include <Services/PapyrusService.h>
+ #include <Services/NativeTrade.h>
+ #include <Services/HomeActorProtection.h>
++#include <Services/HomePlacementClient.h>
+ #include <Events/ActivateEvent.h>
+ #include <Events/InventoryChangeEvent.h>
+ #include <Events/ScriptAnimationEvent.h>
+@@ -1022,7 +1023,15 @@
+ bool TP_MAKE_THISCALL(HookActivate, TESObjectREFR, TESObjectREFR* apActivator, uint8_t aUnk1, TESBoundObject* apObjectToGet, int32_t aCount, char aDefaultProcessing)
+ {
+     if (NativeTrade::IsProxy(apThis)) return false;
+     if (HomeActorProtection::Resident(apThis)) return false;
++    if (HomePlacementClient::LegacyBlocked(apThis) && !HomePlacementClient::Tracked(apThis)) return false;
++    if (HomePlacementClient::Tracked(apThis))
++    {
++        if (apActivator==PlayerCharacter::Get() && !ScopedActivateOverride::IsOverriden() &&
++            !ScopedInventoryOverride::IsOverriden())
++            World::Get().GetOverlayService().TryTrade(apThis->formID);
++        return false;
++    }
+     if (apActivator && apActivator == PlayerCharacter::Get() && apThis)
+     {
+         auto& service = World::Get().GetOverlayService();
+@@ -1075,7 +1084,9 @@
+ BSPointerHandle<TESObjectREFR>*
+ TP_MAKE_THISCALL(HookRemoveInventoryItem, TESObjectREFR, BSPointerHandle<TESObjectREFR>* apResult, TESBoundObject* apItem, int32_t aCount, ITEM_REMOVE_REASON aReason, ExtraDataList* apExtraList, TESObjectREFR* apMoveToRef, const NiPoint3* apDropLoc, const NiPoint3* apRotate)
+ {
+-    if (NativeTrade::BlockRemove(apThis,apMoveToRef,apItem,aCount,apExtraList))
++    if ((!apMoveToRef && aReason==ITEM_REMOVE_REASON::kDropping &&
++         HomePlacementClient::InterceptDrop(apThis,apItem,apExtraList,aCount,apDropLoc,apRotate)) ||
++        NativeTrade::BlockRemove(apThis,apMoveToRef,apItem,aCount,apExtraList))
+     {
+         if (apResult) apResult->handle.iBits=0;
+         return apResult;
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -1,6 +1,7 @@
+ #include <TiltedOnlinePCH.h>
+ #include <World.h>
+ #include <Services/HomeInstance.h>
++#include <Services/HomePlacementClient.h>
+ #include <Services/CampaignAccess.h>
+ #include <HomeRegistry.h>
+ #include <HomeSnapshot.h>
+@@ -763,6 +764,7 @@
+ void OverlayService::ClearHomes() noexcept
+ {
+     HomeResidentProjection::Clear();residentDisplayNext={};
++    HomePlacementClient::Clear();
+     if (selection && m_pOverlay && m_gameOverlayClient)
+     {m_pOverlay->ExecuteAsync("hideHome");m_gameOverlayClient->SetUIVisible(false);}
+     selection=false;door=0;options.clear();accessMenu={};visit={};lockContext={};projectedRoot.store(0);ads.clear();SetVisit(0,0);refresh={};self.store(invalid);
+diff --git a/Code/client/Services/CampaignAccess.h b/Code/client/Services/CampaignAccess.h
+--- a/Code/client/Services/CampaignAccess.h
++++ b/Code/client/Services/CampaignAccess.h
+@@ -31,6 +31,7 @@
+ std::optional<HomeResidents::Residents> HomeResidentView(uint64_t campaign,uint32_t slot);
+ std::optional<HomeObjects::Records> HomeObjectView(uint64_t campaign,uint32_t slot);
+ std::optional<std::vector<HomePlacement::Stack>> HomePlacements(uint64_t campaign,uint32_t slot);
++bool HomeCanModify(uint64_t campaign,uint32_t slot,uint64_t character);
+ bool ConfirmReceipt(World&, uint64_t stream, uint64_t savedStream, uint32_t cursor, uint32_t receipt,
+                     std::string_view plugin, uint32_t base, int count,int64_t before,std::string_view variant={});
+ }
+diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
+--- a/Code/client/Services/Generic/QuestJournal.cpp
++++ b/Code/client/Services/Generic/QuestJournal.cpp
+@@ -147,6 +147,12 @@
+     }
+     catch (...) {return {};}
+ }
++bool CampaignAccess::HomeCanModify(uint64_t campaign,uint32_t slot,uint64_t character)
++{
++    return Mode()==CampaignReplication::Link::Mode::Ready && campaign==campaignLink.Campaign &&
++        HomePermissions::Effective(campaignLink.Journal,slot,character)==HomePermissions::Right::Modify;
++}
++
+ std::optional<HomeObjects::Records> CampaignAccess::HomeObjectView(uint64_t campaign,uint32_t slot)
+ {
+     if (Mode()!=CampaignReplication::Link::Mode::Ready || campaign!=campaignLink.Campaign) return {};
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign20"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign21"

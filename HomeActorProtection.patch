@@ -1,0 +1,174 @@
+diff --git a/Code/client/Services/HomeActorProtection.h b/Code/client/Services/HomeActorProtection.h
+new file mode 100644
+--- /dev/null
++++ b/Code/client/Services/HomeActorProtection.h
+@@ -0,0 +1,22 @@
++#pragma once
++#include <Services/HomeInstance.h>
++#include <Games/References.h>
++#include <Forms/TESObjectCELL.h>
++
++// A guest NPC is a projection, never a second source of possessions.
++namespace HomeActorProtection
++{
++inline bool Resident(const TESObjectREFR* object) noexcept
++{
++    if (!object || object->formID==0x14) return false;
++    auto* actor=Cast<Actor>(const_cast<TESObjectREFR*>(object));
++    if (!actor) return false;
++    auto* ext=actor->GetExtension();
++    const auto* cell=actor->GetParentCellEx();
++    return ext && !ext->IsPlayer() && cell && HomeInstance::ProjectionForm(cell->formID);
++}
++inline bool PickupBlocked(const TESObjectREFR* object) noexcept
++{
++    return object && (HomeInstance::ProjectionForm(object->formID) || Resident(object));
++}
++}
+diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor.cpp
+--- a/Code/client/Games/Skyrim/Actor.cpp
++++ b/Code/client/Games/Skyrim/Actor.cpp
+@@ -23,6 +23,8 @@
+ 
+ #include <Games/TES.h>
+ #include <World.h>
++#include <Services/HomeActorProtection.h>
++#include <Services/NativeTrade.h>
+ #include <Services/PapyrusService.h>
+ 
+ #include <Forms/ActorValueInfo.h>
+@@ -1016,6 +1018,7 @@
+ // TODO: this is flawed, since it does not account for invulnerable actors
+ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bool aKillMove)
+ {
++    if (HomeActorProtection::Resident(apThis) || HomeActorProtection::Resident(apHitter)) return false;
+     if (apHitter)
+         World::Get().GetRunner().Trigger(HitEvent(apHitter->formID, apThis->formID));
+ 
+@@ -1111,6 +1114,7 @@
+ 
+ void TP_MAKE_THISCALL(HookAddInventoryItem, Actor, TESBoundObject* apItem, ExtraDataList* apExtraData, int32_t aCount, TESObjectREFR* apOldOwner)
+ {
++    if (NativeTrade::BlockAdd(apThis,apOldOwner)) return;
+     if (!ScopedInventoryOverride::IsOverriden())
+     {
+         auto& modSystem = World::Get().GetModSystem();
+@@ -1130,6 +1134,7 @@
+ 
+ void* TP_MAKE_THISCALL(HookPickUpObject, Actor, TESObjectREFR* apObject, int32_t aCount, bool aUnk1, float aUnk2)
+ {
++    if (HomeActorProtection::Resident(apThis) || HomeActorProtection::PickupBlocked(apObject)) return nullptr;
+     if (!ScopedInventoryOverride::IsOverriden())
+     {
+         auto& modSystem = World::Get().GetModSystem();
+@@ -1158,6 +1163,11 @@
+ 
+ void* TP_MAKE_THISCALL(HookDropObject, Actor, void* apResult, TESBoundObject* apObject, ExtraDataList* apExtraData, int32_t aCount, NiPoint3* apLocation, NiPoint3* apRotation)
+ {
++    if (HomeActorProtection::Resident(apThis))
++    {
++        if (apResult) static_cast<BSPointerHandle<TESObjectREFR>*>(apResult)->handle.iBits=0;
++        return apResult;
++    }
+     auto& modSystem = World::Get().GetModSystem();
+ 
+     Inventory::Entry item{};
+@@ -1195,6 +1205,7 @@
+ 
+ void Actor::DropObject(TESBoundObject* apObject, ExtraDataList* apExtraData, int32_t aCount, NiPoint3* apLocation, NiPoint3* apRotation) noexcept
+ {
++    if (HomeActorProtection::Resident(this)) return;
+     spdlog::debug("Dropping object, form id: {:X}, count: {}, actor: {:X}", apObject->formID, aCount, formID);
+     BSPointerHandle<TESObjectREFR> result{};
+     TiltedPhoques::ThisCall(RealDropObject, this, &result, apObject, apExtraData, aCount, apLocation, apRotation);
+diff --git a/Code/client/Games/Skyrim/PlayerCharacter.cpp b/Code/client/Games/Skyrim/PlayerCharacter.cpp
+--- a/Code/client/Games/Skyrim/PlayerCharacter.cpp
++++ b/Code/client/Games/Skyrim/PlayerCharacter.cpp
+@@ -13,6 +13,7 @@
+ #include <Events/RemoveWaypointEvent.h>
+ 
+ #include <World.h>
++#include <Services/HomeActorProtection.h>
+ 
+ #include <Games/Skyrim/Forms/ActorValueInfo.h>
+ #include <Games/ActorExtension.h>
+@@ -164,6 +165,7 @@
+ 
+ char TP_MAKE_THISCALL(HookPickUpObject, PlayerCharacter, TESObjectREFR* apObject, int32_t aCount, bool aUnk1, bool aUnk2)
+ {
++    if (HomeActorProtection::PickupBlocked(apObject)) return 0;
+     auto& modSystem = World::Get().GetModSystem();
+ 
+     Inventory::Entry item{};
+diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyrim/TESObjectREFR.cpp
+--- a/Code/client/Games/Skyrim/TESObjectREFR.cpp
++++ b/Code/client/Games/Skyrim/TESObjectREFR.cpp
+@@ -6,6 +6,7 @@
+ #include <World.h>
+ #include <Services/PapyrusService.h>
+ #include <Services/NativeTrade.h>
++#include <Services/HomeActorProtection.h>
+ #include <Events/ActivateEvent.h>
+ #include <Events/InventoryChangeEvent.h>
+ #include <Events/ScriptAnimationEvent.h>
+@@ -1021,6 +1022,7 @@
+ bool TP_MAKE_THISCALL(HookActivate, TESObjectREFR, TESObjectREFR* apActivator, uint8_t aUnk1, TESBoundObject* apObjectToGet, int32_t aCount, char aDefaultProcessing)
+ {
+     if (NativeTrade::IsProxy(apThis)) return false;
++    if (HomeActorProtection::Resident(apThis)) return false;
+     if (apActivator && apActivator == PlayerCharacter::Get() && apThis)
+     {
+         auto& service = World::Get().GetOverlayService();
+diff --git a/Code/client/Services/Generic/InventoryService.cpp b/Code/client/Services/Generic/InventoryService.cpp
+--- a/Code/client/Services/Generic/InventoryService.cpp
++++ b/Code/client/Services/Generic/InventoryService.cpp
+@@ -15,6 +15,7 @@
+ #include <Events/EquipmentChangeEvent.h>
+ 
+ #include <World.h>
++#include <Services/HomeActorProtection.h>
+ #include <Systems/OwnershipSystem.h>
+ #include <Games/Skyrim/Interface/UI.h>
+ #include <PlayerCharacter.h>
+@@ -179,8 +180,9 @@
+ 
+         ScopedInventoryOverride _;
+ 
+-        if (acMessage.Drop)
+-            pActor->DropOrPickUpObject(acMessage.Item, nullptr, nullptr);
++        // Do not create free loot from the visitor's display actor.
++        if (acMessage.Drop && !HomeActorProtection::Resident(pActor))
++            pActor->DropOrPickUpObject(acMessage.Item, nullptr, nullptr);
+         else
+             pActor->AddOrRemoveItem(acMessage.Item);
+ 
+diff --git a/Code/client/Services/Generic/PartyTrade.cpp b/Code/client/Services/Generic/PartyTrade.cpp
+--- a/Code/client/Services/Generic/PartyTrade.cpp
++++ b/Code/client/Services/Generic/PartyTrade.cpp
+@@ -22,6 +22,8 @@
+ #include <ExtraData/ExtraContainerChanges.h>
+ #include <Services/HomeInventory.h>
+ #include <Services/HomeProjection.h>
++#include <Services/HomeInstance.h>
++#include <Services/HomeActorProtection.h>
+ #include <Forms/TESObjectCELL.h>
+ #include <ExtraData/ExtraCount.h>
+ #include <ExtraData/ExtraHealth.h>
+@@ -1217,6 +1219,8 @@
+ bool NativeTrade::BlockAdd(const TESObjectREFR* to,const TESObjectREFR* from) noexcept
+ {
+     if (ProtectHome(to) || ProtectHome(from)) return true;
++    if (HomeActorProtection::Resident(to) || HomeActorProtection::Resident(from))
++        return !(ScopedInventoryOverride::IsOverriden() && !from && HomeActorProtection::Resident(to));
+     if (shadowMutation && IsProxy(to) && !from) return false;
+     return IsProxy(to)||IsProxy(from);
+ }
+@@ -1224,6 +1228,8 @@
+                               const TESBoundObject* item,int32_t count,ExtraDataList* extra) noexcept
+ {
+     if (ProtectHome(from) || ProtectHome(to)) return true;
++    if (HomeActorProtection::Resident(from) || HomeActorProtection::Resident(to))
++        return !(ScopedInventoryOverride::IsOverriden() && !to && HomeActorProtection::Resident(from));
+     const bool source=IsProxy(from), destination=IsProxy(to);
+     if (!source && !destination) return false;
+     if (shadowMutation && source && !to) return false;

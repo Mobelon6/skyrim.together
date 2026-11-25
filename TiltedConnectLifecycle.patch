@@ -1,0 +1,461 @@
+diff --git a/Code/connect/include/Client.hpp b/Code/connect/include/Client.hpp
+--- a/Code/connect/include/Client.hpp
++++ b/Code/connect/include/Client.hpp
+@@ -78,5 +78,6 @@
+         Statistics m_previousFrame{};
+         void* m_pLoop{};
+         void* m_pHandle{};
++        bool m_dnsCancelled{};
+     };
+ }
+diff --git a/Code/connect/src/Client.cpp b/Code/connect/src/Client.cpp
+--- a/Code/connect/src/Client.cpp
++++ b/Code/connect/src/Client.cpp
+@@ -64,214 +64,239 @@
+ 
+     bool Client::Connect(const std::string& acEndpoint) noexcept
+     {
+-        static auto GetAddrInfoCallback = [](uv_getaddrinfo_t* apHandle, int aStatus, struct addrinfo* apResult)
+-        {
+-            SteamNetworkingIPAddr remoteAddress{};
+-            bool valid = false;
+-
+-            auto* pClient = static_cast<Client*>(apHandle->loop->data);
+-            pClient->m_pHandle = nullptr;
+-            
+-            if (aStatus == 0)
+-            {
+-                switch (apResult->ai_family)
+-                {
+-                case AF_INET:
+-                {
+-                    const auto port = ntohs(reinterpret_cast<sockaddr_in*>(apResult->ai_addr)->sin_port);
+-                    remoteAddress.SetIPv4(ntohl(reinterpret_cast<sockaddr_in*>(apResult->ai_addr)->sin_addr.s_addr), port);
+-                    valid = true;
+-                } break;
+-                case AF_INET6:
+-                {
+-                    const auto port = ntohs(reinterpret_cast<sockaddr_in6*>(apResult->ai_addr)->sin6_port);
+-                    remoteAddress.SetIPv6(reinterpret_cast<sockaddr_in6*>(apResult->ai_addr)->sin6_addr.s6_addr, port);
+-                    valid = true;
+-                } break;
+-                }
+-            }
+-
+-            uv_freeaddrinfo(apResult);
+-            Allocator::GetDefault()->Free(apHandle);
+-
+-            if(aStatus == UV_ECANCELED)
+-            {
+-                pClient->OnDisconnected(kAborted);
+-                return;
+-            }
+-
+-            if (!valid)
+-            {
+-                pClient->OnDisconnected(kCannotResolve);
+-                return;
+-            }
+-
+-            const auto cConnectResult = pClient->Connect(remoteAddress);
+-            if (!cConnectResult)
+-            {
+-                pClient->OnDisconnected(kLocalProblem);
+-            }
+-        };
+-
+-        const auto pos = acEndpoint.find_last_of(':');
+-        auto* pHandle = static_cast<uv_getaddrinfo_t*>(Allocator::GetDefault()->Allocate(sizeof(uv_getaddrinfo_t)));
+-
+-        std::string endpoint = acEndpoint;
+-        std::string serviceName = "25681";
+-        if(pos != std::string::npos)
+-        {
+-            serviceName = acEndpoint.c_str() + 1 + pos;
+-            endpoint = endpoint.substr(0, pos);
+-        }
+-
+-        m_pHandle = pHandle;
+-        uv_getaddrinfo(static_cast<uv_loop_t*>(m_pLoop), pHandle, GetAddrInfoCallback, endpoint.c_str(), serviceName.c_str(), nullptr);
+-
+-        return true;
+-    }
+-
+-    bool Client::Connect(const SteamNetworkingIPAddr& acEndpoint) noexcept
+-    {
+-        SteamNetworkingConfigValue_t opt = {};
+-        opt.SetPtr(k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged, reinterpret_cast<void*>(&SteamNetConnectionStatusChangedCallback));
+-        m_connection = m_pInterface->ConnectByIPAddress(acEndpoint, 1, &opt);
+-
+-        return m_connection != k_HSteamNetConnection_Invalid;
+-    }
+-
+-    bool Client::ConnectByIp(const std::string& acEndpoint) noexcept
+-    {
+-        SteamNetworkingIPAddr remoteAddress{};
+-        remoteAddress.ParseString(acEndpoint.c_str());
+-
+-        return Connect(remoteAddress);
+-    }
+-
+-    void Client::Close() noexcept
+-    {
+-        if (m_connection != k_HSteamNetConnection_Invalid)
+-        {
+-            m_pInterface->CloseConnection(m_connection, 0, nullptr, true);
+-            m_connection = k_HSteamNetConnection_Invalid;
+-
+-            m_clock.Reset();
+-
+-            OnDisconnected(kAborted);
+-        }
+-
+-        if(m_pHandle != nullptr)
+-        {
+-            uv_cancel(static_cast<uv_req_t*>(m_pHandle));
+-        }
+-    }
+-
+-    void Client::Update() noexcept
+-    {
+-        m_clock.Update();
+-
+-        if (m_clock.GetCurrentTick() - m_lastStatisticsPoint >= 1000)
+-        {
+-            m_lastStatisticsPoint = m_clock.GetCurrentTick();
+-            m_previousFrame = m_currentFrame;
+-            m_currentFrame = {};
+-        }
+-
+-        s_pClient = this;
+-        m_pInterface->RunCallbacks();
+-        uv_run(static_cast<uv_loop_t*>(m_pLoop), UV_RUN_NOWAIT);
+-        s_pClient = nullptr;
+-
+-        while (true)
+-        {
+-            ISteamNetworkingMessage* pIncomingMsg = nullptr;
+-            const auto cMessageCount = m_pInterface->ReceiveMessagesOnConnection(m_connection, &pIncomingMsg, 1);
+-            if (cMessageCount <= 0 || pIncomingMsg == nullptr)
+-            {
+-                // TODO: Handle error when messageCount < 0
+-                break;
+-            }
+-
+-            m_currentFrame.RecvBytes += pIncomingMsg->GetSize();
+-            m_currentFrame.UncompressedRecvBytes += pIncomingMsg->GetSize();
+-
+-            m_currentMessageReceiveTime = pIncomingMsg->GetTimeReceived();
+-            HandleMessage(pIncomingMsg->GetData(), pIncomingMsg->GetSize());
+-
+-            pIncomingMsg->Release();
+-        }
+-
+-        OnUpdate();
+-    }
+-
+-    void Client::Send(Packet* apPacket, const EPacketFlags acPacketFlags) const noexcept
+-    {
+-        m_currentFrame.UncompressedSentBytes += apPacket->m_size;
+-
+-        if (apPacket->m_pData[0] == kPayload)
+-        {
+-            std::string data;
+-            snappy::Compress(apPacket->GetData(), apPacket->GetSize(), &data);
+-
+-            if (data.size() < apPacket->GetSize())
+-            {
+-                apPacket->m_pData[0] = kCompressedPayload;
+-                std::copy(std::begin(data), std::end(data), apPacket->GetData());
+-                apPacket->m_size = (data.size() + 1) & 0xFFFFFFFF;
+-            }
+-        }
+-
+-        m_currentFrame.SentBytes += apPacket->m_size;
+-
+-        m_pInterface->SendMessageToConnection(m_connection, apPacket->m_pData, apPacket->m_size,
+-            ToSteamSendFlags(acPacketFlags), nullptr);
+-    }
+-
+-    bool Client::IsConnected() const noexcept
+-    {
+-        if (m_connection != k_HSteamNetConnection_Invalid)
+-        {
+-            SteamNetConnectionInfo_t info{};
+-            if (m_pInterface->GetConnectionInfo(m_connection, &info))
+-            {
+-                if(info.m_eState == k_ESteamNetworkingConnectionState_Connected)
+-                {
+-                    return GetClock().IsSynchronized();
+-                }
+-            }
+-        }
+-
+-        return false;
+-    }
+-
+-    SteamNetConnectionRealTimeStatus_t Client::GetConnectionStatus() const noexcept
+-    {
+-        SteamNetConnectionRealTimeStatus_t status{};
+-
+-        if (m_connection != k_HSteamNetConnection_Invalid)
+-        {
+-            m_pInterface->GetConnectionRealTimeStatus(m_connection, &status, 0, nullptr);
+-        }
+-
+-        return status;
+-    }
+-
+-    Client::Statistics Client::GetStatistics() const noexcept
+-    {
+-        return m_previousFrame;
+-    }
+-
+-    const SynchronizedClock& Client::GetClock() const noexcept
+-    {
+-        return m_clock;
+-    }
+-
+-    SteamNetworkingMicroseconds Client::GetCurrentMessageReceiveTime() const noexcept
+-    {
+-        return m_currentMessageReceiveTime;
+-    }
+-
+-    void Client::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t* apInfo)
+-    {
++        // libuv owns the outstanding request until its completion callback.
++        if (m_pHandle || m_connection != k_HSteamNetConnection_Invalid)
++            return false;
++        m_dnsCancelled = false;
++
++        static auto GetAddrInfoCallback = [](uv_getaddrinfo_t* apHandle, int aStatus, struct addrinfo* apResult)
++        {
++            SteamNetworkingIPAddr remoteAddress{};
++            bool valid = false;
++
++            auto* pClient = static_cast<Client*>(apHandle->loop->data);
++            const bool current = pClient->m_pHandle == apHandle;
++            const bool cancelled = !current || pClient->m_dnsCancelled;
++            if (current)
++            {
++                pClient->m_pHandle = nullptr;
++                pClient->m_dnsCancelled = false;
++            }
++            
++            if (!cancelled && aStatus == 0 && apResult)
++            {
++                switch (apResult->ai_family)
++                {
++                case AF_INET:
++                {
++                    const auto port = ntohs(reinterpret_cast<sockaddr_in*>(apResult->ai_addr)->sin_port);
++                    remoteAddress.SetIPv4(ntohl(reinterpret_cast<sockaddr_in*>(apResult->ai_addr)->sin_addr.s_addr), port);
++                    valid = true;
++                } break;
++                case AF_INET6:
++                {
++                    const auto port = ntohs(reinterpret_cast<sockaddr_in6*>(apResult->ai_addr)->sin6_port);
++                    remoteAddress.SetIPv6(reinterpret_cast<sockaddr_in6*>(apResult->ai_addr)->sin6_addr.s6_addr, port);
++                    valid = true;
++                } break;
++                }
++            }
++
++            if (apResult) uv_freeaddrinfo(apResult);
++            Allocator::GetDefault()->Free(apHandle);
++
++            if (!current) return;
++            if (cancelled || aStatus == UV_ECANCELED)
++            {
++                pClient->OnDisconnected(kAborted);
++                return;
++            }
++
++            if (!valid)
++            {
++                pClient->OnDisconnected(kCannotResolve);
++                return;
++            }
++
++            const auto cConnectResult = pClient->Connect(remoteAddress);
++            if (!cConnectResult)
++            {
++                pClient->OnDisconnected(kLocalProblem);
++            }
++        };
++
++        const auto pos = acEndpoint.find_last_of(':');
++        auto* pHandle = static_cast<uv_getaddrinfo_t*>(Allocator::GetDefault()->Allocate(sizeof(uv_getaddrinfo_t)));
++
++        std::string endpoint = acEndpoint;
++        std::string serviceName = "25681";
++        if(pos != std::string::npos)
++        {
++            serviceName = acEndpoint.c_str() + 1 + pos;
++            endpoint = endpoint.substr(0, pos);
++        }
++
++        m_pHandle = pHandle;
++        const auto result = uv_getaddrinfo(static_cast<uv_loop_t*>(m_pLoop), pHandle, GetAddrInfoCallback, endpoint.c_str(), serviceName.c_str(), nullptr);
++        if (result != 0)
++        {
++            m_pHandle = nullptr;
++            Allocator::GetDefault()->Free(pHandle);
++            return false;
++        }
++
++        return true;
++    }
++
++    bool Client::Connect(const SteamNetworkingIPAddr& acEndpoint) noexcept
++    {
++        if (m_pHandle || m_connection != k_HSteamNetConnection_Invalid)
++            return false;
++        SteamNetworkingConfigValue_t opt = {};
++        opt.SetPtr(k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged, reinterpret_cast<void*>(&SteamNetConnectionStatusChangedCallback));
++        m_connection = m_pInterface->ConnectByIPAddress(acEndpoint, 1, &opt);
++
++        return m_connection != k_HSteamNetConnection_Invalid;
++    }
++
++    bool Client::ConnectByIp(const std::string& acEndpoint) noexcept
++    {
++        SteamNetworkingIPAddr remoteAddress{};
++        remoteAddress.ParseString(acEndpoint.c_str());
++
++        return Connect(remoteAddress);
++    }
++
++    void Client::Close() noexcept
++    {
++        if (m_connection != k_HSteamNetConnection_Invalid)
++        {
++            m_pInterface->CloseConnection(m_connection, 0, nullptr, true);
++            m_connection = k_HSteamNetConnection_Invalid;
++
++            m_clock.Reset();
++
++            OnDisconnected(kAborted);
++        }
++
++        if(m_pHandle != nullptr)
++        {
++            // uv_cancel may return UV_EBUSY; discard the callback result anyway.
++            m_dnsCancelled = true;
++            uv_cancel(static_cast<uv_req_t*>(m_pHandle));
++        }
++    }
++
++    void Client::Update() noexcept
++    {
++        m_clock.Update();
++
++        if (m_clock.GetCurrentTick() - m_lastStatisticsPoint >= 1000)
++        {
++            m_lastStatisticsPoint = m_clock.GetCurrentTick();
++            m_previousFrame = m_currentFrame;
++            m_currentFrame = {};
++        }
++
++        s_pClient = this;
++        m_pInterface->RunCallbacks();
++        uv_run(static_cast<uv_loop_t*>(m_pLoop), UV_RUN_NOWAIT);
++        s_pClient = nullptr;
++
++        while (true)
++        {
++            ISteamNetworkingMessage* pIncomingMsg = nullptr;
++            const auto cMessageCount = m_pInterface->ReceiveMessagesOnConnection(m_connection, &pIncomingMsg, 1);
++            if (cMessageCount <= 0 || pIncomingMsg == nullptr)
++            {
++                // TODO: Handle error when messageCount < 0
++                break;
++            }
++
++            m_currentFrame.RecvBytes += pIncomingMsg->GetSize();
++            m_currentFrame.UncompressedRecvBytes += pIncomingMsg->GetSize();
++
++            m_currentMessageReceiveTime = pIncomingMsg->GetTimeReceived();
++            HandleMessage(pIncomingMsg->GetData(), pIncomingMsg->GetSize());
++
++            pIncomingMsg->Release();
++        }
++
++        OnUpdate();
++    }
++
++    void Client::Send(Packet* apPacket, const EPacketFlags acPacketFlags) const noexcept
++    {
++        m_currentFrame.UncompressedSentBytes += apPacket->m_size;
++
++        if (apPacket->m_pData[0] == kPayload)
++        {
++            std::string data;
++            snappy::Compress(apPacket->GetData(), apPacket->GetSize(), &data);
++
++            if (data.size() < apPacket->GetSize())
++            {
++                apPacket->m_pData[0] = kCompressedPayload;
++                std::copy(std::begin(data), std::end(data), apPacket->GetData());
++                apPacket->m_size = (data.size() + 1) & 0xFFFFFFFF;
++            }
++        }
++
++        m_currentFrame.SentBytes += apPacket->m_size;
++
++        m_pInterface->SendMessageToConnection(m_connection, apPacket->m_pData, apPacket->m_size,
++            ToSteamSendFlags(acPacketFlags), nullptr);
++    }
++
++    bool Client::IsConnected() const noexcept
++    {
++        if (m_connection != k_HSteamNetConnection_Invalid)
++        {
++            SteamNetConnectionInfo_t info{};
++            if (m_pInterface->GetConnectionInfo(m_connection, &info))
++            {
++                if(info.m_eState == k_ESteamNetworkingConnectionState_Connected)
++                {
++                    return GetClock().IsSynchronized();
++                }
++            }
++        }
++
++        return false;
++    }
++
++    SteamNetConnectionRealTimeStatus_t Client::GetConnectionStatus() const noexcept
++    {
++        SteamNetConnectionRealTimeStatus_t status{};
++
++        if (m_connection != k_HSteamNetConnection_Invalid)
++        {
++            m_pInterface->GetConnectionRealTimeStatus(m_connection, &status, 0, nullptr);
++        }
++
++        return status;
++    }
++
++    Client::Statistics Client::GetStatistics() const noexcept
++    {
++        return m_previousFrame;
++    }
++
++    const SynchronizedClock& Client::GetClock() const noexcept
++    {
++        return m_clock;
++    }
++
++    SteamNetworkingMicroseconds Client::GetCurrentMessageReceiveTime() const noexcept
++    {
++        return m_currentMessageReceiveTime;
++    }
++
++    void Client::OnSteamNetConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t* apInfo)
++    {
++        // Ignore delayed status notifications from an already closed handle.
++        if (apInfo->m_hConn != m_connection)
++            return;
+         switch (apInfo->m_info.m_eState)
+         {
+         case k_ESteamNetworkingConnectionState_None:

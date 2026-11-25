@@ -1,0 +1,1433 @@
+diff --git a/Code/common/TradeLedger.h b/Code/common/TradeLedger.h
+--- a/Code/common/TradeLedger.h
++++ b/Code/common/TradeLedger.h
+@@ -1,6 +1,8 @@
+ #pragma once
+ #include "QuestJournalDisk.h"
+ #include "CampaignJournal.h"
++#include "TradeProperties.h"
++#include <tuple>
+ #include <algorithm>
+ #include <fstream>
+ #include <iomanip>
+@@ -19,6 +21,7 @@
+         int count{}; // Positive credits the backpack; negative reserves the deposit in escrow.
+         int64_t before{-1}; // -1 = legacy receipt without an inventory checkpoint.
+         bool refund{}; // R record: consume only the depositor's own escrow.
++        std::string variant{};
+     };
+     explicit TradeLedger(std::filesystem::path path) : root(std::move(path)) {}
+     TradeLedger(CampaignJournal::Journal& journal,uint64_t campaign) : authority(&journal), campaignId(campaign) {}
+@@ -67,9 +70,18 @@
+         return stream;
+     }
+     const std::vector<Row>& History(const std::string& user) {return accounts[user];}
++    struct ItemKey
++    {
++        std::string first; uint32_t second{}; std::string variant;
++        ItemKey(std::string plugin,uint32_t base,std::string properties={}):
++            first(std::move(plugin)),second(base),variant(std::move(properties)){}
++        ItemKey(const std::pair<std::string,uint32_t>& old):ItemKey(old.first,old.second){}
++        bool operator<(const ItemKey& other) const
++        {return std::tie(first,second,variant)<std::tie(other.first,other.second,other.variant);}
++    };
++    using Items = std::map<ItemKey,int64_t>;
+-    using Items = std::map<std::pair<std::string,uint32_t>,int64_t>;
+     const Items& Stock(const std::string& a,const std::string& b) {return stock[std::minmax(a,b)];}
++    struct Refund { std::string peer,plugin; uint32_t base{},count{}; std::string variant; };
+-    struct Refund { std::string peer,plugin; uint32_t base{},count{}; };
+     // Reconstruct the balance of each depositor from the same durable ledger.
+     // Existing T records are fungible; a normal take consumes one's own
+     // contribution first, then the peer's. No separate persistent store.
+@@ -80,7 +92,7 @@
+                 for (const auto& [item,count]:items)
+                     if (count>0)
+                         return Refund{owners.second,item.first,item.second,
++                            static_cast<uint32_t>(std::min<int64_t>(count,9999)),item.variant};
+-                            static_cast<uint32_t>(std::min<int64_t>(count,9999))};
+         return {};
+     }
+     bool HasOutstanding(const std::string& user)
+@@ -107,12 +119,12 @@
+         return true;
+     }
+     bool MatchesReceipt(const std::string& user,uint64_t savedStream,uint32_t cursor,uint32_t receipt,
++                        const std::string& plugin,uint32_t base,int count,int64_t before,const std::string& variant={})
+-                        const std::string& plugin,uint32_t base,int count,int64_t before)
+     {
+         if (!AcceptCursor(user,savedStream,cursor) || receipt!=cursor+1 ||
+             receipt>accounts[user].size()) return false;
+         const auto& r=accounts[user][receipt-1];
++        return r.plugin==plugin && r.base==base && r.count==count && r.before==before && r.variant==variant;
+-        return r.plugin==plugin && r.base==base && r.count==count && r.before==before;
+     }
+     // This is a pure precondition check for a receipt whose cursor is not yet
+     // applied. Never infer application from a matching after-count alone.
+@@ -142,18 +154,20 @@
+         if (r.count>0)
+         {
+             const auto& items=r.refund ? contributions[{r.user,r.peer}] : Stock(r.user,r.peer);
++            auto i=items.find({r.plugin,r.base,r.variant});
+-            auto i=items.find({r.plugin,r.base});
+             if (i==items.end() || i->second<r.count) return false;
+         }
+         std::ostringstream out;
+         out<<(r.refund?"R ":"T ")<<std::quoted(r.user)<<' '<<std::quoted(r.peer)<<' '<<std::quoted(r.plugin)<<' '<<r.base<<' '<<r.count;
+         if (r.before>=0) out<<' '<<r.before;
++        if (!r.variant.empty()) out<<' '<<std::quoted(r.variant);
+         if (!Store(out.str())) return false;
+         Append(r); return true;
+     }
+ private:
+     static bool ValidCounts(const Row& r)
+     {
++        if (!TradeProperties::Decode(r.variant) || (!r.variant.empty() && r.before<0)) return false;
+         return r.before==-1 || (r.before>=0 && r.before<=INT32_MAX &&
+             r.before+static_cast<int64_t>(r.count)>=0 &&
+             r.before+static_cast<int64_t>(r.count)<=INT32_MAX);
+@@ -177,8 +191,13 @@
+             if (!(in>>std::quoted(r.peer)>>std::quoted(r.plugin)>>r.base>>r.count))
+                 throw std::runtime_error("invalid trade operation");
+             in>>std::ws;
++            if (!in.eof())
++            {
++                if (!(in>>r.before) || r.before<0) throw std::runtime_error("invalid trade checkpoint");
++                in>>std::ws;
++                if (!in.eof() && (!(in>>std::quoted(r.variant)) || r.variant.empty() || in>>extra))
++                    throw std::runtime_error("invalid trade properties");
++            }
+-            if (!in.eof() && (!(in>>r.before) || in>>extra || r.before<0))
+-                throw std::runtime_error("invalid trade checkpoint");
+             if (!ValidCounts(r) || (r.refund && (r.count<=0 || r.before<0)) || r.peer.empty() || r.user==r.peer || r.plugin.empty() || !r.base || !r.count ||
+                 std::abs(static_cast<long long>(r.count))>9999 ||
+                 accounts[r.user].size()!=confirmed[r.user] || accounts[r.user].size()>=0xFFFFFE)
+@@ -186,7 +205,7 @@
+             if (r.count>0)
+             {
+                 const auto& items=r.refund ? contributions[{r.user,r.peer}] : Stock(r.user,r.peer);
++                auto it=items.find({r.plugin,r.base,r.variant});
+-                auto it=items.find({r.plugin,r.base});
+                 if (it==items.end() || it->second<r.count) throw std::runtime_error("invalid trade stock");
+             }
+             Append(r);
+@@ -209,7 +228,7 @@
+         accounts[r.user].push_back(r);
+         if (r.count>0)
+         {
++            const auto item=ItemKey{r.plugin,r.base,r.variant};
+-            const auto item=std::make_pair(r.plugin,r.base);
+             auto& own=contributions[{r.user,r.peer}][item];
+             const auto used=std::min<int64_t>(own,r.count);
+             own-=used;
+@@ -224,7 +243,7 @@
+         const auto& r=accounts[user][pos-1];
+         if (r.count<0)
+         {
++            const auto item=ItemKey{r.plugin,r.base,r.variant};
+-            const auto item=std::make_pair(r.plugin,r.base);
+             contributions[{r.user,r.peer}][item]-=r.count;
+             stock[std::minmax(r.user,r.peer)][item]-=r.count;
+         }
+diff --git a/Code/encoding/Structs/PartyTrade.h b/Code/encoding/Structs/PartyTrade.h
+--- a/Code/encoding/Structs/PartyTrade.h
++++ b/Code/encoding/Structs/PartyTrade.h
+@@ -12,7 +12,7 @@
+     TiltedPhoques::String Text{};
+     uint64_t Campaign{}, Character{}, SaveTag{};
+     uint32_t SaveRevision{}, BeforePlusOne{}; // zero = no checkpoint
++    TiltedPhoques::String Profile{}, Credential{}, Variant{};
+-    TiltedPhoques::String Profile{}, Credential{};
+     bool operator==(const PartyTrade&) const noexcept = default;
+     void Serialize(TiltedPhoques::Buffer::Writer& w) const noexcept
+     {
+@@ -23,7 +23,7 @@
+         Item.Serialize(w);
+         S::WriteString(w,Text);
+         S::WriteVarInt(w,Campaign);S::WriteVarInt(w,Character);S::WriteVarInt(w,SaveTag);S::WriteVarInt(w,SaveRevision);
++        S::WriteString(w,Profile);S::WriteString(w,Credential);S::WriteVarInt(w,BeforePlusOne);S::WriteString(w,Variant);
+-        S::WriteString(w,Profile);S::WriteString(w,Credential);S::WriteVarInt(w,BeforePlusOne);
+     }
+     void Deserialize(TiltedPhoques::Buffer::Reader& r) noexcept
+     {
+@@ -32,6 +32,6 @@
+         for (auto* x : {&Peer,&Session,&Cursor,&Count}) *x=static_cast<uint32_t>(S::ReadVarInt(r));
+         Stream=S::ReadVarInt(r); Item.Deserialize(r); Text=S::ReadString(r);
+         Campaign=S::ReadVarInt(r);Character=S::ReadVarInt(r);SaveTag=S::ReadVarInt(r);SaveRevision=static_cast<uint32_t>(S::ReadVarInt(r));
++        Profile=S::ReadString(r);Credential=S::ReadString(r);BeforePlusOne=static_cast<uint32_t>(S::ReadVarInt(r));Variant=S::ReadString(r);
+-        Profile=S::ReadString(r);Credential=S::ReadString(r);BeforePlusOne=static_cast<uint32_t>(S::ReadVarInt(r));
+     }
+ };
+diff --git a/Code/server/Services/PartyTrade.cpp b/Code/server/Services/PartyTrade.cpp
+--- a/Code/server/Services/PartyTrade.cpp
++++ b/Code/server/Services/PartyTrade.cpp
+@@ -82,7 +82,7 @@
+         if (count<=0) continue;
+         PartyTrade event{TradeOp::Entry,q.GetId(),session};
+         event.Count=static_cast<uint32_t>(std::min<int64_t>(count,INT32_MAX));
++        event.Item.BaseId=item.second; event.Text=item.first.c_str(); event.Variant=item.variant.c_str(); Send(p,event);
+-        event.Item.BaseId=item.second; event.Text=item.first.c_str(); Send(p,event);
+     }
+ }
+ }
+@@ -114,7 +114,7 @@
+             {
+                 const auto& r=log[e.Cursor];
+                 PartyTrade op{TradeOp::Receipt,static_cast<uint32_t>(r.count>0),0,e.Cursor+1,static_cast<uint32_t>(std::abs(r.count)),uuid};
++                op.Text=r.plugin.c_str(); op.Item.BaseId=r.base;op.Variant=r.variant.c_str();
+-                op.Text=r.plugin.c_str(); op.Item.BaseId=r.base;
+                 if (r.before>=0) op.BeforePlusOne=static_cast<uint32_t>(r.before+1);
+                 Send(p,op);
+             }
+@@ -148,7 +148,7 @@
+                 if (const auto refund=ledger.NextRefund(user))
+                 {
+                     PartyTrade offer{TradeOp::ReturnOffer,0,0,e.Cursor,refund->count,uuid};
++                    offer.Item.BaseId=refund->base;offer.Text=refund->plugin.c_str();offer.Variant=refund->variant.c_str();
+-                    offer.Item.BaseId=refund->base;offer.Text=refund->plugin.c_str();
+                     Send(p,offer);return;
+                 }
+             Send(p,{TradeOp::Ready,0,e.Session,e.Cursor,0,uuid});
+@@ -166,10 +166,10 @@
+                 e.BeforePlusOne>0x80000000u) return;
+             const auto refund=ledger.NextRefund(user);
+             if (!refund || refund->base!=e.Item.BaseId || refund->count!=e.Count ||
++                refund->plugin!=Plugin(m_world,e.Item.ModId) || refund->variant!=std::string(e.Variant.data(),e.Variant.size())) return;
+-                refund->plugin!=Plugin(m_world,e.Item.ModId)) return;
+             const auto before=static_cast<int64_t>(e.BeforePlusOne)-1;
+             if (!ledger.Ack(user,e.Cursor) || !ledger.Commit(
++                {user,refund->peer,refund->plugin,refund->base,int(refund->count),before,true,refund->variant},e.Cursor))
+-                {user,refund->peer,refund->plugin,refund->base,int(refund->count),before,true},e.Cursor))
+             {
+                 Send(p,{TradeOp::Error,0,0});return;
+             }
+@@ -212,7 +212,8 @@
+             if (!e.BeforePlusOne || e.BeforePlusOne>0x80000000u)
+             { Send(p,{TradeOp::Error,0,e.Session});return; }
+             const int64_t before=static_cast<int64_t>(e.BeforePlusOne)-1;
++            const std::string variant(e.Variant.data(),e.Variant.size());
++            bool ok=TradeProperties::Decode(variant).has_value() && ledger.Ack(user,e.Cursor) && ledger.Commit({user,Name(peer),plugin,e.Item.BaseId,(e.Op==TradeOp::Take?1:-1)*int(e.Count),before,false,variant},e.Cursor);
+-            bool ok=ledger.Ack(user,e.Cursor) && ledger.Commit({user,Name(peer),plugin,e.Item.BaseId,(e.Op==TradeOp::Take?1:-1)*int(e.Count),before},e.Cursor);
+             if (!ok) Send(p,{TradeOp::Error,0,e.Session});
+             next();
+         }
+diff --git a/Code/client/Services/Generic/PartyTrade.cpp b/Code/client/Services/Generic/PartyTrade.cpp
+--- a/Code/client/Services/Generic/PartyTrade.cpp
++++ b/Code/client/Services/Generic/PartyTrade.cpp
+@@ -20,6 +20,20 @@
+ #include <Forms/TESGlobal.h>
+ #include <Games/TES.h>
+ #include <ExtraData/ExtraContainerChanges.h>
++#include <ExtraData/ExtraCount.h>
++#include <ExtraData/ExtraHealth.h>
++#include <ExtraData/ExtraCharge.h>
++#include <ExtraData/ExtraSoul.h>
++#include <ExtraData/ExtraEnchantment.h>
++#include <ExtraData/ExtraPoison.h>
++#include <ExtraData/ExtraTextDisplayData.h>
++#include <Components/TESContainer.h>
++#include <Forms/EnchantmentItem.h>
++#include <Forms/AlchemyItem.h>
++#include <InventoryEvidence.h>
++#include <Games/Memory.h>
++#include <Games/BGSCreatedObjectManager.h>
++#include <Magic/EffectItem.h>
+ #include <Games/ActorExtension.h>
+ #include <Utils.h>
+ #include <Interface/UI.h>
+@@ -73,13 +87,15 @@
+ uint32_t lastConflict=UINT32_MAX;
+ std::string partner;
+ Clock::time_point pollAt{};
++using LocalItem=std::pair<uint32_t,std::string>;
++using LocalStock=std::map<LocalItem,int>;
++LocalStock buffer,incomingStock;
+-std::map<uint32_t,int> buffer, incomingStock;
+ uint32_t stockRemaining{};
+ bool stockComplete{}, nativeRequested{}, nativeOpened{};
+ bool shadowCleanupPending=true;
+ Clock::time_point cleanupRetry{};
+ Clock::time_point nativeDeadline{};
++struct NativeIntent { LocalItem Item; uint32_t Count; bool Take; };
+-struct NativeIntent { uint32_t Id,Count; bool Take; };
+ std::deque<NativeIntent> nativeIntents;
+ bool nativeAwaiting{}, takeAllRegistered{};
+ Clock::time_point nativeReceiptDeadline{};
+@@ -169,8 +185,8 @@
+             return;
+         }
+         // Capture only the displayed stock, not later deposits.
++        for (const auto& [item,count]:buffer)
++            if (count>0) nativeIntents.push_back({item,static_cast<uint32_t>(count),true});
+-        for (const auto& [id,count]:buffer)
+-            if (count>0) nativeIntents.push_back({id,static_cast<uint32_t>(count),true});
+     });
+ }
+ class TradeCallbackProcessor final : public Processor
+@@ -270,6 +286,459 @@
+     VirtualProtect(table+0x56,5*sizeof(void*),prior,&unused);
+     return true;
+ }
++// Use the same static-form resolution as the existing diagnostic code,
++// but no diagnostic sampling or network mod ID is required.
++std::optional<TradeProperties::FormKey> PropertyKey(uint32_t form)
++{
++    std::vector<InventoryEvidence::PluginSlot> slots;
++    if (auto* manager=ModManager::Get())
++        for (const auto* mod:manager->mods)
++        {
++            if (!mod || !mod->IsLoaded()) continue;
++            const auto* end=std::find(mod->filename,mod->filename+sizeof(mod->filename),'\0');
++            if (end==mod->filename+sizeof(mod->filename)) continue;
++            slots.push_back({mod->GetId(),mod->IsLite(),std::string(mod->filename,end)});
++        }
++    auto key=InventoryEvidence::Resolve(form,slots);
++    if (!key) return {};
++    TradeProperties::FormKey result{key->Plugin,key->Local};
++    if (!result.Valid()) return {};
++    return result;
++}
++TESForm* ResolvePropertyForm(const TradeProperties::FormKey& key)
++{
++    auto* manager=ModManager::Get();
++    auto* mod=manager?manager->GetByName(key.Plugin.c_str()):nullptr;
++    if (!key.Valid() || !mod || !mod->IsLoaded() || (mod->IsLite()&&key.Local>0xFFF)) return nullptr;
++    auto id=mod->GetFormId(key.Local);
++    auto resolved=PropertyKey(id);
++    if (!resolved || resolved->Plugin!=key.Plugin || resolved->Local!=key.Local) return nullptr;
++    return TESForm::GetById(id);
++}
++template<class T> T* PropertyForm(const TradeProperties::FormKey& key)
++{
++    return Cast<T>(ResolvePropertyForm(key));
++}
++// CommonLibSSE-NG ExtraOwnership: type 0x21, owner at 0x10, size 0x18.
++// A static NPC base or faction, never a reference or a connection ID.
++struct TradeOwnership : BSExtraData
++{
++    TESForm* Owner{};
++};
++static_assert(sizeof(TradeOwnership)==0x18);
++constexpr auto OwnershipType=static_cast<ExtraDataType>(0x21);
++bool SupportedOwner(const TESForm* owner)
++{
++    return owner && owner->formID!=7 && !owner->IsTemporary() && !owner->IsDeleted() &&
++        (owner->formType==FormType::Npc || owner->formType==static_cast<FormType>(0x0B));
++}
++TESForm* PropertyOwner(const TradeProperties::FormKey& key)
++{
++    auto* owner=ResolvePropertyForm(key);
++    return SupportedOwner(owner)?owner:nullptr;
++}
++// SKSE v2.2.8 GameExtraData.cpp: ExtraOwnership vtable, Steam 1.6.1170.
++void** ResolveOwnershipTable()
++{
++    if (VersionDb::Get().GetLoadedVersionString()!="1.6.1170.0") return nullptr;
++    auto module=GetModuleHandleW(nullptr);
++    if (!module) return nullptr;
++    auto** table=reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(module)+0x01770830);
++    const auto check=[module](const void* addr,bool executable,size_t bytes)
++    {
++        MEMORY_BASIC_INFORMATION info{};
++        if (!VirtualQuery(addr,&info,sizeof(info)) || info.AllocationBase!=module ||
++            info.State!=MEM_COMMIT || (info.Protect&(PAGE_GUARD|PAGE_NOACCESS))) return false;
++        const auto start=reinterpret_cast<uintptr_t>(addr);
++        const auto end=reinterpret_cast<uintptr_t>(info.BaseAddress)+info.RegionSize;
++        if (start>end || bytes>end-start) return false;
++        const auto prot=info.Protect&0xff;
++        if (executable) return prot==PAGE_EXECUTE || prot==PAGE_EXECUTE_READ ||
++            prot==PAGE_EXECUTE_READWRITE || prot==PAGE_EXECUTE_WRITECOPY;
++        return prot==PAGE_READONLY || prot==PAGE_READWRITE || prot==PAGE_WRITECOPY ||
++            prot==PAGE_EXECUTE_READ || prot==PAGE_EXECUTE_READWRITE || prot==PAGE_EXECUTE_WRITECOPY;
++    };
++    return check(table,false,3*sizeof(void*)) && check(table[0],true,1) &&
++        check(table[1],true,1) && check(table[2],true,1)?table:nullptr;
++}
++bool SetTradeOwner(ExtraDataList& list,const TradeProperties::FormKey& key)
++{
++    auto* owner=PropertyOwner(key);
++    auto** table=ResolveOwnershipTable();
++    if (!owner || !table || list.Contains(OwnershipType)) return false;
++    auto* data=Memory::Allocate<TradeOwnership>();
++    if (!data) return false;
++    std::memset(static_cast<void*>(data),0,sizeof(*data));
++    *reinterpret_cast<void***>(data)=table;
++    data->Owner=owner;
++    if (!list.Add(OwnershipType,data))
++    {
++        Memory::Free(data);return false;
++    }
++    return true;
++}
++// Base COED may contain ownership, rank/global and health. Do not infer
++// a clean implicit stack from a base entry with unrepresented metadata.
++bool UnambiguousBase(const TESObjectREFR& object,uint32_t id)
++{
++    if (const auto* base=object.GetContainer())
++    {
++        if (base->count && !base->entries) return false;
++        for (uint32_t i=0;i<base->count;++i)
++        {
++            const auto* entry=base->entries[i];
++            if (entry && entry->form && entry->form->formID==id && entry->data) return false;
++        }
++    }
++    return true;
++}
++bool UnownedProxy(const TESObjectREFR& object)
++{
++    // CommonLibSSE-NG TESObjectREFR::GetOwner, AE 20194.
++    if (VersionDb::Get().GetLoadedVersionString()!="1.6.1170.0") return false;
++    using GetOwner=TESForm*(const TESObjectREFR*);
++    auto* owner=Address<GetOwner>(20194);
++    return owner && !owner(&object);
++}
++// SKSE v2.2.8 GameExtraData.cpp/GameExtraData.h and GameBSExtraData.cpp:
++// Steam 1.6.1170, ExtraTextDisplayData vtable RVA and native SetName.
++// Do not use the obsolete absolute 0x1416244D0 from upstream STR.
++struct NameApi
++{
++    void** Table{};
++    using Setter=void(ExtraTextDisplayData*,const char*);
++    Setter* Set{};
++};
++std::optional<NameApi> ResolveNameApi()
++{
++    if (VersionDb::Get().GetLoadedVersionString()!="1.6.1170.0") return {};
++    const auto module=GetModuleHandleW(nullptr);
++    if (!module) return {};
++    auto base=reinterpret_cast<uintptr_t>(module);
++    auto** table=reinterpret_cast<void**>(base+0x01771390);
++    auto* setter=reinterpret_cast<NameApi::Setter*>(base+0x00184230);
++    const auto committed=[module](const void* addr,bool executable,size_t bytes)
++    {
++        MEMORY_BASIC_INFORMATION info{};
++        if (!VirtualQuery(addr,&info,sizeof(info)) || info.AllocationBase!=module ||
++            info.State!=MEM_COMMIT || (info.Protect&(PAGE_GUARD|PAGE_NOACCESS))) return false;
++        const auto start=reinterpret_cast<uintptr_t>(addr);
++        const auto end=reinterpret_cast<uintptr_t>(info.BaseAddress)+info.RegionSize;
++        if (start>end || bytes>end-start) return false;
++        const auto prot=info.Protect&0xff;
++        if (executable) return prot==PAGE_EXECUTE || prot==PAGE_EXECUTE_READ ||
++            prot==PAGE_EXECUTE_READWRITE || prot==PAGE_EXECUTE_WRITECOPY;
++        return prot==PAGE_READONLY || prot==PAGE_READWRITE || prot==PAGE_WRITECOPY ||
++            prot==PAGE_EXECUTE_READ || prot==PAGE_EXECUTE_READWRITE || prot==PAGE_EXECUTE_WRITECOPY;
++    };
++    if (!committed(table,false,2*sizeof(void*)) ||
++        !committed(table[0],true,1) || !committed(table[1],true,1) ||
++        !committed(reinterpret_cast<void*>(setter),true,1)) return {};
++    return NameApi{table,setter};
++}
++std::optional<std::string> ReadCustomName(const ExtraTextDisplayData& name)
++{
++    const auto api=ResolveNameApi();
++    if (!api || *reinterpret_cast<void* const* const*>(&name)!=api->Table ||
++        name.iOwnerInstance!=-2 || name.pDisplayNameText || name.pOwnerQuest ||
++        !name.usCustomNameLength || name.usCustomNameLength>TradeProperties::MaxNameBytes ||
++        !name.DisplayName.data) return {};
++    // CommonLib: customNameLength excludes the generated temper suffix.
++    std::string value;
++    for (size_t i=0;i<name.usCustomNameLength;++i)
++    {
++        const char ch=name.DisplayName.data[i];
++        if (!ch) return {};
++        value+=ch;
++    }
++    if (!TradeProperties::ValidName(value)) return {};
++    return value;
++}
++bool SetCustomName(ExtraDataList& list,const std::string& name)
++{
++    auto api=ResolveNameApi();
++    if (!api || !TradeProperties::ValidName(name) ||
++        list.Contains(ExtraDataType::TextDisplayData)) return false;
++    auto* data=Memory::Allocate<ExtraTextDisplayData>();
++    if (!data) return false;
++    // Equivalent to SKSE BSExtraData::Create: game heap, zeroed storage,
++    // engine vtable, default owner and temper factor, then native setter.
++    std::memset(static_cast<void*>(data),0,sizeof(*data));
++    *reinterpret_cast<void***>(data)=api->Table;
++    data->iOwnerInstance=-1;
++    data->fTemperFactor=1.f;
++    api->Set(data,name.c_str());
++    const auto actual=ReadCustomName(*data);
++    if (!actual || *actual!=name || !list.Add(ExtraDataType::TextDisplayData,data))
++    {
++        if (data->DisplayName.data) data->DisplayName.Release();
++        Memory::Free(data);
++        return false;
++    }
++    return true;
++}
++std::optional<TradeProperties::CreatedEnchant> DescribeCreated(const EnchantmentItem& item)
++{
++    if ((item.formID>>24)!=0xFF) return {};
++    TradeProperties::CreatedEnchant out;
++    // The two existing STR constructors distinguish offensive and defensive.
++    if (item.eCastingType==MagicSystem::CONSTANT_EFFECT && item.eDelivery==MagicSystem::SELF)
++        out.Weapon=false;
++    else if (item.eCastingType==MagicSystem::FIRE_AND_FORGET && item.eDelivery==MagicSystem::TOUCH)
++        out.Weapon=true;
++    else return {};
++    out.Metadata={static_cast<uint32_t>(item.iCostOverride),static_cast<uint32_t>(item.iFlags),
++        static_cast<uint32_t>(item.eCastingType),static_cast<uint32_t>(item.iChargeOverride),
++        static_cast<uint32_t>(item.eDelivery),static_cast<uint32_t>(item.eSpellType),
++        std::bit_cast<uint32_t>(item.fChargeTime)};
++    if (item.pBaseEnchantment)
++    {
++        auto key=PropertyKey(item.pBaseEnchantment->formID);
++        if (!key) return {};
++        out.Base=*key;
++    }
++    if (item.pWornRestrictions)
++    {
++        auto key=PropertyKey(item.pWornRestrictions->formID);
++        if (!key) return {};
++        out.Restrictions=*key;
++    }
++    if (item.fullName.value.data)
++    {
++        const auto* text=item.fullName.value.data;
++        for (size_t i=0;text[i];++i)
++        {
++            if (i>=TradeProperties::MaxNameBytes) return {};
++            out.Name+=text[i];
++        }
++    }
++    for (const auto* effect:item.listOfEffects)
++    {
++        // STR's constructor cannot preserve instance-level TESCondition.
++        // Conditions on the static EffectSetting itself remain in its plugin.
++        if (!effect || !effect->pEffectSetting || effect->Condition.pHead ||
++            out.Effects.size()>=8 || effect->data.iArea<0 || effect->data.iDuration<0) return {};
++        auto key=PropertyKey(effect->pEffectSetting->formID);
++        if (!key) return {};
++        out.Effects.push_back({*key,std::bit_cast<uint32_t>(effect->data.fMagnitude),
++            static_cast<uint32_t>(effect->data.iArea),static_cast<uint32_t>(effect->data.iDuration),
++            std::bit_cast<uint32_t>(effect->fRawCost)});
++    }
++    if (!out.Valid() || out.Encode().size()>3000) return {};
++    return out;
++}
++bool CreatedAvailable(const TradeProperties::CreatedEnchant& value)
++{
++    if ((!value.Base.Empty()&&!PropertyForm<EnchantmentItem>(value.Base)) ||
++        (!value.Restrictions.Empty()&&!PropertyForm<BGSListForm>(value.Restrictions))) return false;
++    for (const auto& e:value.Effects)
++        if (!PropertyForm<EffectSetting>(e.Setting)) return false;
++    return true;
++}
++EnchantmentItem* RecreateEnchant(const TradeProperties::CreatedEnchant& value)
++{
++    if (!value.Valid() || !CreatedAvailable(value) || !BGSCreatedObjectManager::Get()) return nullptr;
++    Inventory::EnchantmentData data;
++    data.IsWeapon=value.Weapon;
++    auto& mods=World::Get().GetModSystem();
++    for (const auto& e:value.Effects)
++    {
++        auto* setting=PropertyForm<EffectSetting>(e.Setting);
++        Inventory::EffectItem effect;
++        if (!setting || !mods.GetServerModId(setting->formID,effect.EffectId) ||
++            mods.GetGameId(effect.EffectId)!=setting->formID) return nullptr;
++        effect.Magnitude=std::bit_cast<float>(e.Magnitude);
++        effect.Area=static_cast<int32_t>(e.Area);effect.Duration=static_cast<int32_t>(e.Duration);
++        effect.RawCost=std::bit_cast<float>(e.Cost);
++        data.Effects.push_back(effect);
++    }
++    auto* enchant=EnchantmentItem::Create(data);
++    auto restored=enchant?DescribeCreated(*enchant):std::nullopt;
++    // Never mutate shared/deduplicated engine enchantment forms to force a match.
++    return restored && restored->Encode()==value.Encode()?enchant:nullptr;
++}
++bool PropertiesAvailable(const TradeProperties::Values& value)
++{
++    return (!(value.Mask&value.HasEnchant) || (value.Created?CreatedAvailable(*value.Created):
++        PropertyForm<EnchantmentItem>(value.Enchant)!=nullptr)) &&
++        (!(value.Mask&value.HasPoison) || PropertyForm<AlchemyItem>(value.Poison)) &&
++        (!(value.Mask&value.HasName) || ResolveNameApi().has_value()) &&
++        (!(value.Mask&value.HasOwnership) || (PropertyOwner(value.Owner) && ResolveOwnershipTable()));
++}
++struct ObservedExtra { std::string Variant; int Count=1; };
++std::optional<ObservedExtra> ReadExtra(ExtraDataList* list)
++{
++    if (!list) return ObservedExtra{};
++    TradeProperties::Values value;
++    ObservedExtra out;
++    bool valid=true,hasCount=false;
++    list->lock.LockForRead();
++    for (auto* data=list->data;data;data=data->next)
++    {
++        uint32_t bit=0;
++        switch (data->GetType())
++        {
++        case ExtraDataType::Count:
++            if (hasCount) valid=false;
++            hasCount=true;out.Count=static_cast<ExtraCount*>(data)->count;
++            break;
++        case OwnershipType:
++        {
++            const auto* owner=static_cast<TradeOwnership*>(data)->Owner;
++            if (!SupportedOwner(owner)) {valid=false;break;}
++            auto key=PropertyKey(owner->formID);
++            if (!key) {valid=false;break;}
++            bit=value.HasOwnership;value.Owner=*key;
++            break;
++        }
++        case ExtraDataType::Health:
++            bit=value.HasHealth;value.Health=std::bit_cast<uint32_t>(static_cast<ExtraHealth*>(data)->fHealth);break;
++        case ExtraDataType::Charge:
++            bit=value.HasCharge;value.Charge=std::bit_cast<uint32_t>(static_cast<ExtraCharge*>(data)->fCharge);break;
++        case ExtraDataType::Soul:
++            bit=value.HasSoul;value.Soul=static_cast<uint32_t>(static_cast<ExtraSoul*>(data)->cSoul);break;
++        case ExtraDataType::Enchantment:
++        {
++            auto* enchant=static_cast<ExtraEnchantment*>(data);
++            if (!enchant->pEnchantment) {valid=false;break;}
++            bit=value.HasEnchant;
++            if ((enchant->pEnchantment->formID>>24)==0xFF)
++            {
++                auto created=DescribeCreated(*enchant->pEnchantment);
++                if (!created || value.Created) {valid=false;break;}
++                bit|=value.HasCreated;value.Created=std::move(*created);
++            }
++            else
++            {
++                auto key=PropertyKey(enchant->pEnchantment->formID);
++                if (!key) {valid=false;break;}
++                value.Enchant=*key;
++            }
++            value.EnchantCharge=enchant->usCharge;value.RemoveOnUnequip=enchant->bRemoveOnUnequip;
++            break;
++        }
++        case ExtraDataType::Poison:
++        {
++            auto* poison=static_cast<ExtraPoison*>(data);
++            auto key=poison->pPoison?PropertyKey(poison->pPoison->formID):std::nullopt;
++            if (!key) {valid=false;break;}
++            bit=value.HasPoison;value.Poison=*key;value.PoisonCount=poison->uiCount;
++            break;
++        }
++        case ExtraDataType::TextDisplayData:
++        {
++            // Derived text is regenerated; quest/message-owned text is
++            // never copied. Explicit names retain their exact original bytes.
++            auto* name=static_cast<ExtraTextDisplayData*>(data);
++            if (name->iOwnerInstance==-2)
++            {
++                auto custom=ReadCustomName(*name);
++                if (!custom) {valid=false;break;}
++                bit=value.HasName;value.Name=std::move(*custom);
++            }
++            else if (name->iOwnerInstance!=-1 || name->usCustomNameLength ||
++                name->pDisplayNameText || name->pOwnerQuest) valid=false;
++            break;
++        }
++        default:valid=false;break;
++        }
++        if (bit && (value.Mask&bit)) valid=false;
++        value.Mask|=bit;
++        if (!valid) break;
++    }
++    list->lock.UnlockRead();
++    if (!valid || out.Count<=0 || !value.Valid()) return {};
++    out.Variant=value.Encode();
++    if (!TradeProperties::Decode(out.Variant)) return {};
++    return out;
++}
++// Exact property groups are counted from live extra-data lists, not from
++// Inventory::Entry::CanBeMerged (which can ignore individual properties).
++struct VariantCount { int64_t Count{}; ExtraDataList* First{}; int FirstCount{}; };
++std::optional<VariantCount> CountVariant(TESObjectREFR& object,const LocalItem& key)
++{
++    auto properties=TradeProperties::Decode(key.second);
++    if (key.second.empty() || !properties || !PropertiesAvailable(*properties)) return {};
++    auto* form=TESForm::GetById(key.first);
++    if (!form || !UnambiguousBase(object,key.first)) return {};
++    const auto total=object.GetItemCountInInventory(form);
++    if (total<0 || total>INT32_MAX) return {};
++    VariantCount result;
++    const auto* changes=object.GetContainerChanges();
++    if (!changes) return result;
++    if (!changes->entries) return {};
++    for (auto* entry:*changes->entries)
++    {
++        if (!entry || !entry->form || entry->form->formID!=key.first) continue;
++        if (entry->IsQuestObject()) return {};
++        if (!entry->dataList) continue;
++        for (auto* list:*entry->dataList)
++        {
++            auto extra=ReadExtra(list);
++            if (!extra || extra->Variant!=key.second) continue;
++            result.Count+=extra->Count;
++            if (result.Count>total) return {};
++            if (!result.First) {result.First=list;result.FirstCount=extra->Count;}
++        }
++    }
++    return result;
++}
++bool ChangeVariant(TESObjectREFR& object,const LocalItem& key,int delta)
++{
++    auto value=TradeProperties::Decode(key.second);
++    auto before=CountVariant(object,key);
++    auto* form=Cast<TESBoundObject>(TESForm::GetById(key.first));
++    if (!value || !value->Mask || !before || !form || !delta ||
++        before->Count+delta<0 || before->Count+delta>INT32_MAX) return false;
++    const auto totalBefore=object.GetItemCountInInventory(form);
++    if (totalBefore<0 || totalBefore+delta<0 || totalBefore+delta>INT32_MAX) return false;
++    if (delta>0)
++    {
++        auto* enchant=(value->Mask&value->HasEnchant)?(value->Created?RecreateEnchant(*value->Created):
++            PropertyForm<EnchantmentItem>(value->Enchant)):nullptr;
++        auto* poison=(value->Mask&value->HasPoison)?PropertyForm<AlchemyItem>(value->Poison):nullptr;
++        if (((value->Mask&value->HasEnchant)&&!enchant) || ((value->Mask&value->HasPoison)&&!poison)) return false;
++        auto* list=ExtraDataList::New();
++        if (!list) return false;
++        if (value->Mask&value->HasHealth) list->SetHealth(std::bit_cast<float>(value->Health));
++        if (value->Mask&value->HasCharge) list->SetChargeData(std::bit_cast<float>(value->Charge));
++        if (value->Mask&value->HasSoul) list->SetSoulData(static_cast<SOUL_LEVEL>(value->Soul));
++        if (enchant) list->SetEnchantmentData(enchant,static_cast<uint16_t>(value->EnchantCharge),value->RemoveOnUnequip!=0);
++        if (poison) list->SetPoison(poison,value->PoisonCount);
++        if ((value->Mask&value->HasName) && !SetCustomName(*list,value->Name)) return false;
++        if ((value->Mask&value->HasOwnership) && !SetTradeOwner(*list,value->Owner)) return false;
++        // Validate the generated representation before admitting it.
++        auto generated=ReadExtra(list);
++        if (!generated || generated->Variant!=key.second)
++        {
++            // Ownership of a newly allocated engine list is deliberately not
++            // passed to the inventory when a setter cannot represent the value.
++            spdlog::error("Trade: engine could not recreate item properties");
++            return false;
++        }
++        object.AddObjectToContainer(form,list,delta,nullptr);
++    }
++    else
++    {
++        int remaining=-delta;
++        while (remaining)
++        {
++            // Resolve again after each mutation. Never retain a list pointer
++            // across an engine call or network round trip.
++            auto current=CountVariant(object,key);
++            if (!current || !current->First || current->Count<remaining) return false;
++            const int chunk=std::min(remaining,current->FirstCount);
++            object.RemoveItem(form,chunk,ITEM_REMOVE_REASON::kRemove,current->First,nullptr);
++            auto after=CountVariant(object,key);
++            if (!after || after->Count!=current->Count-chunk) return false;
++            remaining-=chunk;
++        }
++    }
++    auto after=CountVariant(object,key);
++    return after && after->Count==before->Count+delta &&
++        object.GetItemCountInInventory(form)==totalBefore+delta;
++}
++
+ std::optional<std::map<uint32_t,int>> ShadowCounts(TESObjectREFR& object)
+ {
+     std::map<uint32_t,int> result;
+@@ -286,38 +755,78 @@
+     std::erase_if(result,[](const auto& row){return !row.second;});
+     return result;
+ }
++std::optional<LocalStock> ShadowVariants(TESObjectREFR& object)
++{
++    auto counts=ShadowCounts(object);
++    if (!counts) return {};
++    LocalStock result;
++    for (const auto& [id,n]:*counts) result[{id,{}}]=n;
++    const auto* changes=object.GetContainerChanges();
++    if (changes && changes->entries)
++        for (auto* entry:*changes->entries)
++        {
++            if (!entry || !entry->form || !entry->dataList) continue;
++            for (auto* list:*entry->dataList)
++            {
++                auto extra=ReadExtra(list);
++                if (!extra) return {};
++                if (extra->Variant.empty()) continue;
++                auto& plain=result[{entry->form->formID,{}}];
++                if (plain<extra->Count) return {};
++                plain-=extra->Count;
++                result[{entry->form->formID,extra->Variant}]+=extra->Count;
++            }
++        }
++    std::erase_if(result,[](const auto& row){return !row.second;});
++    return result;
++}
++bool SetShadow(World&,const LocalStock& desired)
+-bool SetShadow(World& world,const std::map<uint32_t,int>& desired)
+ {
+     auto* object=Proxy();
++    if (!object || !UnownedProxy(*object)) return false;
+-    if (!object) return false;
++    auto current=ShadowVariants(*object);
+-    auto current=ShadowCounts(*object);
+     if (!current) return false;
+     if (*current==desired) return true;
+     auto keys=*current;
++    for (const auto& [key,count]:desired) keys.try_emplace(key,0);
+-    for (const auto& [id,count]:desired) keys.try_emplace(id,0);
+-    std::vector<std::pair<TESBoundObject*,Inventory::Entry>> changes;
+-    for (const auto& [id,_]:keys)
+-    {
+-        const auto found=desired.find(id);
+-        const int delta=(found==desired.end()?0:found->second)-(*current)[id];
+-        if (!delta) continue;
+-        auto* form=Cast<TESBoundObject>(TESForm::GetById(id));
+-        Inventory::Entry entry{};
+-        if (!form || !world.GetModSystem().GetServerModId(id,entry.BaseId)) return false;
+-        entry.Count=delta;
+-        changes.emplace_back(form,std::move(entry));
+-    }
+     using Refresh=void(TESObjectREFR*,const TESBoundObject*);
++    auto* refresh=Address<Refresh>(52849);
+-    auto* refresh=Address<Refresh>(52849); // RE::SendUIMessage::SendInventoryUpdateMessage, AE
+     if (!refresh) return false;
++    // Remove variants before plain stacks; adding happens only after removals.
++    // If a plain stack shares a base with a variant, rebuild the scratch chest
++    // instead of using an ambiguous plain RemoveItem.
+     {
+         ShadowWrite guard;
++        const auto totals=ShadowCounts(*object);
++        if (!totals) return false;
++        for (const auto& [id,count]:*totals)
++        {
++            auto* form=Cast<TESBoundObject>(TESForm::GetById(id));
++            if (!form || count<=0) return false;
++            object->RemoveItem(form,count,ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
++        }
++        auto empty=ShadowCounts(*object);
++        if (!empty || !empty->empty()) return false;
++        for (const auto& [key,count]:desired)
++        {
++            if (count<=0) return false;
++            if (!key.second.empty())
++            {
++                if (!ChangeVariant(*object,key,count)) return false;
++            }
++            else
++            {
++                auto* form=Cast<TESBoundObject>(TESForm::GetById(key.first));
++                if (!form) return false;
++                object->AddObjectToContainer(form,nullptr,count,nullptr);
++            }
++        }
+-        for (auto& [form,entry]:changes) object->AddOrRemoveItem(entry,true);
+     }
++    auto updated=ShadowVariants(*object);
+-    auto updated=ShadowCounts(*object);
+     if (!updated || *updated!=desired) return false;
+     if (NativeMenuOpen())
++        for (const auto& [key,_]:keys)
++            if (auto* form=Cast<TESBoundObject>(TESForm::GetById(key.first))) refresh(object,form);
+-        for (const auto& [form,entry]:changes) refresh(object,form);
+     return true;
+ }
+ // The scratch copy is not authoritative. Clear it even without server mod IDs.
+@@ -425,6 +934,83 @@
+ {
+     return !receiptFailure && walletReady && !nativeAwaiting && readyCursor==w.Cursor() && (!w.Stream() || readyStream==w.Stream());
+ }
++std::optional<int64_t> ReceiptCount(World& world,PlayerCharacter& player,const LocalItem& key,bool credit=false)
++{
++    if (!UnambiguousBase(player,key.first)) return {};
++    if (!key.second.empty())
++    {
++        auto observed=CountVariant(player,key);
++        if (!observed) return {};
++        return observed->Count;
++    }
++    auto* form=TESForm::GetById(key.first);
++    if (!form) return {};
++    const auto total=player.GetItemCountInInventory(form);
++    if (total<0 || total>INT32_MAX) return {};
++    if (!credit)
++    {
++        // Without a selected list, an implicit clean debit of a mixed stack is ambiguous.
++        if (Unsuitable(player).count(key.first) || total!=Pocket(world,player)[key.first]) return {};
++        return total;
++    }
++    // Clean credit/refund may coexist with known special stacks. Count only
++    // the clean remainder, never an owned stack as part of a clean receipt.
++    int64_t special=0,listed=0;
++    const auto* changes=player.GetContainerChanges();
++    if (changes && !changes->entries) return {};
++    if (changes)
++        for (auto* entry:*changes->entries)
++        {
++            if (!entry || !entry->form || entry->form->formID!=key.first) continue;
++            if (entry->IsQuestObject()) return {};
++            if (!entry->dataList) continue;
++            for (auto* list:*entry->dataList)
++            {
++                if (!list) continue;
++                auto extra=ReadExtra(list);
++                if (!extra) return {};
++                listed+=extra->Count;
++                if (listed>total) return {};
++                if (!extra->Variant.empty()) special+=extra->Count;
++            }
++        }
++    return total-special;
++}
++bool SubmitTransfer(World& world,const Wallet& wallet,const LocalItem& key,uint32_t count,bool take)
++{
++    if (!tradeOpen || !stockComplete || !count || count>9999 ||
++        (!nativeRequested && !key.second.empty())) return false;
++    auto* player=PlayerCharacter::Get();
++    const auto properties=TradeProperties::Decode(key.second);
++    if (!player || !properties) return false;
++    if (properties->Created)
++    {
++        auto* base=TESForm::GetById(key.first);
++        if (!base || (properties->Created->Weapon?base->formType!=FormType::Weapon:base->formType!=FormType::Armor) ||
++            !RecreateEnchant(*properties->Created)) return false;
++    }
++    auto before=ReceiptCount(world,*player,key,take);
++    if (!before || (take ? (*before+count>INT32_MAX || !buffer.count(key) || buffer[key]<int(count))
++                         : (*before<count))) return false;
++    PartyTrade e{take?TradeOp::Take:TradeOp::Deposit,peer,session,wallet.Cursor(),count,wallet.Stream()};
++    if (!world.GetModSystem().GetServerModId(key.first,e.Item)) return false;
++    e.Variant=key.second.c_str();e.BeforePlusOne=static_cast<uint32_t>(*before+1);
++    if (!Send(e)) return false;
++    walletReady=false;
++    if (nativeRequested)
++    {
++        nativeAwaiting=true;nativeReceiptDeadline=Clock::now()+15s;
++    }
++    return true;
++}
++std::map<uint32_t,int> PlainBuffer()
++{
++    std::map<uint32_t,int> result;
++    for (const auto& [item,count]:buffer)
++        if (item.second.empty()) result[item.first]=count;
++    return result;
++}
++
+ CefString Rows(const std::map<uint32_t,int>& items)
+ {
+     auto list=CefListValue::Create();
+@@ -462,28 +1048,21 @@
+     // stale menu callbacks, direct transfers and TakeAll loops.
+     if (!token || source==destination || !item || count<=0 ||
+         (source ? (!to || to->formID!=0x14) : (!from || from->formID!=0x14))) return true;
++    const auto selected=ReadExtra(extra);
+-    bool special=false;
+-    if (extra)
+-    {
+-        extra->lock.LockForRead();
+-        for (auto* data=extra->data;data;data=data->next)
+-            if (data->GetType()!=ExtraDataType::Count) {special=true;break;}
+-        extra->lock.UnlockRead();
+-    }
+     const auto id=item->formID;
++    World::Get().GetRunner().Queue([token,id,count,source,selected]()
+-    World::Get().GetRunner().Queue([token,id,count,source,special]()
+     {
+         auto& world=World::Get();
+         if (nativeToken.load()!=token || !world.GetTransport().IsOnline() ||
+             !CampaignAccess::GameReady() || !NativeMenuOpen() || !stockComplete) return;
++        if (!selected || (!selected->Variant.empty() && count>selected->Count))
+-        if (special)
+         {
+             Utils::ShowHudMessage("Этот экземпляр пока нельзя передать через обмен.");
+             return;
+         }
+         if (nativeIntents.size()>=128)
+         {Utils::ShowHudMessage("Дождитесь завершения перемещений.");return;}
++        nativeIntents.push_back({{id,selected->Variant},static_cast<uint32_t>(count),source});
+-        nativeIntents.push_back({id,static_cast<uint32_t>(count),source});
+     });
+     return true;
+ }
+@@ -546,29 +1125,9 @@
+     if (!w.Load(m_world) || !Ready(w)) return;
+     PartyTrade e{TradeOp::Accept,peer,session,w.Cursor(),count,w.Stream()};
+     if (action==1 && !tradeOpen) {Send(e);return;}
++    if (action!=2 && action!=3) return;
++    if (!SubmitTransfer(m_world,w,{id,{}},count,action==3) && nativeRequested)
++        Utils::ShowHudMessage("Предмет недоступен для обмена.");
+-    if (!tradeOpen || !stockComplete || (action!=2 && action!=3) || !count || count>9999) return;
+-    auto* p=PlayerCharacter::Get(); if (!p) return;
+-    if (action==2 && Pocket(m_world,*p)[id]<static_cast<int>(count))
+-    {if (nativeRequested) Utils::ShowHudMessage("Предмет недоступен для обмена.");return;}
+-    if (action==3 && (!buffer.count(id) || buffer[id]<static_cast<int>(count))) return;
+-    if (!m_world.GetModSystem().GetServerModId(id,e.Item)) return;
+-    // Require a before-count for all new operations, including legacy mode.
+-    {
+-        auto* form=TESForm::GetById(id);
+-        if (!form || Unsuitable(*p).count(id)) return;
+-        const int64_t before=p->GetItemCountInInventory(form);
+-        if (before<0 || before>INT32_MAX || before!=Pocket(m_world,*p)[id] ||
+-            (action==3 && before+count>INT32_MAX)) return;
+-        e.BeforePlusOne=static_cast<uint32_t>(before+1);
+-    }
+-    e.Op=action==2?TradeOp::Deposit:TradeOp::Take;
+-    if (!Send(e)) return;
+-    walletReady=false;
+-    if (nativeRequested)
+-    {
+-        nativeAwaiting=true;
+-        nativeReceiptDeadline=Clock::now()+15s;
+-    }
+ }
+ void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
+ {
+@@ -593,20 +1152,21 @@
+         if (!mod || !mod->IsLoaded()) return;
+         const auto id=mod->GetFormId(e.Item.BaseId);
+         auto* form=TESForm::GetById(id);
++        if (!form || !Cast<TESBoundObject>(form))
+-        if (!form || !Cast<TESBoundObject>(form) || Unsuitable(*p).count(id))
+         {
+             if (lastConflict!=e.Cursor) {lastConflict=e.Cursor;Utils::ShowHudMessage("Возврат обмена приостановлен: предмет недоступен или имеет особые свойства.");}
+             return;
+         }
++        const LocalItem key{id,{e.Variant.data(),e.Variant.size()}};
++        const auto before=ReceiptCount(m_world,*p,key,true);
++        if (!before || *before+e.Count>INT32_MAX)
+-        const int64_t before=p->GetItemCountInInventory(form);
+-        if (before<0 || before>INT32_MAX || before+e.Count>INT32_MAX || before!=Pocket(m_world,*p)[id])
+         {
+             if (lastConflict!=e.Cursor) {lastConflict=e.Cursor;Utils::ShowHudMessage("Возврат обмена приостановлен: инвентарь не соответствует записи.");}
+             return;
+         }
+         PartyTrade request{TradeOp::Return,0,0,w.Cursor(),e.Count,e.Stream};
+         if (!m_world.GetModSystem().GetServerModId(id,request.Item)) return;
++        request.BeforePlusOne=static_cast<uint32_t>(*before+1);request.Variant=e.Variant;
+-        request.BeforePlusOne=static_cast<uint32_t>(before+1);
+         Send(request);return;
+     }
+     if (e.Op==TradeOp::Receipt)
+@@ -619,44 +1179,52 @@
+         if (!form || !Cast<TESBoundObject>(form)) return;
+         if (e.Peer>1) return;
+         const int count=(e.Peer?1:-1)*int(e.Count);
++        const LocalItem key{id,{e.Variant.data(),e.Variant.size()}};
++        if (!TradeProperties::Decode(key.second)) return;
+         walletReady=false;
+         const int64_t checkpoint=e.BeforePlusOne?static_cast<int64_t>(e.BeforePlusOne)-1:-1;
+         if (CampaignAccess::Mode()!=Mode::Disabled)
+         {
+             if (!CampaignAccess::ConfirmReceipt(m_world,e.Stream,w.Stream(),w.Cursor(),e.Cursor,
++                                           {e.Text.data(),e.Text.size()},e.Item.BaseId,count,checkpoint,key.second))
+-                                           {e.Text.data(),e.Text.size()},e.Item.BaseId,count,checkpoint))
+                 return; // replica may still be behind; poll again after it catches up
+         }
+         if (CampaignAccess::Mode()!=Mode::Disabled || checkpoint>=0)
+         {
++            const auto actual=ReceiptCount(m_world,*p,key,count>0);
++            TradeLedger::Row row{"","","",e.Item.BaseId,count,checkpoint,false,key.second};
++            if (!actual || !TradeLedger::CanApply(row,*actual))
+-            const int64_t actual=p->GetItemCountInInventory(form);
+-            TradeLedger::Row row{"","","",e.Item.BaseId,count,checkpoint};
+-            if (!TradeLedger::CanApply(row,actual) || Unsuitable(*p).count(id) || actual!=Pocket(m_world,*p)[id])
+             {
+                 if (lastConflict!=e.Cursor)
+                 {
+                     lastConflict=e.Cursor;
++                    spdlog::warn("Trade recovery conflict at receipt {}: expected {}, found {}",e.Cursor,checkpoint,actual.value_or(-1));
+-                    spdlog::warn("Trade recovery conflict at receipt {}: expected {}, found {}",e.Cursor,checkpoint,actual);
+                     Utils::ShowHudMessage("Обмен приостановлен: имущество не соответствует квитанции.");
+                 }
+                 ClearTrade();
+                 return;
+             }
+         }
++        const auto before=ReceiptCount(m_world,*p,key,count>0);
++        if (!before || (count<0 && *before<-count) || *before+count>INT32_MAX) return;
++        const auto totalBefore=p->GetItemCountInInventory(form);
++        if (totalBefore<0 || totalBefore+count<0 || totalBefore+count>INT32_MAX) return;
+-        if (count<0 && Pocket(m_world,*p)[id]<-count) return;
+         Inventory::Entry item{};
+         if (!m_world.GetModSystem().GetServerModId(id,item.BaseId)) return;
+-        const auto before=p->GetItemCountInInventory(form);
+         item.Count=count;
+         // Preserve ordinary STR player inventory synchronization. Only the
+         // local display copy suppresses inventory events.
++        bool changed=true;
++        if (key.second.empty()) p->AddOrRemoveItem(item,true);
++        else changed=ChangeVariant(*p,key,count);
+-        p->AddOrRemoveItem(item,true);
+         if (nativeRequested && NativeMenuOpen())
+         {
+             using Refresh=void(TESObjectREFR*,const TESBoundObject*);
+             if (auto* refresh=Address<Refresh>(52849)) refresh(p,Cast<TESBoundObject>(form));
+         }
++        const auto after=ReceiptCount(m_world,*p,key,count>0);
++        if (!changed || !after || *after!=*before+count ||
++            p->GetItemCountInInventory(form)!=totalBefore+count || !w.Write(e.Stream,e.Cursor))
+-        if (p->GetItemCountInInventory(form)!=before+count || !w.Write(e.Stream,e.Cursor))
+         {
+             receiptFailure=true;
+             receiptFailureCampaign=CampaignAccess::Mode()==Mode::Ready;
+@@ -714,8 +1282,10 @@
+     {
+         if (!stockRemaining) return;
+         auto* mod=ModManager::Get()->GetByName(e.Text.c_str());
++        const std::string variant(e.Variant.data(),e.Variant.size());
+         if (!mod || !mod->IsLoaded() || !e.Item.BaseId || !e.Count || e.Count>INT32_MAX ||
++            !TradeProperties::Decode(variant) || (!nativeRequested && !variant.empty()) ||
++            !incomingStock.emplace(LocalItem{mod->GetFormId(e.Item.BaseId),variant},int(e.Count)).second)
+-            !incomingStock.emplace(mod->GetFormId(e.Item.BaseId),int(e.Count)).second)
+         {Send({TradeOp::Close,peer,session});ClearTrade();return;}
+         if (!--stockRemaining) {buffer=std::move(incomingStock);stockComplete=true;}
+     }
+@@ -767,7 +1337,7 @@
+                 auto& intent=nativeIntents.front();
+                 if (intent.Take)
+                 {
++                    const auto found=buffer.find(intent.Item);
+-                    const auto found=buffer.find(intent.Id);
+                     const auto available=found==buffer.end()?0u:static_cast<uint32_t>(found->second);
+                     intent.Count=std::min(intent.Count,available);
+                 }
+@@ -775,7 +1345,7 @@
+                 else
+                 {
+                     const auto chunk=std::min(intent.Count,9999u);
++                    SubmitTransfer(m_world,w,intent.Item,chunk,intent.Take);
+-                    TradeAction(session,intent.Take?3:2,intent.Id,chunk);
+                     if (!nativeAwaiting)
+                     {
+                         // A rejected local operation must not silently take a different item.
+@@ -799,7 +1369,7 @@
+         auto* p=PlayerCharacter::Get();
+         auto args=CefListValue::Create();
+         args->SetInt(0,session); args->SetString(1,partner);args->SetBool(2,tradeOpen);
++        args->SetString(3,tradeOpen?Rows(Pocket(m_world,*p)):CefString("[]"));args->SetString(4,Rows(PlainBuffer()));
+-        args->SetString(3,tradeOpen?Rows(Pocket(m_world,*p)):CefString("[]"));args->SetString(4,Rows(buffer));
+         m_pOverlay->ExecuteAsync("partyTrade",args);
+     }
+     const auto now=Clock::now();
+diff --git a/Code/client/Services/CampaignAccess.h b/Code/client/Services/CampaignAccess.h
+--- a/Code/client/Services/CampaignAccess.h
++++ b/Code/client/Services/CampaignAccess.h
+@@ -15,5 +15,5 @@
+ bool GameReady();
+ bool TradeEnabled();
+ bool ConfirmReceipt(World&, uint64_t stream, uint64_t savedStream, uint32_t cursor, uint32_t receipt,
++                    std::string_view plugin, uint32_t base, int count,int64_t before,std::string_view variant={});
+-                    std::string_view plugin, uint32_t base, int count,int64_t before);
+ }
+diff --git a/Code/common/TradeProperties.h b/Code/common/TradeProperties.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/TradeProperties.h
+@@ -0,0 +1,308 @@
++#pragma once
++#include <array>
++#include <bit>
++#include <charconv>
++#include <cmath>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++#include <utility>
++
++// Canonical values for supported extra-data. Never persist a load-order slot
++// or a dynamic engine form ID. V1 records remain byte-for-byte valid.
++namespace TradeProperties
++{
++inline bool Number(std::string_view s,uint32_t& v)
++{
++    if (s.empty() || (s.size()>1 && s.front()=='0')) return false;
++    auto parsed=std::from_chars(s.data(),s.data()+s.size(),v);
++    return parsed.ec==std::errc{} && parsed.ptr==s.data()+s.size();
++}
++struct FormKey
++{
++    std::string Plugin{};
++    uint32_t Local{};
++    bool Empty() const {return Plugin.empty() && !Local;}
++    bool Valid() const
++    {
++        if (Plugin.empty() || Plugin.size()>103 || !Local || Local>0xFFFFFF) return false;
++        for (unsigned char ch:Plugin)
++            if (ch<32 || ch==127 || (ch>='A' && ch<='Z') || ch=='/' || ch=='\\' || ch==':') return false;
++        return true;
++    }
++    std::string Encode() const
++    {
++        if (Empty()) return "-";
++        std::string out;
++        constexpr char digits[]="0123456789abcdef";
++        for (unsigned char ch:Plugin)
++        {
++            out+=digits[ch>>4];out+=digits[ch&15];
++        }
++        return out+"."+std::to_string(Local);
++    }
++};
++inline std::optional<FormKey> DecodeForm(std::string_view s)
++{
++    if (s=="-") return FormKey{};
++    auto dot=s.find('.');
++    if (dot==std::string_view::npos || !dot || dot>206 || dot%2) return {};
++    FormKey key;
++    auto digit=[](char c)->int
++    {
++        if (c>='0'&&c<='9') return c-'0';
++        if (c>='a'&&c<='f') return c-'a'+10;
++        return -1;
++    };
++    for (size_t i=0;i<dot;i+=2)
++    {
++        auto hi=digit(s[i]),lo=digit(s[i+1]);
++        if (hi<0||lo<0) return {};
++        key.Plugin+=static_cast<char>(hi*16+lo);
++    }
++    if (!Number(s.substr(dot+1),key.Local)||!key.Valid()) return {};
++    return key;
++}
++// Preserve the original engine bytes (including non-ASCII names), not
++// the localized/tempered suffix. Hex prevents delimiter and log injection.
++inline constexpr size_t MaxNameBytes=255;
++inline bool ValidName(std::string_view name)
++{
++    if (name.empty() || name.size()>MaxNameBytes) return false;
++    for (unsigned char ch:name)
++        if (ch<32 || ch==127) return false;
++    return true;
++}
++inline std::string EncodeName(std::string_view name)
++{
++    constexpr char digits[]="0123456789abcdef";
++    std::string out;
++    for (unsigned char ch:name) {out+=digits[ch>>4];out+=digits[ch&15];}
++    return out;
++}
++inline std::optional<std::string> DecodeName(std::string_view hex)
++{
++    if (hex.empty() || hex.size()%2 || hex.size()>2*MaxNameBytes) return {};
++    std::string out;
++    const auto digit=[](char c)->int
++    {
++        if (c>='0'&&c<='9') return c-'0';
++        if (c>='a'&&c<='f') return c-'a'+10;
++        return -1;
++    };
++    for (size_t i=0;i<hex.size();i+=2)
++    {
++        const auto hi=digit(hex[i]),lo=digit(hex[i+1]);
++        if (hi<0||lo<0) return {};
++        out+=static_cast<char>(hi*16+lo);
++    }
++    if (!ValidName(out)) return {};
++    return out;
++}
++// Created enchantments use ordered effects, never a save-local FF form ID.
++struct Effect
++{
++    FormKey Setting;
++    uint32_t Magnitude{},Area{},Duration{},Cost{};
++    bool Valid() const
++    {
++        return Setting.Valid() && std::isfinite(std::bit_cast<float>(Magnitude)) &&
++            std::isfinite(std::bit_cast<float>(Cost)) && Area<=INT32_MAX && Duration<=INT32_MAX;
++    }
++};
++struct CreatedEnchant
++{
++    bool Weapon{};
++    // Cost override, flags, casting, charge override, delivery, spell type, charge time.
++    std::array<uint32_t,7> Metadata{};
++    FormKey Base{},Restrictions{};
++    std::string Name;
++    std::vector<Effect> Effects;
++    bool Valid() const
++    {
++        if (Effects.empty() || Effects.size()>8 || Metadata[2]>2 || Metadata[4]>4 ||
++            Metadata[5]>13 || !std::isfinite(std::bit_cast<float>(Metadata[6])) ||
++            (!Base.Empty()&&!Base.Valid()) || (!Restrictions.Empty()&&!Restrictions.Valid()) ||
++            (!Name.empty()&&!ValidName(Name))) return false;
++        for (const auto& e:Effects) if (!e.Valid()) return false;
++        return true;
++    }
++    std::string Encode() const
++    {
++        std::string out=Weapon?"1":"0";
++        for (auto v:Metadata) out+=","+std::to_string(v);
++        out+=","+Base.Encode()+","+Restrictions.Encode()+","+(Name.empty()?"-":EncodeName(Name));
++        for (const auto& e:Effects)
++            out+=","+e.Setting.Encode()+","+std::to_string(e.Magnitude)+","+std::to_string(e.Area)+
++                 ","+std::to_string(e.Duration)+","+std::to_string(e.Cost);
++        return out;
++    }
++};
++inline std::optional<CreatedEnchant> DecodeCreated(std::string_view input)
++{
++    if (input.empty() || input.size()>3000) return {};
++    std::vector<std::string_view> f;
++    auto rest=input;
++    for (;;)
++    {
++        auto end=rest.find(',');
++        f.push_back(rest.substr(0,end));
++        if (f.back().empty() || f.size()>51) return {};
++        if (end==std::string_view::npos) break;
++        rest.remove_prefix(end+1);
++    }
++    if (f.size()<16 || (f.size()-11)%5 || (f[0]!="0"&&f[0]!="1")) return {};
++    CreatedEnchant result;result.Weapon=f[0]=="1";
++    for (unsigned i=0;i<7;++i) if (!Number(f[i+1],result.Metadata[i])) return {};
++    auto base=DecodeForm(f[8]),restrictions=DecodeForm(f[9]);
++    if (!base||!restrictions) return {};
++    result.Base=*base;result.Restrictions=*restrictions;
++    if (f[10]!="-")
++    {
++        auto name=DecodeName(f[10]);
++        if (!name) return {};
++        result.Name=std::move(*name);
++    }
++    for (size_t i=11;i<f.size();i+=5)
++    {
++        Effect e;
++        auto key=DecodeForm(f[i]);
++        if (!key||!Number(f[i+1],e.Magnitude)||!Number(f[i+2],e.Area)||
++            !Number(f[i+3],e.Duration)||!Number(f[i+4],e.Cost)) return {};
++        e.Setting=*key;result.Effects.push_back(std::move(e));
++    }
++    if (!result.Valid()||result.Encode()!=input) return {};
++    return result;
++}
++struct Values
++{
++    uint32_t Mask{},Health{},Charge{},Soul{};
++    enum : uint32_t { HasHealth=1, HasCharge=2, HasSoul=4, HasEnchant=8, HasPoison=16, HasName=32, HasCreated=64, HasOwnership=128 };
++    FormKey Enchant{},Poison{},Owner{};
++    uint32_t EnchantCharge{},RemoveOnUnequip{},PoisonCount{};
++    std::string Name{};
++    std::optional<CreatedEnchant> Created;
++    bool Valid() const
++    {
++        if (Mask&~255u) return false;
++        if (Mask&HasOwnership)
++        {
++            // Player base 7 is local to each player; no stable campaign
++            // character identity can be inferred from this engine marker.
++            if (!Owner.Valid() || (Owner.Plugin=="skyrim.esm" && Owner.Local==7)) return false;
++        }
++        else if (!Owner.Empty()) return false;
++        if (Mask&HasCreated)
++        {
++            if (!(Mask&HasEnchant) || !Created || !Created->Valid() || !Enchant.Empty()) return false;
++        }
++        else if (Created) return false;
++        if (Mask&HasName)
++        {
++            if (!ValidName(Name)) return false;
++        }
++        else if (!Name.empty()) return false;
++        if (Mask&HasHealth)
++        {
++            const auto v=std::bit_cast<float>(Health);
++            if (!std::isfinite(v)||v<=0) return false;
++        }
++        else if (Health) return false;
++        if (Mask&HasCharge)
++        {
++            const auto v=std::bit_cast<float>(Charge);
++            if (!std::isfinite(v)||v<0) return false;
++        }
++        else if (Charge) return false;
++        if (Mask&HasSoul) {if (Soul>5) return false;}
++        else if (Soul) return false;
++        if (Mask&HasEnchant)
++        {
++            if ((!(Mask&HasCreated)&&!Enchant.Valid()) || EnchantCharge>UINT16_MAX || RemoveOnUnequip>1) return false;
++        }
++        else if (!Enchant.Empty() || EnchantCharge || RemoveOnUnequip) return false;
++        if (Mask&HasPoison)
++        {
++            if (!Poison.Valid() || !PoisonCount) return false;
++        }
++        else if (!Poison.Empty() || PoisonCount) return false;
++        return true;
++    }
++    std::string Encode() const
++    {
++        if (!Mask) return {};
++        if (Mask&HasOwnership)
++        {
++            auto inner=*this;
++            inner.Mask&=~HasOwnership;inner.Owner={};
++            auto encoded=inner.Encode();
++            return "5:"+Owner.Encode()+":"+(encoded.empty()?"-":encoded);
++        }
++        const auto fields=std::to_string(Mask)+":"+std::to_string(Health)+":"+
++            std::to_string(Charge)+":"+std::to_string(Soul);
++        if (!(Mask&(HasEnchant|HasPoison|HasName))) return "1:"+fields;
++        const auto extra=fields+":"+Enchant.Encode()+":"+std::to_string(EnchantCharge)+":"+
++            std::to_string(RemoveOnUnequip)+":"+Poison.Encode()+":"+std::to_string(PoisonCount);
++        if (Mask&HasCreated) return "4:"+extra+":"+(Name.empty()?"-":EncodeName(Name))+":"+(Created?Created->Encode():"-");
++        if (Mask&HasName) return "3:"+extra+":"+EncodeName(Name);
++        return "2:"+extra;
++    }
++};
++inline std::optional<Values> Decode(std::string_view input)
++{
++    if (input.empty()) return Values{};
++    if (input.size()>3000) return {};
++    if (input.starts_with("5:"))
++    {
++        const auto end=input.find(':',2);
++        if (end==std::string_view::npos) return {};
++        auto owner=DecodeForm(input.substr(2,end-2));
++        auto inner=input.substr(end+1);
++        if (!owner || !owner->Valid() || inner.empty() || inner.starts_with("5:")) return {};
++        auto v=Decode(inner=="-"?std::string_view{}:inner);
++        if (!v || (v->Mask&Values::HasOwnership)) return {};
++        v->Mask|=Values::HasOwnership;v->Owner=*owner;
++        if (!v->Valid() || v->Encode()!=input) return {};
++        return v;
++    }
++    if (!input.starts_with("1:")&&!input.starts_with("2:")&&!input.starts_with("3:")&&!input.starts_with("4:")) return {};
++    const bool created=input.front()=='4',named=input.front()=='3'||created,extended=input.front()!='1';
++    auto rest=input.substr(2);
++    std::array<std::string_view,11> fields{};
++    const unsigned n=created?11:named?10:extended?9:4;
++    for (unsigned i=0;i<n;++i)
++    {
++        const auto end=rest.find(':');
++        if ((i==n-1)!=(end==std::string_view::npos)) return {};
++        fields[i]=rest.substr(0,end);
++        if (fields[i].empty()) return {};
++        if (i!=n-1) rest.remove_prefix(end+1);
++    }
++    Values v;
++    if (!Number(fields[0],v.Mask)||!Number(fields[1],v.Health)||
++        !Number(fields[2],v.Charge)||!Number(fields[3],v.Soul)) return {};
++    if (extended)
++    {
++        auto enchant=DecodeForm(fields[4]),poison=DecodeForm(fields[7]);
++        if (!enchant||!poison||!Number(fields[5],v.EnchantCharge)||
++            !Number(fields[6],v.RemoveOnUnequip)||!Number(fields[8],v.PoisonCount)) return {};
++        v.Enchant=*enchant;v.Poison=*poison;
++    }
++    if (named && (!created || fields[9]!="-"))
++    {
++        auto name=DecodeName(fields[9]);
++        if (!name) return {};
++        v.Name=std::move(*name);
++    }
++    if (created)
++    {
++        auto enchant=DecodeCreated(fields[10]);
++        if (!enchant) return {};
++        v.Created=std::move(*enchant);
++    }
++    if (!v.Mask||!v.Valid()||v.Encode()!=input) return {};
++    return v;
++}
++}
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign5"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign10"
