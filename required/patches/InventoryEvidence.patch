@@ -339,6 +339,37 @@ diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyr
  
      return count;
  }
+@@ -1080,7 +1075,30 @@
+         }
+ 
+         item.Count = -aCount;
+ 
++        // A unique quest object removed by the player's native script is
++        // observed only after the real inventory count has decreased.
++        // Transfers, drops and sales are not evidence of consumption.
++        if (item.IsQuestItem && apThis==PlayerCharacter::Get() && aCount==1 &&
++            !apMoveToRef && aReason==ITEM_REMOVE_REASON::kRemove)
++        {
++            InventoryChangeEvent change(apThis->formID,item);
++            CaptureQuestItem(apExtraList,nullptr,apItem,change);
++            if (change.QuestId && change.QuestRef)
++            {
++                const auto before=apThis->GetItemCountInInventory(apItem);
++                ScopedEquipOverride equip;
++                auto* result=TiltedPhoques::ThisCall(RealRemoveInventoryItem,apThis,apResult,apItem,aCount,
++                    aReason,apExtraList,apMoveToRef,apDropLoc,apRotate);
++                const auto after=apThis->GetItemCountInInventory(apItem);
++                if (before>0 && after==before-1)
++                    QueueReferenceInventoryChange(std::move(change),nullptr);
++                else
++                    spdlog::debug("Quest removal not confirmed in local inventory");
++                return result;
++            }
++        }
++
+         QueueReferenceInventoryChange(InventoryChangeEvent(apThis->formID, std::move(item)), apMoveToRef);
+     }
+ 
 diff --git a/Code/common/InventoryEvidence.h b/Code/common/InventoryEvidence.h
 new file mode 100644
 --- /dev/null
@@ -512,7 +543,7 @@ new file mode 100644
 diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor.cpp
 --- a/Code/client/Games/Skyrim/Actor.cpp
 +++ b/Code/client/Games/Skyrim/Actor.cpp
-@@ -1129,6 +1129,79 @@
+@@ -1129,6 +1129,95 @@
      TiltedPhoques::ThisCall(RealAddInventoryItem, apThis, apItem, apExtraData, aCount, apOldOwner);
  }
  
@@ -550,11 +581,12 @@ diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor
 +    ~QuestAliasReadGuard(){Lock.UnlockRead();}
 +};
 +
-+void CaptureQuestPickup(TESObjectREFR* object, InventoryChangeEvent& event)
++}
++
++void CaptureQuestItem(ExtraDataList* extra,TESObjectREFR* object,TESForm* base,InventoryChangeEvent& event)
 +{
-+    if (!object||object->IsTemporary()||ScopedExtraDataOverride::IsOverriden()) return;
-+    auto* extra=object->GetExtraDataList();
-+    if (!extra) return;
++    if (!extra||!base||ScopedExtraDataOverride::IsOverriden()) return;
++    if (object&&object->IsTemporary()) return;
 +    uint32_t questId{},aliasId{};
 +    {
 +        QuestAliasReadGuard extraGuard(extra->lock);
@@ -579,6 +611,14 @@ diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor
 +        }
 +    }
 +    if (!questId) return;
++    // In inventory, resolve the exact reference selected by the native alias.
++    // Do not infer its identity from an ordinary item of the same base type.
++    if (!object)
++    {
++        auto* owner=Cast<TESQuest>(TESForm::GetById(questId));
++        object=owner&&!owner->IsStopped()?owner->GetAliasedRef(aliasId):nullptr;
++    }
++    if (!object||object->IsTemporary()||object->baseForm!=base) return;
 +    GameId quest{},reference{};
 +    auto& mods=World::Get().GetModSystem();
 +    if (!mods.GetServerModId(questId,quest)||!mods.GetServerModId(object->formID,reference)||
@@ -587,12 +627,19 @@ diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor
 +    event.QuestRef=reference;
 +    event.QuestAlias=aliasId;
 +}
++
++namespace
++{
++void CaptureQuestPickup(TESObjectREFR* object,InventoryChangeEvent& event)
++{
++    if (object) CaptureQuestItem(object->GetExtraDataList(),object,object->baseForm,event);
++}
 +}
 +
  void* TP_MAKE_THISCALL(HookPickUpObject, Actor, TESObjectREFR* apObject, int32_t aCount, bool aUnk1, float aUnk2)
  {
      if (!ScopedInventoryOverride::IsOverriden())
-@@ -1142,11 +1215,32 @@
+@@ -1142,11 +1231,32 @@
          if (apObject->GetExtraDataList())
              apThis->GetItemFromExtraData(item, apObject->GetExtraDataList());
  
@@ -634,6 +681,14 @@ diff --git a/Code/client/Events/InventoryChangeEvent.h b/Code/client/Events/Inve
 +    GameId QuestId{}, QuestRef{};
 +    uint32_t QuestAlias{};
      bool Drop = false;
+@@ -37,3 +39,7 @@
+     // The item moved to or from the local player, e.g. looting or pickpocketing an actor owned by someone else
+     bool IsPlayerTransfer = false;
+ };
++
++// Copy a stable quest/alias/reference identity before the native operation.
++// An absent or ambiguous alias leaves all identity fields empty.
++void CaptureQuestItem(ExtraDataList*,TESObjectREFR*,TESForm*,InventoryChangeEvent&);
 diff --git a/Code/encoding/Messages/RequestInventoryChanges.h b/Code/encoding/Messages/RequestInventoryChanges.h
 --- a/Code/encoding/Messages/RequestInventoryChanges.h
 +++ b/Code/encoding/Messages/RequestInventoryChanges.h
@@ -685,9 +740,9 @@ diff --git a/Code/server/Services/InventoryService.cpp b/Code/server/Services/In
      auto& inventoryComponent = view.get<InventoryComponent>(*it);
      inventoryComponent.Content.AddOrRemoveEntry(message.Item);
 +    if (message.QuestId && message.QuestRef && message.Item.IsQuestItem &&
-+        message.Item.Count > 0 && !message.Drop && acMessage.pPlayer->GetCharacter() &&
++        message.Item.Count != 0 && !message.Drop && acMessage.pPlayer->GetCharacter() &&
 +        *acMessage.pPlayer->GetCharacter() == *it)
-+        CampaignAccess::RecordQuestPickup(m_world,*acMessage.pPlayer,message);
++        CampaignAccess::RecordQuestItemChange(m_world,*acMessage.pPlayer,message);
  
      if (!message.UpdateClients && !isRemoteNpcInteraction)
          return;

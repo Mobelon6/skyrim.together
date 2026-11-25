@@ -240,6 +240,29 @@ int main(){
 }
 ''')
 
+item_change=extract('server/Services/QuestService.cpp','enum class QuestItemDecision','// A player who has independently accepted')
+run('unique quest item consumption matches original holder and reference',headers+'''
+namespace CampaignJournal {struct Operation{std::string Id,Kind,Payload;};}
+'''+item_change+'''
+int main(){
+    using D=QuestItemDecision;
+    std::vector<CampaignJournal::Operation> ops;
+    const std::string prefix="q 1 3 ",pickup=prefix+"ref item 1 101";
+    assert(QuestItemChange(ops,prefix,pickup,false)==D::Record);
+    assert(QuestItemChange(ops,prefix,pickup,true)==D::Reject);
+    ops.push_back({"1","quest-pickup-v1",pickup});
+    assert(QuestItemChange(ops,prefix,pickup,false)==D::Duplicate);
+    assert(QuestItemChange(ops,prefix,pickup,true)==D::Record);
+    assert(QuestItemChange(ops,prefix,prefix+"ref item 1 202",true)==D::Reject);
+    assert(QuestItemChange(ops,prefix,prefix+"other item 1 101",true)==D::Reject);
+    assert(QuestItemChange(ops,prefix,prefix+"ref item 2 101",true)==D::Reject);
+    assert(QuestItemChange(ops,"q 2 3 ","q 2 3 ref item 1 101",true)==D::Reject);
+    ops.push_back({"2","quest-consumed-v1",pickup});
+    assert(QuestItemChange(ops,prefix,pickup,true)==D::Duplicate);
+    assert(QuestItemChange(ops,prefix,pickup,false)==D::Duplicate);
+}
+''')
+
 hp=extract('server/Services/ActorValueService.cpp','void ActorValueService::OnHealthChangeBroadcast(','void ActorValueService::OnDeathStateChange')
 run('actual server health relay over an actor ownership transfer',headers+'''
 #include <cmath>
