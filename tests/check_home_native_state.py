@@ -77,7 +77,8 @@ owner=fn("void SyncObjects(")
 assert "catalog?catalog->Refs.size():baseline.Refs.size()" in owner
 assert "parentControlled=extra->Contains(static_cast<ExtraDataType>(0x36))" in owner
 assert "extra->HasQuestObjectAlias()" in owner
-assert "catalog?catalog->GuestDoors.count(key):old.Value.GuestDoor" in owner
+assert "catalog?catalog->GuestDoors.count(key):nativeDoor" in owner
+assert "NativeCapability('D',root,key,base.Encode())" in owner
 assert "if (slot && Owned(m_world,original,p))" in source
 assert "const auto destination=EntranceRoot(form,cell)" in source
 assert "destination->Encode()!=menu.Root" in source

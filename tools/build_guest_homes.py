@@ -6,7 +6,9 @@ parser.add_argument('archive',type=Path)
 parser.add_argument('loadorder',type=Path)
 parser.add_argument('plugins',type=Path)
 parser.add_argument('output',type=Path)
-parser.add_argument('--instances', action='store_true', help='Build generic isolated projection cells, not legacy decorative homes')
+mode=parser.add_mutually_exclusive_group()
+mode.add_argument('--native-capabilities', action='store_true', help='Write original interaction metadata only')
+mode.add_argument('--instances', action='store_true', help='Build generic isolated projection cells, not legacy decorative homes')
 args=parser.parse_args()
 P=args.output;P.mkdir(parents=True,exist_ok=True)
 archive=zipfile.ZipFile(args.archive)
@@ -106,6 +108,10 @@ def refs(houses):
 def grp(typ,label,data):
  if isinstance(label,int):label=struct.pack('<I',label)
  return struct.pack('<4sI4sIII',b'GRUP',24+len(data),label,typ,0,0)+data
+if args.native_capabilities:
+ from build_native_home_capabilities import build
+ build(P,reader,unpack)
+ sys.exit(0)
 if args.instances:
  from build_home_instances import build
  build(P,order,reader,grp,unpack)
