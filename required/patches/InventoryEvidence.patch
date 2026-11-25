@@ -216,7 +216,7 @@ diff --git a/Code/client/Services/Generic/InventoryService.cpp b/Code/client/Ser
  void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEvent) noexcept
  {
      if (!m_transport.IsConnected())
-@@ -98,5 +292,44 @@
+@@ -92,10 +286,49 @@
      request.Item = acEvent.Item;
      request.Drop = acEvent.Drop;
      request.UpdateClients = acEvent.UpdateClients;
@@ -261,6 +261,11 @@ diff --git a/Code/client/Services/Generic/InventoryService.cpp b/Code/client/Ser
 +    // Inventory evidence is sent first. If the native stage event already
 +    // arrived, the existing server deduplicator ignores this observation.
 +    if (reportStage) m_transport.Send(observedStage);
+ 
+     spdlog::info("Sending item request, item: {:X}, count: {}, target object: {:X}", acEvent.Item.BaseId.BaseId, acEvent.Item.Count, acEvent.FormId);
+ }
+ 
+ void InventoryService::OnEquipmentChangeEvent(const EquipmentChangeEvent& acEvent) noexcept
 diff --git a/Code/client/Services/InventoryService.h b/Code/client/Services/InventoryService.h
 --- a/Code/client/Services/InventoryService.h
 +++ b/Code/client/Services/InventoryService.h
