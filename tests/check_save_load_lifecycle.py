@@ -25,7 +25,7 @@ assert source.index("m_transport.CloseWorld();\n        ResetWorldTracking();")<
 engine=(root/"Games/SaveLoad.cpp").read_text()
 assert "0x610480" in engine and "0x605F90" in engine and '1.6.1170.0' in engine
 assert engine.index("BeginSaveLoad()")<engine.index("scope.Success=original(args...)")
-assert "WithSaveLoadBoundary(false,realLoadRequest" in engine and "WithSaveLoadBoundary(true,realLoadWorld" in engine
+assert "WithSaveLoadBoundary(false,realLoadRequest" in engine and "WithSaveLoadBoundary(true,LoadWorldWithCheckpoint" in engine
 assert source.index("GetOverlayService().RecheckTradeAfterLoad();")<source.index("m_dispatcher.trigger(PreUpdateEvent")
 discovery=function("Services/Generic/DiscoveryService.cpp","BSTEventResult DiscoveryService::OnEvent(")
 assert "m_loadEventPending.store(true" in discovery and "VisitCell(" not in discovery and "ResetSessionProgress" not in discovery
@@ -53,6 +53,7 @@ code=r"""
 #include <thread>
 #include <chrono>
 namespace spdlog { template<class... T> void info(const char*,T...){} template<class... T> void warn(const char*,T...){} }
+namespace CampaignCheckpointClient { void ForgetLoaded() noexcept {} }
 thread_local uint32_t threadId=1;
 uint32_t GetCurrentThreadId(){return threadId;}
 struct DisconnectedEvent{};

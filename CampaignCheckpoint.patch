@@ -1,0 +1,673 @@
+diff --git a/Code/common/CampaignCheckpoint.h b/Code/common/CampaignCheckpoint.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/CampaignCheckpoint.h
+@@ -0,0 +1,126 @@
++#pragma once
++#include "CampaignIdentity.h"
++#include "HomeRegistry.h"
++#include "QuestJournalDisk.h"
++#include <array>
++#include <bit>
++#include <cmath>
++#include <locale>
++#include <sstream>
++
++// Observed is the downloaded journal prefix, NOT proof of applied game effects.
++namespace CampaignCheckpoint
++{
++inline constexpr std::string_view Kind="save-checkpoint-v1";
++inline bool DigestValid(std::string_view s)
++{
++    if (s.size()!=64) return false;
++    for (char c:s) if (!(c>='0'&&c<='9')&&!(c>='a'&&c<='f')) return false;
++    return true;
++}
++struct Record
++{
++    CampaignIdentity::Stamp Save;
++    CampaignJournal::Head Observed;
++    std::string Digest;
++    TradeProperties::FormKey Cell,WorldSpace;
++    uint32_t HomeSlot{};
++    std::array<uint32_t,6> Pose{};
++    bool Valid() const
++    {
++        if (!CampaignIdentity::Encode(Save)||!Observed.Tag||Observed.Revision<Save.Applied.Revision||
++            Observed.Revision==UINT32_MAX||!DigestValid(Digest)||
++            (!Cell.Empty()&&!Cell.Valid())||(!WorldSpace.Empty()&&!WorldSpace.Valid())||
++            (Cell.Empty()&&WorldSpace.Empty())||HomeSlot>HomeRegistry::MaxSlot||
++            (HomeSlot&&(!Cell.Valid()||!WorldSpace.Empty()))) return false;
++        for (auto v:Pose) if (!std::isfinite(std::bit_cast<float>(v))) return false;
++        return true;
++    }
++    std::string Encode() const
++    {
++        std::string s=std::to_string(Save.Campaign)+" "+std::to_string(Save.Character)+" "+
++            std::to_string(Save.Applied.Revision)+" "+std::to_string(Save.Applied.Tag)+" "+
++            std::to_string(Observed.Revision)+" "+std::to_string(Observed.Tag)+" "+Digest+
++            " "+Cell.Encode()+" "+WorldSpace.Encode()+" "+std::to_string(HomeSlot);
++        for (auto v:Pose) s+=" "+std::to_string(v);
++        return s;
++    }
++};
++inline std::optional<Record> Decode(std::string_view s)
++{
++    if (s.empty()||s.size()>1024) return {};
++    std::istringstream in{std::string(s)};in.imbue(std::locale::classic());
++    Record r;std::string cell,world,extra;
++    if (!(in>>r.Save.Campaign>>r.Save.Character>>r.Save.Applied.Revision>>r.Save.Applied.Tag
++          >>r.Observed.Revision>>r.Observed.Tag>>r.Digest>>cell>>world>>r.HomeSlot)) return {};
++    for (auto& v:r.Pose) if (!(in>>v)) return {};
++    auto c=TradeProperties::DecodeForm(cell),w=TradeProperties::DecodeForm(world);
++    if (!c||!w||in>>extra) return {};
++    r.Cell=std::move(*c);r.WorldSpace=std::move(*w);
++    if (!r.Valid()||r.Encode()!=s) return {};
++    return r;
++}
++inline std::string Id(uint64_t character,std::string_view digest)
++{return "save-"+std::to_string(character)+"-"+std::string(digest);}
++inline bool Known(const CampaignJournal::Journal& journal,uint64_t campaign,const Record& r)
++{
++    if (!r.Valid()||!CampaignIdentity::Known(journal,campaign,r.Save)) return false;
++    const auto observed=journal.At(r.Observed.Revision);
++    if (!observed||*observed!=r.Observed) return false;
++    if (r.HomeSlot)
++    {
++        // Initial slice: owner's original CELL only, not the old guest projection.
++        auto home=HomeRegistry::BySlot(journal,r.HomeSlot);
++        if (!home||home->Owner!=r.Save.Character||home->Root.Encode()!=r.Cell.Encode()) return false;
++    }
++    return true;
++}
++inline std::optional<Record> Find(const CampaignJournal::Journal& journal,uint64_t campaign,
++                                  uint64_t character,std::string_view digest)
++{
++    if (!character||!DigestValid(digest)) return {};
++    const auto id=Id(character,digest);
++    for (const auto& op:journal.Operations())
++        if (op.Id==id)
++        {
++            auto r=Decode(op.Payload);
++            if (op.Kind==Kind&&r&&r->Save.Character==character&&r->Digest==digest&&Known(journal,campaign,*r)) return r;
++            return {};
++        }
++    return {};
++}
++inline CampaignJournal::Result Publish(CampaignJournal::Journal& journal,uint64_t campaign,
++                                        uint64_t character,const Record& r)
++{
++    if (!character||r.Save.Character!=character||!Known(journal,campaign,r)) return CampaignJournal::Result::Invalid;
++    return journal.Append(journal.Current(),{Id(character,r.Digest),std::string(Kind),r.Encode()});
++}
++// Retry copy only: the same durable primitive, not a second authority.
++inline std::filesystem::path Outbox(const std::filesystem::path& root,uint64_t campaign,std::string_view digest)
++{return root/"checkpoint-outbox"/std::to_string(campaign)/std::string(digest);}
++inline bool StoreLocal(const std::filesystem::path& root,const Record& r)
++{
++    if (!r.Valid()) return false;
++    try
++    {
++        auto path=Outbox(root,r.Save.Campaign,r.Digest);
++        std::filesystem::create_directories(path/std::to_string(r.Save.Character));
++        return QuestJournalDisk::Store(path,r.Save.Character,1,r.Encode());
++    }
++    catch (...) {return false;}
++}
++inline std::optional<Record> ReadLocal(const std::filesystem::path& root,uint64_t campaign,
++                                      uint64_t character,std::string_view digest)
++{
++    if (!campaign||!character||!DigestValid(digest)) return {};
++    try
++    {
++        std::string row;
++        if (!QuestJournalDisk::Read(Outbox(root,campaign,digest),character,1,row)) return {};
++        auto r=Decode(row);
++        if (r&&r->Save.Campaign==campaign&&r->Save.Character==character&&r->Digest==digest) return r;
++    }
++    catch (...) {}
++    return {};
++}
++}
+diff --git a/Code/client/Services/CampaignCheckpointClient.h b/Code/client/Services/CampaignCheckpointClient.h
+new file mode 100644
+--- /dev/null
++++ b/Code/client/Services/CampaignCheckpointClient.h
+@@ -0,0 +1,14 @@
++#pragma once
++#include <CampaignCheckpoint.h>
++struct World;
++namespace CampaignCheckpointClient
++{
++std::optional<CampaignCheckpoint::Record> Capture(World&) noexcept;
++void Queue(CampaignCheckpoint::Record) noexcept;
++// Native load target may execute on a worker. Exchange metadata only.
++void ForgetLoaded() noexcept;
++void NoteLoadedFile(std::string) noexcept;
++void CompleteLoad() noexcept;
++// Exact loaded ESS and authenticated replicated record; no teleport/replay.
++std::optional<CampaignCheckpoint::Record> Loaded(World&) noexcept;
++}
+diff --git a/Code/client/Games/CampaignCheckpointFile.h b/Code/client/Games/CampaignCheckpointFile.h
+new file mode 100644
+--- /dev/null
++++ b/Code/client/Games/CampaignCheckpointFile.h
+@@ -0,0 +1,10 @@
++#pragma once
++#include <cstdint>
++#include <filesystem>
++#include <optional>
++#include <string>
++namespace CampaignCheckpointFile
++{
++std::filesystem::path Path(const uint64_t*) noexcept;
++std::optional<std::string> Digest(const std::filesystem::path&) noexcept;
++}
+diff --git a/Code/client/Games/CampaignCheckpointFile.cpp b/Code/client/Games/CampaignCheckpointFile.cpp
+new file mode 100644
+--- /dev/null
++++ b/Code/client/Games/CampaignCheckpointFile.cpp
+@@ -0,0 +1,65 @@
++#include <TiltedOnlinePCH.h>
++#include <Games/CampaignCheckpointFile.h>
++#include <Games/TES.h>
++#include <cryptopp/sha.h>
++#include <shlobj.h>
++#include <array>
++#include <fstream>
++#include <cstring>
++
++namespace CampaignCheckpointFile
++{
++std::filesystem::path Path(const uint64_t* data) noexcept
++{
++    try
++    {
++        // SKSE 2.2.8 Hooks_SaveLoad.cpp: the resolved native save name.
++        if (!data) return {};
++        const auto* name=reinterpret_cast<const char*>(data[0xBB0/8]);
++        if (!name||!*name) return {};
++        std::filesystem::path file(name);
++        if (file.has_root_path()||file.has_parent_path()||file.filename()!=file||file=="."||file=="..") return {};
++        if (_stricmp(file.extension().string().c_str(),".ess")!=0) file+=".ess";
++        char documents[MAX_PATH]{};
++        if (FAILED(SHGetFolderPathA(nullptr,CSIDL_MYDOCUMENTS,nullptr,SHGFP_TYPE_CURRENT,documents))) return {};
++        std::filesystem::path local="Saves";
++        if (auto* settings=INISettingCollection::Get())
++            if (auto* value=settings->GetSetting("sLocalSavePath:General");value&&value->data)
++                local=reinterpret_cast<const char*>(value->data);
++        if (local.empty()||local.has_root_path()) return {};
++        return std::filesystem::path(documents)/"My Games"/"Skyrim Special Edition"/local/file;
++    }
++    catch (...) {return {};}
++}
++std::optional<std::string> Digest(const std::filesystem::path& path) noexcept
++{
++    try
++    {
++        if (path.empty()||!std::filesystem::is_regular_file(path)) return {};
++        const auto size=std::filesystem::file_size(path);
++        const auto stamp=std::filesystem::last_write_time(path);
++        if (size<13) return {};
++        std::ifstream in(path,std::ios::binary);
++        std::array<char,65536> data{};
++        CryptoPP::SHA256 hash;
++        uintmax_t read{};
++        while (in)
++        {
++            in.read(data.data(),data.size());
++            const auto n=in.gcount();
++            if (n<=0) break;
++            if (!read&&(n<13||std::memcmp(data.data(),"TESV_SAVEGAME",13)!=0)) return {};
++            hash.Update(reinterpret_cast<const CryptoPP::byte*>(data.data()),static_cast<size_t>(n));
++            read+=static_cast<uintmax_t>(n);
++        }
++        if (in.bad()||!in.eof()||read!=size||size!=std::filesystem::file_size(path)||
++            stamp!=std::filesystem::last_write_time(path)) return {};
++        std::array<CryptoPP::byte,CryptoPP::SHA256::DIGESTSIZE> digest{};
++        hash.Final(digest.data());
++        std::string out;constexpr char hex[]="0123456789abcdef";
++        for (auto c:digest) {out+=hex[c>>4];out+=hex[c&15];}
++        return out;
++    }
++    catch (...) {return {};}
++}
++}
+diff --git a/Code/client/xmake.lua b/Code/client/xmake.lua
+--- a/Code/client/xmake.lua
++++ b/Code/client/xmake.lua
+@@ -62,5 +62,6 @@
+     add_syslinks(
+         "version",
+         "dbghelp",
+-        "kernel32")
++        "kernel32",
++        "shell32")
+ end
+diff --git a/Code/encoding/Messages/RequestCampaignPull.h b/Code/encoding/Messages/RequestCampaignPull.h
+--- a/Code/encoding/Messages/RequestCampaignPull.h
++++ b/Code/encoding/Messages/RequestCampaignPull.h
+@@ -12,6 +12,6 @@
+     uint64_t Character{}, SaveTag{};
+     uint32_t SaveRevision{};
+-    String Credential{};
+-    bool operator==(const RequestCampaignPull& o) const noexcept
+-    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile && Character==o.Character && SaveTag==o.SaveTag && SaveRevision==o.SaveRevision && Credential==o.Credential; }
++    String Credential{}, Checkpoint{};
++    bool operator==(const RequestCampaignPull& o) const noexcept
++    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile && Character==o.Character && SaveTag==o.SaveTag && SaveRevision==o.SaveRevision && Credential==o.Credential && Checkpoint==o.Checkpoint; }
+ };
+diff --git a/Code/encoding/Messages/RequestCampaignPull.cpp b/Code/encoding/Messages/RequestCampaignPull.cpp
+--- a/Code/encoding/Messages/RequestCampaignPull.cpp
++++ b/Code/encoding/Messages/RequestCampaignPull.cpp
+@@ -6,13 +6,15 @@
+     Serialization::WriteString(w,Profile);
+     Serialization::WriteVarInt(w,Character);Serialization::WriteVarInt(w,SaveTag);
+     Serialization::WriteVarInt(w,SaveRevision);Serialization::WriteString(w,Credential);
+-}
+-void RequestCampaignPull::DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept
+-{
+-    ClientMessage::DeserializeRaw(r);
+-    Campaign=Serialization::ReadVarInt(r);Nonce=Serialization::ReadVarInt(r);
+-    Tag=Serialization::ReadVarInt(r);Revision=Serialization::ReadVarInt(r)&0xffffffff;
+-    Profile=Serialization::ReadString(r);
+-    Character=Serialization::ReadVarInt(r);SaveTag=Serialization::ReadVarInt(r);
+-    SaveRevision=Serialization::ReadVarInt(r)&0xffffffff;Credential=Serialization::ReadString(r);
++    Serialization::WriteString(w,Checkpoint);
++}
++void RequestCampaignPull::DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept
++{
++    ClientMessage::DeserializeRaw(r);
++    Campaign=Serialization::ReadVarInt(r);Nonce=Serialization::ReadVarInt(r);
++    Tag=Serialization::ReadVarInt(r);Revision=Serialization::ReadVarInt(r)&0xffffffff;
++    Profile=Serialization::ReadString(r);
++    Character=Serialization::ReadVarInt(r);SaveTag=Serialization::ReadVarInt(r);
++    SaveRevision=Serialization::ReadVarInt(r)&0xffffffff;Credential=Serialization::ReadString(r);
++    Checkpoint=Serialization::ReadString(r);
+ }
+diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJournal.cpp
+--- a/Code/server/Services/QuestJournal.cpp
++++ b/Code/server/Services/QuestJournal.cpp
+@@ -8,5 +8,6 @@
+ #include <QuestJournalDisk.h>
+ #include <CampaignReplication.h>
+ #include <CampaignIdentity.h>
++#include <CampaignCheckpoint.h>
+ #include <Services/CampaignAccess.h>
+ #include <Messages/RequestCampaignPull.h>
+@@ -133,9 +134,22 @@
+         const auto& p=event.Packet;
+-        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64) return;
+-        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
+-        CampaignReplication::Reply reply;
+-        reply.Campaign=p.Campaign;reply.Nonce=p.Nonce;reply.Base=pull.Base;
+-        const CampaignIdentity::Stamp stamp{p.Campaign,p.Character,{p.SaveRevision,p.SaveTag}};
+-        if (CampaignAccess::Admit(m_world,*event.pPlayer,stamp,pull.Profile,{p.Credential.data(),p.Credential.size()}))
+-            reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
++        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64 || p.Checkpoint.size()>1024) return;
++        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
++        CampaignReplication::Reply reply;
++        reply.Campaign=p.Campaign;reply.Nonce=p.Nonce;reply.Base=pull.Base;
++        const CampaignIdentity::Stamp stamp{p.Campaign,p.Character,{p.SaveRevision,p.SaveTag}};
++        if (CampaignAccess::Admit(m_world,*event.pPlayer,stamp,pull.Profile,{p.Credential.data(),p.Credential.size()}))
++        {
++            if (!p.Checkpoint.empty())
++            {
++                const auto record=CampaignCheckpoint::Decode({p.Checkpoint.data(),p.Checkpoint.size()});
++                if (record)
++                {
++                    const auto result=CampaignCheckpoint::Publish(campaignLink.Journal,campaignLink.Campaign,
++                        CampaignAccess::Character(*event.pPlayer),*record);
++                    if (result!=CampaignJournal::Result::Committed&&result!=CampaignJournal::Result::Duplicate)
++                        spdlog::warn("STM checkpoint refused for character {}",p.Character);
++                }
++            }
++            reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
++        }
+         NotifyCampaignRecord out;
+diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
+--- a/Code/client/Services/Generic/QuestJournal.cpp
++++ b/Code/client/Services/Generic/QuestJournal.cpp
+@@ -9,5 +9,13 @@
+ #include <QuestJournalDisk.h>
+ #include <CampaignReplication.h>
+ #include <CampaignIdentity.h>
+ #include <Services/CampaignAccess.h>
++#include <Services/CampaignCheckpointClient.h>
++#include <Services/HomeInstance.h>
++#include <InventoryEvidence.h>
++#include <Forms/TESObjectCELL.h>
++#include <Forms/TESWorldSpace.h>
++#include <algorithm>
++#include <mutex>
++#include <map>
+ #include <HomeRegistry.h>
+@@ -26,6 +34,15 @@
+ namespace
+ {
+ CampaignReplication::Link campaignLink;
+ CampaignReplication::Pull pending;
+ CampaignIdentity::Stamp pendingSave;
++std::mutex checkpointLoadMutex;
++std::string loadedDigest;
++bool confirmedLoad{};
++std::map<std::string,CampaignCheckpoint::Record> checkpointOutbox;
++std::string LoadedDigest()
++{
++    std::lock_guard lock(checkpointLoadMutex);
++    return confirmedLoad?loadedDigest:std::string{};
++}
+ bool enrollmentUsed{};
+@@ -221,6 +238,110 @@
+     return 2;
+ }
+ 
++namespace
++{
++std::string NextCheckpoint(const CampaignIdentity::Stamp& stamp)
++{
++    const auto digest=LoadedDigest();
++    if (CampaignCheckpoint::DigestValid(digest))
++    {
++        const auto known=CampaignCheckpoint::Find(campaignLink.Journal,stamp.Campaign,stamp.Character,digest);
++        if (!known)
++            if (auto r=CampaignCheckpoint::ReadLocal(campaignLink.Root,stamp.Campaign,stamp.Character,digest);
++                r&&r->Save==stamp)
++                checkpointOutbox.insert_or_assign(CampaignCheckpoint::Id(stamp.Character,digest),std::move(*r));
++    }
++    for (auto it=checkpointOutbox.begin();it!=checkpointOutbox.end();)
++    {
++        auto& r=it->second;
++        if (r.Save.Campaign!=stamp.Campaign||r.Save.Character!=stamp.Character) {++it;continue;}
++        if (auto known=CampaignCheckpoint::Find(campaignLink.Journal,stamp.Campaign,stamp.Character,r.Digest))
++        {
++            if (known->Encode()!=r.Encode()) spdlog::warn("STM checkpoint digest already has different metadata");
++            it=checkpointOutbox.erase(it);continue;
++        }
++        if (CampaignCheckpoint::Known(campaignLink.Journal,stamp.Campaign,r)) return r.Encode();
++        ++it;
++    }
++    return {};
++}
++}
++std::optional<CampaignCheckpoint::Record> CampaignCheckpointClient::Capture(World& world) noexcept
++{
++    try
++    {
++        const auto identity=CampaignAccess::Current(world);
++        auto* player=PlayerCharacter::Get();
++        auto* cell=player?player->GetParentCellEx():nullptr;
++        if (!identity||!cell||!cell->IsAttached()||HomeInstance::ProjectionForm(cell->formID)) return {};
++        std::vector<InventoryEvidence::PluginSlot> slots;
++        if (auto* mods=ModManager::Get())
++            for (const auto* mod:mods->mods)
++            {
++                if (!mod||!mod->IsLoaded()) continue;
++                const auto* end=std::find(mod->filename,mod->filename+sizeof(mod->filename),'\0');
++                if (end!=mod->filename+sizeof(mod->filename))
++                    slots.push_back({mod->GetId(),mod->IsLite(),std::string(mod->filename,end)});
++            }
++        CampaignCheckpoint::Record r;
++        r.Save=identity->Save;r.Observed=campaignLink.Journal.Current();
++        if (auto key=InventoryEvidence::Resolve(cell->formID,slots)) r.Cell={key->Plugin,key->Local};
++        if (auto* space=player->GetWorldSpace())
++            if (auto key=InventoryEvidence::Resolve(space->formID,slots)) r.WorldSpace={key->Plugin,key->Local};
++        if (r.Cell.Empty()&&r.WorldSpace.Empty()) return {};
++        uint32_t scope{},base{};
++        if (HomeInstance::Encode(cell->formID,scope,base))
++        {
++            if (!HomeRegistry::Scoped(scope)) return {};
++            r.HomeSlot=scope&HomeRegistry::MaxSlot;
++        }
++        if (HomeInstance::PrivateCell(cell->formID)&&!r.HomeSlot) return {};
++        r.Pose={std::bit_cast<uint32_t>(player->position.x),std::bit_cast<uint32_t>(player->position.y),
++                std::bit_cast<uint32_t>(player->position.z),std::bit_cast<uint32_t>(player->rotation.x),
++                std::bit_cast<uint32_t>(player->rotation.y),std::bit_cast<uint32_t>(player->rotation.z)};
++        return r;
++    }
++    catch (...) {return {};}
++}
++void CampaignCheckpointClient::Queue(CampaignCheckpoint::Record r) noexcept
++{
++    try
++    {
++        if (!CampaignCheckpoint::Known(campaignLink.Journal,campaignLink.Campaign,r)) return;
++        if (!CampaignCheckpoint::StoreLocal(campaignLink.Root,r))
++        {spdlog::warn("STM checkpoint local outbox write failed");return;}
++        const auto id=CampaignCheckpoint::Id(r.Save.Character,r.Digest);
++        checkpointOutbox.insert_or_assign(id,std::move(r));nextPull={};
++        spdlog::info("STM exact ESS checkpoint queued");
++    }
++    catch (...) {spdlog::warn("STM checkpoint queue failed");}
++}
++void CampaignCheckpointClient::ForgetLoaded() noexcept
++{
++    std::lock_guard lock(checkpointLoadMutex);loadedDigest.clear();confirmedLoad=false;
++}
++void CampaignCheckpointClient::NoteLoadedFile(std::string digest) noexcept
++{
++    std::lock_guard lock(checkpointLoadMutex);loadedDigest=std::move(digest);confirmedLoad=false;
++}
++void CampaignCheckpointClient::CompleteLoad() noexcept
++{
++    std::lock_guard lock(checkpointLoadMutex);confirmedLoad=CampaignCheckpoint::DigestValid(loadedDigest);
++}
++std::optional<CampaignCheckpoint::Record> CampaignCheckpointClient::Loaded(World& world) noexcept
++{
++    try
++    {
++        const auto identity=CampaignAccess::Current(world);
++        if (!identity) return {};
++        auto r=CampaignCheckpoint::Find(campaignLink.Journal,identity->Save.Campaign,
++            identity->Save.Character,LoadedDigest());
++        if (r&&r->Save==identity->Save) return r;
++    }
++    catch (...) {}
++    return {};
++}
++
+ void QuestService::PollCampaign(const UpdateEvent&) noexcept
+ {
+     if (!m_world.GetTransport().IsOnline())
+@@ -250,6 +371,7 @@
+         request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
+         request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
+         pendingSave=*stamp;
+         request.Character=stamp->Character;request.SaveRevision=stamp->Applied.Revision;request.SaveTag=stamp->Applied.Tag;
+         request.Credential=credential->Secret.c_str();
++        request.Checkpoint=NextCheckpoint(*stamp).c_str();
+         m_world.GetTransport().Send(request);
+diff --git a/Code/client/World.h b/Code/client/World.h
+--- a/Code/client/World.h
++++ b/Code/client/World.h
+@@ -20,5 +20,7 @@
+     void Update() noexcept;
+ 
++    bool BeginCheckpointWrite() noexcept;
++    void EndCheckpointWrite() noexcept;
+     // Native save-load entry points. Only the game-update thread can tear
+     // down an authenticated session; an offline load may run on a worker.
+     bool BeginSaveLoad() noexcept;
+diff --git a/Code/client/World.cpp b/Code/client/World.cpp
+--- a/Code/client/World.cpp
++++ b/Code/client/World.cpp
+@@ -61,4 +61,17 @@
+-World::~World() = default;
+-
++#include <Services/CampaignCheckpointClient.h>
++
++World::~World() = default;
++
++bool World::BeginCheckpointWrite() noexcept
++{
++    if (!m_saveLoadMutex.try_lock()) return false;
++    if (GetCurrentThreadId()!=m_gameThreadId||m_inWorldFrame||m_preparingLoad||IsLoadingSave())
++    {m_saveLoadMutex.unlock();return false;}
++    m_inWorldFrame=true;return true;
++}
++void World::EndCheckpointWrite() noexcept
++{
++    m_inWorldFrame=false;m_saveLoadMutex.unlock();
++}
+ bool World::BeginSaveLoad() noexcept
+ {
+@@ -85,3 +98,4 @@
++    CampaignCheckpointClient::ForgetLoaded();
+     m_loadedWorld=m_loadFailed=m_successfulLoadPending=false;
+     m_saveLoadDepth.store(1,std::memory_order_release);
+     m_transport.SuspendForSaveLoad();
+@@ -160,12 +174,14 @@
+     if (!m_transport.PrepareWorldFrame())
+     {
+-        if (!wasSuspended && m_transport.AtTitle()) ResetWorldTracking();
+-        m_runner.OnUpdate(UpdateEvent(cDeltaSeconds)); // suspended tickets are discarded
+-        m_transport.Update();
+-        return;
+-    }
+-    if (m_successfulLoadPending)
+-    {
++        if (!wasSuspended && m_transport.AtTitle())
++        {CampaignCheckpointClient::ForgetLoaded();ResetWorldTracking();}
++        m_runner.OnUpdate(UpdateEvent(cDeltaSeconds)); // suspended tickets are discarded
++        m_transport.Update();
++        return;
++    }
++    if (m_successfulLoadPending)
++    {
++        CampaignCheckpointClient::CompleteLoad();
+         GetOverlayService().RecheckTradeAfterLoad();
+         m_successfulLoadPending=false;
+     }
+diff --git a/Code/client/Games/SaveLoad.cpp b/Code/client/Games/SaveLoad.cpp
+--- a/Code/client/Games/SaveLoad.cpp
++++ b/Code/client/Games/SaveLoad.cpp
+@@ -6,6 +6,9 @@
+ #include <Forms/TESForm.h>
+ 
+ #include <World.h>
+ #include <VersionDb.h>
++#include <Services/CampaignCheckpointClient.h>
++#include <Games/CampaignCheckpointFile.h>
++#include <cstdlib>
+ 
+ #include <TiltedCore/Serialization.hpp>
+@@ -141,5 +144,83 @@
+ LoadRequest* realLoadRequest{};
+ LoadWorld* realLoadWorld{};
+ 
++using SaveRequest=bool(BGSSaveLoadManager*,int32_t,uint32_t,const char*);
++using SaveWorld=void(BGSSaveLoadManager*,uint64_t*);
++SaveRequest* realSaveRequest{};
++SaveWorld* realSaveWorld{};
++struct CheckpointWrite
++{
++    std::filesystem::path Path;
++    std::string Before;
++    bool Entered{},Returned{},Invalid{};
++};
++thread_local CheckpointWrite* currentWrite{};
++void HookSaveWorld(BGSSaveLoadManager* manager,uint64_t* data)
++{
++    auto* write=currentWrite;
++    if (write)
++    {
++        if (write->Entered) write->Invalid=true;
++        write->Entered=true;write->Path=CampaignCheckpointFile::Path(data);
++        std::error_code ec;
++        const bool exists=!write->Path.empty()&&std::filesystem::exists(write->Path,ec);
++        if (write->Path.empty()||ec) write->Invalid=true;
++        if (exists)
++        {
++            auto before=CampaignCheckpointFile::Digest(write->Path);
++            if (!before) write->Invalid=true;
++            else write->Before=std::move(*before);
++        }
++    }
++    realSaveWorld(manager,data);
++    if (write) write->Returned=true;
++}
++bool HookSaveRequest(BGSSaveLoadManager* manager,int32_t device,uint32_t stats,const char* name)
++{
++    if (currentWrite)
++    {
++        currentWrite->Invalid=true;return realSaveRequest(manager,device,stats,name);
++    }
++    auto* world=World::Exists()?&World::Get():nullptr;
++    if (!world||!world->BeginCheckpointWrite()) return realSaveRequest(manager,device,stats,name);
++    struct Guard
++    {
++        World* Instance;
++        ~Guard(){currentWrite=nullptr;if (Instance) Instance->EndCheckpointWrite();}
++    } guard{world};
++    auto record=CampaignCheckpointClient::Capture(*world);
++    if (!record)
++    {
++        world->EndCheckpointWrite();guard.Instance=nullptr;
++        return realSaveRequest(manager,device,stats,name);
++    }
++    CheckpointWrite write;currentWrite=&write;
++    const bool success=realSaveRequest(manager,device,stats,name);
++    // Require the actual outer bool, inner return and changed readable ESS.
++    // A queued/worker write not observed here is left to native Skyrim.
++    if (success&&write.Entered&&write.Returned&&!write.Invalid)
++    {
++        auto digest=CampaignCheckpointFile::Digest(write.Path);
++        if (digest&&*digest!=write.Before)
++        {
++            record->Digest=std::move(*digest);
++            CampaignCheckpointClient::Queue(std::move(*record));
++        }
++        else spdlog::warn("STM checkpoint skipped: ESS not changed or not readable after save");
++    }
++    else if (success) spdlog::warn("STM checkpoint skipped: native write boundary not observed");
++    return success;
++}
++bool LoadWorldWithCheckpoint(BGSSaveLoadManager* manager,uint64_t* data,uint32_t flags,uint32_t mode,void* context)
++{
++    const auto* root=_wgetenv(L"STM_CAMPAIGN_ROOT");
++    const auto path=root&&*root?CampaignCheckpointFile::Path(data):std::filesystem::path{};
++    const auto before=CampaignCheckpointFile::Digest(path);
++    const bool ok=realLoadWorld(manager,data,flags,mode,context);
++    if (ok&&before&&CampaignCheckpointFile::Digest(path)==before)
++        CampaignCheckpointClient::NoteLoadedFile(*before);
++    return ok;
++}
++
+ template <class Fn,class... Args>
+ bool WithSaveLoadBoundary(bool actualWorldLoad,Fn* original,Args... args)
+@@ -166,6 +247,6 @@
+ bool HookLoadWorld(BGSSaveLoadManager* manager,uint64_t* data,uint32_t flags,uint32_t mode,void* context)
+ {
+-    return WithSaveLoadBoundary(true,realLoadWorld,manager,data,flags,mode,context);
++    return WithSaveLoadBoundary(true,LoadWorldWithCheckpoint,manager,data,flags,mode,context);
+ }
+ 
+ bool ExecutableAddress(const void* address)
+@@ -207,5 +288,18 @@
+     TP_HOOK(&realLoadRequest,HookLoadRequest);
+     TP_HOOK(&realLoadWorld,HookLoadWorld);
+     spdlog::info("STM registered early save load hooks for Steam 1.6.1170");
++    // SKSE 2.2.8 Save_Internal and SaveGame_HookTarget; CommonLib AE 35727.
++    unsigned long long saveOffset{};
++    if (!db.FindOffsetById(35727,saveOffset)||saveOffset!=0x60FD40)
++    {spdlog::warn("STM native save checkpoint hooks unavailable");return;}
++    auto* save=db.FindAddressById(35727);
++    auto* write=base+0x605880;
++    if (save!=base+saveOffset||!ExecutableAddress(save)||!ExecutableAddress(write))
++    {spdlog::warn("STM native save checkpoint addresses invalid");return;}
++    realSaveRequest=reinterpret_cast<SaveRequest*>(save);
++    realSaveWorld=reinterpret_cast<SaveWorld*>(write);
++    TP_HOOK(&realSaveRequest,HookSaveRequest);
++    TP_HOOK(&realSaveWorld,HookSaveWorld);
++    spdlog::info("STM registered native save checkpoint hooks for Steam 1.6.1170");
+ });
+ }
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign25"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign26"
