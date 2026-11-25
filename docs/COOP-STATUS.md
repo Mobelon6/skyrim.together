@@ -388,3 +388,5 @@ Campaign39: linked-room guest save/resume uses the existing deferred personal ES
 
 
 Campaign42 CI 45646849839 failed applying ObjectService.cpp hunk: overlapping context in two adjacent edits. Merged both edits into one hunk; verified all ObjectService hunks against reconstructed pinned upstream + HomeScope. Full CI remains pending; no exterior activation or gameplay claims.
+
+Campaign42 retry CI 45647580020 failed on the merged zero-context ObjectService hunk. Rebuilt the entire ObjectService section with exact source offsets, surrounding context and nonoverlapping hunks. Full CI still pending.

@@ -197,7 +197,10 @@ diff --git a/Code/server/Services/CharacterService.cpp b/Code/server/Services/Ch
 diff --git a/Code/server/Services/ObjectService.cpp b/Code/server/Services/ObjectService.cpp
 --- a/Code/server/Services/ObjectService.cpp
 +++ b/Code/server/Services/ObjectService.cpp
-@@ -66,10 +66,12 @@
+@@ -63,16 +63,18 @@
+ 
+     AssignObjectsResponse response;
+ 
 -    for (const ObjectData& object : acMessage.Packet.Objects)
 -    {
 -        if (!HomeScope::AdmittedCell(acMessage.pPlayer->GetCellComponent().Cell,object.CellId,object.WorldSpaceId)) continue;
@@ -220,71 +223,134 @@ diff --git a/Code/server/Services/ObjectService.cpp b/Code/server/Services/Objec
 +                return sender->GetCellComponent().SamePresence(view.get<CellIdComponent>(entity))&&
 +                    HomeScope::ReferenceMatches(formIdComponent.Id,view.get<CellIdComponent>(entity).Cell,id,cell);
 +            });
-@@ -105,5 +107,7 @@
-             objectComponent.CurrentLockData = object.CurrentLockData;
  
+         if (iter != std::end(view))
+         {
+@@ -99,11 +101,13 @@
+             m_world.emplace<FormIdComponent>(cEntity, object.Id);
+ 
+             auto& objectComponent = m_world.emplace<ObjectComponent>(cEntity, acMessage.pPlayer);
+-            objectComponent.CurrentLockData = object.CurrentLockData;
+-
 -            m_world.emplace<CellIdComponent>(cEntity, object.CellId, object.WorldSpaceId, object.CurrentCoords);
+-            auto& inventoryComp = m_world.emplace<InventoryComponent>(cEntity);
+-            inventoryComp.Content = object.CurrentInventory;
++            objectComponent.CurrentLockData = object.CurrentLockData;
++
 +            auto& location=m_world.emplace<CellIdComponent>(cEntity, object.CellId, object.WorldSpaceId, object.CurrentCoords);
 +            if (HomeScope::Private(object.CellId.ModId)&&acMessage.pPlayer->GetCellComponent().Cell==object.CellId)
 +                location.Estate=acMessage.pPlayer->GetCellComponent().Estate;
-             auto& inventoryComp = m_world.emplace<InventoryComponent>(cEntity);
-             inventoryComp.Content = object.CurrentInventory;
-@@ -123,4 +127,5 @@
-     // for homes until scoped object application is implemented.
-     if (HomeScope::Private(acMessage.Packet.CellId.ModId) ||
++            auto& inventoryComp = m_world.emplace<InventoryComponent>(cEntity);
++            inventoryComp.Content = object.CurrentInventory;
+ 
+             ObjectData objectData;
+             objectData.Id = object.Id;
+@@ -121,41 +125,45 @@
+ void ObjectService::OnActivate(const PacketEvent<ActivateRequest>& acMessage) const noexcept
+ {
+     // Legacy notify contains only a canonical reference ID; suppress it
+-    // for homes until scoped object application is implemented.
+-    if (HomeScope::Private(acMessage.Packet.CellId.ModId) ||
+-        HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)) return;
+-    NotifyActivate notifyActivate;
++    // for homes until scoped object application is implemented.
++    if (HomeScope::Private(acMessage.Packet.CellId.ModId) ||
 +        acMessage.pPlayer->GetCellComponent().HasExteriorEstate() ||
-         HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)) return;
-     NotifyActivate notifyActivate;
-@@ -135,5 +140,6 @@
-     for (auto pPlayer : m_world.GetPlayerManager())
-     {
++        HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)) return;
++    NotifyActivate notifyActivate;
+     notifyActivate.Id = acMessage.Packet.Id;
+     notifyActivate.ActivatorId = acMessage.Packet.ActivatorId;
+     notifyActivate.PreActivationOpenState = acMessage.Packet.PreActivationOpenState;
+ 
+-    for (auto pPlayer : m_world.GetPlayerManager())
+-    {
 -        if (pPlayer != acMessage.pPlayer && pPlayer->GetCellComponent().Cell == acMessage.Packet.CellId)
+-        {
+-            pPlayer->Send(notifyActivate);
++    for (auto pPlayer : m_world.GetPlayerManager())
++    {
 +        if (pPlayer != acMessage.pPlayer && !pPlayer->GetCellComponent().HasExteriorEstate() &&
 +            pPlayer->GetCellComponent().Cell == acMessage.Packet.CellId)
-         {
-             pPlayer->Send(notifyActivate);
-@@ -145,5 +151,6 @@
- void ObjectService::OnLockChange(const PacketEvent<LockChangeRequest>& acMessage) const noexcept
- {
-     if (HomeScope::Private(acMessage.Packet.CellId.ModId) ||
++        {
++            pPlayer->Send(notifyActivate);
+         }
+     }
+ }
+ 
+-void ObjectService::OnLockChange(const PacketEvent<LockChangeRequest>& acMessage) const noexcept
+-{
+-    if (HomeScope::Private(acMessage.Packet.CellId.ModId) ||
+-        HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)) return;
+-    NotifyLockChange notifyLockChange;
++void ObjectService::OnLockChange(const PacketEvent<LockChangeRequest>& acMessage) const noexcept
++{
++    if (HomeScope::Private(acMessage.Packet.CellId.ModId) ||
 +        acMessage.pPlayer->GetCellComponent().HasExteriorEstate() ||
-         HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)) return;
-     NotifyLockChange notifyLockChange;
-@@ -157,7 +164,8 @@
-     const auto iter = std::find_if(
-         std::begin(objectView), std::end(objectView),
++        HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)) return;
++    NotifyLockChange notifyLockChange;
+     notifyLockChange.Id = acMessage.Packet.Id;
+     notifyLockChange.IsLocked = acMessage.Packet.IsLocked;
+     notifyLockChange.LockLevel = acMessage.Packet.LockLevel;
+ 
+     auto objectView = m_world.view<FormIdComponent, ObjectComponent, CellIdComponent>();
+ 
+-    const auto iter = std::find_if(
+-        std::begin(objectView), std::end(objectView),
 -        [objectView, id = acMessage.Packet.Id, cell=acMessage.Packet.CellId](auto entity)
 -        {
 -            const auto& formIdComponent = objectView.get<FormIdComponent>(entity);
 -            return HomeScope::ReferenceMatches(formIdComponent.Id,objectView.get<CellIdComponent>(entity).Cell,id,cell);
+-        });
++    const auto iter = std::find_if(
++        std::begin(objectView), std::end(objectView),
 +        [objectView, id = acMessage.Packet.Id, cell=acMessage.Packet.CellId,sender=acMessage.pPlayer](auto entity)
 +        {
 +            const auto& formIdComponent = objectView.get<FormIdComponent>(entity);
 +            return sender->GetCellComponent().SamePresence(objectView.get<CellIdComponent>(entity))&&
 +                HomeScope::ReferenceMatches(formIdComponent.Id,objectView.get<CellIdComponent>(entity).Cell,id,cell);
-         });
-@@ -181,6 +189,6 @@
-         if (pPlayer == acMessage.pPlayer)
-             continue;
++        });
  
+     if (iter != std::end(objectView))
+     {
+@@ -166,12 +174,12 @@
+ 
+     for (Player* pPlayer : m_world.GetPlayerManager())
+     {
+-        if (pPlayer == acMessage.pPlayer)
+-            continue;
+-
 -        if (pPlayer->GetCellComponent().Cell == acMessage.Packet.CellId)
+-            pPlayer->Send(notifyLockChange);
+-    }
++        if (pPlayer == acMessage.pPlayer)
++            continue;
++
 +        if (!pPlayer->GetCellComponent().HasExteriorEstate()&&pPlayer->GetCellComponent().Cell == acMessage.Packet.CellId)
-             pPlayer->Send(notifyLockChange);
-     }
-@@ -194,7 +202,9 @@
-     // ScriptAnimation carries a raw local FormID and no target cell.
++            pPlayer->Send(notifyLockChange);
++    }
+ }
+ 
+ void ObjectService::OnScriptAnimationRequest(const PacketEvent<ScriptAnimationRequest>& acMessage) noexcept
+@@ -183,10 +191,12 @@
+     message.Animation = packet.Animation;
+     message.EventName = packet.EventName;
+ 
+-    // ScriptAnimation carries a raw local FormID and no target cell.
 -    if (HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)) return;
 -    for (Player* pPlayer : m_world.GetPlayerManager())
 -    {
 -        if (!HomeScope::Private(pPlayer->GetCellComponent().Cell.ModId)) pPlayer->Send(message);
+-    }
+-}
++    // ScriptAnimation carries a raw local FormID and no target cell.
 +    if (HomeScope::Private(acMessage.pPlayer->GetCellComponent().Cell.ModId)||
 +        acMessage.pPlayer->GetCellComponent().HasExteriorEstate()) return;
 +    for (Player* pPlayer : m_world.GetPlayerManager())
 +    {
 +        if (!HomeScope::Private(pPlayer->GetCellComponent().Cell.ModId)&&
 +            !pPlayer->GetCellComponent().HasExteriorEstate()) pPlayer->Send(message);
-     }
- }
++    }
++}
 diff --git a/Code/server/Services/InventoryService.cpp b/Code/server/Services/InventoryService.cpp
 --- a/Code/server/Services/InventoryService.cpp
 +++ b/Code/server/Services/InventoryService.cpp
