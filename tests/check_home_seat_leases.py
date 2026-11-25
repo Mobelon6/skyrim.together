@@ -41,3 +41,12 @@ assert "SeatReply(m_world,e)" in client and "UpdateSeat(m_world)" in client
 assert "if (!object->Activate(player,0,nullptr,1,0)) ReleaseSeat(world);" in client
 assert "HomeVisit::CanEnter(*p,cell.ModId,cell.BaseId)" in server
 print("PASS seat contention, distinct scopes, stale release, lease renewal, expiry, disconnect pruning")
+# Existing native seat marker is protected only in a registered original home.
+interp=(up/"Code/client/Systems/InterpolationSystem.cpp").read_text()
+assert "actorExtension->IsRemotePlayer()" in interp
+assert "HomeRegistry::Scoped(mod)" in interp
+assert "furniture->GetParentCellEx()==cell" in interp
+assert "occupiedFurniture.handle.iBits" in interp
+assert "|| nativeRemoteSeat) && !cIsTeleport" in interp
+assert "if (!sittingInPlace)" in interp
+print("PASS scoped native seated interpolation source checks")

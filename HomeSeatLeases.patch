@@ -196,10 +196,11 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
  Clock::time_point resumePoll{};
  struct PendingLock {uint32_t Revision{};Clock::time_point Until;};
  struct LockContext
-@@ -1075,6 +1204,7 @@
+@@ -1075,7 +1204,8 @@
  void OverlayService::ClearHomes() noexcept
  {
 +    seat={};
+     HomeResidentProjection::Clear();residentDisplayNext={};
      HomePlacementClient::Clear();
      if (selection && m_pOverlay && m_gameOverlayClient)
      {m_pOverlay->ExecuteAsync("hideHome");m_gameOverlayClient->SetUIVisible(false);}
@@ -217,7 +218,7 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +                if (!visit.Nonce || e.AccessGuest!=visit.Nonce || e.House!=visit.Slot ||
                      e.Campaign!=visit.Campaign || e.Character!=visit.Character ||
                      std::string_view(e.Root.data(),e.Root.size())!=visit.Root || e.AccessRight>2) return;
-                 visit.Granted=e.AccessRight!=0;
+                 visit.Right=e.AccessRight;visit.Granted=e.AccessRight!=0;
 @@ -1171,7 +1302,15 @@
  }
  bool OverlayService::TryHouseDoor(uint32_t form) noexcept
@@ -346,6 +347,51 @@ diff --git a/Code/server/Services/PartyHome.cpp b/Code/server/Services/PartyHome
              {
                  if (!e.House || e.AccessGuest || (e.AccessRight!=1 && e.AccessRight!=3) ||
                      e.SnapshotDigest || e.SnapshotPart || e.SnapshotParts || e.Visible.empty()) return;
+diff --git a/Code/client/Systems/InterpolationSystem.cpp b/Code/client/Systems/InterpolationSystem.cpp
+--- a/Code/client/Systems/InterpolationSystem.cpp
++++ b/Code/client/Systems/InterpolationSystem.cpp
+@@ -7,6 +7,10 @@
+ #include <Misc/MiddleProcess.h>
+ 
+ #include <Games/References.h>
+ #include <World.h>
++#include <PlayerCharacter.h>
++#include <Forms/TESObjectCELL.h>
++#include <Services/HomeInstance.h>
++#include <HomeRegistry.h>
+ 
+ namespace
+@@ -96,9 +100,29 @@
+     if (!apActor)
+         return;
+ 
++    // Keep the existing STR action replay and animation graph. Only protect
++    // a real, currently occupied native furniture marker from interpolation.
++    bool nativeRemoteSeat=false;
++    const auto* actorExtension=apActor->GetExtension();
++    if (actorExtension && actorExtension->IsRemotePlayer() &&
++        ((apActor->actorState.flags1 >> 14) & 15u)==3u &&
++        apActor->currentProcess && apActor->currentProcess->middleProcess &&
++        apActor->currentProcess->middleProcess->occupiedFurniture)
++    {
++        const auto* player=PlayerCharacter::Get();
++        const auto* cell=apActor->GetParentCellEx();
++        uint32_t mod{},base{};
++        if (player && cell && player->GetParentCellEx()==cell && !HomeInstance::ProjectionForm(cell->formID) &&
++            HomeInstance::Encode(cell->formID,mod,base) && HomeRegistry::Scoped(mod))
++        {
++            const auto* furniture=TESObjectREFR::GetByHandle(apActor->currentProcess->middleProcess->occupiedFurniture.handle.iBits);
++            nativeRemoteSeat=furniture && furniture->baseForm && static_cast<uint32_t>(furniture->baseForm->formType)==40 &&
++                !furniture->IsTemporary() && !furniture->IsDisabled() && !furniture->IsDeleted() && furniture->GetParentCellEx()==cell;
++        }
++    }
+     const bool sittingInPlace = ((apActor->actorState.flags1 >> 14) & 15u) == 3u &&
+         apActor->currentProcess && apActor->currentProcess->middleProcess && apActor->currentProcess->middleProcess->occupiedFurniture &&
+-        !apActor->GetExtension()->IsPlayer() && !cIsTeleport &&
++        ((actorExtension && !actorExtension->IsPlayer()) || nativeRemoteSeat) && !cIsTeleport &&
+         glm::distance(aInterpolationComponent.Position, static_cast<const glm::vec3&>(apActor->position)) < 160.f;
+     if (!sittingInPlace)
+         apActor->ForcePosition(aInterpolationComponent.Position);
 diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
 --- a/Code/common/BuildInfo.h.in
 +++ b/Code/common/BuildInfo.h.in
