@@ -123,51 +123,66 @@ jobs:
           path: connect-upstream
           persist-credentials: false
       - run: git -C connect-upstream apply ../TiltedConnectLifecycle.patch
-      - run: python3 tests/check_connection_lifecycle.py connect-upstream upstream
-      - run: python3 tests/check_world_epoch.py upstream
-      - run: python3 tests/check_save_load_lifecycle.py upstream
-      - run: python3 tests/check_inventory_evidence.py upstream
-      - run: python3 tests/check_encounter_combat.py upstream
-      - run: python3 tests/check_home_routes.py upstream
-      - run: python3 tests/check_home_registry.py upstream
-      - run: python3 tests/check_home_scope.py upstream
-      - run: python3 tests/check_home_snapshot.py upstream
-      - run: python3 tests/check_home_projection.py upstream
-      - run: python3 tests/check_home_catalog.py upstream
-      - run: python3 tests/check_home_inventory_ledger.py upstream
-      - run: python3 tests/check_home_container_menu.py upstream
-      - run: python3 tests/check_home_visit.py upstream
-      - run: python3 tests/check_home_locks.py upstream
-      - run: python3 tests/check_home_residents.py upstream
-      - run: python3 tests/check_home_actor_protection.py upstream
-      - run: python3 tests/check_home_resident_projection.py upstream
-      - run: python3 tests/check_home_loose_property.py upstream
-      - run: python3 tests/check_home_objects.py upstream
-      - run: python3 tests/check_home_placement.py upstream
-      - run: python3 tests/check_guest_packaging.py
-      - run: python3 tests/check_home_instances_generation.py
-      - run: python3 tests/check_home_navmesh.py
-      - run: python3 tests/check_encounter_recovery.py upstream
-      - run: python3 tests/check_trade.py upstream
-      - run: python3 tests/check_native_trade.py upstream
-      - run: python3 tests/check_actor_replay.py upstream
-      - run: python3 tools/check_progress_consent.py upstream
-      - run: python3 tools/check_party_travel.py upstream
-      - run: python3 tools/check_interaction_owner.py upstream
-      - run: python3 tools/check_follower_dialogue.py upstream
-      - run: python3 tools/check_coop_interaction.py upstream
-      - run: python3 tools/check_quest_journal.py upstream
-      - run: python3 tests/check_campaign_journal.py upstream
-      - run: python3 tests/check_campaign_replication.py upstream
-      - run: python3 tests/check_campaign_identity.py upstream
-      - run: python3 tools/check_life_confirmation.py upstream
-      - run: python3 tools/check_observer.py upstream
-      - run: python3 tools/check_replica_and_input.py upstream
-      - run: python3 tools/check_dialogue_draw.py upstream
-      - run: python3 tools/check_remote_hit.py upstream
-      - run: python3 check.py upstream
-      - run: python3 check_state3.py upstream
-      - run: python3 check_dialogue2.py upstream
+      - name: Run all independent source and model checks
+        shell: bash
+        run: |
+          failed=0
+          run_check() {
+            echo "::group::$*"
+            if "$@"; then
+              echo "PASS: $*"
+            else
+              echo "::error::Failed: $*"
+              failed=1
+            fi
+            echo "::endgroup::"
+          }
+          run_check python3 tests/check_connection_lifecycle.py connect-upstream upstream
+          run_check python3 tests/check_world_epoch.py upstream
+          run_check python3 tests/check_save_load_lifecycle.py upstream
+          run_check python3 tests/check_inventory_evidence.py upstream
+          run_check python3 tests/check_encounter_combat.py upstream
+          run_check python3 tests/check_home_routes.py upstream
+          run_check python3 tests/check_home_registry.py upstream
+          run_check python3 tests/check_home_scope.py upstream
+          run_check python3 tests/check_home_snapshot.py upstream
+          run_check python3 tests/check_home_projection.py upstream
+          run_check python3 tests/check_home_catalog.py upstream
+          run_check python3 tests/check_home_inventory_ledger.py upstream
+          run_check python3 tests/check_home_container_menu.py upstream
+          run_check python3 tests/check_home_visit.py upstream
+          run_check python3 tests/check_home_locks.py upstream
+          run_check python3 tests/check_home_residents.py upstream
+          run_check python3 tests/check_home_actor_protection.py upstream
+          run_check python3 tests/check_home_resident_projection.py upstream
+          run_check python3 tests/check_home_loose_property.py upstream
+          run_check python3 tests/check_home_objects.py upstream
+          run_check python3 tests/check_home_placement.py upstream
+          run_check python3 tests/check_guest_packaging.py
+          run_check python3 tests/check_home_instances_generation.py
+          run_check python3 tests/check_home_navmesh.py
+          run_check python3 tests/check_encounter_recovery.py upstream
+          run_check python3 tests/check_trade.py upstream
+          run_check python3 tests/check_native_trade.py upstream
+          run_check python3 tests/check_actor_replay.py upstream
+          run_check python3 tools/check_progress_consent.py upstream
+          run_check python3 tools/check_party_travel.py upstream
+          run_check python3 tools/check_interaction_owner.py upstream
+          run_check python3 tools/check_follower_dialogue.py upstream
+          run_check python3 tools/check_coop_interaction.py upstream
+          run_check python3 tools/check_quest_journal.py upstream
+          run_check python3 tests/check_campaign_journal.py upstream
+          run_check python3 tests/check_campaign_replication.py upstream
+          run_check python3 tests/check_campaign_identity.py upstream
+          run_check python3 tools/check_life_confirmation.py upstream
+          run_check python3 tools/check_observer.py upstream
+          run_check python3 tools/check_replica_and_input.py upstream
+          run_check python3 tools/check_dialogue_draw.py upstream
+          run_check python3 tools/check_remote_hit.py upstream
+          run_check python3 check.py upstream
+          run_check python3 check_state3.py upstream
+          run_check python3 check_dialogue2.py upstream
+          exit "$failed"
 
   build:
     needs: check

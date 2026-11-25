@@ -8,6 +8,8 @@
 
 Публичный CI [45518894136](https://github.com/Mobelon6/skyrim.together/actions/runs/45518894136): все патчи применились, check остановлен на изолированном тесте RecheckTradeAfterLoad (не объявлен HomePlacementClient::Forget); добавлена модель вызова с проверкой обоих сценариев. [45518893878](https://github.com/Mobelon6/skyrim.together/actions/runs/45518893878) campaign success. Независимый UI workflow [45518894445](https://github.com/Mobelon6/skyrim.together/actions/runs/45518894445) не нашёл архив; удалён автоматический push trigger, ручной и reusable вход сохранены. Компиляция ещё не подтверждена.
 
+CI [45519641253](https://github.com/Mobelon6/skyrim.together/actions/runs/45519641253): save-load regression passed, также passed inventory evidence, encounter combat, home routes/registry/scope/snapshot/projection/catalog/inventory ledger. Остановился на устаревшем exact-string assertion ProtectHome в check_home_container_menu.py. Обновлены проверки защиты гостевых и динамических объектов, также актуализированы два assertion в check_home_actor_protection.py после изменений native drop. Все 45 независимых тестовых команд теперь выполняются в одной группе с отдельными результатами и общим failure gate: Windows не запускается, если хотя бы одна проверка не прошла. Порядок применения патчей неизменён.
+
 ## Interaction07 — рабочая, незавершённая итерация
 
 ### HomeLegacyPlacement — начальный импорт старых предметов (campaign23)

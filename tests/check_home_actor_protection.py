@@ -12,12 +12,13 @@ assert "!ext->IsPlayer()" in policy and "HomeInstance::ProjectionForm(cell->form
 assert "if (HomeActorProtection::Resident(apThis) || HomeActorProtection::Resident(apHitter)) return false;" in actor
 assert "if (NativeTrade::BlockAdd(apThis,apOldOwner)) return;" in actor
 assert "if (HomeActorProtection::Resident(apThis) || HomeActorProtection::PickupBlocked(apObject)) return nullptr;" in actor
-assert "if (HomeActorProtection::Resident(this)) return;" in actor
+assert "if (HomeActorProtection::Resident(this) || HomePlacementClient::Scoped(this)) return;" in actor
 assert "if (HomeActorProtection::PickupBlocked(apObject))" in player
 assert "World::Get().GetOverlayService().TryTrade(apObject->formID);" in player
 assert ref.index("if (HomeActorProtection::Resident(apThis)) return false;") < ref.index("if (service.TryJoinConversation(apThis->formID))")
 assert "#include <Services/HomeInstance.h>" in trade
 assert "ScopedInventoryOverride::IsOverriden() && !from && HomeActorProtection::Resident(to)" in trade
 assert "ScopedInventoryOverride::IsOverriden() && !to && HomeActorProtection::Resident(from)" in trade
-assert "if (acMessage.Drop && !HomeActorProtection::Resident(pActor))" in inv
+assert "if (acMessage.Drop && !HomeActorProtection::Resident(pActor) && !HomePlacementClient::Scoped(pActor))" in inv
+assert "pActor->AddOrRemoveItem(acMessage.Item);" in inv
 print("PASS projection actor inventory, pickup, drop, activation and damage hook integration")

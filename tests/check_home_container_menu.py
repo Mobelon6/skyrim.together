@@ -14,5 +14,10 @@ assert "ProtectHome(to) || ProtectHome(from)" in client
 assert "PartyTrade request{TradeOp::HomeOpen" in client
 assert "CampaignAccess::LocalIdentity(world)" in client
 assert "HomeInstance::GuestReference(object->formID,source)" in client
-assert "if (object && HomeInstance::ProjectionForm(object->formID)) return true;" in client
+# Protection must include guest shells as well as journal-backed temporary stacks.
+protect=client.split("bool ProtectHome(const TESObjectREFR* object) noexcept",1)[1].split("catch (...)",1)[0]
+assert "HomeInstance::ProjectionForm(object->formID)" in protect
+assert "HomePlacementClient::Tracked(object)" in protect
+assert "HomePlacementClient::LegacyBlocked(object)" in protect
+assert "return true;" in protect
 print("PASS home container session integration points")
