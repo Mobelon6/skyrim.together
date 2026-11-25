@@ -34,6 +34,19 @@ int main(int argc,char** argv)
     const auto catalog=HomeEstateCatalog::Read(input);assert(catalog);
     const auto* estate=catalog->ForRoom(secondKey);assert(estate&&estate->Main==main);
     assert(HomeEstateCatalog::RegisteredRooms(*estate,j,*second)==slots);
+    assert(!estate->ContainsCandidate(worldKey,0,0)); // legacy catalog carries no spatial proposal
+    const auto regions=index+"B "+q+" main 4 -100 -100 100 -100 100 100 -100 100\n"+
+        "B "+q+" hatchery 4 300 300 400 300 400 400 300 400\n";
+    std::istringstream spatial(regions);
+    const auto withRegions=HomeEstateCatalog::Read(spatial);assert(withRegions);
+    const auto* plot=withRegions->ForRoom(main);assert(plot);
+    assert(plot->ContainsCandidate(worldKey,0,0)&&plot->ContainsCandidate(worldKey,100,100));
+    assert(plot->ContainsCandidate(worldKey,350,350)&&!plot->ContainsCandidate(worldKey,200,200));
+    assert(!plot->ContainsCandidate(table,0,0)&&!plot->ContainsCandidate(worldKey,NAN,0));
+    std::istringstream badPolygon(index+"B "+q+" main 4 0 0 100 100 0 100 100 0\n");
+    assert(!HomeEstateCatalog::Read(badPolygon));
+    std::istringstream duplicateRegion(regions+"B "+q+" main 3 0 0 100 0 100 100\n");
+    assert(!HomeEstateCatalog::Read(duplicateRegion));
     const auto mainId=HomeEstateCatalog::Identity(*catalog,j,71,*first);
     const auto roomId=HomeEstateCatalog::Identity(*catalog,j,71,*second);
     assert(mainId&&roomId&&*mainId==*roomId&&mainId->RootSlot==first->Slot);

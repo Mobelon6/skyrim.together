@@ -257,8 +257,98 @@ def collect(reader, unpack):
             "enable_children": {k: sorted(v) for k, v in children.items()}}
 
 
+# Verified vanilla garden/unique improvement enable roots. The fish hatchery's
+# controller is on the main site, while its physical enclosure is offshore.
+SITE_IMPROVEMENTS = {
+    "lakeview": (0x690c, 0x12a57),
+    "windstad": (0xa8ce, 0x8d0),
+    "heljarchen": (0xc3c5, 0x12a59),
+}
+HATCHERY = stable((HF, 0x8d0))
+SPATIAL_CLEARANCE = 128  # provisional walking clearance, not a vanilla property boundary
+
+
+def hull(points):
+    """Counter-clockwise convex hull of integer XY points (no repeated closing point)."""
+    points = sorted(set(points))
+    def cross(a, b, c):
+        return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])
+    def half(seq):
+        result = []
+        for p in seq:
+            while len(result) >= 2 and cross(result[-2], result[-1], p) <= 0:
+                result.pop()
+            result.append(p)
+        return result
+    if len(points) < 3:
+        return []
+    return half(points)[:-1] + half(reversed(points))[:-1]
+
+
+def spatial_candidate(catalog, estate):
+    """Physical proposal only: no collision, ownership or mutation assertion."""
+    refs = catalog["refs"]
+    table = refs[estate["drafting_table"]]
+    world = table["world"]
+    def pose(key):
+        r = refs.get(key, {})
+        return r.get("pose") if r.get("world") == world and r.get("kind") == "REFR" else None
+    main = {estate["drafting_table"]}
+    main.update(k for k in estate["construction"] if pose(k))
+    for name, values in estate["properties"].items():
+        if name.casefold() in ("stewardchest", "housecraftingtrigger"):
+            main.update(v["key"] for v in values if v["alias"] == 65535 and pose(v["key"]))
+    detached = set()
+    for local in SITE_IMPROVEMENTS.get(estate["name"], ()):
+        root = stable((HF, local))
+        if not pose(root):
+            raise ValueError("missing improvement root: " + root)
+        main.add(root)
+        # Only known improvement roots, not all transitive site dependencies.
+        children = {k for k in catalog["enable_children"].get(root, ())
+                    if k.startswith(HF.encode().hex()+".") and pose(k)}
+        if root == HATCHERY:
+            if not children:
+                raise ValueError("missing hatchery footprint")
+            detached.update(children)
+        else:
+            main.update(children)
+    # Include the actual exterior arrival from each reciprocal native door.
+    arrivals = []
+    for source, target in estate["reciprocal_door_candidates"]:
+        if not pose(target):
+            continue
+        main.add(target)
+        arrivals.append({"source": source, "target": target,
+                         "pose": refs[source]["teleport_pose"]})
+    # Nearby original site furniture/markers can extend the working footprint.
+    # Distant encounter triggers and other dependencies do not set boundaries.
+    anchors = [pose(k) for k in main if pose(k)]
+    for k in catalog["enable_children"].get(estate["site_marker"], ()):
+        p = pose(k)
+        if p and k.startswith(HF.encode().hex()+".") and any(
+                (p[0]-a[0])**2+(p[1]-a[1])**2 <= 512**2 for a in anchors):
+            main.add(k)
+    def region(name, keys, extra=()):
+        raw = [pose(k) for k in sorted(keys) if pose(k)] + list(extra)
+        # Expand the anchor hull by a small square clearance. Not mesh bounds.
+        points = [(x, y) for p in raw
+                  for x in (math.floor(p[0])-SPATIAL_CLEARANCE, math.ceil(p[0])+SPATIAL_CLEARANCE)
+                  for y in (math.floor(p[1])-SPATIAL_CLEARANCE, math.ceil(p[1])+SPATIAL_CLEARANCE)]
+        polygon = hull(points)
+        if len(polygon) < 3 or len(polygon) > 64:
+            raise ValueError("unsupported provisional footprint")
+        return {"region": name, "polygon_xy": polygon, "anchors": sorted(keys)}
+    regions = [region("main", main, [a["pose"] for a in arrivals])]
+    if detached:
+        regions.append(region("hatchery", detached))
+    return {"status": "provisional", "world": world, "clearance": SPATIAL_CLEARANCE,
+            "regions": regions, "switch_anchor": estate["drafting_table"],
+            "door_arrivals": arrivals, "safe_arrival": None}
+
+
 def compact_index(catalog):
-    """One owner-independent estate identity, with no approved boundary."""
+    """One owner-independent estate identity with provisional spatial proposals."""
     rows = ["STM-ESTATE-INDEX 1"]
     seen = set()
     for e in sorted(catalog["estates"], key=lambda v: v["key"]):
@@ -277,6 +367,11 @@ def compact_index(catalog):
                      and catalog["refs"][k]["pose"])
         e["anchor_extent_xy"] = [min(p[0] for p in poses), min(p[1] for p in poses),
                                  max(p[0] for p in poses), max(p[1] for p in poses)]
+        e["spatial_candidate"] = spatial_candidate(catalog, e)
+        for region in e["spatial_candidate"]["regions"]:
+            polygon = region["polygon_xy"]
+            rows.append(" ".join(["B", e["key"], region["region"], str(len(polygon))] +
+                                 [str(v) for point in polygon for v in point]))
     return "\n".join(rows) + "\n"
 
 

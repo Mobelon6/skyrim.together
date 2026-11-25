@@ -72,7 +72,13 @@ with tempfile.TemporaryDirectory() as tmp:
     index = (p / "CoopEstateIndex.txt").read_text().splitlines()
     assert index[0] == "STM-ESTATE-INDEX 1"
     assert index[1] == " ".join(("E", stable(1), stable(4), stable(90), stable(6), stable(7)))
-    assert set(index[2:]) == {"I "+stable(1)+" "+stable(4), "I "+stable(1)+" "+stable(5)}
+    assert set(index[2:4]) == {"I "+stable(1)+" "+stable(4), "I "+stable(1)+" "+stable(5)}
+    assert index[4] == "B "+stable(1)+" main 4 -128 -128 128 -128 128 128 -128 128"
+    candidate = json.loads((p / "CoopEstateEvidence.json").read_text())["estates"][0]["spatial_candidate"]
+    assert candidate["safe_arrival"] is None and candidate["status"] == "provisional"
+    assert candidate["switch_anchor"] == stable(6)
+    assert candidate["door_arrivals"][0]["source"] == stable(15)
+    assert ec.hull([(0,0),(1,0),(2,0),(2,2),(0,2),(1,1)]) == [(0,0),(2,0),(2,2),(0,2)]
     assert json.loads((p / "CoopEstateEvidence.json").read_text())["estates"][0]["anchor_extent_xy"] == [0,0,0,0]
 for bad in (vmad([10])[:-1], b"\0" * 6):
     try:

@@ -2,7 +2,7 @@ diff --git a/Code/common/HomeEstateCatalog.h b/Code/common/HomeEstateCatalog.h
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/HomeEstateCatalog.h
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,156 @@
 +#pragma once
 +#include "HomeRegistry.h"
 +#include <map>
@@ -11,15 +11,43 @@ new file mode 100644
 +#include <fstream>
 +#include <filesystem>
 +#include <cstdlib>
++#include <cmath>
++#include <vector>
 +
 +namespace HomeEstateCatalog
 +{
 +// Derived from the same frozen winning plugin profile as native capabilities.
-+// No boundary or safe-arrival assertion is encoded in this index.
++// Optional B rows are provisional anchor polygons, never access grants.
++struct Point {int32_t X{},Y{};};
++using Polygon=std::vector<Point>;
++inline double Cross(const Point& a,const Point& b,double x,double y) noexcept
++{return (double(b.X)-a.X)*(y-a.Y)-(double(b.Y)-a.Y)*(x-a.X);}
++inline bool ValidPolygon(const Polygon& p) noexcept
++{
++    if (p.size()<3||p.size()>64) return false;
++    for (size_t i=0;i<p.size();++i)
++        for (size_t j=0;j<p.size();++j)
++            if (j!=i&&j!=(i+1)%p.size()&&Cross(p[i],p[(i+1)%p.size()],p[j].X,p[j].Y)<=0) return false;
++    return true;
++}
++inline bool Contains(const Polygon& p,double x,double y) noexcept
++{
++    if (p.size()<3||!std::isfinite(x)||!std::isfinite(y)) return false;
++    for (size_t i=0;i<p.size();++i)
++        if (Cross(p[i],p[(i+1)%p.size()],x,y)<0) return false;
++    return true;
++}
 +struct Estate
 +{
 +    std::string Quest,Main,World,Table,Marker;
 +    std::set<std::string> Rooms;
++    std::map<std::string,Polygon> CandidateRegions;
++    bool ContainsCandidate(const std::string& world,double x,double y) const noexcept
++    {
++        if (World!=world) return false;
++        for (const auto& [_,p]:CandidateRegions) if (Contains(p,x,y)) return true;
++        return false;
++    }
 +};
 +struct Catalog
 +{
@@ -67,11 +95,26 @@ new file mode 100644
 +                !result.RoomEstate.emplace(room,quest).second) return {};
 +            found->second.Rooms.insert(room);
 +        }
++        else if (tag=='B')
++        {
++            std::string quest,region;size_t count{};
++            if (!(row>>quest>>region>>count)||count<3||count>64||(region!="main"&&region!="hatchery")) return {};
++            auto found=result.Estates.find(quest);
++            if (found==result.Estates.end()) return {};
++            Polygon polygon;
++            for (size_t i=0;i<count;++i)
++            {
++                Point p;
++                if (!(row>>p.X>>p.Y)||p.X < -10000000||p.X > 10000000||p.Y < -10000000||p.Y > 10000000) return {};
++                polygon.push_back(p);
++            }
++            if (row>>extra||!ValidPolygon(polygon)||!found->second.CandidateRegions.emplace(region,std::move(polygon)).second) return {};
++        }
 +        else return {};
 +    }
 +    if (input.bad()||result.Estates.empty()) return {};
 +    for (const auto& [_,e]:result.Estates)
-+        if (!e.Rooms.count(e.Main)) return {};
++        if (!e.Rooms.count(e.Main)||(!e.CandidateRegions.empty()&&!e.CandidateRegions.count("main"))) return {};
 +    return result;
 +}
 +inline const std::optional<Catalog>& Host()
