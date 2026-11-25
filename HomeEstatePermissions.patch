@@ -1,0 +1,443 @@
+diff --git a/Code/common/HomePermissions.h b/Code/common/HomePermissions.h
+--- a/Code/common/HomePermissions.h
++++ b/Code/common/HomePermissions.h
+@@ -3,125 +3,238 @@
+ #include <map>
+ #include <sstream>
+ #include <string>
+ #include <utility>
+-
+-namespace HomePermissions
+-{
+-enum class Right : uint32_t { None, Visit, Modify };
+-struct Change
+-{
+-    uint32_t Slot{};
+-    uint64_t Owner{}, Guest{};
+-    Right Access{};
+-};
+-inline std::string Encode(const Change& c)
+-{
+-    return std::to_string(c.Slot)+" "+std::to_string(c.Owner)+" "+
+-        std::to_string(c.Guest)+" "+std::to_string(static_cast<uint32_t>(c.Access));
+-}
+-inline std::optional<Change> Decode(std::string_view bytes)
+-{
+-    Change c;uint32_t right{};std::string extra;
+-    std::istringstream in{std::string(bytes)};
+-    if (!(in>>c.Slot>>c.Owner>>c.Guest>>right) || in>>extra ||
+-        !c.Slot || !c.Owner || !c.Guest || c.Owner==c.Guest || right>2) return {};
+-    c.Access=static_cast<Right>(right);
+-    if (Encode(c)!=bytes) return {};
+-    return c;
+-}
+-struct GroupChange
+-{
+-    uint64_t Owner{},Guest{};
+-    Right Access{};
+-    std::vector<uint32_t> Slots;
+-};
+-inline constexpr size_t MaxGroupRooms=128;
+-inline std::string Encode(const GroupChange& c)
+-{
+-    std::string out=std::to_string(c.Owner)+" "+std::to_string(c.Guest)+" "+
+-        std::to_string(static_cast<uint32_t>(c.Access))+" "+std::to_string(c.Slots.size());
+-    for (auto slot:c.Slots) out+=" "+std::to_string(slot);
+-    return out;
+-}
+-inline std::optional<GroupChange> DecodeGroup(std::string_view bytes)
+-{
+-    GroupChange c;uint32_t right{},count{};std::string extra;
+-    std::istringstream in{std::string(bytes)};
+-    if (!(in>>c.Owner>>c.Guest>>right>>count)||!c.Owner||!c.Guest||c.Owner==c.Guest||
+-        right>2||count<2||count>MaxGroupRooms) return {};
+-    c.Access=static_cast<Right>(right);
+-    for (uint32_t i=0;i<count;++i)
+-    {
+-        uint32_t slot{};
+-        if (!(in>>slot)||!slot||slot>HomeRegistry::MaxSlot||(!c.Slots.empty()&&slot<=c.Slots.back())) return {};
+-        c.Slots.push_back(slot);
+-    }
+-    if (in>>extra||Encode(c)!=bytes) return {};
+-    return c;
+-}
+-inline bool AccessOperation(std::string_view kind)
+-{return kind=="home-access-v1"||kind=="home-access-group-v1";}
+-inline std::optional<std::vector<Change>> Changes(std::string_view kind,std::string_view bytes)
+-{
+-    if (kind=="home-access-v1")
+-    {
+-        const auto c=Decode(bytes);
+-        if (c) return std::vector<Change>{*c};
+-    }
+-    else if (kind=="home-access-group-v1")
+-    {
+-        const auto c=DecodeGroup(bytes);
+-        if (c)
+-        {
+-            std::vector<Change> result;
+-            for (auto slot:c->Slots) result.push_back({slot,c->Owner,c->Guest,c->Access});
+-            return result;
+-        }
+-    }
+-    return {};
+-}
+-struct Rules
+-{
+-    std::map<std::pair<uint32_t,uint64_t>,Right> Guests;
+-    uint32_t Revision{};
+-};
+-inline std::optional<Rules> Read(const CampaignJournal::Journal& journal)
+-{
+-    auto homes=HomeRegistry::Read(journal);
+-    if (!homes) return {};
+-    Rules out;
+-    for (const auto& row:journal.Operations())
+-    {
+-        if (!AccessOperation(row.Kind)) continue;
+-        const auto changes=Changes(row.Kind,row.Payload);
+-        if (!changes||out.Revision==UINT32_MAX||row.Id!="home-access-"+std::to_string(out.Revision+1)) return {};
+-        bool changed=false;
+-        for (const auto& c:*changes)
+-        {
+-            if (c.Slot>homes->size()||(*homes)[c.Slot-1].Owner!=c.Owner) return {};
+-            const auto key=std::pair{c.Slot,c.Guest};
+-            const auto prior=out.Guests.find(key);
+-            const auto right=prior==out.Guests.end()?Right::None:prior->second;
+-            if (right==c.Access) continue;
+-            changed=true;
+-            if (c.Access==Right::None) out.Guests.erase(key);
+-            else out.Guests[key]=c.Access;
+-        }
+-        if (!changed) return {};
+-        ++out.Revision;
+-    }
+-    return out;
+-}
+-inline Right Effective(const CampaignJournal::Journal& journal,uint32_t slot,uint64_t character)
+-{
+-    if (!character) return Right::None;
+-    auto home=HomeRegistry::BySlot(journal,slot);
+-    auto rules=Read(journal);
+-    if (!home || !rules) return Right::None;
+-    if (home->Owner==character) return Right::Modify;
+-    const auto it=rules->Guests.find({slot,character});
+-    return it==rules->Guests.end()?Right::None:it->second;
++#include <set>
++#include <tuple>
++
++namespace HomePermissions
++{
++enum class Right : uint32_t { None, Visit, Modify };
++struct Change
++{
++    uint32_t Slot{};
++    uint64_t Owner{}, Guest{};
++    Right Access{};
++};
++inline std::string Encode(const Change& c)
++{
++    return std::to_string(c.Slot)+" "+std::to_string(c.Owner)+" "+
++        std::to_string(c.Guest)+" "+std::to_string(static_cast<uint32_t>(c.Access));
++}
++inline std::optional<Change> Decode(std::string_view bytes)
++{
++    Change c;uint32_t right{};std::string extra;
++    std::istringstream in{std::string(bytes)};
++    if (!(in>>c.Slot>>c.Owner>>c.Guest>>right) || in>>extra ||
++        !c.Slot || !c.Owner || !c.Guest || c.Owner==c.Guest || right>2) return {};
++    c.Access=static_cast<Right>(right);
++    if (Encode(c)!=bytes) return {};
++    return c;
++}
++struct GroupChange
++{
++    uint64_t Owner{},Guest{};
++    Right Access{};
++    std::vector<uint32_t> Slots;
++};
++inline constexpr size_t MaxGroupRooms=128;
++inline std::string Encode(const GroupChange& c)
++{
++    std::string out=std::to_string(c.Owner)+" "+std::to_string(c.Guest)+" "+
++        std::to_string(static_cast<uint32_t>(c.Access))+" "+std::to_string(c.Slots.size());
++    for (auto slot:c.Slots) out+=" "+std::to_string(slot);
++    return out;
++}
++inline std::optional<GroupChange> DecodeGroup(std::string_view bytes)
++{
++    GroupChange c;uint32_t right{},count{};std::string extra;
++    std::istringstream in{std::string(bytes)};
++    if (!(in>>c.Owner>>c.Guest>>right>>count)||!c.Owner||!c.Guest||c.Owner==c.Guest||
++        right>2||count<2||count>MaxGroupRooms) return {};
++    c.Access=static_cast<Right>(right);
++    for (uint32_t i=0;i<count;++i)
++    {
++        uint32_t slot{};
++        if (!(in>>slot)||!slot||slot>HomeRegistry::MaxSlot||(!c.Slots.empty()&&slot<=c.Slots.back())) return {};
++        c.Slots.push_back(slot);
++    }
++    if (in>>extra||Encode(c)!=bytes) return {};
++    return c;
++}
++// Explicit owner consent for a plot, including its known but unregistered rooms.
++// Store stable room keys, not a mutable list of registry slots or a live catalog lookup.
++struct EstateChange
++{
++    uint64_t Owner{},Guest{};
++    Right Access{};
++    std::string Plot;
++    std::set<std::string> Rooms;
++    bool operator==(const EstateChange&) const=default;
++};
++using EstateKey=std::tuple<uint64_t,std::string,uint64_t>;
++inline bool StableKey(const std::string& key)
++{
++    const auto form=TradeProperties::DecodeForm(key);
++    return form&&form->Valid()&&form->Encode()==key;
++}
++inline std::string Encode(const EstateChange& c)
++{
++    std::string s=std::to_string(c.Owner)+" "+std::to_string(c.Guest)+" "+
++        std::to_string(static_cast<uint32_t>(c.Access))+" "+c.Plot+" "+std::to_string(c.Rooms.size());
++    for (const auto& room:c.Rooms) s+=" "+room;
++    return s;
++}
++inline std::optional<EstateChange> DecodeEstate(std::string_view bytes)
++{
++    EstateChange c;uint32_t right{},count{};std::string extra;
++    std::istringstream in{std::string(bytes)};
++    if (!(in>>c.Owner>>c.Guest>>right>>c.Plot>>count)||!c.Owner||!c.Guest||c.Owner==c.Guest||
++        right>2||!StableKey(c.Plot)||!count||count>MaxGroupRooms) return {};
++    c.Access=static_cast<Right>(right);
++    for (uint32_t i=0;i<count;++i)
++    {
++        std::string room;
++        if (!(in>>room)||!StableKey(room)||!c.Rooms.insert(room).second) return {};
++    }
++    if (in>>extra||Encode(c)!=bytes) return {};
++    return c;
++}
++inline bool AccessOperation(std::string_view kind)
++{return kind=="home-access-v1"||kind=="home-access-group-v1"||kind=="home-access-estate-v1";}
++inline std::optional<std::vector<Change>> Changes(std::string_view kind,std::string_view bytes)
++{
++    if (kind=="home-access-v1")
++    {
++        const auto c=Decode(bytes);
++        if (c) return std::vector<Change>{*c};
++    }
++    else if (kind=="home-access-group-v1")
++    {
++        const auto c=DecodeGroup(bytes);
++        if (c)
++        {
++            std::vector<Change> result;
++            for (auto slot:c->Slots) result.push_back({slot,c->Owner,c->Guest,c->Access});
++            return result;
++        }
++    }
++    return {};
++}
++struct Rules
++{
++    std::map<std::pair<uint32_t,uint64_t>,Right> Guests;
++    std::map<EstateKey,EstateChange> Estates;
++    uint32_t Revision{};
++    size_t Registered{};
++};
++inline bool Apply(Rules& rules,uint32_t slot,uint64_t guest,Right access)
++{
++    const auto key=std::pair{slot,guest};
++    const auto it=rules.Guests.find(key);
++    if ((it==rules.Guests.end()?Right::None:it->second)==access) return false;
++    if (access==Right::None) rules.Guests.erase(key);
++    else rules.Guests[key]=access;
++    return true;
++}
++// Replay only the requested journal prefix. Explicit estate grants apply to
++// every matching room registered by that prefix, even if registered later than
++// the grant. Legacy slot grants never acquire this behavior.
++inline std::optional<Rules> ReadAt(const CampaignJournal::Journal& journal,size_t limit)
++{
++    const auto homes=HomeRegistry::Read(journal);
++    const auto& ops=journal.Operations();
++    if (!homes||limit>ops.size()) return {};
++    Rules out;
++    for (size_t i=0;i<limit;++i) if (ops[i].Kind=="home-register-v1") ++out.Registered;
++    if (out.Registered>homes->size()) return {};
++    size_t seen=0;
++    for (size_t i=0;i<limit;++i)
++    {
++        const auto& row=ops[i];
++        if (row.Kind=="home-register-v1") {++seen;continue;}
++        if (!AccessOperation(row.Kind)) continue;
++        if (out.Revision==UINT32_MAX||row.Id!="home-access-"+std::to_string(out.Revision+1)) return {};
++        if (row.Kind=="home-access-estate-v1")
++        {
++            const auto c=DecodeEstate(row.Payload);
++            if (!c) return {};
++            const EstateKey key{c->Owner,c->Plot,c->Guest};
++            const auto old=out.Estates.find(key);
++            // The catalog is frozen for a campaign profile. Never silently
++            // reinterpret previously granted room membership after profile edits.
++            if (old!=out.Estates.end()&&old->second.Rooms!=c->Rooms) return {};
++            bool observed=false;
++            for (size_t k=0;k<out.Registered;++k)
++            {
++                const auto& home=(*homes)[k];
++                if (home.Owner!=c->Owner||!c->Rooms.count(home.Root.Encode())) continue;
++                if (k<seen) observed=true;
++                Apply(out,home.Slot,c->Guest,c->Access);
++            }
++            if (!observed) return {};
++            out.Estates[key]=*c;
++        }
++        else
++        {
++            const auto changes=Changes(row.Kind,row.Payload);
++            if (!changes) return {};
++            bool changed=false;
++            for (const auto& c:*changes)
++            {
++                if (c.Slot>seen||(*homes)[c.Slot-1].Owner!=c.Owner) return {};
++                if (Apply(out,c.Slot,c.Guest,c.Access)) changed=true;
++            }
++            if (!changed) return {};
++        }
++        ++out.Revision;
++    }
++    return out;
++}
++inline std::optional<Rules> Read(const CampaignJournal::Journal& journal)
++{return ReadAt(journal,journal.Operations().size());}
++inline Right EffectiveAt(const CampaignJournal::Journal& journal,uint32_t slot,uint64_t character,size_t limit)
++{
++    if (!character) return Right::None;
++    const auto home=HomeRegistry::BySlot(journal,slot);
++    const auto rules=ReadAt(journal,limit);
++    if (!home||!rules||slot>rules->Registered) return Right::None;
++    if (home->Owner==character) return Right::Modify;
++    const auto it=rules->Guests.find({slot,character});
++    return it==rules->Guests.end()?Right::None:it->second;
++}
++inline Right Effective(const CampaignJournal::Journal& journal,uint32_t slot,uint64_t character)
++{return EffectiveAt(journal,slot,character,journal.Operations().size());}
++inline Right EstateRight(const Rules& rules,uint64_t owner,const std::string& plot,uint64_t guest)
++{
++    if (!owner||!guest) return Right::None;
++    if (owner==guest) return Right::Modify; // presence only, not proof of land purchase
++    const auto it=rules.Estates.find({owner,plot,guest});
++    return it==rules.Estates.end()?Right::None:it->second.Access;
++}
++inline bool SetEstate(CampaignJournal::Journal& journal,uint64_t actor,const std::string& plot,
++    const std::set<std::string>& rooms,uint64_t guest,Right access,uint32_t expected)
++{
++    const auto homes=HomeRegistry::Read(journal);
++    const auto rules=Read(journal);
++    const EstateChange c{actor,guest,access,plot,rooms};
++    const auto payload=Encode(c);
++    if (!homes||!rules||rules->Revision!=expected||!DecodeEstate(payload)) return false;
++    const auto old=rules->Estates.find({actor,plot,guest});
++    if (old!=rules->Estates.end()&&old->second.Rooms!=rooms) return false;
++    bool observed=false,changed=old==rules->Estates.end()||old->second.Access!=access;
++    for (const auto& home:*homes)
++    {
++        if (home.Owner!=actor||!rooms.count(home.Root.Encode())) continue;
++        observed=true;
++        const auto it=rules->Guests.find({home.Slot,guest});
++        if ((it==rules->Guests.end()?Right::None:it->second)!=access) changed=true;
++    }
++    if (!observed) return false;
++    if (!changed) return true;
++    if (expected==UINT32_MAX) return false;
++    return journal.Append(journal.Current(),{"home-access-"+std::to_string(expected+1),
++        "home-access-estate-v1",payload})==CampaignJournal::Result::Committed;
+ }
+ inline bool Set(CampaignJournal::Journal& journal,uint64_t actor,uint32_t slot,
+                 uint64_t guest,Right right,uint32_t expected)
+ {
+diff --git a/Code/common/CampaignCheckpoint.h b/Code/common/CampaignCheckpoint.h
+--- a/Code/common/CampaignCheckpoint.h
++++ b/Code/common/CampaignCheckpoint.h
+@@ -96,31 +96,10 @@
+ inline bool HadHomeAccess(const CampaignJournal::Journal& journal,const Record& r)
+ {
+     const auto home=HomeRegistry::BySlot(journal,r.HomeSlot);
+     if (!home||home->Root.Encode()!=r.Cell.Encode()) return false;
+-    const auto& ops=journal.Operations();
+-    if (r.Observed.Revision>ops.size()) return false;
+-    bool registered=false;
+-    auto right=HomePermissions::Right::None;
+-    for (size_t i=0;i<r.Observed.Revision;++i)
+-    {
+-        const auto& op=ops[i];
+-        if (op.Kind=="home-register-v1"&&op.Id==HomeRegistry::Id(r.HomeSlot))
+-        {
+-            if (op.Payload!=HomeRegistry::Payload(*home)) return false;
+-            registered=true;
+-        }
+-        if (!HomePermissions::AccessOperation(op.Kind)) continue;
+-        const auto changes=HomePermissions::Changes(op.Kind,op.Payload);
+-        if (!changes) return false;
+-        for (const auto& change:*changes)
+-        {
+-            if (change.Slot!=r.HomeSlot) continue;
+-            if (!registered||change.Owner!=home->Owner) return false;
+-            if (change.Guest==r.Save.Character) right=change.Access;
+-        }
+-    }
+-    if (!registered||(home->Owner!=r.Save.Character&&right==HomePermissions::Right::None)) return false;
++    if (HomePermissions::EffectiveAt(journal,r.HomeSlot,r.Save.Character,r.Observed.Revision)==
++        HomePermissions::Right::None) return false;
+     if (!r.EntrySlot) return true;
+     const auto entry=HomeRegistry::BySlot(journal,r.EntrySlot);
+     if (!entry||entry->Owner!=home->Owner||entry->Slot==home->Slot) return false;
+     auto prior=r;prior.HomeSlot=entry->Slot;prior.Cell=entry->Root;prior.EntrySlot=0;prior.ArrivalPose={};
+diff --git a/Code/server/Services/PartyHome.cpp b/Code/server/Services/PartyHome.cpp
+--- a/Code/server/Services/PartyHome.cpp
++++ b/Code/server/Services/PartyHome.cpp
+@@ -147,5 +147,7 @@
+                 if (!home || !home->Same(character,*root)) return;
+                 const auto prior=HomePermissions::Read(link.Journal);
+                 const auto roomSlots=HomeLinkedAccess::RegisteredRooms(link.Journal,*home);
+                 if (!prior||roomSlots.empty()) return;
++                const auto& estateCatalog=HomeEstateCatalog::Host();
++                const auto* estate=estateCatalog?estateCatalog->ForRoom(home->Root.Encode()):nullptr;
+                 // Resolve stable character IDs on the authority. Include
+@@ -170,10 +172,11 @@
+                     std::ostringstream rows;
+                     for (const auto& [id,name]:candidates)
+                     {
+                         const auto right=HomePermissions::Effective(link.Journal,e.House,id);
+-                        const bool mixed=std::any_of(roomSlots.begin(),roomSlots.end(),[&](uint32_t slot)
+-                            {return HomePermissions::Effective(link.Journal,slot,id)!=right;});
+-                        rows<<id<<' '<<(mixed?3u:static_cast<uint32_t>(right))
+-                            <<' '<<std::quoted(name+(mixed?" (разные права по помещениям)":roomSlots.size()>1?" (все связанные помещения)":""))<<'\n';
++                        const auto estateRight=estate?HomePermissions::EstateRight(*prior,character,estate->Quest,id):right;
++                        const bool mixed=(estate&&estateRight!=right)||std::any_of(roomSlots.begin(),roomSlots.end(),[&](uint32_t slot)
++                            {return HomePermissions::Effective(link.Journal,slot,id)!=right;});
++                        rows<<id<<' '<<(mixed?3u:static_cast<uint32_t>(right))
++                            <<' '<<std::quoted(name+(mixed?" (частичные права)":estate?" (всё поместье, включая будущие помещения)":roomSlots.size()>1?" (все связанные помещения)":""))<<'\n';
+                     }
+                     const auto list=rows.str();
+@@ -187,7 +190,9 @@
+                 if (!candidates.count(e.AccessGuest)) return;
+                 const auto right=static_cast<HomePermissions::Right>(e.AccessRight);
+-                const bool applied=roomSlots.size()==1?
++                const bool applied=estate?
++                    HomePermissions::SetEstate(link.Journal,character,estate->Quest,estate->Rooms,e.AccessGuest,right,e.AccessRevision):
++                    roomSlots.size()==1?
+                     HomePermissions::Set(link.Journal,character,e.House,e.AccessGuest,right,e.AccessRevision):
+                     HomePermissions::SetGroup(link.Journal,character,roomSlots,e.AccessGuest,right,e.AccessRevision);
+                 if (!applied) return;
+                 const auto rules=HomePermissions::Read(link.Journal);
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign43"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign44"

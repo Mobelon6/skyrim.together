@@ -89,6 +89,37 @@ int main(int argc,char** argv)
     assert(restart.Open(argv[1],71,"profile",false));
     assert(Read(restart)->Revision==3&&CampaignCheckpoint::HadHomeAccess(restart,save));
     assert(Effective(restart,second->Slot,303)==Right::None);
+    // A durable explicit estate grant is different from old per-slot grants.
+    const auto lateKey=TradeProperties::FormKey{"skyrim.esm",13};
+    const auto allowed=std::set<std::string>{main,secondKey,lateKey.Encode()};
+    assert(Set(restart,202,foreign->Slot,505,Right::Visit,3));
+    const auto newMain=HomeRegistry::Register(restart,202,a);assert(newMain);
+    assert(Effective(restart,newMain->Slot,505)==Right::None);
+    assert(EstateRight(*Read(restart),202,q,505)==Right::None);
+    assert(!SetEstate(restart,404,q,allowed,505,Right::Modify,4)); // no observed owner room
+    assert(!SetEstate(restart,202,q,allowed,505,Right::Modify,3)); // stale CAS
+    assert(SetEstate(restart,202,q,allowed,505,Right::Modify,4));
+    assert(Effective(restart,newMain->Slot,505)==Right::Modify);
+    assert(Effective(restart,first->Slot,505)==Right::None);
+    assert(EstateRight(*Read(restart),202,q,505)==Right::Modify);
+    const auto grantHead=restart.Current();
+    assert(SetEstate(restart,202,q,allowed,505,Right::Modify,5)&&restart.Current()==grantHead);
+    const auto late=HomeRegistry::Register(restart,202,lateKey);assert(late);
+    assert(Effective(restart,late->Slot,505)==Right::Modify);
+    assert(EffectiveAt(restart,late->Slot,505,grantHead.Revision)==Right::None);
+    auto saved=save;saved.Save.Character=505;saved.Cell=lateKey;saved.HomeSlot=late->Slot;
+    saved.Observed=grantHead;assert(!CampaignCheckpoint::HadHomeAccess(restart,saved));
+    saved.Observed=restart.Current();assert(CampaignCheckpoint::HadHomeAccess(restart,saved));
+    assert(CampaignCheckpoint::CanResume(restart,71,saved));
+    assert(!SetEstate(restart,202,q,{main,secondKey},505,Right::None,5)); // changed catalog requires migration
+    assert(SetEstate(restart,202,q,allowed,505,Right::None,5));
+    assert(!CampaignCheckpoint::CanResume(restart,71,saved));
+    assert(CampaignCheckpoint::HadHomeAccess(restart,saved));
+    assert(Effective(restart,foreign->Slot,505)==Right::None&&Effective(restart,late->Slot,505)==Right::None);
+    CampaignJournal::Journal finalRead;assert(finalRead.Open(argv[1],71,"profile",false));
+    assert(Read(finalRead)->Revision==6&&CampaignCheckpoint::HadHomeAccess(finalRead,saved));
+    assert(Effective(finalRead,late->Slot,505)==Right::None&&EstateRight(*Read(finalRead),202,q,505)==Right::None);
+    assert(!DecodeEstate("202 505 1 "+q+" 2 "+main+" "+main));
     assert(!DecodeGroup("101 303 2 2 2 1"));
     assert(!DecodeGroup("101 303 2 2 1 1"));
 }

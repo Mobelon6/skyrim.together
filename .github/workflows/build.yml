@@ -92,6 +92,7 @@ jobs:
       - run: git -C upstream apply ../HomeLinkedCheckpoint.patch
       - run: git -C upstream apply ../HomeEstateContext.patch
       - run: git -C upstream apply ../HomeEstateRouting.patch
+      - run: git -C upstream apply ../HomeEstatePermissions.patch
       - uses: actions/checkout@v4
         with:
           repository: tiltedphoques/TiltedConnect
@@ -254,6 +255,7 @@ jobs:
           git apply ../HomeLinkedCheckpoint.patch
           git apply ../HomeEstateContext.patch
           git apply ../HomeEstateRouting.patch
+          git apply ../HomeEstatePermissions.patch
           git -C Libraries/TiltedConnect apply ../../../TiltedConnectLifecycle.patch
           git -C Libraries/TiltedUI apply ../../../OverlayProcess.patch
       - name: Cache compiled xmake packages
