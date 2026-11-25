@@ -1,18 +1,16 @@
 diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
 --- a/Code/client/Services/Generic/PartyHome.cpp
 +++ b/Code/client/Services/Generic/PartyHome.cpp
-@@ -24,3 +24,5 @@
+@@ -23,6 +23,8 @@
+ #include <Services/HomeResidentProjection.h>
  #include <Forms/TESObjectCELL.h>
  #include <Forms/BGSEncounterZone.h>
 +#include <ExtraData/ExtraDataList.h>
 +#include <cstring>
  #include <Messages/NotifyPartyHome.h>
-@@ -95,9 +97,67 @@
- const HomeCatalog::Cell* CatalogEntrance(uint32_t id)
- {
-     if (!LoadProjectionCatalog()) return nullptr;
-     for (const auto& [_,cell]:*projectionCatalog)
-         for (const auto& entry:cell.Entrances)
+ #include <Messages/RequestPartyHome.h>
+ #include <Interface/UI.h>
+@@ -100,6 +102,64 @@
              if (CatalogForm(entry.Door)==id) return &cell;
      return nullptr;
  }
@@ -75,12 +73,19 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +    return {};
 +}
  struct CandidateVisit {uint32_t Slot{};uint64_t Owner{};};
-@@ -601,3 +661,3 @@
+ struct VisitState
+ {
+@@ -613,7 +673,7 @@
+ };
+ ObjectContext objectContext;
  void SyncObjects(World& world,TESObjectCELL& cell,const CampaignAccess::Identity& identity,
 -                 uint32_t slot,const std::string& root)
 +                 uint32_t slot,const std::string& root,const HomeSnapshot::State& baseline)
  {
-@@ -618,21 +678,41 @@
+     auto& ctx=objectContext;
+     if (ctx.Campaign!=identity.Save.Campaign || ctx.Character!=identity.Save.Character ||
+@@ -627,24 +687,44 @@
+     if (now<ctx.Next || !cell.IsAttached()) return;
      ctx.Next=now+1s;
      const auto* catalog=CatalogCell(cell.formID);
 -    if (!catalog || catalog->Refs.empty()) return;
@@ -140,13 +145,19 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +            parentControlled=extra->Contains(static_cast<ExtraDataType>(0x36));
 +        }
          auto tracked=ctx.Tracks.find(key);
-@@ -640,3 +720,5 @@
+         // Restore committed state before admitting a new owner observation.
+         // A spent loose stack is still governed exclusively by ApplyLoose.
+@@ -654,6 +734,8 @@
+                old.Revision==tracked->second.Revision+1 &&
                 tracked->second.Pending->Encode()==old.Value.Encode()))))
          {
 +            if (parentControlled && object->IsDisabled()!=(old.Value.Disabled!=0))
 +            {ctx.Tracks.erase(key);continue;}
              const auto result=RestoreObject(world,cell,*object,old.Type,old.Value.Disabled!=0,old.Value);
-@@ -660,4 +742,6 @@
+             if (result!=RestoreResult::Ready) {ctx.Tracks.erase(key);continue;}
+             ctx.Tracks.insert_or_assign(key,ObjectTrack{old.Revision,{},{}});
+@@ -670,7 +752,9 @@
+             if (n!=1 && n!=3) continue;
              open=n;
          }
 -        auto state=ObjectPose(*object,open,open && catalog->GuestDoors.count(key)?1u:0u);
@@ -154,7 +165,9 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +        // the old generator's verified guest-door capability.
 +        auto state=ObjectPose(*object,open,open && (catalog?catalog->GuestDoors.count(key):old.Value.GuestDoor)?1u:0u);
          if (state.Disabled) state.Transform=old.Value.Transform;
-@@ -680,6 +764,7 @@
+         if (!HomeObjects::Allowed(old,state)) continue;
+         if (tracked==ctx.Tracks.end())
+@@ -684,7 +768,8 @@
          if (ctx.SaveRevision<old.SaveRevision)
          {
              // An older authenticated checkpoint cannot replace newer state.
@@ -163,7 +176,10 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +                RestoreObject(world,cell,*object,old.Type,old.Value.Disabled!=0,old.Value);
              continue;
          }
-@@ -950,3 +1035,6 @@
+         if (now<t.Retry || old.Revision==UINT32_MAX || !state.Significant(old.Value)) continue;
+@@ -951,7 +1036,10 @@
+                 }
+             }
              if (!input.eof()) {accessMenu={};return;}
 -            if (const auto* cell=CatalogEntrance(door)) AddVisits(*identity,*cell,labels);
 +            const auto* catalog=CatalogEntrance(door);
@@ -171,7 +187,10 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +            if (!actual || actual->Encode()!=accessMenu.Root) {accessMenu={};return;}
 +            if (catalog && catalog->Root.Encode()==accessMenu.Root) AddVisits(*identity,*catalog,labels);
              selection=true;
-@@ -1043,7 +1131,8 @@
+             auto args=CefListValue::Create();args->SetInt(0,token);args->SetString(1,labels);
+             m_pOverlay->ExecuteAsync("offerHome",args);m_gameOverlayClient->SetUIVisible(true);
+@@ -1042,11 +1130,12 @@
+             !CampaignAccess::GameReady()) return false;
          const auto* cell=CatalogEntrance(form);
          const auto identity=CampaignAccess::Current(m_world);
 -        if (!cell || !identity) return false;
@@ -185,13 +204,22 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +        const auto slot=CampaignAccess::HomeScope(identity->Save.Campaign,identity->Save.Character,root);
 +        auto* p=PlayerCharacter::Get();
 +        auto* original=Cast<TESObjectCELL>(TESForm::GetById(CatalogForm(*destination)));
-@@ -1061,2 +1150,4 @@
+         if (visit.Nonce) return true;
+         if (!p || !NearDoor(*p,form)) return false;
+         if (accessMenu.Nonce && Clock::now()<accessMenu.Until) return true;
+@@ -1059,7 +1148,9 @@
+             if (!SendAccess(m_world,*identity,2,slot,root,0,token,0)) {accessMenu={};return false;}
+             return true;
+         }
 -        std::string labels;AddVisits(*identity,*cell,labels);accessMenu.Nonce=0;
 +        std::string labels;
 +        if (cell && cell->Root.Encode()==root) AddVisits(*identity,*cell,labels);
 +        accessMenu.Nonce=0;
          if (accessMenu.Visits.empty()) {accessMenu={};return false;}
-@@ -1099,4 +1190,6 @@
+         selection=true;auto args=CefListValue::Create();args->SetInt(0,token);args->SetString(1,labels);
+         m_pOverlay->ExecuteAsync("offerHome",args);m_gameOverlayClient->SetUIVisible(true);return true;
+@@ -1098,7 +1189,9 @@
+     {
          const auto menu=std::move(accessMenu);accessMenu={};
          auto identity=CampaignAccess::Current(m_world);
 -        if (!identity || identity->Save.Campaign!=menu.Campaign || identity->Save.Character!=menu.Character ||
@@ -199,7 +227,10 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +        if (!identity || !destination || destination->Encode()!=menu.Root ||
 +            identity->Save.Campaign!=menu.Campaign || identity->Save.Character!=menu.Character ||
              static_cast<size_t>(choice)>menu.Choices.size()+menu.Visits.size()) return;
-@@ -1394,4 +1487,7 @@
+         if (static_cast<size_t>(choice)>menu.Choices.size())
+         {
+@@ -1394,8 +1487,11 @@
+                 looseNext=Clock::now()+1s;
                  const auto bytes=CampaignAccess::HomeBaseline(identity->Save.Campaign,slot);
                  const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
 -                if (state) ApplyLoose(*cell,*state,nullptr);
@@ -209,6 +240,9 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +                    ApplyLoose(*cell,*state,nullptr);
 +                    SyncObjects(world,*cell,*identity,slot,encoded,*state);
 +                }
+             }
+             return;
+         }
 diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
 --- a/Code/common/BuildInfo.h.in
 +++ b/Code/common/BuildInfo.h.in
