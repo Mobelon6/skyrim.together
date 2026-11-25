@@ -1,0 +1,534 @@
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -1,6 +1,8 @@
+ #include <TiltedOnlinePCH.h>
+ #include <World.h>
+ #include <Services/HomeInstance.h>
++#include <Services/HomeOriginalOverlay.h>
++#include <cstdlib>
+ #include <Services/HomePlacementClient.h>
+ #include <Services/CampaignAccess.h>
+ #include <HomeRegistry.h>
+@@ -58,7 +60,8 @@
+ constexpr uint32_t invalid=UINT32_MAX;
+ // Atomic local cell + wire namespace; never retain game pointers in a route.
+ std::atomic_uint64_t activeHomeRoute{};
+ std::atomic_uint64_t projectedRoot{}; // copy CELL low, canonical root high
++std::atomic_uint32_t originalGuestCell{};
+ uint32_t RouteBase(uint32_t local,uint32_t mod)
+ {
+     if (HomeRegistry::Pending(mod)) return local;
+@@ -160,13 +163,18 @@
+     if (catalog) return catalog->Root;
+     return {};
+ }
+-struct CandidateVisit {uint32_t Slot{};uint64_t Owner{};};
+-struct VisitState
+-{
+-    uint64_t Campaign{},Character{};uint32_t Slot{},Nonce{},Door{},Copy{},Base{},Right{};
+-    std::string Root;
+-    Clock::time_point Until{},Next{};
+-    bool Granted{},Moved{},Ready{};
++struct CandidateVisit {uint32_t Slot{};uint64_t Owner{};bool Native{};};
++struct VisitState
++{
++    uint64_t Campaign{},Character{};uint32_t Slot{},Nonce{},Door{},Copy{},Base{},Right{};
++    std::string Root;
++    Clock::time_point Until{},Next{};
++    bool Granted{},Moved{},Ready{};
++    bool Native{},Prepared{},Applied{},Leaving{},Closing{},ExitIssued{},Warned{};
++    uint32_t ReturnCell{},ExitDoor{};
++    std::array<uint32_t,12> Pose{};
++    Clock::time_point MoveUntil{},ShapeAt{};
++    std::string Shape;
+ };
+ VisitState visit;
+ struct PendingLock {uint32_t Revision{};Clock::time_point Until;};
+@@ -389,16 +397,67 @@
+-void AddVisits(const CampaignAccess::Identity& id,const HomeCatalog::Cell& cell,std::string& labels)
+-{
+-    accessMenu.Visits.clear();
+-    for (const auto& [slot,owner]:CampaignAccess::HomeOffers(id.Save.Campaign,id.Save.Character,cell.Root.Encode()))
+-    {
+-        const auto bytes=CampaignAccess::HomeBaseline(id.Save.Campaign,slot);
+-        const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
+-        if (!state || !ResidentPlan(cell,*state,id.Save.Campaign,slot)) continue;
+-        if (!labels.empty()) labels+='\n';
+-        labels+="В гости к персонажу "+std::to_string(owner);
+-        accessMenu.Visits.push_back({slot,owner});
++// Opt-in until save suspension/resumption is connected. No generated CELL is
++// needed for a compatible original interior.
++bool NativeVisitsEnabled()
++{
++    const auto* flag=std::getenv("STM_NATIVE_HOME_VISITS");
++    return flag && std::string_view(flag)=="1";
++}
++std::optional<std::string> NativeVisitShape(uint64_t campaign,uint32_t slot)
++{
++    const auto bytes=CampaignAccess::HomeBaseline(campaign,slot);
++    auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
++    const auto residents=CampaignAccess::HomeResidentView(campaign,slot);
++    const auto objects=CampaignAccess::HomeObjectView(campaign,slot);
++    if (!state || state->Omitted || !state->ResidentKeys.empty() || !state->Legacy.empty() ||
++        !residents || !residents->empty() || !objects) return {};
++    for (auto& r:state->Refs)
++        if (r.Inventory==1) r.Items.clear(); // contents have their own ledger
++    auto shape=state->Encode();
++    for (const auto& [key,record]:*objects)
++        shape+=" "+key+":"+std::to_string(record.Value.Open);
++    return shape;
++}
++bool NativeEntry(PlayerCharacter& p,VisitState& v)
++{
++    auto* source=Cast<TESObjectREFR>(TESForm::GetById(v.Door));
++    auto* target=NativeLinkedDoor(source);
++    auto* cell=NativeDoorDestination(source);
++    auto* outside=p.GetParentCellEx();
++    if (!source || !target || !cell || !outside || cell->formID!=v.Copy ||
++        source->GetParentCellEx()!=outside || !NearDoor(p,v.Door)) return false;
++    auto* extras=source->GetExtraDataList();
++    const auto* teleport=extras?extras->GetByType(ExtraDataType::Teleport):nullptr;
++    const void* data{};
++    if (!teleport) return false;
++    std::memcpy(&data,reinterpret_cast<const unsigned char*>(teleport)+0x10,sizeof(data));
++    if (!data) return false;
++    // DoorTeleportData: position 0x04 and rotation 0x10.
++    std::memcpy(v.Pose.data(),reinterpret_cast<const unsigned char*>(data)+4,6*sizeof(uint32_t));
++    v.Pose[6]=std::bit_cast<uint32_t>(p.position.x);v.Pose[7]=std::bit_cast<uint32_t>(p.position.y);
++    v.Pose[8]=std::bit_cast<uint32_t>(p.position.z);v.Pose[9]=std::bit_cast<uint32_t>(p.rotation.x);
++    v.Pose[10]=std::bit_cast<uint32_t>(p.rotation.y);v.Pose[11]=std::bit_cast<uint32_t>(p.rotation.z);
++    for (auto x:v.Pose) if (!std::isfinite(std::bit_cast<float>(x))) return false;
++    v.ReturnCell=outside->formID;v.ExitDoor=target->formID;return true;
++}
++void AddVisits(const CampaignAccess::Identity& id,std::string_view root,
++               const HomeCatalog::Cell* cell,uint32_t entrance,std::string& labels)
++{
++    accessMenu.Visits.clear();
++    const auto nativeRoot=NativeVisitsEnabled()?NativeEntranceRoot(entrance):std::nullopt;
++    for (const auto& [slot,owner]:CampaignAccess::HomeOffers(id.Save.Campaign,id.Save.Character,std::string(root)))
++    {
++        const bool native=nativeRoot && nativeRoot->Encode()==root && NativeVisitShape(id.Save.Campaign,slot).has_value();
++        if (!native)
++        {
++            const auto bytes=CampaignAccess::HomeBaseline(id.Save.Campaign,slot);
++            const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
++            if (!cell || cell->Root.Encode()!=root || !state || !ResidentPlan(*cell,*state,id.Save.Campaign,slot)) continue;
++        }
++        if (!labels.empty()) labels+='\n';
++        labels+="В гости к персонажу "+std::to_string(owner);
++        if (native) labels+=" [тест оригинальной ячейки]";
++        accessMenu.Visits.push_back({slot,owner,native});
+     }
+ }
+ void MoveAt(PlayerCharacter& p,TESObjectCELL& cell,const std::array<uint32_t,12>& pose,size_t start)
+ {
+     const auto f=[&](size_t i){return std::bit_cast<float>(pose[start+i]);};
+@@ -980,7 +1039,10 @@
+     HomePlacementClient::Clear();
+     if (selection && m_pOverlay && m_gameOverlayClient)
+     {m_pOverlay->ExecuteAsync("hideHome");m_gameOverlayClient->SetUIVisible(false);}
+-    selection=false;door=0;options.clear();accessMenu={};visit={};lockContext={};projectedRoot.store(0);ads.clear();SetVisit(0,0);refresh={};self.store(invalid);
++    selection=false;door=0;options.clear();accessMenu={};
++    if (visit.Native && visit.Moved && originalGuestCell.load()) {visit.Leaving=true;visit.Ready=false;}
++    else visit={};
++    lockContext={};projectedRoot.store(0);ads.clear();SetVisit(0,0);refresh={};self.store(invalid);
+     activeHomeRoute.store(0);acknowledgedHome={};baselineUpload={};residentContext={};objectContext={};
+     for (unsigned i=0;i<routeCount.load();++i) routes[i].own.store(0);
+     for (auto& [_,h]:houses){h.owned=false;h.visible.clear();}
+@@ -1039,7 +1101,7 @@
+             const auto* catalog=CatalogEntrance(door);
+             const auto actual=EntranceRoot(door,catalog);
+             if (!actual || actual->Encode()!=accessMenu.Root) {accessMenu={};return;}
+-            if (catalog && catalog->Root.Encode()==accessMenu.Root) AddVisits(*identity,*catalog,labels);
++            AddVisits(*identity,accessMenu.Root,catalog,door,labels);
+             selection=true;
+             auto args=CefListValue::Create();args->SetInt(0,token);args->SetString(1,labels);
+             m_pOverlay->ExecuteAsync("offerHome",args);m_gameOverlayClient->SetUIVisible(true);
+@@ -1065,5 +1127,19 @@
+ bool OverlayService::TryHouseDoor(uint32_t form) noexcept
+ {
++    if (originalGuestCell.load())
++    {
++        auto* player=PlayerCharacter::Get();
++        auto* cell=player?player->GetParentCellEx():nullptr;
++        if (!cell || !HomeInstance::NativeGuestCell(cell->formID) || !visit.Ready || visit.Leaving) return true;
++        if (form==visit.ExitDoor && NearDoor(*player,form))
++        {visit.Leaving=true;visit.Ready=false;return true;}
++        auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
++        if (auto* actor=Cast<Actor>(object);actor && actor->GetExtension() && actor->GetExtension()->IsPlayer()) return false;
++        if (object && object->baseForm && object->GetParentCellEx()==cell &&
++            object->baseForm->formType==FormType::Container && !object->IsDisabled() && !object->IsDeleted())
++            TryTrade(form);
++        return true;
++    }
+     if (CampaignAccess::Mode()!=CampaignReplication::Link::Mode::Disabled)
+     {
+         auto* player=PlayerCharacter::Get();
+@@ -1148,7 +1224,7 @@
+             return true;
+         }
+         std::string labels;
+-        if (cell && cell->Root.Encode()==root) AddVisits(*identity,*cell,labels);
++        AddVisits(*identity,root,cell,form,labels);
+         accessMenu.Nonce=0;
+         if (accessMenu.Visits.empty()) {accessMenu={};return false;}
+         selection=true;auto args=CefListValue::Create();args->SetInt(0,token);args->SetString(1,labels);
+@@ -1196,11 +1272,15 @@
+         if (static_cast<size_t>(choice)>menu.Choices.size())
+         {
+             const auto& chosen=menu.Visits[choice-1-menu.Choices.size()];
+             const auto* cell=CatalogEntrance(door);
+-            if (!cell || cell->Root.Encode()!=menu.Root || !Entry(*cell,door)) return;
+-            visit={};visit.Campaign=menu.Campaign;visit.Character=menu.Character;
+-            visit.Slot=chosen.Slot;visit.Nonce=token;visit.Door=door;visit.Root=menu.Root;
+-            visit.Copy=CatalogForm(cell->Copy);visit.Base=cell->Root.Local;visit.Until=Clock::now()+10s;
++            if (!chosen.Native && (!cell || cell->Root.Encode()!=menu.Root || !Entry(*cell,door))) return;
++            if (chosen.Native && (!NativeVisitsEnabled() || !NativeEntranceRoot(door) ||
++                !NativeVisitShape(menu.Campaign,chosen.Slot))) return;
++            visit={};visit.Campaign=menu.Campaign;visit.Character=menu.Character;
++            visit.Slot=chosen.Slot;visit.Nonce=token;visit.Door=door;visit.Root=menu.Root;
++            visit.Native=chosen.Native;
++            visit.Copy=chosen.Native?CatalogForm(*destination):CatalogForm(cell->Copy);
++            visit.Base=destination->Local;visit.Until=Clock::now()+10s;
+             visit.Next=Clock::now()+3s;
+             if (!visit.Copy || !SendAccess(m_world,*identity,3,visit.Slot,visit.Root,0,visit.Nonce,0)) visit={};
+             return;
+@@ -1223,5 +1303,106 @@
+     if (auto* p=PlayerCharacter::Get();!p || !p->GetParentCellEx() || p->GetParentCellEx()->formID!=lockContext.Cell ||
+         !CampaignAccess::GameReady() || !m_transport.IsOnline()) lockContext={};
++    if (visit.Native)
++    {
++        if (!CampaignAccess::GameReady()) return;
++        auto* p=PlayerCharacter::Get();
++        auto* current=p?p->GetParentCellEx():nullptr;
++        if (!current) return;
++        const auto now=Clock::now();
++        const auto identity=CampaignAccess::Current(m_world);
++        const bool valid=visit.Nonce && identity && identity->Save.Campaign==visit.Campaign &&
++            identity->Save.Character==visit.Character && now<visit.Until;
++        if (!visit.Moved)
++        {
++            if (!valid) {visit={};return;}
++            if (!visit.Granted) return;
++            const auto shape=NativeVisitShape(visit.Campaign,visit.Slot);
++            if (!shape || !NativeEntry(*p,visit))
++            {visit={};Utils::ShowHudMessage("Не удалось подготовить посещение оригинального жилья.");return;}
++            auto* target=Cast<TESObjectCELL>(TESForm::GetById(visit.Copy));
++            if (!target) {visit={};return;}
++            ClearTrade();HomePlacementClient::Clear();
++            visit.Shape=*shape;visit.Moved=true;visit.MoveUntil=now+15s;
++            originalGuestCell.store(visit.Copy);
++            MoveAt(*p,*target,visit.Pose,0);return;
++        }
++        const auto warn=[&]()
++        {
++            if (visit.Warned) return;
++            visit.Warned=true;
++            Utils::ShowHudMessage("Не удалось восстановить личное жильё. Загрузите последнее личное сохранение.");
++        };
++        if (visit.ExitIssued)
++        {
++            if (current->formID==visit.ReturnCell && current->IsAttached())
++            {originalGuestCell.store(0);visit={};projectedRoot.store(0);activeHomeRoute.store(0);}
++            else if (now>=visit.MoveUntil) warn();
++            return;
++        }
++        if (!valid || !visit.Granted) {visit.Leaving=true;visit.Ready=false;}
++        if (current->formID!=visit.Copy)
++        {
++            if (!visit.Prepared && now<visit.MoveUntil) return;
++            visit.Leaving=true;visit.Ready=false;
++        }
++        if (!visit.Leaving && visit.Ready && now>=visit.ShapeAt)
++        {
++            visit.ShapeAt=now+2s;
++            const auto shape=NativeVisitShape(visit.Campaign,visit.Slot);
++            if (!shape || *shape!=visit.Shape)
++            {
++                visit.Leaving=true;visit.Ready=false;
++                Utils::ShowHudMessage("Состояние жилья изменилось. Войдите повторно.");
++            }
++        }
++        if (!visit.Leaving && !visit.Prepared)
++        {
++            if (!current->IsAttached()) return;
++            visit.Prepared=HomeOriginalOverlay::Prepare(m_world,*current,visit.Campaign,visit.Slot);
++            if (!visit.Prepared)
++            {visit.Leaving=true;Utils::ShowHudMessage("Это жильё пока не поддерживает безопасную подмену.");}
++        }
++        if (visit.Prepared && !visit.Applied)
++        {
++            const auto result=HomeOriginalOverlay::Switch(m_world,true);
++            if (result==HomeOriginalOverlay::Result::Pending) return;
++            if (result==HomeOriginalOverlay::Result::Unavailable)
++            {
++                visit.Leaving=true;visit.Ready=false;
++                if (HomeOriginalOverlay::Dirty()) {warn();return;}
++            }
++            else visit.Applied=true;
++        }
++        if (visit.Leaving)
++        {
++            visit.Ready=false;
++            const auto id=m_transport.GetLocalPlayerId();
++            activeHomeRoute.store(m_transport.IsOnline() && id<=0xFFFFu && current->formID==visit.Copy?
++                (uint64_t(HomeRegistry::PendingPrefix|id)<<32)|visit.Copy:0);
++            if (!visit.Closing)
++            {visit.Closing=true;ClearTrade();HomePlacementClient::Clear();HomeResidentProjection::Clear();}
++            if (visit.Applied)
++            {
++                const auto result=HomeOriginalOverlay::Switch(m_world,false);
++                if (result==HomeOriginalOverlay::Result::Pending) return;
++                if (result!=HomeOriginalOverlay::Result::Ready) {warn();return;}
++                visit.Applied=false;
++            }
++            if (!HomeOriginalOverlay::Release()) {warn();return;}
++            visit.Prepared=false;
++            auto* out=Cast<TESObjectCELL>(TESForm::GetById(visit.ReturnCell));
++            if (!out) {warn();return;}
++            visit.ExitIssued=true;visit.MoveUntil=now+15s;
++            MoveAt(*p,*out,visit.Pose,6);return;
++        }
++        if (visit.Applied) visit.Ready=true;
++        if (valid && visit.Nonce && now>=visit.Next)
++        {
++            visit.Next=now+3s;
++            if (!SendAccess(m_world,*identity,3,visit.Slot,visit.Root,0,visit.Nonce,0)) visit.Until={};
++        }
++        return;
++    }
+     // A saved or disconnected projection must be exited even when the
+     // campaign link is unavailable. Never fall through to original activation.
+     if (auto* p=PlayerCharacter::Get();p && CampaignAccess::GameReady())
+@@ -1340,6 +1521,15 @@
+ // Run before cell discovery so the first cell announcement has the right
+ // namespace. Until the replicated registration exists, use a private
+ // connection-local quarantine. No guest projection is enabled in this mode.
++bool HomeInstance::NativeGuestCell(uint32_t form) noexcept
++{return form && form==originalGuestCell.load();}
++bool HomeInstance::NativeGuestActive() noexcept
++{return originalGuestCell.load()!=0;}
++void HomeInstance::ForgetOriginalVisit() noexcept
++{
++    if (visit.Native) {visit={};activeHomeRoute.store(0);projectedRoot.store(0);}
++    originalGuestCell.store(0);
++}
+ bool HomeInstance::ProjectionForm(uint32_t form) noexcept
+ {
+     auto* mods=ModManager::Get();
+@@ -1350,7 +1540,15 @@
+ uint32_t HomeInstance::GuestReference(uint32_t local,uint32_t& source) noexcept
+ {
+     source=0;
+-    if (!visit.Ready || !visit.Granted || Clock::now()>=visit.Until) return 0;
++    if (!visit.Ready || !visit.Granted || visit.Leaving || Clock::now()>=visit.Until) return 0;
++    if (visit.Native)
++    {
++        auto* object=Cast<TESObjectREFR>(TESForm::GetById(local));
++        auto* parent=object?object->GetParentCellEx():nullptr;
++        if (!parent || !NativeGuestCell(parent->formID) || object->IsTemporary() || object->IsDeleted() ||
++            object->IsDisabled() || !object->baseForm || object->baseForm->formType!=FormType::Container) return 0;
++        source=local;return visit.Slot;
++    }
+     const auto* cell=CopyCell(visit.Copy);
+     if (!cell) return 0;
+     for (const auto& row:cell->Refs)
+@@ -1373,7 +1571,7 @@
+     try
+     {
+         auto& world=World::Get();auto& ctx=lockContext;
+-        if (!ctx.Slot || !CampaignAccess::GameReady() || ProjectionForm(reference)) return;
++        if (NativeGuestActive() || !ctx.Slot || !CampaignAccess::GameReady() || ProjectionForm(reference)) return;
+         auto* player=PlayerCharacter::Get();
+         auto* ref=Cast<TESObjectREFR>(TESForm::GetById(reference));
+         auto identity=CampaignAccess::Current(world);
+@@ -1409,7 +1607,16 @@
+         auto* player=PlayerCharacter::Get();
+         if (!player) return;
+         const auto id=world.GetTransport().GetLocalPlayerId();
+         const auto mode=CampaignAccess::Mode();
++        if (NativeGuestCell(cell->formID))
++        {
++            residentContext={};objectContext={};lockContext={};baselineUpload={};
++            if (id>0xFFFFu) {activeHomeRoute.store(0);return;}
++            const bool ready=visit.Native && visit.Ready && !visit.Leaving && visit.Granted &&
++                Clock::now()<visit.Until && mode==CampaignReplication::Link::Mode::Ready;
++            activeHomeRoute.store((uint64_t(ready?HomeRegistry::ScopePrefix|visit.Slot:HomeRegistry::PendingPrefix|id)<<32)|cell->formID);
++            return; // no owner observation, registration or inventory recovery
++        }
+         if (HomeInstance::ProjectionForm(cell->formID))
+         {
+             residentContext={};objectContext={};
+diff --git a/Code/client/Services/Generic/HomeOriginalOverlay.cpp b/Code/client/Services/Generic/HomeOriginalOverlay.cpp
+--- a/Code/client/Services/Generic/HomeOriginalOverlay.cpp
++++ b/Code/client/Services/Generic/HomeOriginalOverlay.cpp
+@@ -147,7 +147,7 @@
+         const auto bytes=CampaignAccess::HomeBaseline(campaign,slot);
+         const auto state=bytes?HomeSnapshot::Decode(*bytes):std::nullopt;
+         const auto objects=CampaignAccess::HomeObjectView(campaign,slot);
+-        if (!state||!objects) return false;
++        if (!state||!objects||state->Omitted||!state->ResidentKeys.empty()||!state->Legacy.empty()) return false;
+         cellId=cell.formID;
+         std::map<uint32_t,Delta> rows;
+         for (const auto& r:state->Refs)
+@@ -178,6 +178,14 @@
+             }
+             if (!rows.emplace(d.Ref,std::move(d)).second) return false;
+         }
++        // Never reuse original NPCs or unaccounted personal refs.
++        if (!cell.refData.refArray || !cell.refData.capacity || cell.refData.capacity>131072) return false;
++        for (uint32_t i=0;i<cell.refData.capacity;++i)
++        {
++            auto* ref=cell.refData.refArray[i].Get();
++            if (!ref || ref->formID==0x14) continue;
++            if (!rows.count(ref->formID)) return false;
++        }
+         const auto toggles=[](const Delta& d){return d.Personal.Disabled!=d.Guest.Disabled;};
+         // Only toggle the root of a closed enable-state group in this CELL.
+         std::map<uint32_t,uint32_t> parents;
+@@ -238,6 +246,6 @@
+ }
+ void ForgetReplacedWorld() noexcept
+ {
+-    overlay.ForgetReplacedWorld();cellId=0;
++    overlay.ForgetReplacedWorld();cellId=0;HomeInstance::ForgetOriginalVisit();
+ }
+ }
+diff --git a/Code/client/Services/HomeInstance.h b/Code/client/Services/HomeInstance.h
+--- a/Code/client/Services/HomeInstance.h
++++ b/Code/client/Services/HomeInstance.h
+@@ -14,5 +14,8 @@
+ bool ProjectionForm(uint32_t local) noexcept;
+ uint32_t GuestReference(uint32_t local,uint32_t& source) noexcept;
+ bool ManagedCell(uint32_t local) noexcept;
++bool NativeGuestCell(uint32_t local) noexcept;
++bool NativeGuestActive() noexcept;
++void ForgetOriginalVisit() noexcept;
+ void ObserveLock(uint32_t reference) noexcept;
+ }
+diff --git a/Code/client/Services/Generic/CharacterService.cpp b/Code/client/Services/Generic/CharacterService.cpp
+--- a/Code/client/Services/Generic/CharacterService.cpp
++++ b/Code/client/Services/Generic/CharacterService.cpp
+@@ -62,7 +62,7 @@
+ {
+     const auto* cell=CurrentActorCell();
+     if (!cell) return false;
+-    const bool projection=HomeInstance::ProjectionForm(cell->formID);
++    const bool projection=HomeInstance::ProjectionForm(cell->formID)||HomeInstance::NativeGuestCell(cell->formID);
+     GameId current{};
+     if (!world.GetModSystem().GetServerModId(cell->formID,current))
+         return !projection && !HomeInstance::PrivateCell(cell->formID) && !HomeScope::Private(incoming.ModId);
+@@ -72,7 +72,7 @@
+ bool InHomeProjection() noexcept
+ {
+     const auto* cell=CurrentActorCell();
+-    return cell && HomeInstance::ProjectionForm(cell->formID);
++    return cell && (HomeInstance::ProjectionForm(cell->formID)||HomeInstance::NativeGuestCell(cell->formID));
+ }
+ // Use a static base supplied by the owner, never the visitor's placed actor.
+ // Actor::Create marks the new reference remote and sets its skip-save flag.
+@@ -708,7 +708,7 @@
+         }
+ 
+         const auto* actorCell=pActor->GetParentCellEx();
+-        if ((actorCell && HomeInstance::ProjectionForm(actorCell->formID)) ||
++        if ((actorCell && (HomeInstance::ProjectionForm(actorCell->formID)||HomeInstance::NativeGuestCell(actorCell->formID))) ||
+             (HomeScope::Private(acMessage.CellId.ModId) && actorCell!=CurrentActorCell()) ||
+             (actorCell && HomeInstance::PrivateCell(actorCell->formID) && !HomeInstance::Tagged(acMessage.CellId.ModId))) return;
+         // Moving an uninitialized reference crashes (e.g. null race); discovery will request its assignment once it loads
+@@ -1700,7 +1700,8 @@
+     auto* pActor = Cast<Actor>(TESForm::GetById(formIdComponent.Id));
+     if (!pActor || !pActor->parentCell)
+         return;
+-    if (formIdComponent.Id!=0x14 && HomeInstance::ProjectionForm(pActor->parentCell->formID))
++    if (formIdComponent.Id!=0x14 && (HomeInstance::ProjectionForm(pActor->parentCell->formID) ||
++        HomeInstance::NativeGuestCell(pActor->parentCell->formID)))
+         return;
+ 
+     TESNPC* pNpc = Cast<TESNPC>(pActor->baseForm);
+diff --git a/Code/client/Services/HomeActorProtection.h b/Code/client/Services/HomeActorProtection.h
+--- a/Code/client/Services/HomeActorProtection.h
++++ b/Code/client/Services/HomeActorProtection.h
+@@ -15,7 +15,8 @@
+     if (!actor) return false;
+     auto* ext=actor->GetExtension();
+     const auto* cell=actor->GetParentCellEx();
+-    return ext && !ext->IsPlayer() && cell && HomeInstance::ProjectionForm(cell->formID);
++    return ext && !ext->IsPlayer() && cell &&
++        (HomeInstance::ProjectionForm(cell->formID)||HomeInstance::NativeGuestCell(cell->formID));
+ }
+ inline bool PickupBlocked(const TESObjectREFR* object) noexcept
+ {
+diff --git a/Code/client/Services/Generic/PartyTrade.cpp b/Code/client/Services/Generic/PartyTrade.cpp
+--- a/Code/client/Services/Generic/PartyTrade.cpp
++++ b/Code/client/Services/Generic/PartyTrade.cpp
+@@ -1400,7 +1400,8 @@
+     if (!loose && object->baseForm->formType!=FormType::Container) return {};
+     auto* cell=const_cast<TESObjectREFR*>(object)->GetParentCellEx();
+     if (!cell || cell->worldspace) return {};
+-    if (HomeInstance::ProjectionForm(object->formID))
++    if (HomeInstance::NativeGuestCell(cell->formID) && loose) return {};
++    if (HomeInstance::ProjectionForm(object->formID) || HomeInstance::NativeGuestCell(cell->formID))
+     {
+         uint32_t source{};
+         const auto slot=HomeInstance::GuestReference(object->formID,source);
+@@ -1430,6 +1431,10 @@
+ }
+ bool ProtectHome(const TESObjectREFR* object) noexcept
+ {
++    // Protect originals during pending/active/exit; don't block player receipts.
++    if (object && object->formID!=0x14 && !Cast<Actor>(const_cast<TESObjectREFR*>(object)))
++        if (const auto* cell=object->GetParentCellEx();cell && HomeInstance::NativeGuestCell(cell->formID))
++            return true;
+     if (object && (HomeInstance::ProjectionForm(object->formID) || HomePlacementClient::Tracked(object) ||
+         HomePlacementClient::LegacyBlocked(object))) return true;
+     try {return ManagedHome(object).has_value();}
+@@ -1500,7 +1505,7 @@
+ {
+     const auto* cell=object?object->GetParentCellEx():nullptr;
+     uint32_t mod{},base{};
+-    return cell && (HomeInstance::ProjectionForm(cell->formID) ||
++    return cell && (HomeInstance::ProjectionForm(cell->formID) || HomeInstance::NativeGuestCell(cell->formID) ||
+         (HomeInstance::Encode(cell->formID,mod,base) && (HomeRegistry::Scoped(mod)||HomeRegistry::Pending(mod))));
+ }
+ void HomePlacementClient::Forget() noexcept
+@@ -1600,7 +1605,7 @@
+         const auto stacks=CampaignAccess::HomePlacements(displayCampaign,slot);
+         if (!baseline || !stacks) return;
+         std::set<uint32_t> conflicts;
+-        if (!HomeInstance::ProjectionForm(cell->formID))
++        if (!HomeInstance::ProjectionForm(cell->formID) && !HomeInstance::NativeGuestCell(cell->formID))
+         {
+             // Reserve the original even after its ledger balance is zero.
+             for (const auto& source:baseline->Legacy)
+diff --git a/Code/client/Games/SaveLoad.cpp b/Code/client/Games/SaveLoad.cpp
+--- a/Code/client/Games/SaveLoad.cpp
++++ b/Code/client/Games/SaveLoad.cpp
+@@ -9,7 +9,8 @@
+ #include <VersionDb.h>
+ #include <Services/CampaignCheckpointClient.h>
+ #include <Services/HomeOriginalOverlay.h>
++#include <Services/HomeInstance.h>
+ #include <Games/CampaignCheckpointFile.h>
+ #include <cstdlib>
+ 
+ #include <TiltedCore/Serialization.hpp>
+@@ -183,7 +184,7 @@
+ bool HookSaveRequest(BGSSaveLoadManager* manager,int32_t device,uint32_t stats,const char* name)
+ {
+     // Fail closed until the guest-save coordinator has restored the original.
+-    if (HomeOriginalOverlay::Dirty())
++    if (HomeOriginalOverlay::Dirty() || HomeInstance::NativeGuestActive())
+     {
+         spdlog::warn("STM save refused: original home state not restored");
+         return false;
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign28"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign29"

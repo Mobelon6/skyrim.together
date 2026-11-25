@@ -79,6 +79,7 @@ jobs:
       - run: git -C upstream apply ../CampaignCheckpoint.patch
       - run: git -C upstream apply ../HomeNativeState.patch
       - run: git -C upstream apply ../HomeOriginalOverlay.patch
+      - run: git -C upstream apply ../HomeOriginalVisit.patch
       - uses: actions/checkout@v4
         with:
           repository: tiltedphoques/TiltedConnect
@@ -140,6 +141,7 @@ jobs:
           run_check python3 tests/check_campaign_checkpoint.py upstream
           run_check python3 tests/check_home_native_state.py upstream
           run_check python3 tests/check_home_original_overlay.py upstream
+          run_check python3 tests/check_home_original_visit.py upstream
           run_check python3 tools/check_life_confirmation.py upstream
           run_check python3 tools/check_observer.py upstream
           run_check python3 tools/check_replica_and_input.py upstream
@@ -220,6 +222,7 @@ jobs:
           git apply ../CampaignCheckpoint.patch
           git apply ../HomeNativeState.patch
           git apply ../HomeOriginalOverlay.patch
+          git apply ../HomeOriginalVisit.patch
           git -C Libraries/TiltedConnect apply ../../../TiltedConnectLifecycle.patch
           git -C Libraries/TiltedUI apply ../../../OverlayProcess.patch
       - name: Cache compiled xmake packages
