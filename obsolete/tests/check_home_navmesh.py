@@ -2,8 +2,9 @@
 from pathlib import Path
 import tempfile,sys,struct,subprocess
 from zipfile import ZipFile
-ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT/"tools"))
+ROOT=Path(__file__).resolve().parents[2]
+sys.path.insert(0,str(ROOT/"required/tools"))
+sys.path.insert(0,str(ROOT/"obsolete/tools"))
 from build_trade_plugin import record,sub,group
 from home_navmesh import CELL_CRC,Geometry
 from check_home_instances_plugin import validate
@@ -37,7 +38,7 @@ with tempfile.TemporaryDirectory() as tmp:
         with ZipFile(p/"profile.zip","w") as z:
             z.writestr("Skyrim.esm",sk);z.writestr("ExampleHouse.esp",mod)
         output=p/str(bad)
-        subprocess.run([sys.executable,str(ROOT/"tools/build_guest_homes.py"),str(p/"profile.zip"),
+        subprocess.run([sys.executable,str(ROOT/"reusable/tools/build_guest_homes.py"),str(p/"profile.zip"),
                         str(p/"loadorder.txt"),str(p/"plugins.txt"),str(output),"--instances"],check=True)
         assert validate(output)==(1,1,2 if bad else 0)
         rows=(output/"CoopHomeInstances.txt").read_text().splitlines()

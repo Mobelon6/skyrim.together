@@ -5,7 +5,7 @@ import shutil,sys
 from functools import partial
 from http.server import ThreadingHTTPServer
 from threading import Thread
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
+sys.path.insert(0,str(Path(__file__).resolve().parent))
 from check_dialogue_ui import BRIDGE,Files
 from playwright.sync_api import sync_playwright,expect
 root=Path(sys.argv[1]).resolve()

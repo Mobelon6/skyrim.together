@@ -10,6 +10,9 @@ not a complete visitor implementation.
 from collections import defaultdict
 import itertools
 import struct
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "required/tools"))
 from build_trade_plugin import record
 from home_navmesh import clone_cell, nav_info, sub
 

@@ -1,4 +1,7 @@
 """Classify original references, without generating any game records."""
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "obsolete/tools"))
 from build_home_instances import stable
 
 GENERATED = {"skyrimcoophomeinstances.esp", "skyrimcoopguesthomes.esp"}

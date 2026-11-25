@@ -6,8 +6,8 @@ import sys
 import tempfile
 from zipfile import ZipFile
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tools"))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "required/tools"))
 from build_trade_plugin import record, sub
 
 def u(value):
@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory() as tmp:
     with ZipFile(p / "base.zip", "w") as archive:
         for name, data in base_members.items():
             archive.writestr(name, data)
-    command = [sys.executable, str(ROOT / "tools/package_guest_homes.py"), str(p / "base.zip"),
+    command = [sys.executable, str(ROOT / "obsolete/tools/package_guest_homes.py"), str(p / "base.zip"),
                str(p / "snapshot.zip"), str(p / "loadorder.txt"), str(p / "plugins.txt")]
     for name in ("first.zip", "second.zip"):
         subprocess.run(command + [str(p / name)], check=True)

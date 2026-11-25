@@ -57,6 +57,6 @@ jobs:
       - name: Check displayed subtitles, direction and leader actions
         run: |
           python -m pip install playwright==1.55.0
-          python tools/check_dialogue_ui.py installer/SkyrimTogetherReborn/UI --chromium "$(command -v google-chrome)"
-          python tools/verify_travel_settings.py installer/SkyrimTogetherReborn/UI "$(command -v google-chrome)"
-          python tests/check_party_windows.py installer/SkyrimTogetherReborn/UI
+          python important/tests/check_dialogue_ui.py installer/SkyrimTogetherReborn/UI --chromium "$(command -v google-chrome)"
+          python important/tests/verify_travel_settings.py installer/SkyrimTogetherReborn/UI "$(command -v google-chrome)"
+          python important/tests/check_party_windows.py installer/SkyrimTogetherReborn/UI

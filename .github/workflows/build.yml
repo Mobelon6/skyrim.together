@@ -2,13 +2,13 @@ name: Skyrim SE 1.6.1170 co-op
 on:
   push:
     paths:
-      - "*.patch"
+      - "required/**"
+      - "important/**"
+      - "reusable/patches/**"
+      - "reusable/tests/**"
+      - "reusable/tools/**"
+      - "obsolete/**"
       - .github/workflows/build.yml
-      - check*.py
-      - tools/check*.py
-      - tools/build*.py
-      - tools/package_guest_homes.py
-      - tests/**
       - GPL-3.0.txt
       - TiltedEvolution-LICENSE.txt
       - .github/workflows/dialogue-ui-test.yml
@@ -31,78 +31,78 @@ jobs:
           ref: 13ff0b5a934bf3016c8c898d9a019aa04e5c1fb0
           path: upstream
           persist-credentials: false
-      - run: git -C upstream apply ../CoopState.patch
-      - run: git -C upstream apply ../PartyLeadership.patch
-      - run: git -C upstream apply ../PartyConversationHud.patch
-      - run: git -C upstream apply ../Dialogue02.patch
-      - run: git -C upstream apply ../PartyTravelAndRecovery.patch
-      - run: git -C upstream apply ../Interaction02.patch
-      - run: git -C upstream apply ../Interaction03.patch
-      - run: git -C upstream apply ../Interaction04.patch
-      - run: git -C upstream apply ../Interaction05.patch
-      - run: git -C upstream apply ../Interaction06.patch
-      - run: git -C upstream apply ../Interaction07.patch
-      - run: git -C upstream apply ../CampaignReplication.patch
-      - run: git -C upstream apply ../CampaignIdentity.patch
-      - run: git -C upstream apply ../CampaignTrade.patch
-      - run: git -C upstream apply ../CampaignTradeAccess.patch
-      - run: git -C upstream apply ../WorldLifecycle.patch
-      - run: git -C upstream apply ../ConnectionLifecycle.patch
-      - run: git -C upstream apply ../SaveLoadLifecycle.patch
-      - run: git -C upstream apply ../InventoryEvidence.patch
-      - run: git -C upstream apply ../TradeReturn.patch
-      - run: git -C upstream apply ../NativeTrade.patch
-      - run: git -C upstream apply ../TradeItemProperties.patch
-      - run: git -C upstream apply ../HomeInstances.patch
-      - run: git -C upstream apply ../HomeScope.patch
-      - run: git -C upstream apply ../HomeSnapshot.patch
-      - run: git -C upstream apply ../HomeProjection.patch
-      - run: git -C upstream apply ../HomeCatalog.patch
-      - run: git -C upstream apply ../HomeAccessMenu.patch
-      - run: git -C upstream apply ../HomeInventoryLedger.patch
-      - run: git -C upstream apply ../HomeContainerMenu.patch
-      - run: git -C upstream apply ../HomeVisit.patch
-      - run: git -C upstream apply ../HomeLocks.patch
-      - run: git -C upstream apply ../HomeActorRouting.patch
-      - run: git -C upstream apply ../HomeResidents.patch
-      - run: git -C upstream apply ../HomeActorProtection.patch
-      - run: git -C upstream apply ../HomeResidentProjection.patch
-      - run: git -C upstream apply ../HomeLooseProperty.patch
-      - run: git -C upstream apply ../HomeObjectChanges.patch
-      - run: git -C upstream apply ../HomePlacement.patch
-      - run: git -C upstream apply ../HomePlacementClient.patch
-      - run: git -C upstream apply ../HomeOwnerRecovery.patch
-      - run: git -C upstream apply ../HomeLegacyPlacement.patch
-      - run: git -C upstream apply ../HomeResidentRecovery.patch
-      - run: git -C upstream apply ../HomeResidentPresence.patch
-      - run: git -C upstream apply ../HomeGuestDoors.patch
-      - run: git -C upstream apply ../CampaignCheckpoint.patch
-      - run: git -C upstream apply ../HomeNativeState.patch
-      - run: git -C upstream apply ../HomeOriginalOverlay.patch
-      - run: git -C upstream apply ../HomeOriginalVisit.patch
-      - run: git -C upstream apply ../HomeGuestSave.patch
-      - run: git -C upstream apply ../HomeNativeLoose.patch
-      - run: git -C upstream apply ../HomeNativeDoors.patch
-      - run: git -C upstream apply ../HomeNativeInteractions.patch
-      - run: git -C upstream apply ../HomeSeatLeases.patch
-      - run: git -C upstream apply ../HomeNativeResidents.patch
-      - run: git -C upstream apply ../HomeNativeResidentPresence.patch
-      - run: git -C upstream apply ../HomeLinkedRooms.patch
-      - run: git -C upstream apply ../HomeLinkedAccess.patch
-      - run: git -C upstream apply ../HomeLinkedCheckpoint.patch
-      - run: git -C upstream apply ../HomeEstateContext.patch
-      - run: git -C upstream apply ../HomeEstateRouting.patch
-      - run: git -C upstream apply ../HomeEstatePermissions.patch
-      - run: git -C upstream apply ../HomeSpatialEpoch.patch
-      - run: git -C upstream apply ../HomeEstateConstruction.patch
-      - run: git -C upstream apply ../HomeSharedProperty.patch
+      - run: git -C upstream apply ../required/patches/CoopState.patch
+      - run: git -C upstream apply ../required/patches/PartyLeadership.patch
+      - run: git -C upstream apply ../required/patches/PartyConversationHud.patch
+      - run: git -C upstream apply ../required/patches/Dialogue02.patch
+      - run: git -C upstream apply ../important/patches/PartyTravelAndRecovery.patch
+      - run: git -C upstream apply ../important/patches/Interaction02.patch
+      - run: git -C upstream apply ../important/patches/Interaction03.patch
+      - run: git -C upstream apply ../important/patches/Interaction04.patch
+      - run: git -C upstream apply ../important/patches/Interaction05.patch
+      - run: git -C upstream apply ../important/patches/Interaction06.patch
+      - run: git -C upstream apply ../important/patches/Interaction07.patch
+      - run: git -C upstream apply ../required/patches/CampaignReplication.patch
+      - run: git -C upstream apply ../required/patches/CampaignIdentity.patch
+      - run: git -C upstream apply ../required/patches/CampaignTrade.patch
+      - run: git -C upstream apply ../important/patches/CampaignTradeAccess.patch
+      - run: git -C upstream apply ../required/patches/WorldLifecycle.patch
+      - run: git -C upstream apply ../required/patches/ConnectionLifecycle.patch
+      - run: git -C upstream apply ../required/patches/SaveLoadLifecycle.patch
+      - run: git -C upstream apply ../required/patches/InventoryEvidence.patch
+      - run: git -C upstream apply ../important/patches/TradeReturn.patch
+      - run: git -C upstream apply ../important/patches/NativeTrade.patch
+      - run: git -C upstream apply ../important/patches/TradeItemProperties.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeInstances.patch
+      - run: git -C upstream apply ../reusable/patches/HomeScope.patch
+      - run: git -C upstream apply ../reusable/patches/HomeSnapshot.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeProjection.patch
+      - run: git -C upstream apply ../reusable/patches/HomeCatalog.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeAccessMenu.patch
+      - run: git -C upstream apply ../important/patches/HomeInventoryLedger.patch
+      - run: git -C upstream apply ../important/patches/HomeContainerMenu.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeVisit.patch
+      - run: git -C upstream apply ../important/patches/HomeLocks.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeActorRouting.patch
+      - run: git -C upstream apply ../reusable/patches/HomeResidents.patch
+      - run: git -C upstream apply ../reusable/patches/HomeActorProtection.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeResidentProjection.patch
+      - run: git -C upstream apply ../important/patches/HomeLooseProperty.patch
+      - run: git -C upstream apply ../important/patches/HomeObjectChanges.patch
+      - run: git -C upstream apply ../important/patches/HomePlacement.patch
+      - run: git -C upstream apply ../important/patches/HomePlacementClient.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeOwnerRecovery.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeLegacyPlacement.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeResidentRecovery.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeResidentPresence.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeGuestDoors.patch
+      - run: git -C upstream apply ../required/patches/CampaignCheckpoint.patch
+      - run: git -C upstream apply ../reusable/patches/HomeNativeState.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeOriginalOverlay.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeOriginalVisit.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeGuestSave.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeNativeLoose.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeNativeDoors.patch
+      - run: git -C upstream apply ../reusable/patches/HomeNativeInteractions.patch
+      - run: git -C upstream apply ../important/patches/HomeSeatLeases.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeNativeResidents.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeNativeResidentPresence.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeLinkedRooms.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeLinkedAccess.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeLinkedCheckpoint.patch
+      - run: git -C upstream apply ../reusable/patches/HomeEstateContext.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeEstateRouting.patch
+      - run: git -C upstream apply ../obsolete/patches/HomeEstatePermissions.patch
+      - run: git -C upstream apply ../required/patches/HomeSpatialEpoch.patch
+      - run: git -C upstream apply ../reusable/patches/HomeEstateConstruction.patch
+      - run: git -C upstream apply ../important/patches/HomeSharedProperty.patch
       - uses: actions/checkout@v4
         with:
           repository: tiltedphoques/TiltedConnect
           ref: e6f5759364a64462e717db1153781a7eae26a13e
           path: connect-upstream
           persist-credentials: false
-      - run: git -C connect-upstream apply ../TiltedConnectLifecycle.patch
+      - run: git -C connect-upstream apply ../required/patches/TiltedConnectLifecycle.patch
       - name: Run all independent source and model checks
         shell: bash
         run: |
@@ -117,63 +117,63 @@ jobs:
             fi
             echo "::endgroup::"
           }
-          run_check python3 tests/check_connection_lifecycle.py connect-upstream upstream
-          run_check python3 tests/check_world_epoch.py upstream
-          run_check python3 tests/check_save_load_lifecycle.py upstream
-          run_check python3 tests/check_inventory_evidence.py upstream
-          run_check python3 tests/check_encounter_combat.py upstream
-          run_check python3 tests/check_home_routes.py upstream
-          run_check python3 tests/check_home_registry.py upstream
-          run_check python3 tests/check_home_scope.py upstream
-          run_check python3 tests/check_home_spatial_epoch.py upstream
-          run_check python3 tests/check_home_snapshot.py upstream
-          run_check python3 tests/check_home_projection.py upstream
-          run_check python3 tests/check_home_catalog.py upstream
-          run_check python3 tests/check_home_inventory_ledger.py upstream
-          run_check python3 tests/check_home_container_menu.py upstream
-          run_check python3 tests/check_home_visit.py upstream
-          run_check python3 tests/check_home_locks.py upstream
-          run_check python3 tests/check_home_residents.py upstream
-          run_check python3 tests/check_home_actor_protection.py upstream
-          run_check python3 tests/check_home_resident_projection.py upstream
-          run_check python3 tests/check_home_loose_property.py upstream
-          run_check python3 tests/check_home_objects.py upstream
-          run_check python3 tests/check_home_placement.py upstream
-          run_check python3 tests/check_guest_packaging.py
-          run_check python3 tests/check_home_instances_generation.py
-          run_check python3 tests/check_home_navmesh.py
-          run_check python3 tests/check_encounter_recovery.py upstream
-          run_check python3 tests/check_trade.py upstream
-          run_check python3 tests/check_native_trade.py upstream
-          run_check python3 tests/check_actor_replay.py upstream
-          run_check python3 tools/check_progress_consent.py upstream
-          run_check python3 tools/check_party_travel.py upstream
-          run_check python3 tools/check_interaction_owner.py upstream
-          run_check python3 tools/check_follower_dialogue.py upstream
-          run_check python3 tools/check_coop_interaction.py upstream
-          run_check python3 tools/check_quest_journal.py upstream
-          run_check python3 tests/check_campaign_journal.py upstream
-          run_check python3 tests/check_campaign_replication.py upstream
-          run_check python3 tests/check_campaign_identity.py upstream
-          run_check python3 tests/check_campaign_checkpoint.py upstream
-          run_check python3 tests/check_home_native_state.py upstream
-          run_check python3 tests/check_home_original_overlay.py upstream
-          run_check python3 tests/check_home_original_visit.py upstream
-          run_check python3 tests/check_home_guest_save.py upstream
-          run_check python3 tests/check_home_native_capabilities.py upstream
-          run_check python3 tests/check_home_seat_leases.py upstream
-          run_check python3 tests/check_home_native_residents.py upstream
-          run_check python3 tests/check_home_linked_rooms.py upstream
-          run_check python3 tests/check_estate_catalog.py
-          run_check python3 tests/check_home_linked_access.py upstream
-          run_check python3 tools/check_life_confirmation.py upstream
-          run_check python3 tools/check_observer.py upstream
-          run_check python3 tools/check_replica_and_input.py upstream
-          run_check python3 tools/check_dialogue_draw.py upstream
-          run_check python3 tools/check_remote_hit.py upstream
-          run_check python3 check.py upstream
-          run_check python3 check_state3.py upstream
-          run_check python3 check_dialogue2.py upstream
+          run_check python3 required/tests/check_connection_lifecycle.py connect-upstream upstream
+          run_check python3 required/tests/check_world_epoch.py upstream
+          run_check python3 required/tests/check_save_load_lifecycle.py upstream
+          run_check python3 required/tests/check_inventory_evidence.py upstream
+          run_check python3 required/tests/check_encounter_combat.py upstream
+          run_check python3 obsolete/tests/check_home_routes.py upstream
+          run_check python3 obsolete/tests/check_home_registry.py upstream
+          run_check python3 reusable/tests/check_home_scope.py upstream
+          run_check python3 required/tests/check_home_spatial_epoch.py upstream
+          run_check python3 reusable/tests/check_home_snapshot.py upstream
+          run_check python3 obsolete/tests/check_home_projection.py upstream
+          run_check python3 reusable/tests/check_home_catalog.py upstream
+          run_check python3 important/tests/check_home_inventory_ledger.py upstream
+          run_check python3 important/tests/check_home_container_menu.py upstream
+          run_check python3 obsolete/tests/check_home_visit.py upstream
+          run_check python3 important/tests/check_home_locks.py upstream
+          run_check python3 reusable/tests/check_home_residents.py upstream
+          run_check python3 reusable/tests/check_home_actor_protection.py upstream
+          run_check python3 obsolete/tests/check_home_resident_projection.py upstream
+          run_check python3 important/tests/check_home_loose_property.py upstream
+          run_check python3 important/tests/check_home_objects.py upstream
+          run_check python3 important/tests/check_home_placement.py upstream
+          run_check python3 obsolete/tests/check_guest_packaging.py
+          run_check python3 obsolete/tests/check_home_instances_generation.py
+          run_check python3 obsolete/tests/check_home_navmesh.py
+          run_check python3 important/tests/check_encounter_recovery.py upstream
+          run_check python3 important/tests/check_trade.py upstream
+          run_check python3 important/tests/check_native_trade.py upstream
+          run_check python3 required/tests/check_actor_replay.py upstream
+          run_check python3 important/tests/check_progress_consent.py upstream
+          run_check python3 important/tests/check_party_travel.py upstream
+          run_check python3 important/tests/check_interaction_owner.py upstream
+          run_check python3 important/tests/check_follower_dialogue.py upstream
+          run_check python3 important/tests/check_coop_interaction.py upstream
+          run_check python3 required/tests/check_quest_journal.py upstream
+          run_check python3 required/tests/check_campaign_journal.py upstream
+          run_check python3 required/tests/check_campaign_replication.py upstream
+          run_check python3 required/tests/check_campaign_identity.py upstream
+          run_check python3 required/tests/check_campaign_checkpoint.py upstream
+          run_check python3 reusable/tests/check_home_native_state.py upstream
+          run_check python3 obsolete/tests/check_home_original_overlay.py upstream
+          run_check python3 obsolete/tests/check_home_original_visit.py upstream
+          run_check python3 obsolete/tests/check_home_guest_save.py upstream
+          run_check python3 reusable/tests/check_home_native_capabilities.py upstream
+          run_check python3 important/tests/check_home_seat_leases.py upstream
+          run_check python3 obsolete/tests/check_home_native_residents.py upstream
+          run_check python3 obsolete/tests/check_home_linked_rooms.py upstream
+          run_check python3 reusable/tests/check_estate_catalog.py
+          run_check python3 important/tests/check_home_linked_access.py upstream
+          run_check python3 required/tests/check_life_confirmation.py upstream
+          run_check python3 important/tests/check_observer.py upstream
+          run_check python3 required/tests/check_replica_and_input.py upstream
+          run_check python3 important/tests/check_dialogue_draw.py upstream
+          run_check python3 required/tests/check_remote_hit.py upstream
+          run_check python3 required/tests/check.py upstream
+          run_check python3 required/tests/check_state3.py upstream
+          run_check python3 required/tests/check_dialogue2.py upstream
           exit "$failed"
 
   build:
@@ -198,73 +198,73 @@ jobs:
           persist-credentials: false
       - name: Apply co-op and overlay changes
         run: |
-          git apply ../CoopState.patch
-          git apply ../PartyLeadership.patch
-          git apply ../PartyConversationHud.patch
-          git apply ../Dialogue02.patch
-          git apply ../PartyTravelAndRecovery.patch
-          git apply ../Interaction02.patch
-          git apply ../Interaction03.patch
-          git apply ../Interaction04.patch
-          git apply ../Interaction05.patch
-          git apply ../Interaction06.patch
-          git apply ../Interaction07.patch
-          git apply ../CampaignReplication.patch
-          git apply ../CampaignIdentity.patch
-          git apply ../CampaignTrade.patch
-          git apply ../CampaignTradeAccess.patch
-          git apply ../WorldLifecycle.patch
-          git apply ../ConnectionLifecycle.patch
-          git apply ../SaveLoadLifecycle.patch
-          git apply ../InventoryEvidence.patch
-          git apply ../TradeReturn.patch
-          git apply ../NativeTrade.patch
-          git apply ../TradeItemProperties.patch
-          git apply ../HomeInstances.patch
-          git apply ../HomeScope.patch
-          git apply ../HomeSnapshot.patch
-          git apply ../HomeProjection.patch
-          git apply ../HomeCatalog.patch
-          git apply ../HomeAccessMenu.patch
-          git apply ../HomeInventoryLedger.patch
-          git apply ../HomeContainerMenu.patch
-          git apply ../HomeVisit.patch
-          git apply ../HomeLocks.patch
-          git apply ../HomeActorRouting.patch
-          git apply ../HomeResidents.patch
-          git apply ../HomeActorProtection.patch
-          git apply ../HomeResidentProjection.patch
-          git apply ../HomeLooseProperty.patch
-          git apply ../HomeObjectChanges.patch
-          git apply ../HomePlacement.patch
-          git apply ../HomePlacementClient.patch
-          git apply ../HomeOwnerRecovery.patch
-          git apply ../HomeLegacyPlacement.patch
-          git apply ../HomeResidentRecovery.patch
-          git apply ../HomeResidentPresence.patch
-          git apply ../HomeGuestDoors.patch
-          git apply ../CampaignCheckpoint.patch
-          git apply ../HomeNativeState.patch
-          git apply ../HomeOriginalOverlay.patch
-          git apply ../HomeOriginalVisit.patch
-          git apply ../HomeGuestSave.patch
-          git apply ../HomeNativeLoose.patch
-          git apply ../HomeNativeDoors.patch
-          git apply ../HomeNativeInteractions.patch
-          git apply ../HomeSeatLeases.patch
-          git apply ../HomeNativeResidents.patch
-          git apply ../HomeNativeResidentPresence.patch
-          git apply ../HomeLinkedRooms.patch
-          git apply ../HomeLinkedAccess.patch
-          git apply ../HomeLinkedCheckpoint.patch
-          git apply ../HomeEstateContext.patch
-          git apply ../HomeEstateRouting.patch
-          git apply ../HomeEstatePermissions.patch
-          git apply ../HomeSpatialEpoch.patch
-          git apply ../HomeEstateConstruction.patch
-          git apply ../HomeSharedProperty.patch
-          git -C Libraries/TiltedConnect apply ../../../TiltedConnectLifecycle.patch
-          git -C Libraries/TiltedUI apply ../../../OverlayProcess.patch
+          git apply ../required/patches/CoopState.patch
+          git apply ../required/patches/PartyLeadership.patch
+          git apply ../required/patches/PartyConversationHud.patch
+          git apply ../required/patches/Dialogue02.patch
+          git apply ../important/patches/PartyTravelAndRecovery.patch
+          git apply ../important/patches/Interaction02.patch
+          git apply ../important/patches/Interaction03.patch
+          git apply ../important/patches/Interaction04.patch
+          git apply ../important/patches/Interaction05.patch
+          git apply ../important/patches/Interaction06.patch
+          git apply ../important/patches/Interaction07.patch
+          git apply ../required/patches/CampaignReplication.patch
+          git apply ../required/patches/CampaignIdentity.patch
+          git apply ../required/patches/CampaignTrade.patch
+          git apply ../important/patches/CampaignTradeAccess.patch
+          git apply ../required/patches/WorldLifecycle.patch
+          git apply ../required/patches/ConnectionLifecycle.patch
+          git apply ../required/patches/SaveLoadLifecycle.patch
+          git apply ../required/patches/InventoryEvidence.patch
+          git apply ../important/patches/TradeReturn.patch
+          git apply ../important/patches/NativeTrade.patch
+          git apply ../important/patches/TradeItemProperties.patch
+          git apply ../obsolete/patches/HomeInstances.patch
+          git apply ../reusable/patches/HomeScope.patch
+          git apply ../reusable/patches/HomeSnapshot.patch
+          git apply ../obsolete/patches/HomeProjection.patch
+          git apply ../reusable/patches/HomeCatalog.patch
+          git apply ../obsolete/patches/HomeAccessMenu.patch
+          git apply ../important/patches/HomeInventoryLedger.patch
+          git apply ../important/patches/HomeContainerMenu.patch
+          git apply ../obsolete/patches/HomeVisit.patch
+          git apply ../important/patches/HomeLocks.patch
+          git apply ../obsolete/patches/HomeActorRouting.patch
+          git apply ../reusable/patches/HomeResidents.patch
+          git apply ../reusable/patches/HomeActorProtection.patch
+          git apply ../obsolete/patches/HomeResidentProjection.patch
+          git apply ../important/patches/HomeLooseProperty.patch
+          git apply ../important/patches/HomeObjectChanges.patch
+          git apply ../important/patches/HomePlacement.patch
+          git apply ../important/patches/HomePlacementClient.patch
+          git apply ../obsolete/patches/HomeOwnerRecovery.patch
+          git apply ../obsolete/patches/HomeLegacyPlacement.patch
+          git apply ../obsolete/patches/HomeResidentRecovery.patch
+          git apply ../obsolete/patches/HomeResidentPresence.patch
+          git apply ../obsolete/patches/HomeGuestDoors.patch
+          git apply ../required/patches/CampaignCheckpoint.patch
+          git apply ../reusable/patches/HomeNativeState.patch
+          git apply ../obsolete/patches/HomeOriginalOverlay.patch
+          git apply ../obsolete/patches/HomeOriginalVisit.patch
+          git apply ../obsolete/patches/HomeGuestSave.patch
+          git apply ../obsolete/patches/HomeNativeLoose.patch
+          git apply ../obsolete/patches/HomeNativeDoors.patch
+          git apply ../reusable/patches/HomeNativeInteractions.patch
+          git apply ../important/patches/HomeSeatLeases.patch
+          git apply ../obsolete/patches/HomeNativeResidents.patch
+          git apply ../obsolete/patches/HomeNativeResidentPresence.patch
+          git apply ../obsolete/patches/HomeLinkedRooms.patch
+          git apply ../obsolete/patches/HomeLinkedAccess.patch
+          git apply ../obsolete/patches/HomeLinkedCheckpoint.patch
+          git apply ../reusable/patches/HomeEstateContext.patch
+          git apply ../obsolete/patches/HomeEstateRouting.patch
+          git apply ../obsolete/patches/HomeEstatePermissions.patch
+          git apply ../required/patches/HomeSpatialEpoch.patch
+          git apply ../reusable/patches/HomeEstateConstruction.patch
+          git apply ../important/patches/HomeSharedProperty.patch
+          git -C Libraries/TiltedConnect apply ../../../required/patches/TiltedConnectLifecycle.patch
+          git -C Libraries/TiltedUI apply ../../../required/patches/OverlayProcess.patch
       - name: Cache compiled xmake packages
         uses: actions/cache@v4
         with:
@@ -301,7 +301,7 @@ jobs:
           set -eu
           mkdir -p ../mo2/SkyrimTogetherReborn
           cp -R GameFiles/Skyrim/. ../mo2/
-          python ../tools/build_trade_plugin.py ../mo2/SkyrimCoopTrade.esp
+          python ../required/tools/build_trade_plugin.py ../mo2/SkyrimCoopTrade.esp
           test -s ../mo2/SkyrimCoopTrade.esp
           cp ../GPL-3.0.txt ../TiltedEvolution-LICENSE.txt ../mo2/
           cp -R build/windows/x64/release/. ../mo2/SkyrimTogetherReborn/

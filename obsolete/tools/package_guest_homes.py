@@ -12,7 +12,7 @@ import sys
 import tempfile
 from zipfile import ZipFile, ZIP_DEFLATED
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 GUEST = ("SkyrimCoopGuestHomes.esp", "SkyrimTogetherReborn/config/CoopHomes.txt")
 
 
@@ -25,9 +25,9 @@ def package(base, snapshot, loadorder, plugins, output, instances=False):
     with tempfile.TemporaryDirectory(dir=output.parent) as work:
         work = Path(work)
         generated = work / "generated"
-        subprocess.run([sys.executable, str(ROOT / "tools/build_guest_homes.py"),
+        subprocess.run([sys.executable, str(ROOT / "reusable/tools/build_guest_homes.py"),
                         str(snapshot), str(loadorder), str(plugins), str(generated)] + (["--instances"] if instances else []), check=True)
-        subprocess.run([sys.executable, str(ROOT / ("tests/check_home_instances_plugin.py" if instances else "tests/check_guest_homes.py")),
+        subprocess.run([sys.executable, str(ROOT / ("obsolete/tests/check_home_instances_plugin.py" if instances else "obsolete/tests/check_guest_homes.py")),
                         str(generated)], check=True)
         temporary = work / "package.zip"
         with ZipFile(base) as source, ZipFile(temporary, "w", compression=ZIP_DEFLATED) as result:

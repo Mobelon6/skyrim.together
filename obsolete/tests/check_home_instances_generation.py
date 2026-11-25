@@ -2,8 +2,8 @@
 from pathlib import Path
 import tempfile,sys,struct,subprocess
 from zipfile import ZipFile
-ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT/"tools"))
+ROOT=Path(__file__).resolve().parents[2]
+sys.path.insert(0,str(ROOT/"required/tools"))
 from build_trade_plugin import record,sub,group
 from check_home_instances_plugin import validate
 def u(n):return struct.pack("<I",n)
@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory() as tmp:
         z.writestr("Skyrim.esm",sk);z.writestr("ExampleHouse.esp",mod)
     (p/"loadorder.txt").write_text("Skyrim.esm\nExampleHouse.esp\n")
     (p/"plugins.txt").write_text("*Skyrim.esm\n*ExampleHouse.esp\n")
-    command=[sys.executable,str(ROOT/"tools/build_guest_homes.py"),str(p/"profile.zip"),
+    command=[sys.executable,str(ROOT/"reusable/tools/build_guest_homes.py"),str(p/"profile.zip"),
              str(p/"loadorder.txt"),str(p/"plugins.txt")]
     for n in ("first","second"):
         subprocess.run(command+[str(p/n),"--instances"],check=True)

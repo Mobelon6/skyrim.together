@@ -1,7 +1,7 @@
 import struct
 import sys
 from pathlib import Path
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"tools"))
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"reusable/tools"))
 from build_native_home_capabilities import classify
 u=lambda n:struct.pack("<I",n)
 unpack=lambda d:struct.unpack_from("<I",d)[0]

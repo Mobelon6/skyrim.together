@@ -1,5 +1,8 @@
 import argparse, struct, zlib, zipfile, itertools, sys
 from pathlib import Path
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "required/tools"))
+sys.path.insert(0, str(ROOT / "obsolete/tools"))
 from build_trade_plugin import sub, record
 parser=argparse.ArgumentParser(description="Create read-only co-op guest interiors from an MO2 plugin snapshot.")
 parser.add_argument('archive',type=Path)

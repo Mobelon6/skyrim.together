@@ -1,8 +1,8 @@
 """Test the real save stamp codec and server admission with the generated ESP."""
 import struct, subprocess, sys, tempfile
 from pathlib import Path
-ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT/"tools"))
+ROOT=Path(__file__).resolve().parents[2]
+sys.path.insert(0,str(ROOT/"required/tools"))
 from build_trade_plugin import make
 data=make()
 kind,length,flags,form,*_=struct.unpack_from("<4sIIIIHH",data)

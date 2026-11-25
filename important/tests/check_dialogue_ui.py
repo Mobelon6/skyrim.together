@@ -1,6 +1,6 @@
 """Exercise the shipped Angular bundle using real Chromium and a mock of the in-game CEF event bridge.
 
-python tools/check_dialogue_ui.py /path/to/extracted/SkyrimTogetherReborn/UI
+python important/tests/check_dialogue_ui.py /path/to/extracted/SkyrimTogetherReborn/UI
 Requires Python Playwright and Chromium. No Skyrim executable or saves are used.
 """
 import argparse

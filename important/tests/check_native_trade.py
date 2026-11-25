@@ -2,7 +2,7 @@
 from pathlib import Path
 import struct,sys
 root=Path(sys.argv[1])
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"tools"))
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"required/tools"))
 from build_trade_plugin import make
 def walk(data,start=0,end=None):
     end=len(data) if end is None else end
