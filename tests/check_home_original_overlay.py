@@ -67,6 +67,32 @@ int main()
     before=writes;
     assert(t.RefreshHidden({{3,true}},read,write)==Result::Unavailable&&writes==before);
     assert(t.Switch(false,read,write)==Result::Ready&&t.Release());
+    Fields closed=a,opened=a,moving=a;
+    closed.Open=3;opened.Open=1;moving.Open=2;
+    Delta door{4,6,29,100,closed,closed,false,false,false,true};
+    current={{4,closed}};queued.clear();
+    assert(t.Stage({door})&&t.Switch(true,read,write)==Result::Ready&&t.DoorState(4)==3);
+    before=writes;
+    assert(t.RefreshDoors({{4,1}},read,write)==Result::Pending&&t.DoorState(4)==0);
+    current[4]=moving;
+    assert(t.Switch(true,read,write)==Result::Pending&&writes==before+1);
+    current=queued;
+    assert(t.Switch(true,read,write)==Result::Ready&&t.DoorState(4)==1);
+    assert(t.RefreshDoors({{4,1}},read,write)==Result::Ready&&writes==before+1);
+    assert(t.RefreshDoors({{4,2}},read,write)==Result::Unavailable);
+    assert(t.Switch(false,read,write)==Result::Pending);
+    current[4].Open=4;
+    assert(t.Switch(false,read,write)==Result::Pending&&writes==before+2);
+    current=queued;
+    assert(t.Switch(false,read,write)==Result::Ready&&t.Release()&&current[4].Same(closed));
+    door.Personal=moving;assert(!t.Stage({door}));
+    door.Personal=closed;door.Guest=opened;
+    assert(t.Stage({door})&&t.Switch(true,read,write)==Result::Pending);
+    current=queued;
+    assert(t.Switch(true,read,write)==Result::Ready&&t.DoorState(4)==1);
+    assert(t.Switch(false,read,write)==Result::Pending);
+    current=queued;
+    assert(t.Switch(false,read,write)==Result::Ready&&t.Release()&&current[4].Same(closed));
 }
 """
 with tempfile.TemporaryDirectory() as tmp:
@@ -90,4 +116,7 @@ assert "HomeOriginalOverlay::CanTake(local)" in home
 assert "HomeOriginalOverlay::RefreshLoose(m_world,visit.Campaign,visit.Slot)" in home
 assert "if (HomeInstance::NativeGuestCell(cell->formID) && loose) return {};" not in trade
 assert "d.LiveLoose=object&&CanChange" in native
+assert "HomeOriginalOverlay::RefreshDoors(m_world,visit.Campaign,visit.Slot)" in home
+assert "HomeOriginalOverlay::DoorState(form)" in home
+assert 'Get("ObjectReference","SetOpen")' in native
 print("PASS real overlay transaction: readback, pending transition, failed mutation guard, restore")
