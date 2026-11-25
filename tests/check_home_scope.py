@@ -57,18 +57,20 @@ int main(){
     assert(!ca.IsInRange(bad,true)&&!bad.IsInRange(ca,true));
     assert(cx.IsInRange(cx,false));
     CellIdComponent estateA(ordinary,world,{0,0}),estateB(ordinary,world,{0,0}),guest(ordinary,world,{0,0});
-    estateA.Estate={71,1};estateB.Estate={71,2};guest.Estate={71,1};
+    estateA.Estate={71,101,"plotA"};estateB.Estate={71,202,"plotA"};guest.Estate={71,101,"plotA"};
     assert(estateA.IsInRange(guest,false));
     assert(!estateA.IsInRange(estateB,false)&&!estateB.IsInRange(estateA,true));
     assert(!estateA.IsInRange(cx,false)&&!cx.IsInRange(estateA,false));
-    guest.Estate={72,1};assert(!estateA.IsInRange(guest,false));
-    guest.Estate={0,1};assert(!guest.IsInRange(guest,false));
-    guest.Estate={71,1};guest.CenterCoords={1,0};
+    guest.Estate={72,101,"plotA"};assert(!estateA.IsInRange(guest,false));
+    guest.Estate={71,101,"plotB"};assert(!estateA.IsInRange(guest,false));
+    guest.Estate={0,101,"plotA"};assert(!guest.IsInRange(guest,false));
+    guest.Estate={71,101,""};assert(!guest.IsInRange(guest,false));
+    guest.Estate={71,101,"plotA"};guest.CenterCoords={1,0};
     assert(!estateA.IsInRange(guest,false)); // physical range is still required
     assert(estateA.HasExteriorEstate()&&!cx.HasExteriorEstate());
     assert(!estateA.SamePresence(estateB)&&!estateA.SamePresence(cx));
     CellIdComponent ca2(a);
-    ca.Estate={71,1};
+    ca.Estate={71,101,"plotA"};
     assert(ca.SamePresence(ca2)&&ca.IsInRange(ca2,false));
     assert(!ca.HasExteriorEstate()&&!ca.SamePresence(estateA));
     assert(!ca.SamePresence(cb)); // distinct physical interior slot

@@ -49,8 +49,18 @@ int main(int argc,char** argv)
     assert(!HomeEstateCatalog::Read(duplicateRegion));
     const auto mainId=HomeEstateCatalog::Identity(*catalog,j,71,*first);
     const auto roomId=HomeEstateCatalog::Identity(*catalog,j,71,*second);
-    assert(mainId&&roomId&&*mainId==*roomId&&mainId->RootSlot==first->Slot);
-    assert(!HomeEstateCatalog::Identity(*catalog,j,71,*foreign)); // no main-room registration
+    assert(mainId&&roomId&&*mainId==*roomId&&mainId->Owner==101&&mainId->Plot==q);
+    const auto foreignId=HomeEstateCatalog::Identity(*catalog,j,71,*foreign);
+    assert(foreignId&&foreignId->Owner==202&&*foreignId!=*mainId); // no main-room registration needed
+    const auto beforeEmpty=j.Current();
+    const auto empty=HomeEstateCatalog::Identity(*catalog,71,404,q);
+    assert(empty&&empty->Owner==404&&empty->Plot==q&&*empty!=*mainId);
+    assert(!HomeRegistry::Find(j,404,a)&&j.Current()==beforeEmpty);
+    assert(!HomeEstateCatalog::Identity(*catalog,71,0,q));
+    assert(!HomeEstateCatalog::Identity(*catalog,0,404,q));
+    assert(!HomeEstateCatalog::Identity(*catalog,71,404,"missing"));
+    auto forged=*second;forged.Owner=404;
+    assert(!HomeEstateCatalog::Identity(*catalog,j,71,forged));
     assert(!HomeEstateCatalog::Identity(*catalog,j,71,*unrelated));
     std::istringstream duplicate(index+"I "+q+" "+main+"\n");
     assert(!HomeEstateCatalog::Read(duplicate));

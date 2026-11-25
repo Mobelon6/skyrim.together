@@ -2,7 +2,7 @@ diff --git a/Code/common/HomeEstateCatalog.h b/Code/common/HomeEstateCatalog.h
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/HomeEstateCatalog.h
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,162 @@
 +#pragma once
 +#include "HomeRegistry.h"
 +#include <map>
@@ -133,19 +133,25 @@ new file mode 100644
 +    }();
 +    return catalog;
 +}
-+// Main room's existing journal slot is the estate's stable owner-specific
-+// identity. No new registration, no ACL inference, no connection ID.
++// Presence identity is not a property registration or an access grant.
++// Stable quest key + character + campaign exists even before land purchase.
++// The caller must authenticate the character and independently check access.
++inline std::optional<HomeScope::EstateContext> Identity(const Catalog& catalog,
++    uint64_t campaign,uint64_t owner,const std::string& quest)
++{
++    if (!campaign||!owner) return {};
++    const auto found=catalog.Estates.find(quest);
++    if (found==catalog.Estates.end()) return {};
++    return HomeScope::EstateContext{campaign,owner,found->first};
++}
 +inline std::optional<HomeScope::EstateContext> Identity(const Catalog& catalog,
 +    const CampaignJournal::Journal& journal,uint64_t campaign,const HomeRegistry::Home& room)
 +{
 +    const auto* e=catalog.ForRoom(room.Root.Encode());
-+    if (!campaign||!e) return {};
-+    const auto main=TradeProperties::DecodeForm(e->Main);
++    if (!e) return {};
 +    const auto registered=HomeRegistry::BySlot(journal,room.Slot);
-+    if (!main||!registered||!registered->Same(room.Owner,room.Root)) return {};
-+    const auto root=HomeRegistry::Find(journal,room.Owner,*main);
-+    if (!root) return {};
-+    return HomeScope::EstateContext{campaign,root->Slot};
++    if (!registered||!registered->Same(room.Owner,room.Root)) return {};
++    return Identity(catalog,campaign,room.Owner,e->Quest);
 +}
 +inline std::vector<uint32_t> RegisteredRooms(const Estate& estate,
 +    const CampaignJournal::Journal& journal,const HomeRegistry::Home& room)
@@ -162,23 +168,28 @@ new file mode 100644
 diff --git a/Code/common/HomeScope.h b/Code/common/HomeScope.h
 --- a/Code/common/HomeScope.h
 +++ b/Code/common/HomeScope.h
-@@ -4,5 +4,18 @@
+@@ -1,8 +1,23 @@
+ #pragma once
+ #include <cstdint>
++#include <string>
+ 
  namespace HomeScope
  {
 -// Canonical plugin/form keys remain unchanged; the cell namespace is an
 +// Estate presence is separate from the canonical physical cell/world/grid.
++// Ownership of land, a registered home and the right to visit are separate.
 +struct EstateContext
 +{
-+    uint64_t Campaign{};
-+    uint32_t RootSlot{};
-+    constexpr bool Valid() const noexcept
-+    {return (!Campaign&&!RootSlot)||(Campaign&&RootSlot&&RootSlot<=0xffffu);}
-+    constexpr bool operator==(const EstateContext&) const noexcept=default;
++    uint64_t Campaign{},Owner{};
++    std::string Plot;
++    bool Valid() const noexcept
++    {return (!Campaign&&!Owner&&Plot.empty())||(Campaign&&Owner&&!Plot.empty()&&Plot.size()<=216);}
++    bool operator==(const EstateContext&) const noexcept=default;
 +};
-+inline constexpr bool EstateCompatible(EstateContext a,EstateContext b) noexcept
++inline bool EstateCompatible(const EstateContext& a,const EstateContext& b) noexcept
 +{return a.Valid()&&b.Valid()&&a==b;}
 +// Default zero context is the ordinary/shared world. Private presence is
-+// assigned only after the future authoritative admission and overlay readback.
++// assigned only after authoritative admission and overlay readback.
 +// Canonical plugin/form keys remain unchanged; the cell namespace is an
  // additional discriminator for reference entities, not for base forms.
  inline constexpr uint32_t Registered=0xFFFD0000u;
