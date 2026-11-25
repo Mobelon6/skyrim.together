@@ -8,7 +8,7 @@ SEAT_FIELDS = {b"EDID", b"NAME", b"DATA", b"XSCL", b"XESP"}
 
 def classify(reader, unpack):
     cells, bases = set(), {}
-    for kind, key, flags, _, resolve, read in reader({b"CELL", b"DOOR", b"FURN"}):
+    for kind, key, flags, _, resolve, read in reader({b"CELL", b"DOOR", b"FURN", b"NPC_"}):
         if kind == b"CELL":
             cells.discard(key)
             if not flags & 32 and read().get(b"DATA", b"\0")[0] & 1:
@@ -22,6 +22,9 @@ def classify(reader, unpack):
             continue
         if kind == b"DOOR":
             bases[key] = "D"
+        elif kind == b"NPC_":
+            if b"TPLT" not in d:
+                bases[key] = "A"
         elif not flags & ((1 << 7) | (1 << 23)):
             marker = d.get(b"MNAM", b"")
             bench = d.get(b"WBDT", b"")
@@ -32,7 +35,7 @@ def classify(reader, unpack):
             if mask & (1 << 30) and mask & 0xffffff and not mask & ((1 << 31) | (1 << 25) | (1 << 26)):
                 bases[key] = "S"
     rows, parents = {}, {}
-    for _, key, flags, ctx, resolve, read in reader({b"REFR"}):
+    for kind, key, flags, ctx, resolve, read in reader({b"REFR", b"ACHR"}):
         rows.pop(key, None)
         parents.pop(key, None)
         if flags & 32:
@@ -48,10 +51,12 @@ def classify(reader, unpack):
         tag = bases.get(base)
         if root not in cells or not tag or any(k[0] in GENERATED for k in (root, key, base)):
             continue
-        if set(d) <= (DOOR_FIELDS if tag == "D" else SEAT_FIELDS):
+        if (kind == b"ACHR") != (tag == "A"):
+            continue
+        if set(d) <= (DOOR_FIELDS if tag in ("D", "A") else SEAT_FIELDS):
             rows[key] = tag, root, key, base
     controlled = set(parents.values())
-    return sorted(row for k, row in rows.items() if row[0] != "D" or k not in controlled)
+    return sorted(row for k, row in rows.items() if row[0] not in ("D", "A") or k not in controlled)
 
 
 def build(out, reader, unpack):
