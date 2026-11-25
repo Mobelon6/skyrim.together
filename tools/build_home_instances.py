@@ -284,6 +284,11 @@ def build(out, order, reader, grp, unpack):
             else:
                 temp += record(b"REFR", flags & 0x800, own | target, ref)
             manifest.append(f"R {stable(root)} {stable(key)} {stable(base)} {target} {stable(newbase)}")
+            # Only plain, non-persistent, non-teleport DOOR refs are advertised
+            # for guest changes. Script-bearing bases were already rejected.
+            if (typ == b"DOOR" and key not in entry_links and not (flags & ~0x800) and
+                set(rd) <= {b"EDID", b"NAME", b"DATA", b"XSCL", b"XNDP"}):
+                manifest.append(f"T {stable(root)} {stable(key)}")
             if key in entry_links:
                 values = " ".join(str(n) for n in struct.unpack("<12I", inside + outside))
                 manifest.append(f"D {stable(root)} {stable(other)} {stable(parent)} {target} {values}")

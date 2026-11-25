@@ -30,7 +30,9 @@ with tempfile.TemporaryDirectory() as tmp:
         ref(0x01000901,0x101)+ref(0x01000902,0x01000801)+ref(0x01000903,0x01000802)+
         record(b"ACHR",0,0x01000904,b"")+record(b"NAVM",0,0x01000905,b"")+
         record(b"ACHR",0,0x01000907,sub(b"NAME",u(0x103))+sub(b"DATA",bytes(24)))+
-        record(b"ACHR",0,0x01000908,sub(b"NAME",u(0x104))+sub(b"DATA",bytes(24)))))
+        record(b"ACHR",0,0x01000908,sub(b"NAME",u(0x104))+sub(b"DATA",bytes(24)))+
+        ref(0x01000914,0x102)+
+        record(b"REFR",0,0x01000915,sub(b"NAME",u(0x102))+sub(b"DATA",bytes(24))+sub(b"VMAD",b"script"))))
     # Non-house interior must not appear.
     mod+=cell(0x01000910,0)
     mod+=group(6,0x01000910,group(9,0x01000910,
@@ -49,9 +51,11 @@ with tempfile.TemporaryDirectory() as tmp:
              str(p/"loadorder.txt"),str(p/"plugins.txt")]
     for n in ("first","second"):
         subprocess.run(command+[str(p/n),"--instances"],check=True)
-        assert validate(p/n)==(1,3,4)
+        assert validate(p/n)==(1,5,4)
         manifest=(p/n/"CoopHomeInstances.txt").read_text()
         assert "\nD " in manifest
+        doors=[line.split() for line in manifest.splitlines() if line.startswith("T ")]
+        assert doors==[["T","6578616d706c65686f7573652e657370.2304","6578616d706c65686f7573652e657370.2324"]]
         assert manifest.startswith("STM-HOME-INSTANCES 3\n")
         pool={tuple(line.split()[1:]) for line in manifest.splitlines() if line.startswith("M ")}
         assert ("6578616d706c65686f7573652e657370.2322","736b7972696d2e65736d.259") in pool

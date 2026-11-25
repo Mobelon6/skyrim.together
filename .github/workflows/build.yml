@@ -2,51 +2,7 @@ name: Skyrim SE 1.6.1170 co-op
 on:
   push:
     paths:
-      - CoopState.patch
-      - OverlayProcess.patch
-      - PartyLeadership.patch
-      - PartyConversationHud.patch
-      - Dialogue02.patch
-      - PartyTravelAndRecovery.patch
-      - Interaction02.patch
-      - Interaction03.patch
-      - Interaction04.patch
-      - Interaction05.patch
-      - Interaction06.patch
-      - Interaction07.patch
-      - CampaignReplication.patch
-      - CampaignIdentity.patch
-      - CampaignTrade.patch
-      - CampaignTradeAccess.patch
-      - WorldLifecycle.patch
-      - ConnectionLifecycle.patch
-      - SaveLoadLifecycle.patch
-      - InventoryEvidence.patch
-      - TradeReturn.patch
-      - NativeTrade.patch
-      - TradeItemProperties.patch
-      - HomeInstances.patch
-      - HomeScope.patch
-      - HomeSnapshot.patch
-      - HomeProjection.patch
-      - HomeCatalog.patch
-      - HomeAccessMenu.patch
-      - HomeInventoryLedger.patch
-      - HomeContainerMenu.patch
-      - HomeVisit.patch
-      - HomeLocks.patch
-      - HomeActorRouting.patch
-      - HomeResidents.patch
-      - HomeActorProtection.patch
-      - HomeResidentProjection.patch
-      - HomeLooseProperty.patch
-      - HomeObjectChanges.patch
-      - HomePlacement.patch
-      - HomePlacementClient.patch
-      - HomeOwnerRecovery.patch
-      - HomeLegacyPlacement.patch
-      - HomeResidentRecovery.patch
-      - TiltedConnectLifecycle.patch
+      - "*.patch"
       - .github/workflows/build.yml
       - check*.py
       - tools/check*.py
@@ -119,6 +75,7 @@ jobs:
       - run: git -C upstream apply ../HomeLegacyPlacement.patch
       - run: git -C upstream apply ../HomeResidentRecovery.patch
       - run: git -C upstream apply ../HomeResidentPresence.patch
+      - run: git -C upstream apply ../HomeGuestDoors.patch
       - uses: actions/checkout@v4
         with:
           repository: tiltedphoques/TiltedConnect
@@ -253,6 +210,7 @@ jobs:
           git apply ../HomeLegacyPlacement.patch
           git apply ../HomeResidentRecovery.patch
           git apply ../HomeResidentPresence.patch
+          git apply ../HomeGuestDoors.patch
           git -C Libraries/TiltedConnect apply ../../../TiltedConnectLifecycle.patch
           git -C Libraries/TiltedUI apply ../../../OverlayProcess.patch
       - name: Cache compiled xmake packages

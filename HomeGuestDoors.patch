@@ -1,0 +1,621 @@
+diff --git a/Code/common/HomeObjects.h b/Code/common/HomeObjects.h
+--- a/Code/common/HomeObjects.h
++++ b/Code/common/HomeObjects.h
+@@ -1,112 +1,153 @@
+ #pragma once
+ #include "HomeSnapshot.h"
+-
+-namespace HomeObjects
+-{
+-// Changes to presentation do not create or replenish an inventory account.
+-struct State
+-{
+-    uint32_t Disabled{},Open{}; // 0 unknown, 1 open, 3 closed
+-    std::array<uint32_t,6> Transform{};
+-    bool Valid() const
+-    {
+-        if (Disabled>1 || (Open!=0 && Open!=1 && Open!=3)) return false;
+-        for (auto x:Transform) if (!std::isfinite(std::bit_cast<float>(x))) return false;
+-        return true;
+-    }
+-    std::string Encode() const
+-    {
+-        auto s=std::to_string(Disabled)+" "+std::to_string(Open);
+-        for (auto x:Transform) s+=" "+std::to_string(x);
+-        return s;
+-    }
+-    bool Significant(const State& other) const
+-    {
+-        if (Disabled!=other.Disabled || Open!=other.Open) return true;
+-        for (size_t i=0;i<Transform.size();++i)
+-            if (std::abs(std::bit_cast<float>(Transform[i])-std::bit_cast<float>(other.Transform[i]))>
+-                (i<3?1.f:0.02f)) return true;
+-        return false;
+-    }
+-};
+-struct Record
+-{
+-    uint32_t Revision{},SaveRevision{},Type{},Inventory{};
+-    State Value;
+-};
+-using Records=std::map<std::string,Record>;
+-struct Change
+-{
+-    uint32_t Slot{},Revision{},SaveRevision{};
+-    std::string Key;
+-    State Value;
+-    std::string Encode() const
+-    {
+-        return std::to_string(Slot)+" "+std::to_string(Revision)+" "+std::to_string(SaveRevision)+" "+Key+" "+Value.Encode();
+-    }
+-};
+-inline std::optional<Change> Decode(std::string_view bytes)
+-{
+-    Change c;std::string extra;
+-    std::istringstream in{std::string(bytes)};
+-    if (!(in>>c.Slot>>c.Revision>>c.SaveRevision>>c.Key>>c.Value.Disabled>>c.Value.Open)) return {};
+-    for (auto& v:c.Value.Transform) if (!(in>>v)) return {};
+-    const auto key=TradeProperties::DecodeForm(c.Key);
+-    if (in>>extra || !c.Slot || !c.Revision || !key || !key->Valid() || key->Encode()!=c.Key ||
+-        !c.Value.Valid() || c.Encode()!=bytes) return {};
+-    return c;
+-}
+-inline bool Eligible(const HomeSnapshot::Ref& ref)
+-{
+-    return !(ref.Flags&2u) && ref.Inventory!=2 &&
+-        (!HomeSnapshot::LooseType(ref.Type) || ref.Inventory==3);
+-}
+-inline bool Allowed(const Record& previous,const State& state)
+-{
+-    return state.Valid() && (previous.Type==29 || !state.Open) &&
+-        (!previous.Value.Open || state.Open) &&
+-        (previous.Inventory!=3 || state.Disabled==previous.Value.Disabled);
+-}
+-inline std::optional<Records> Read(const CampaignJournal::Journal& journal,uint32_t slot)
+-{
+-    const auto baseline=HomeSnapshot::Read(journal,slot);
+-    if (baseline.State!=HomeSnapshot::Status::Ready) return {};
+-    const auto state=HomeSnapshot::Decode(baseline.Bytes);
+-    if (!state) return {};
+-    Records records;
+-    for (const auto& r:state->Refs)
+-        if (Eligible(r)) records.emplace(r.Key.Encode(),Record{0,0,r.Type,r.Inventory,{r.Flags&1u,0,r.Transform}});
+-    bool published=false;size_t position=0;
+-    for (const auto& row:journal.Operations())
+-    {
+-        ++position;
+-        if (row.Id==HomeSnapshot::Marker(slot) && row.Kind=="home-static-v1") published=true;
+-        if (row.Kind!="home-object-v1") continue;
+-        const auto c=Decode(row.Payload);
+-        if (!c || row.Id!="home-object-"+std::to_string(position) || c->SaveRevision>=position) return {};
+-        if (c->Slot!=slot) continue;
+-        auto it=records.find(c->Key);
+-        if (!published || it==records.end() || it->second.Revision==UINT32_MAX ||
+-            c->Revision!=it->second.Revision+1 || c->SaveRevision<it->second.SaveRevision ||
+-            !Allowed(it->second,c->Value) || !c->Value.Significant(it->second.Value)) return {};
+-        it->second.Revision=c->Revision;it->second.SaveRevision=c->SaveRevision;it->second.Value=c->Value;
+-    }
+-    return records;
+-}
+-inline bool Set(CampaignJournal::Journal& journal,uint64_t owner,const Change& change,uint32_t expected)
+-{
+-    const auto home=HomeRegistry::BySlot(journal,change.Slot);
+-    if (!home || !owner || home->Owner!=owner || expected==UINT32_MAX || change.Revision!=expected+1 ||
+-        change.SaveRevision>journal.Current().Revision) return false;
+-    auto view=Read(journal,change.Slot);
+-    if (!view) return false;
+-    const auto it=view->find(change.Key);
+-    if (it==view->end() || expected!=it->second.Revision ||
+-        change.SaveRevision<it->second.SaveRevision || !Allowed(it->second,change.Value)) return false;
+-    if (!change.Value.Significant(it->second.Value)) return true;
+-    if (journal.Current().Revision==UINT32_MAX) return false;
+-    return journal.Append(journal.Current(),{"home-object-"+std::to_string(journal.Current().Revision+1),
+-        "home-object-v1",change.Encode()})==CampaignJournal::Result::Committed;
++#include "HomePermissions.h"
++#include "HomeLocks.h"
++
++namespace HomeObjects
++{
++// Changes to presentation do not create or replenish an inventory account.
++struct State
++{
++    uint32_t Disabled{},Open{}; // 0 unknown, 1 open, 3 closed
++    std::array<uint32_t,6> Transform{};
++    uint32_t GuestDoor{}; // owner-confirmed plain door capability; zero in old rows
++    bool Valid() const
++    {
++        if (Disabled>1 || (Open!=0 && Open!=1 && Open!=3) || GuestDoor>1 || (GuestDoor && !Open)) return false;
++        for (auto x:Transform) if (!std::isfinite(std::bit_cast<float>(x))) return false;
++        return true;
++    }
++    std::string Encode() const
++    {
++        auto s=std::to_string(Disabled)+" "+std::to_string(Open);
++        for (auto x:Transform) s+=" "+std::to_string(x);
++        if (GuestDoor) s+=" 1"; // retain exact canonical legacy encoding when absent
++        return s;
++    }
++    bool Significant(const State& other) const
++    {
++        if (Disabled!=other.Disabled || Open!=other.Open || GuestDoor!=other.GuestDoor) return true;
++        for (size_t i=0;i<Transform.size();++i)
++            if (std::abs(std::bit_cast<float>(Transform[i])-std::bit_cast<float>(other.Transform[i]))>
++                (i<3?1.f:0.02f)) return true;
++        return false;
++    }
++};
++struct Record
++{
++    uint32_t Revision{},SaveRevision{},Type{},Inventory{};
++    State Value;
++};
++using Records=std::map<std::string,Record>;
++struct Change
++{
++    uint32_t Slot{},Revision{},SaveRevision{};
++    std::string Key;
++    State Value;
++    std::string Encode() const
++    {
++        return std::to_string(Slot)+" "+std::to_string(Revision)+" "+std::to_string(SaveRevision)+" "+Key+" "+Value.Encode();
++    }
++};
++inline std::optional<Change> Decode(std::string_view bytes)
++{
++    Change c;std::string extra;
++    std::istringstream in{std::string(bytes)};
++    if (!(in>>c.Slot>>c.Revision>>c.SaveRevision>>c.Key>>c.Value.Disabled>>c.Value.Open)) return {};
++    for (auto& v:c.Value.Transform) if (!(in>>v)) return {};
++    if (in>>extra)
++    {
++        if (extra!="1" || in>>extra) return {};
++        c.Value.GuestDoor=1;
++    }
++    const auto key=TradeProperties::DecodeForm(c.Key);
++    if (in>>extra || !c.Slot || !c.Revision || !key || !key->Valid() || key->Encode()!=c.Key ||
++        !c.Value.Valid() || c.Encode()!=bytes) return {};
++    return c;
++}
++inline bool Eligible(const HomeSnapshot::Ref& ref)
++{
++    return !(ref.Flags&2u) && ref.Inventory!=2 &&
++        (!HomeSnapshot::LooseType(ref.Type) || ref.Inventory==3);
++}
++inline bool Allowed(const Record& previous,const State& state)
++{
++    return state.Valid() && (previous.Type==29 || (!state.Open && !state.GuestDoor)) &&
++        (!previous.Value.Open || state.Open) &&
++        (previous.Inventory!=3 || state.Disabled==previous.Value.Disabled);
++}
++inline std::optional<Records> Read(const CampaignJournal::Journal& journal,uint32_t slot)
++{
++    const auto baseline=HomeSnapshot::Read(journal,slot);
++    if (baseline.State!=HomeSnapshot::Status::Ready) return {};
++    const auto state=HomeSnapshot::Decode(baseline.Bytes);
++    if (!state) return {};
++    Records records;
++    for (const auto& r:state->Refs)
++        if (Eligible(r)) records.emplace(r.Key.Encode(),Record{0,0,r.Type,r.Inventory,{r.Flags&1u,0,r.Transform}});
++    bool published=false;size_t position=0;
++    for (const auto& row:journal.Operations())
++    {
++        ++position;
++        if (row.Id==HomeSnapshot::Marker(slot) && row.Kind=="home-static-v1") published=true;
++        if (row.Kind!="home-object-v1") continue;
++        const auto c=Decode(row.Payload);
++        if (!c || row.Id!="home-object-"+std::to_string(position) || c->SaveRevision>=position) return {};
++        if (c->Slot!=slot) continue;
++        auto it=records.find(c->Key);
++        if (!published || it==records.end() || it->second.Revision==UINT32_MAX ||
++            c->Revision!=it->second.Revision+1 || c->SaveRevision<it->second.SaveRevision ||
++            !Allowed(it->second,c->Value) || !c->Value.Significant(it->second.Value)) return {};
++        it->second.Revision=c->Revision;it->second.SaveRevision=c->SaveRevision;it->second.Value=c->Value;
++    }
++    return records;
++}
++inline bool Set(CampaignJournal::Journal& journal,uint64_t owner,const Change& change,uint32_t expected)
++{
++    const auto home=HomeRegistry::BySlot(journal,change.Slot);
++    if (!home || !owner || home->Owner!=owner || expected==UINT32_MAX || change.Revision!=expected+1 ||
++        change.SaveRevision>journal.Current().Revision) return false;
++    auto view=Read(journal,change.Slot);
++    if (!view) return false;
++    const auto it=view->find(change.Key);
++    if (it==view->end() || expected!=it->second.Revision ||
++        change.SaveRevision<it->second.SaveRevision || !Allowed(it->second,change.Value)) return false;
++    if (!change.Value.Significant(it->second.Value)) return true;
++    if (journal.Current().Revision==UINT32_MAX) return false;
++    return journal.Append(journal.Current(),{"home-object-"+std::to_string(journal.Current().Revision+1),
++        "home-object-v1",change.Encode()})==CampaignJournal::Result::Committed;
++}
++// A guest requests an explicit target state, not a toggle to replay. Only the
++// owner-observed capability grants this operation; pose, visibility, lock and
++// owner checkpoint are unchanged. All validations occur on the authority.
++inline bool SetGuestDoor(CampaignJournal::Journal& journal,uint64_t actor,uint32_t slot,
++    const std::string& key,uint32_t expected,uint32_t desired,const std::array<float,3>& position)
++{
++    const auto home=HomeRegistry::BySlot(journal,slot);
++    if (!home || !actor || home->Owner==actor || expected==UINT32_MAX ||
++        (desired!=1 && desired!=3) ||
++        HomePermissions::Effective(journal,slot,actor)!=HomePermissions::Right::Modify) return false;
++    const auto objects=Read(journal,slot);
++    const auto locks=HomeLocks::Read(journal,slot);
++    if (!objects || !locks) return false;
++    const auto it=objects->find(key);
++    if (it==objects->end()) return false;
++    const auto& record=it->second;
++    const auto& value=record.Value;
++    if (!record.Revision || record.Revision!=expected || record.Type!=29 || record.Inventory ||
++        !value.GuestDoor || value.Disabled || !value.Open || desired==value.Open) return false;
++    const auto lock=locks->find(key);
++    if (lock!=locks->end() && lock->second.State==2) return false;
++    double distance=0;
++    for (size_t i=0;i<position.size();++i)
++    {
++        if (!std::isfinite(position[i])) return false;
++        const double delta=double(position[i])-std::bit_cast<float>(value.Transform[i]);
++        distance+=delta*delta;
++    }
++    if (distance>420.0*420.0) return false;
++    auto changed=value;changed.Open=desired;
++    return Set(journal,home->Owner,{slot,expected+1,record.SaveRevision,key,changed},expected);
+ }
+ inline bool Apply(const CampaignJournal::Journal& journal,uint32_t slot,HomeSnapshot::State& state)
+ {
+diff --git a/Code/common/HomeCatalog.h b/Code/common/HomeCatalog.h
+--- a/Code/common/HomeCatalog.h
++++ b/Code/common/HomeCatalog.h
+@@ -29,106 +29,120 @@
+     std::set<std::string> ResidentCandidates;
+     std::map<std::string,TradeProperties::FormKey> ResidentBases;
+     std::vector<TradeProperties::FormKey> Navigation;
+-    // The profile-wide pool is immutable and shared across home cells.
+-    std::shared_ptr<const MovableResidents> Movable;
+-};
+-using Catalog=std::map<std::string,Cell>;
+-inline std::optional<Catalog> Read(std::istream& in)
+-{
+-    std::string line;
+-    if (!std::getline(in,line) || (line!="STM-HOME-INSTANCES 2" && line!="STM-HOME-INSTANCES 3")) return {};
+-    const bool withMovable=line=="STM-HOME-INSTANCES 3";
+-    auto movable=std::make_shared<MovableResidents>();
+-    Catalog result;
+-    std::set<std::string> sources,doors;
+-    std::set<uint32_t> targets;
+-    size_t lines=0;
+-    while (std::getline(in,line))
+-    {
+-        if (++lines>1000000 || line.empty() || line.size()>2048) return {};
+-        std::istringstream row(line);
+-        std::string tag,root,source,base,targetBase,outside,reason,extra;
+-        uint32_t id{};
+-        if (!(row>>tag>>root)) return {};
+-        auto key=TradeProperties::DecodeForm(root);
+-        if (!key || !key->Valid() || key->Encode()!=root || key->Plugin==Plugin) return {};
+-        if (tag=="M")
+-        {
+-            if (!withMovable || !(row>>base) || row>>extra || movable->size()>=131072) return {};
+-            auto b=TradeProperties::DecodeForm(base);
+-            if (!b || !b->Valid() || b->Encode()!=base || b->Plugin==Plugin ||
+-                (key->Plugin=="skyrim.esm" && key->Local==0x14) ||
+-                (b->Plugin=="skyrim.esm" && b->Local==7) ||
+-                !movable->emplace(root,*b).second) return {};
+-            continue;
+-        }
+-        if (tag=="H")
+-        {
+-            if (!(row>>id) || row>>extra || id<0x800 || id>0xFFFFFF ||
+-                !targets.insert(id).second || result.count(root)) return {};
+-            Cell c;c.Root=*key;c.Copy={std::string(Plugin),id};result.emplace(root,std::move(c));
+-            continue;
+-        }
+-        auto it=result.find(root);
+-        if (it==result.end()) return {};
+-        auto& c=it->second;
+-        if (!(row>>source)) return {};
+-        auto src=TradeProperties::DecodeForm(source);
+-        if (!src || !src->Valid() || src->Encode()!=source || src->Plugin==Plugin) return {};
+-        if (tag=="R")
+-        {
+-            if (!(row>>base>>id>>targetBase) || row>>extra || id<0x800 || id>0xFFFFFF ||
+-                !targets.insert(id).second || !sources.insert(source).second) return {};
+-            auto b=TradeProperties::DecodeForm(base),tb=TradeProperties::DecodeForm(targetBase);
+-            if (!b || !tb || !b->Valid() || !tb->Valid() || b->Encode()!=base ||
+-                tb->Encode()!=targetBase || b->Plugin==Plugin ||
+-                (tb->Plugin!=Plugin && base!=targetBase)) return {};
+-            c.Refs.push_back({*src,*b,{std::string(Plugin),id},*tb});
+-        }
+-        else if (tag=="N")
+-        {
+-            if (!(row>>id) || row>>extra || id<0x800 || id>0xFFFFFF ||
+-                !targets.insert(id).second || !sources.insert(source).second) return {};
+-            c.Navigation.push_back({std::string(Plugin),id});
+-        }
+-        else if (tag=="A")
+-        {
+-            if (!(row>>base) || row>>extra || !sources.insert(source).second ||
+-                c.ResidentBases.size()>=128) return {};
+-            const auto b=TradeProperties::DecodeForm(base);
+-            if (!b || !b->Valid() || b->Encode()!=base || b->Plugin==Plugin) return {};
+-            c.ResidentCandidates.insert(source);
+-            c.ResidentBases.emplace(source,*b);
+-        }
+-        else if (tag=="U")
+-        {
+-            if (!(row>>reason) || row>>extra || !sources.insert(source).second) return {};
+-            c.Unsupported.insert(source);
+-            if (reason=="ACHR") c.ResidentCandidates.insert(source);
+-        }
+-        else if (tag=="D")
+-        {
+-            if (!(row>>outside>>id) || !doors.insert(source).second) return {};
+-            auto ext=TradeProperties::DecodeForm(outside);
+-            if (!ext || !ext->Valid() || ext->Encode()!=outside || ext->Plugin==Plugin ||
+-                ext->Encode()==root) return {};
+-            Entrance e;e.Door=*src;e.Outside=*ext;e.Exit={std::string(Plugin),id};
+-            for (auto& n:e.Pose)
+-                if (!(row>>n) || !std::isfinite(std::bit_cast<float>(n))) return {};
+-            if (row>>extra || std::none_of(c.Refs.begin(),c.Refs.end(),
+-                [&](const Ref& r){return r.Target.Local==id;})) return {};
+-            c.Entrances.push_back(std::move(e));
+-        }
+-        else return {};
+-    }
+-    if (!in.eof() || result.empty()) return {};
+-    if (withMovable)
+-        for (auto& [_,cell]:result)
+-        {
+-            for (const auto& [key,base]:cell.ResidentBases)
+-            {
+-                const auto it=movable->find(key);
+-                if (it==movable->end() || it->second.Encode()!=base.Encode()) return {};
++    std::set<std::string> GuestDoors;
++    // The profile-wide pool is immutable and shared across home cells.
++    std::shared_ptr<const MovableResidents> Movable;
++};
++using Catalog=std::map<std::string,Cell>;
++inline std::optional<Catalog> Read(std::istream& in)
++{
++    std::string line;
++    if (!std::getline(in,line) || (line!="STM-HOME-INSTANCES 2" && line!="STM-HOME-INSTANCES 3")) return {};
++    const bool withMovable=line=="STM-HOME-INSTANCES 3";
++    auto movable=std::make_shared<MovableResidents>();
++    Catalog result;
++    std::set<std::string> sources,doors;
++    std::set<uint32_t> targets;
++    size_t lines=0;
++    while (std::getline(in,line))
++    {
++        if (++lines>1000000 || line.empty() || line.size()>2048) return {};
++        std::istringstream row(line);
++        std::string tag,root,source,base,targetBase,outside,reason,extra;
++        uint32_t id{};
++        if (!(row>>tag>>root)) return {};
++        auto key=TradeProperties::DecodeForm(root);
++        if (!key || !key->Valid() || key->Encode()!=root || key->Plugin==Plugin) return {};
++        if (tag=="M")
++        {
++            if (!withMovable || !(row>>base) || row>>extra || movable->size()>=131072) return {};
++            auto b=TradeProperties::DecodeForm(base);
++            if (!b || !b->Valid() || b->Encode()!=base || b->Plugin==Plugin ||
++                (key->Plugin=="skyrim.esm" && key->Local==0x14) ||
++                (b->Plugin=="skyrim.esm" && b->Local==7) ||
++                !movable->emplace(root,*b).second) return {};
++            continue;
++        }
++        if (tag=="H")
++        {
++            if (!(row>>id) || row>>extra || id<0x800 || id>0xFFFFFF ||
++                !targets.insert(id).second || result.count(root)) return {};
++            Cell c;c.Root=*key;c.Copy={std::string(Plugin),id};result.emplace(root,std::move(c));
++            continue;
++        }
++        auto it=result.find(root);
++        if (it==result.end()) return {};
++        auto& c=it->second;
++        if (!(row>>source)) return {};
++        auto src=TradeProperties::DecodeForm(source);
++        if (!src || !src->Valid() || src->Encode()!=source || src->Plugin==Plugin) return {};
++        if (tag=="R")
++        {
++            if (!(row>>base>>id>>targetBase) || row>>extra || id<0x800 || id>0xFFFFFF ||
++                !targets.insert(id).second || !sources.insert(source).second) return {};
++            auto b=TradeProperties::DecodeForm(base),tb=TradeProperties::DecodeForm(targetBase);
++            if (!b || !tb || !b->Valid() || !tb->Valid() || b->Encode()!=base ||
++                tb->Encode()!=targetBase || b->Plugin==Plugin ||
++                (tb->Plugin!=Plugin && base!=targetBase)) return {};
++            c.Refs.push_back({*src,*b,{std::string(Plugin),id},*tb});
++        }
++        else if (tag=="T")
++        {
++            if (!withMovable || row>>extra || !c.GuestDoors.insert(source).second ||
++                std::none_of(c.Refs.begin(),c.Refs.end(),[&](const Ref& r)
++                {return r.Source.Encode()==source && r.Base.Encode()==r.TargetBase.Encode();})) return {};
++        }
++        else if (tag=="N")
++        {
++            if (!(row>>id) || row>>extra || id<0x800 || id>0xFFFFFF ||
++                !targets.insert(id).second || !sources.insert(source).second) return {};
++            c.Navigation.push_back({std::string(Plugin),id});
++        }
++        else if (tag=="A")
++        {
++            if (!(row>>base) || row>>extra || !sources.insert(source).second ||
++                c.ResidentBases.size()>=128) return {};
++            const auto b=TradeProperties::DecodeForm(base);
++            if (!b || !b->Valid() || b->Encode()!=base || b->Plugin==Plugin) return {};
++            c.ResidentCandidates.insert(source);
++            c.ResidentBases.emplace(source,*b);
++        }
++        else if (tag=="U")
++        {
++            if (!(row>>reason) || row>>extra || !sources.insert(source).second) return {};
++            c.Unsupported.insert(source);
++            if (reason=="ACHR") c.ResidentCandidates.insert(source);
++        }
++        else if (tag=="D")
++        {
++            if (!(row>>outside>>id) || !doors.insert(source).second) return {};
++            auto ext=TradeProperties::DecodeForm(outside);
++            if (!ext || !ext->Valid() || ext->Encode()!=outside || ext->Plugin==Plugin ||
++                ext->Encode()==root) return {};
++            Entrance e;e.Door=*src;e.Outside=*ext;e.Exit={std::string(Plugin),id};
++            for (auto& n:e.Pose)
++                if (!(row>>n) || !std::isfinite(std::bit_cast<float>(n))) return {};
++            if (row>>extra || std::none_of(c.Refs.begin(),c.Refs.end(),
++                [&](const Ref& r){return r.Target.Local==id;})) return {};
++            c.Entrances.push_back(std::move(e));
++        }
++        else return {};
++    }
++    if (!in.eof() || result.empty()) return {};
++    if (withMovable)
++        for (auto& [_,cell]:result)
++        {
++            for (const auto& [key,base]:cell.ResidentBases)
++            {
++                const auto it=movable->find(key);
++                if (it==movable->end() || it->second.Encode()!=base.Encode()) return {};
++            }
++            for (const auto& key:cell.GuestDoors)
++            {
++                const auto binding=std::find_if(cell.Refs.begin(),cell.Refs.end(),
++                    [&](const Ref& r){return r.Source.Encode()==key;});
++                if (binding==cell.Refs.end() || std::any_of(cell.Entrances.begin(),cell.Entrances.end(),
++                    [&](const Entrance& e){return e.Exit.Encode()==binding->Target.Encode();})) return {};
+             }
+             cell.Movable=movable;
+         }
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -100,6 +100,6 @@
+ struct VisitState
+ {
+-    uint64_t Campaign{},Character{};uint32_t Slot{},Nonce{},Door{},Copy{},Base{};
++    uint64_t Campaign{},Character{};uint32_t Slot{},Nonce{},Door{},Copy{},Base{},Right{};
+     std::string Root;
+     Clock::time_point Until{},Next{};
+     bool Granted{},Moved{},Ready{};
+@@ -282,5 +282,5 @@
+     if (disabled) return RestoreResult::Ready;
+     auto expected=wanted;expected.Disabled=0;
+-    const auto observed=ObjectPose(object,wanted.Open);
++    const auto observed=ObjectPose(object,wanted.Open,wanted.GuestDoor);
+     if (!observed.Valid()) return RestoreResult::Unavailable;
+     if (observed.Significant(expected))
+@@ -290,5 +290,5 @@
+         object.MoveTo(&cell,glm::vec3{pos(0),pos(1),pos(2)});
+         if (object.GetParentCellEx()!=&cell) return RestoreResult::Unavailable;
+-        if (ObjectPose(object,wanted.Open).Significant(expected)) return RestoreResult::Pending;
++        if (ObjectPose(object,wanted.Open,wanted.GuestDoor).Significant(expected)) return RestoreResult::Pending;
+     }
+     if (type!=29 || !wanted.Open) return RestoreResult::Ready;
+@@ -293,10 +293,10 @@
+     for (const auto& e:catalog.Entrances) if (e.Exit.Encode()==binding.Target.Encode()) return true;
+     return false;
+ }
+-HomeObjects::State ObjectPose(TESObjectREFR& ref,uint32_t open)
+-{
+-    return {ref.IsDisabled()?1u:0u,open,
+-        {std::bit_cast<uint32_t>(ref.position.x),std::bit_cast<uint32_t>(ref.position.y),
+-         std::bit_cast<uint32_t>(ref.position.z),std::bit_cast<uint32_t>(ref.rotation.x),
+-         std::bit_cast<uint32_t>(ref.rotation.y),std::bit_cast<uint32_t>(ref.rotation.z)}};
++HomeObjects::State ObjectPose(TESObjectREFR& ref,uint32_t open,uint32_t guestDoor=0)
++{
++    return {ref.IsDisabled()?1u:0u,open,
++        {std::bit_cast<uint32_t>(ref.position.x),std::bit_cast<uint32_t>(ref.position.y),
++         std::bit_cast<uint32_t>(ref.position.z),std::bit_cast<uint32_t>(ref.rotation.x),
++         std::bit_cast<uint32_t>(ref.rotation.y),std::bit_cast<uint32_t>(ref.rotation.z)},guestDoor};
+ }
+@@ -571,4 +571,4 @@
+                     std::string_view(e.Root.data(),e.Root.size())!=visit.Root || e.AccessRight>2) return;
+-                visit.Granted=e.AccessRight!=0;
++                visit.Right=e.AccessRight;visit.Granted=e.AccessRight!=0;
+                 visit.Until=visit.Granted?Clock::now()+20s:Clock::time_point{};
+                 return;
+@@ -656,6 +656,6 @@
+             if (n!=1 && n!=3) continue;
+             open=n;
+         }
+-        auto state=ObjectPose(*object,open);
++        auto state=ObjectPose(*object,open,open && catalog->GuestDoors.count(key)?1u:0u);
+         if (state.Disabled) state.Transform=old.Value.Transform;
+         if (!HomeObjects::Allowed(old,state)) continue;
+@@ -964,4 +964,42 @@
+             // Exits are handled above; property uses the durable trade path.
+             auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
++            if (visit.Ready && copy && object && object->baseForm &&
++                object->baseForm->formType==FormType::Door && object->GetParentCellEx()==current &&
++                HomeInstance::ProjectionForm(form))
++            {
++                if (!visit.Granted || Clock::now()>=visit.Until || visit.Right!=2)
++                {Utils::ShowHudMessage("Нет разрешения изменять имущество этого дома.");return true;}
++                if (!CampaignAccess::GameReady() || !m_world.GetTransport().IsOnline() ||
++                    object->IsDisabled() || object->IsDeleted() || !NearDoor(*player,form)) return true;
++                const auto identity=CampaignAccess::Current(m_world);
++                if (!identity || identity->Save.Campaign!=visit.Campaign ||
++                    identity->Save.Character!=visit.Character || copy->Root.Encode()!=visit.Root) return true;
++                const auto binding=std::find_if(copy->Refs.begin(),copy->Refs.end(),
++                    [&](const auto& r){return CatalogForm(r.Target)==form;});
++                if (binding==copy->Refs.end() || IsExit(*copy,*binding) ||
++                    object->baseForm->formID!=CatalogForm(binding->TargetBase)) return true;
++                const auto key=binding->Source.Encode();
++                if (!copy->GuestDoors.count(key)) return true;
++                const auto view=CampaignAccess::HomeObjectView(visit.Campaign,visit.Slot);
++                if (!view) return true;
++                const auto it=view->find(key);
++                if (it==view->end() || !it->second.Revision || it->second.Type!=29 ||
++                    !it->second.Value.GuestDoor || it->second.Value.Disabled || !it->second.Value.Open) return true;
++                if (const auto* lock=object->GetLock();lock && lock->IsLocked())
++                {Utils::ShowHudMessage("Дверь заперта.");return true;}
++                auto& vm=m_world.ctx().at<PapyrusService>();
++                const auto* get=vm.Get("ObjectReference","GetOpenState");
++                if (!get) return true;
++                const auto open=static_cast<uint32_t>(PapyrusFunction<TESObjectREFR::OpenState,TESObjectREFR>(get)(object));
++                if (open!=it->second.Value.Open) return true; // wait for confirmed replay/animation
++                RequestPartyHome request;auto& e=request.Event;
++                e.Campaign=visit.Campaign;e.Character=visit.Character;e.House=visit.Slot;
++                e.SaveRevision=identity->Save.Applied.Revision;e.SaveTag=identity->Save.Applied.Tag;
++                e.Profile=identity->Profile.c_str();e.Credential=identity->Credential.Secret.c_str();e.Root=visit.Root.c_str();
++                e.AccessOp=7;e.AccessRevision=it->second.Revision;e.AccessRight=open==1?3u:1u;
++                e.Visible=key.c_str();
++                m_world.GetTransport().Send(request);
++                return true; // never activate the copy or modify state before journal ACK
++            }
+             if (visit.Ready && object && object->baseForm && object->GetParentCellEx()==current &&
+                 HomeInstance::ProjectionForm(form) &&
+diff --git a/Code/server/Services/PartyHome.cpp b/Code/server/Services/PartyHome.cpp
+--- a/Code/server/Services/PartyHome.cpp
++++ b/Code/server/Services/PartyHome.cpp
+@@ -62,4 +62,21 @@
+             auto root=TradeProperties::DecodeForm({e.Root.data(),e.Root.size()});
+             if (!root || !root->Valid()) return;
++            if (e.AccessOp==7)
++            {
++                if (!e.House || e.AccessGuest || (e.AccessRight!=1 && e.AccessRight!=3) ||
++                    e.SnapshotDigest || e.SnapshotPart || e.SnapshotParts || e.Visible.empty()) return;
++                const auto character=CampaignAccess::Character(*owner);
++                const auto home=HomeRegistry::BySlot(link.Journal,e.House);
++                const auto& cell=owner->GetCellComponent().Cell;
++                if (!home || home->Owner==character || home->Root.Encode()!=root->Encode() ||
++                    cell.ModId!=(HomeRegistry::ScopePrefix|e.House) ||
++                    !HomeVisit::CanEnter(*owner,cell.ModId,cell.BaseId) || !owner->GetCharacter()) return;
++                const auto* movement=m_world.try_get<MovementComponent>(*owner->GetCharacter());
++                if (!movement) return;
++                HomeObjects::SetGuestDoor(link.Journal,character,e.House,
++                    std::string(e.Visible.data(),e.Visible.size()),e.AccessRevision,e.AccessRight,
++                    {movement->Position.x,movement->Position.y,movement->Position.z});
++                return;
++            }
+             if (e.AccessOp==6)
+             {
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign24"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign25"

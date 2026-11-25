@@ -51,6 +51,8 @@ def validate(root):
     version=lines.pop(0)
     assert version in ("STM-HOME-INSTANCES 2", "STM-HOME-INSTANCES 3")
     movable={}
+    source_refs={}
+    guest_doors=set()
     for line in lines:
         t,*f = line.split()
         if t=="M":
@@ -81,7 +83,14 @@ def validate(root):
                 assert kind==b"CONT" and fields[b"COCT"]==bytes(4)
                 assert not ({b"VMAD",b"CNTO",b"COED"}&fields.keys())
             else: assert key(original)==key(base)
-            refs.add(refid);sources.add(source)
+            refs.add(refid);sources.add(source);source_refs[source]=(r,refid)
+        elif t=="T":
+            assert version=="STM-HOME-INSTANCES 3"
+            r,source=f
+            assert source not in guest_doors and source in source_refs
+            parent,target=source_refs[source]
+            assert parent==r and b"XTEL" not in dict(records[target][1])
+            guest_doors.add(source)
         elif t=="N":
             r,source,target=f
             fid=own|int(target)

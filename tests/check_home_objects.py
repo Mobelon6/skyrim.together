@@ -17,7 +17,7 @@ int main(int argc,char** argv)
     HomeSnapshot::State s;
     HomeSnapshot::Ref c;c.Key=chest;c.Base={"skyrim.esm",999};c.Type=28;c.Inventory=1;c.Scale=100;
     c.Items={{item,5,{}}};c.LockState=2;c.LockLevel=40;
-    HomeSnapshot::Ref d;d.Key=door;d.Base={"skyrim.esm",998};d.Type=29;d.Scale=100;
+    HomeSnapshot::Ref d;d.Key=door;d.Base={"skyrim.esm",998};d.Type=29;d.Scale=100;d.LockState=1;d.LockLevel=25;
     HomeSnapshot::Ref r;r.Key=loose;r.Base=item;r.Type=32;r.Inventory=3;r.Scale=100;
     r.Items={{item,3,{}}};s.Refs={c,d,r};assert(s.Valid());
     assert(HomeSnapshot::Publish(j,a->Slot,s.Encode())&&HomeSnapshot::Publish(j,b->Slot,s.Encode()));
@@ -26,7 +26,10 @@ int main(int argc,char** argv)
     auto save=j.Current().Revision;
     HomeObjects::Change change{a->Slot,1,save,door.Encode(),old};
     change.Value.Open=1;
-    assert(HomeObjects::Decode(change.Encode()));
+    assert(HomeObjects::Decode(change.Encode())); // legacy row
+    change.Value.GuestDoor=1;
+    assert(HomeObjects::Decode(change.Encode())->Value.GuestDoor==1);
+    assert(!HomeObjects::Decode(change.Encode()+" 1"));
     assert(!HomeObjects::Decode(change.Encode()+" "));
     assert(!HomeObjects::Set(j,202,change,0));
     assert(HomeObjects::Set(j,101,change,0));
@@ -39,6 +42,28 @@ int main(int argc,char** argv)
     assert(HomeObjects::Set(j,101,change,2)&&j.Current()==h);
     change.Value.Open=2;assert(!HomeObjects::Set(j,101,change,2));
     change.Value.Open=0;assert(!HomeObjects::Set(j,101,change,2));
+    using HomePermissions::Right;
+    const std::array<float,3> near{0,0,0},far{1000,0,0},invalidPosition{NAN,0,0};
+    assert(!HomeObjects::SetGuestDoor(j,202,a->Slot,door.Encode(),2,1,near));
+    assert(HomePermissions::Set(j,101,a->Slot,202,Right::Visit,0));
+    assert(!HomeObjects::SetGuestDoor(j,202,a->Slot,door.Encode(),2,1,near));
+    assert(HomePermissions::Set(j,101,a->Slot,202,Right::Modify,1));
+    assert(!HomeObjects::SetGuestDoor(j,202,a->Slot,door.Encode(),2,1,far));
+    assert(!HomeObjects::SetGuestDoor(j,202,a->Slot,door.Encode(),2,1,invalidPosition));
+    assert(!HomeObjects::SetGuestDoor(j,202,a->Slot,chest.Encode(),0,1,near));
+    assert(!HomeObjects::SetGuestDoor(j,202,b->Slot,door.Encode(),0,1,near));
+    assert(HomeLocks::Set(j,101,a->Slot,door.Encode(),0,2,25));
+    assert(!HomeObjects::SetGuestDoor(j,202,a->Slot,door.Encode(),2,1,near));
+    assert(HomeLocks::Set(j,101,a->Slot,door.Encode(),1,1,25));
+    assert(HomeObjects::SetGuestDoor(j,202,a->Slot,door.Encode(),2,1,near));
+    const auto opened=HomeObjects::Read(j,a->Slot)->at(door.Encode());
+    assert(opened.Value.Open==1 && opened.Revision==3 && opened.SaveRevision==save);
+    assert(opened.Value.Transform==old.Transform && opened.Value.GuestDoor==1);
+    h=j.Current();
+    assert(!HomeObjects::SetGuestDoor(j,202,a->Slot,door.Encode(),2,1,near)&&j.Current()==h);
+    assert(HomeObjects::SetGuestDoor(j,202,a->Slot,door.Encode(),3,3,near));
+    assert(HomePermissions::Set(j,101,a->Slot,202,Right::None,2));
+    assert(!HomeObjects::SetGuestDoor(j,202,a->Slot,door.Encode(),4,1,near));
     auto moved=view->at(loose.Encode()).Value;
     moved.Transform[0]=std::bit_cast<uint32_t>(100.f);
     HomeObjects::Change pose{a->Slot,1,save,loose.Encode(),moved};
@@ -71,7 +96,7 @@ int main(int argc,char** argv)
     {
         TradeLedger l(*journal,71);assert(l.Stream()==71);
         const auto v=HomeObjects::Read(*journal,a->Slot);assert(v);
-        assert(v->at(door.Encode()).Revision==2&&v->at(door.Encode()).Value.Open==3);
+        assert(v->at(door.Encode()).Revision==4&&v->at(door.Encode()).Value.Open==3);
         assert(l.HomeState(a->Slot)->Refs[2].Items.empty());
         assert(l.HomeState(b->Slot)->Refs[2].Transform==r.Transform);
         assert(HomeSnapshot::Read(*journal,a->Slot).Bytes==s.Encode());
@@ -97,3 +122,8 @@ assert "RestoreObject(world,cell,*object,old.Type,old.Value.Disabled!=0,old.Valu
 assert "if (!hide && ref->IsDisabled()) ref->Enable();" in home
 assert "if (ctx.SaveRevision<old.SaveRevision)" in home
 assert "Never publish a value in the same tick that restores it" in home
+
+assert "HomeObjects::SetGuestDoor(link.Journal,character,e.House" in server
+assert "e.AccessOp=7;e.AccessRevision=it->second.Revision" in home
+assert "copy->GuestDoors.count(key)" in home
+assert "visit.Right=e.AccessRight" in home
