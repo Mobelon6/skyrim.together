@@ -1,0 +1,334 @@
+diff --git a/Code/common/HomeEstateConstruction.h b/Code/common/HomeEstateConstruction.h
+--- a/Code/common/HomeEstateConstruction.h
++++ b/Code/common/HomeEstateConstruction.h
+@@ -83,4 +83,61 @@
+     return "\nestate-construction "+record->Plot+" "+std::to_string(record->Owner)+" "+
+         std::to_string(record->Revision)+" "+std::to_string(record->BindingId);
+ }
++
++// One observation per plot in this campaign; author is audit metadata only.
++// The bitmap is evidence, not a native building receipt or ownership grant.
++inline std::optional<Record> ReadShared(const CampaignJournal::Journal& journal,const std::string& plot)
++{
++    if (!journal.Ready()||!HomeEstateCatalog::Key(plot)) return {};
++    Record latest;latest.Plot=plot;
++    size_t position=0;
++    for (const auto& op:journal.Operations())
++    {
++        ++position;
++        if (op.Kind!="home-shared-construction-observed-v1") continue;
++        const auto r=Decode(op.Payload);
++        if (!r||op.Id!="home-shared-observed-"+std::to_string(position)||r->SaveRevision>=position) return {};
++        if (r->Plot!=plot) continue;
++        if (latest.Revision==UINT32_MAX||r->Revision!=latest.Revision+1||
++            (latest.Revision&&(r->BindingId!=latest.BindingId||r->Bits.size()!=latest.Bits.size()||
++                r->Bits==latest.Bits))) return {};
++        latest=*r;
++    }
++    return latest;
++}
++enum class SharedObservation { Accepted, Unchanged, Conflict, Invalid };
++inline uint64_t PriorDigest(const Record& r)
++{return r.Revision?HomeSnapshot::Digest(r.Bits):0;}
++inline SharedObservation ObserveShared(CampaignJournal::Journal& journal,const HomeEstateCatalog::Estate& estate,
++    uint64_t author,uint32_t expected,uint32_t saveRevision,uint64_t binding,
++    uint64_t previous,std::string_view bits)
++{
++    if (!author||!binding||binding!=Binding(estate)||!ValidBits(bits)||bits.size()!=estate.Construction.size()||
++        saveRevision>journal.Current().Revision) return SharedObservation::Invalid;
++    const auto old=ReadShared(journal,estate.Quest);
++    if (!old||(old->Revision&&old->BindingId!=binding)) return SharedObservation::Invalid;
++    if (old->Revision!=expected||PriorDigest(*old)!=previous) return SharedObservation::Conflict;
++    if (old->Revision&&old->Bits==bits) return SharedObservation::Unchanged;
++    if (expected==UINT32_MAX||journal.Current().Revision==UINT32_MAX) return SharedObservation::Invalid;
++    const Record r{author,binding,expected+1,saveRevision,estate.Quest,std::string(bits)};
++    return journal.Append(journal.Current(),{"home-shared-observed-"+std::to_string(journal.Current().Revision+1),
++        "home-shared-construction-observed-v1",r.Encode()})==CampaignJournal::Result::Committed?
++            SharedObservation::Accepted:SharedObservation::Invalid;
++}
++inline bool SharedMode() noexcept
++{
++    const auto* flag=std::getenv("STM_SHARED_PROPERTY");
++    return flag&&std::string_view(flag)=="1";
++}
++inline std::optional<std::pair<uint64_t,std::string_view>> Proposal(std::string_view payload)
++{
++    const auto split=payload.find(' ');
++    if (split==std::string_view::npos||!split) return {};
++    uint64_t previous{};
++    const auto parsed=std::from_chars(payload.data(),payload.data()+split,previous);
++    const auto bits=payload.substr(split+1);
++    if (parsed.ec!=std::errc{}||parsed.ptr!=payload.data()+split||
++        std::to_string(previous)!=payload.substr(0,split)||!ValidBits(bits)) return {};
++    return std::pair{previous,bits};
++}
+ }
+diff --git a/Code/client/Services/CampaignAccess.h b/Code/client/Services/CampaignAccess.h
+--- a/Code/client/Services/CampaignAccess.h
++++ b/Code/client/Services/CampaignAccess.h
+@@ -35,3 +35,4 @@
+ std::optional<HomeEstateConstruction::Record> EstateConstruction(uint64_t campaign,uint64_t owner,const std::string& plot);
++std::optional<HomeEstateConstruction::Record> SharedEstateConstruction(uint64_t campaign,const std::string& plot);
+ std::optional<std::string> EstateRoomShape(uint64_t campaign,uint32_t slot,const std::string& root);
+ bool HomeCanModify(uint64_t campaign,uint32_t slot,uint64_t character);
+diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
+--- a/Code/client/Services/Generic/QuestJournal.cpp
++++ b/Code/client/Services/Generic/QuestJournal.cpp
+@@ -165,6 +165,11 @@
+ std::optional<HomeEstateConstruction::Record> CampaignAccess::EstateConstruction(uint64_t campaign,uint64_t owner,const std::string& plot)
+ {
+     if (Mode()!=CampaignReplication::Link::Mode::Ready||campaign!=campaignLink.Campaign) return {};
+     return HomeEstateConstruction::Read(campaignLink.Journal,owner,plot);
+ }
++std::optional<HomeEstateConstruction::Record> CampaignAccess::SharedEstateConstruction(uint64_t campaign,const std::string& plot)
++{
++    if (Mode()!=CampaignReplication::Link::Mode::Ready||campaign!=campaignLink.Campaign) return {};
++    return HomeEstateConstruction::ReadShared(campaignLink.Journal,plot);
++}
+ std::optional<std::string> CampaignAccess::EstateRoomShape(uint64_t campaign,uint32_t slot,const std::string& root)
+diff --git a/Code/server/Services/PartyHome.cpp b/Code/server/Services/PartyHome.cpp
+--- a/Code/server/Services/PartyHome.cpp
++++ b/Code/server/Services/PartyHome.cpp
+@@ -35,4 +35,5 @@
+ bool HomeVisit::CanEnter(Player& player,uint32_t mod,uint32_t base)
+ {
++    if (HomeEstateConstruction::SharedMode()) return false;
+     auto& link=CampaignAccess::Authority();
+     const auto character=CampaignAccess::Character(player);
+@@ -83,6 +84,11 @@
+             auto root=TradeProperties::DecodeForm({e.Root.data(),e.Root.size()});
+             if (!root || !root->Valid()) return;
+-            if (e.AccessOp==9)
+-            {
+-                if (e.House||e.AccessGuest||e.AccessRight||e.SnapshotPart||e.SnapshotParts||!e.SnapshotDigest||
+-                    !HomeEstateConstruction::ValidBits({e.Visible.data(),e.Visible.size()})) return;
++            const bool shared=HomeEstateConstruction::SharedMode();
++            if (shared&&e.AccessOp!=10) return; // no private registration/visit in transition campaign
++            if (e.AccessOp==9||e.AccessOp==10)
++            {
++                if (shared!=(e.AccessOp==10)||e.House||e.AccessGuest||e.AccessRight||
++                    e.SnapshotPart||e.SnapshotParts||!e.SnapshotDigest) return;
++                const std::string_view raw(e.Visible.data(),e.Visible.size());
++                const auto proposal=shared?HomeEstateConstruction::Proposal(raw):std::nullopt;
++                if (shared?!proposal:!HomeEstateConstruction::ValidBits(raw)) return;
+@@ -107,4 +113,10 @@
+                 const auto character=CampaignAccess::Character(*owner);
++                if (shared)
++                {
++                    HomeEstateConstruction::ObserveShared(link.Journal,estate,character,e.AccessRevision,
++                        e.SaveRevision,e.SnapshotDigest,proposal->first,proposal->second);
++                    return;
++                }
+                 HomeEstateConstruction::Publish(link.Journal,estate,character,e.AccessRevision,
+                     e.SaveRevision,e.SnapshotDigest,{e.Visible.data(),e.Visible.size()});
+                 return;
+diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
+--- a/Code/client/Services/Generic/PartyHome.cpp
++++ b/Code/client/Services/Generic/PartyHome.cpp
+@@ -1302,4 +1302,10 @@
+ bool OverlayService::TryHouseDoor(uint32_t form) noexcept
+ {
+     if (HomeGuestSave::Busy()) return true;
++    if (HomeEstateConstruction::SharedMode()&&!originalGuestCell.load())
++    {
++        const auto* p=PlayerCharacter::Get();
++        const auto* cell=p?p->GetParentCellEx():nullptr;
++        if (!cell||!HomeInstance::ProjectionForm(cell->formID)) return false;
++    }
+     // Original owners must use the same reservation path as guests.
+@@ -1320,77 +1326,96 @@
+ struct ConstructionTrack
+ {
+     uint64_t Campaign{},Character{},SaveTag{},Binding{};
+     uint32_t Revision{};
+     std::string Plot,Previous,Pending,Sample;
+     Clock::time_point Next{};
+-    bool Armed{};
+-};
+-ConstructionTrack constructionTrack;
+-void ObserveEstateConstruction(World& world)
+-{
+-    auto& track=constructionTrack;
+-    auto* player=PlayerCharacter::Get();
+-    auto* cell=player?player->GetParentCellEx():nullptr;
+-    if (!player||!cell||!cell->IsAttached()||!cell->worldspace||
+-        originalGuestCell.load()||visit.Nonce||HomeGuestSave::Busy()||
+-        !NativeVisitsEnabled()||!CampaignAccess::GameReady()||!world.GetTransport().IsOnline())
+-    {track={};return;}
+-    const auto now=Clock::now();
+-    if (now<track.Next) return;
+-    track.Next=now+1s;
+-    const auto id=CampaignAccess::Current(world);
+-    const auto worldKey=NativeFormKey(cell->worldspace->formID);
+-    const auto& catalog=HomeEstateCatalog::Host();
+-    if (!id||!worldKey||!catalog) {track={};return;}
+-    const HomeEstateCatalog::Estate* estate=nullptr;
+-    for (const auto& [_,entry]:catalog->Estates)
+-        if (!entry.Construction.empty()&&entry.ContainsCandidate(worldKey->Encode(),player->position.x,player->position.y))
+-        {
+-            if (estate) {track={};return;}
+-            estate=&entry;
+-        }
+-    if (!estate) {track={};return;}
+-    const auto binding=HomeEstateConstruction::Binding(*estate);
+-    if (track.Campaign!=id->Save.Campaign||track.Character!=id->Save.Character||
+-        track.SaveTag!=id->Save.Applied.Tag||track.Plot!=estate->Quest||track.Binding!=binding)
+-    {
+-        track={};track.Campaign=id->Save.Campaign;track.Character=id->Save.Character;
+-        track.SaveTag=id->Save.Applied.Tag;track.Plot=estate->Quest;track.Binding=binding;track.Next=now+1s;
+-    }
+-    std::string bits;bits.reserve(estate->Construction.size());
+-    for (const auto& [source,base]:estate->Construction)
+-    {
+-        const auto key=TradeProperties::DecodeForm(source),baseKey=TradeProperties::DecodeForm(base);
+-        if (!key||!baseKey) {track.Armed=false;return;}
+-        auto* object=Cast<TESObjectREFR>(TESForm::GetById(CatalogForm(*key)));
+-        if (!object||object->IsTemporary()||object->IsDeleted()||Cast<Actor>(object)||
+-            !object->baseForm||object->baseForm->formID!=CatalogForm(*baseKey))
+-        {track.Armed=false;return;}
+-        bits+=object->IsDisabled()?'0':'1';
+-    }
+-    const auto prior=CampaignAccess::EstateConstruction(track.Campaign,track.Character,track.Plot);
+-    if (!prior||(prior->Revision&&(prior->BindingId!=binding||prior->Bits.size()!=bits.size()||
+-        id->Save.Applied.Revision<prior->SaveRevision))) {track.Armed=false;return;}
+-    if (!track.Armed)
+-    {
+-        // A divergent older/local save must not silently replace server state.
+-        if (prior->Revision&&prior->Bits!=bits) return;
+-        track.Armed=true;track.Revision=prior->Revision;track.Previous=prior->Bits;
+-        track.Pending.clear();track.Sample.clear();
+-    }
+-    if (prior->Revision!=track.Revision)
+-    {
+-        if (track.Pending.empty()||prior->Revision!=track.Revision+1||prior->Bits!=track.Pending)
+-        {track.Armed=false;track.Pending.clear();return;}
+-        track.Revision=prior->Revision;track.Previous=prior->Bits;track.Pending.clear();
+-    }
+-    if (bits==track.Previous) {track.Sample.clear();return;}
+-    if (track.Sample!=bits) {track.Sample=bits;return;}
+-    if (!track.Pending.empty()&&track.Pending!=bits) return;
+-    RequestPartyHome request;auto& e=request.Event;
+-    e.Campaign=track.Campaign;e.Character=track.Character;e.SaveTag=id->Save.Applied.Tag;
+-    e.SaveRevision=id->Save.Applied.Revision;e.Profile=id->Profile.c_str();e.Credential=id->Credential.Secret.c_str();
+-    e.Root=track.Plot.c_str();e.AccessOp=9;e.AccessRevision=track.Revision;e.SnapshotDigest=binding;e.Visible=bits.c_str();
++    bool Armed{},ConflictWarned{};
++};
++ConstructionTrack constructionTrack;
++void ObserveEstateConstruction(World& world)
++{
++    auto& track=constructionTrack;
++    const bool shared=HomeEstateConstruction::SharedMode();
++    auto* player=PlayerCharacter::Get();
++    auto* cell=player?player->GetParentCellEx():nullptr;
++    if (!player||!cell||!cell->IsAttached()||!cell->worldspace||
++        originalGuestCell.load()||visit.Nonce||HomeGuestSave::Busy()||
++        (!shared&&!NativeVisitsEnabled())||!CampaignAccess::GameReady()||!world.GetTransport().IsOnline())
++    {track={};return;}
++    const auto now=Clock::now();
++    if (now<track.Next) return;
++    track.Next=now+1s;
++    const auto id=CampaignAccess::Current(world);
++    const auto worldKey=NativeFormKey(cell->worldspace->formID);
++    const auto& catalog=HomeEstateCatalog::Host();
++    if (!id||!worldKey||!catalog) {track={};return;}
++    const HomeEstateCatalog::Estate* estate=nullptr;
++    for (const auto& [_,entry]:catalog->Estates)
++        if (!entry.Construction.empty()&&entry.ContainsCandidate(worldKey->Encode(),player->position.x,player->position.y))
++        {
++            if (estate) {track={};return;}
++            estate=&entry;
++        }
++    if (!estate) {track={};return;}
++    const auto binding=HomeEstateConstruction::Binding(*estate);
++    if (track.Campaign!=id->Save.Campaign||track.Character!=id->Save.Character||
++        track.SaveTag!=id->Save.Applied.Tag||track.Plot!=estate->Quest||track.Binding!=binding)
++    {
++        track={};track.Campaign=id->Save.Campaign;track.Character=id->Save.Character;
++        track.SaveTag=id->Save.Applied.Tag;track.Plot=estate->Quest;track.Binding=binding;track.Next=now+1s;
++    }
++    std::string bits;bits.reserve(estate->Construction.size());
++    for (const auto& [source,base]:estate->Construction)
++    {
++        const auto key=TradeProperties::DecodeForm(source),baseKey=TradeProperties::DecodeForm(base);
++        if (!key||!baseKey) {track.Armed=false;return;}
++        auto* object=Cast<TESObjectREFR>(TESForm::GetById(CatalogForm(*key)));
++        if (!object||object->IsTemporary()||object->IsDeleted()||Cast<Actor>(object)||
++            !object->baseForm||object->baseForm->formID!=CatalogForm(*baseKey))
++        {track.Armed=false;return;}
++        bits+=object->IsDisabled()?'0':'1';
++    }
++    const auto prior=shared?CampaignAccess::SharedEstateConstruction(track.Campaign,track.Plot):
++        CampaignAccess::EstateConstruction(track.Campaign,track.Character,track.Plot);
++    if (!prior||(prior->Revision&&(prior->BindingId!=binding||prior->Bits.size()!=bits.size()||
++        (!shared&&id->Save.Applied.Revision<prior->SaveRevision)))) {track.Armed=false;return;}
++    const auto conflict=[&]()
++    {
++        track.Armed=false;track.Pending.clear();track.Sample.clear();
++        if (shared&&!track.ConflictWarned)
++        {
++            track.ConflictWarned=true;
++            Utils::ShowHudMessage("Строительство отличается от состояния кампании. Требуется согласование.");
++        }
++    };
++    if (!track.Armed)
++    {
++        // A divergent older/local save must not silently replace server state.
++        if (prior->Revision&&prior->Bits!=bits) {conflict();return;}
++        track.ConflictWarned=false;
++        track.Armed=true;track.Revision=prior->Revision;track.Previous=prior->Bits;
++        track.Pending.clear();track.Sample.clear();
++    }
++    if (prior->Revision!=track.Revision)
++    {
++        if (shared&&prior->Bits==bits)
++        {
++            track.Revision=prior->Revision;track.Previous=prior->Bits;
++            track.Pending.clear();track.Sample.clear();track.ConflictWarned=false;return;
++        }
++        if (track.Pending.empty()||prior->Revision!=track.Revision+1||prior->Bits!=track.Pending)
++        {conflict();return;}
++        track.Revision=prior->Revision;track.Previous=prior->Bits;track.Pending.clear();
++    }
++    if (bits==track.Previous) {track.Sample.clear();return;}
++    if (track.Sample!=bits) {track.Sample=bits;return;}
++    if (!track.Pending.empty()&&track.Pending!=bits) return;
++    RequestPartyHome request;auto& e=request.Event;
++    e.Campaign=track.Campaign;e.Character=track.Character;e.SaveTag=id->Save.Applied.Tag;
++    e.SaveRevision=id->Save.Applied.Revision;e.Profile=id->Profile.c_str();e.Credential=id->Credential.Secret.c_str();
++    e.Root=track.Plot.c_str();e.AccessOp=shared?10:9;e.AccessRevision=track.Revision;e.SnapshotDigest=binding;
++    const auto payload=shared?std::to_string(HomeEstateConstruction::PriorDigest(*prior))+" "+bits:bits;
++    e.Visible=payload.c_str();
+     if (world.GetTransport().Send(request)) {track.Pending=bits;track.Next=now+3s;}
+ }
+ }
+@@ -1662,3 +1687,9 @@
+     UpdateSeat(m_world);
+     try {ObserveEstateConstruction(m_world);} catch (...) {constructionTrack={};}
++    if (HomeEstateConstruction::SharedMode()&&!originalGuestCell.load())
++    {
++        auto* p=PlayerCharacter::Get();
++        auto* cell=p?p->GetParentCellEx():nullptr;
++        if (!cell||!HomeInstance::ProjectionForm(cell->formID)) return;
++    }
+     if (!visit.Nonce && !HomeGuestSave::Busy() && NativeVisitsEnabled() &&
+@@ -2240,4 +2271,11 @@
+         const auto id=world.GetTransport().GetLocalPlayerId();
+         const auto mode=CampaignAccess::Mode();
++        if (HomeEstateConstruction::SharedMode()&&!NativeGuestCell(cell->formID)&&
++            !HomeInstance::ProjectionForm(cell->formID))
++        {
++            activeHomeRoute.store(0);projectedRoot.store(0);
++            acknowledgedHome={};baselineUpload={};residentContext={};objectContext={};lockContext={};
++            return; // ordinary physical CELL; no private registration or owner recovery
++        }
+         if (NativeGuestCell(cell->formID))
+         {
+diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
+--- a/Code/common/BuildInfo.h.in
++++ b/Code/common/BuildInfo.h.in
+@@ -1,4 +1,4 @@
+ #pragma once
+ // This file was autogenerated by xmake
+ #define BUILD_BRANCH "${GIT_BRANCH}"
+-#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign46"
++#define BUILD_COMMIT "${GIT_TAG}-coop-interaction7-campaign47"

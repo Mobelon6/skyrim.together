@@ -151,6 +151,23 @@ int main(int argc,char** argv)
     assert(HomeEstateConstruction::RoomShape(buildRestart,*buildCatalog,foreign->Slot,secondKey)==std::optional<std::string>{""});
     assert(!HomeEstateConstruction::RoomShape(buildRestart,*catalog,first->Slot,main)); // changed binding
     assert(!HomeEstateConstruction::Decode(buildState->Encode()+" "));
+    using O=HomeEstateConstruction::SharedObservation;
+    const auto shared0=HomeEstateConstruction::ReadShared(buildRestart,q);
+    assert(shared0&&shared0->Revision==0); // old per-owner histories are not merged
+    assert(HomeEstateConstruction::ObserveShared(buildRestart,*buildEstate,101,0,0,binding,0,"01")==O::Accepted);
+    const auto shared1=HomeEstateConstruction::ReadShared(buildRestart,q);
+    assert(shared1&&shared1->Revision==1&&shared1->Owner==101&&shared1->Bits=="01");
+    const auto baseDigest=HomeEstateConstruction::PriorDigest(*shared1);
+    assert(HomeEstateConstruction::ObserveShared(buildRestart,*buildEstate,202,0,0,binding,0,"10")==O::Conflict);
+    assert(HomeEstateConstruction::ObserveShared(buildRestart,*buildEstate,202,1,0,binding,0,"10")==O::Conflict);
+    assert(HomeEstateConstruction::ObserveShared(buildRestart,*buildEstate,202,1,0,binding,baseDigest,"01")==O::Unchanged);
+    assert(HomeEstateConstruction::ObserveShared(buildRestart,*buildEstate,202,1,0,binding,baseDigest,"11")==O::Accepted);
+    CampaignJournal::Journal sharedRestart;assert(sharedRestart.Open(argv[1],71,"profile",false));
+    const auto shared2=HomeEstateConstruction::ReadShared(sharedRestart,q);
+    assert(shared2&&shared2->Revision==2&&shared2->Owner==202&&shared2->Bits=="11");
+    assert(HomeEstateConstruction::Read(sharedRestart,101,q)->Revision==2);
+    assert(!HomeEstateConstruction::Proposal("00 01")&&!HomeEstateConstruction::Proposal("0 02"));
+    assert(HomeEstateConstruction::Proposal("0 01")->second=="01");
     std::istringstream duplicateBuild(buildRows+"C "+q+" "+table+" "+main+"\n");
     assert(!HomeEstateCatalog::Read(duplicateBuild));
     assert(!DecodeGroup("101 303 2 2 2 1"));
