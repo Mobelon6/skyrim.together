@@ -566,128 +566,12 @@ diff --git a/Code/common/HomeResidentPlan.h b/Code/common/HomeResidentPlan.h
 diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/Generic/PartyHome.cpp
 --- a/Code/client/Services/Generic/PartyHome.cpp
 +++ b/Code/client/Services/Generic/PartyHome.cpp
-@@ -443,121 +443,155 @@
+@@ -443,8 +443,14 @@
      if (!reference) return {};
      const auto local=CatalogForm(*reference);
      auto* actor=local?Cast<Actor>(TESForm::GetById(local)):nullptr;
 -    if (!actor || actor->formID==0x14 || actor->IsTemporary() || actor->GetParentCellEx()!=&cell ||
 -        actor->IsStillLoading() || !actor->GetExtension() || actor->GetExtension()->IsRemote()) return {};
--    auto* npc=actor->GetLeveledPick();
--    if (!npc || npc->IsTemporary()) npc=Cast<TESNPC>(actor->baseForm);
--    if (!npc || npc->IsTemporary()) return {};
--    auto base=InventoryEvidence::Resolve(npc->formID,slots);
--    if (!base) return {};
--    HomeResidents::State s;
--    s.Reference=*reference;s.Base={base->Plugin,base->Local};
--    s.Flags=(actor->IsDisabled()?1u:0u)|(actor->IsDead()?2u:0u)|(actor->IsDeleted()?4u:0u);
--    s.Scale=actor->scale;
--    s.Transform={std::bit_cast<uint32_t>(actor->position.x),std::bit_cast<uint32_t>(actor->position.y),
--        std::bit_cast<uint32_t>(actor->position.z),std::bit_cast<uint32_t>(actor->rotation.x),
--        std::bit_cast<uint32_t>(actor->rotation.y),std::bit_cast<uint32_t>(actor->rotation.z)};
--    if (!s.Valid()) return {};
--    return s;
--}
--
--HomeResidents::Recovery RestoreResident(TESObjectCELL& cell,const HomeResidents::State& committed,
--    const HomeResidents::State& observed,const std::vector<InventoryEvidence::PluginSlot>& slots)
--{
--    using HomeResidents::Recovery;
--    const auto plan=HomeResidents::RecoveryPlan(committed,observed);
--    if (plan!=Recovery::Restore) return plan;
--    auto* actor=Cast<Actor>(TESForm::GetById(CatalogForm(committed.Reference)));
--    if (!actor || actor->formID==0x14 || actor->IsTemporary() || actor->IsDeleted() ||
--        actor->GetParentCellEx()!=&cell || actor->IsStillLoading() ||
--        !actor->GetExtension() || actor->GetExtension()->IsRemote()) return Recovery::Conflict;
--    const bool disabled=(committed.Flags&1u)!=0;
--    if (actor->IsDisabled()!=disabled)
--    {if (disabled) actor->Disable();else actor->Enable();}
--    if (actor->IsDisabled()!=disabled) return Recovery::Restore;
--    if (!disabled)
--    {
--        const auto v=[&](size_t n){return std::bit_cast<float>(committed.Transform[n]);};
--        actor->SetRotation(v(3),v(4),v(5));
--        actor->MoveTo(&cell,glm::vec3{v(0),v(1),v(2)});
--    }
--    const auto actual=ObserveResident(committed.Reference.Encode(),cell,slots);
--    return actual?HomeResidents::RecoveryPlan(committed,*actual):Recovery::Restore;
--}
--void SyncResidents(World& world,TESObjectCELL& cell,const CampaignAccess::Identity& identity,
--                   uint32_t slot,const std::string& root,const std::vector<InventoryEvidence::PluginSlot>& slots)
--{
--    auto& ctx=residentContext;
--    if (ctx.Campaign!=identity.Save.Campaign || ctx.Character!=identity.Save.Character ||
--        ctx.Slot!=slot || ctx.Cell!=cell.formID || ctx.SaveRevision!=identity.Save.Applied.Revision ||
--        ctx.SaveTag!=identity.Save.Applied.Tag)
--    {
--        ctx={};ctx.Campaign=identity.Save.Campaign;ctx.Character=identity.Save.Character;
--        ctx.Slot=slot;ctx.Cell=cell.formID;ctx.SaveRevision=identity.Save.Applied.Revision;ctx.SaveTag=identity.Save.Applied.Tag;
--    }
--    const auto now=Clock::now();
--    if (now<ctx.Next || !cell.IsAttached()) return;
--    ctx.Next=now+3s;
--    const auto* catalog=CatalogCell(cell.formID);
--    if (!catalog || catalog->ResidentCandidates.empty() ||
--        catalog->ResidentCandidates.size()>HomeResidents::MaxResidents) return;
--    const auto view=CampaignAccess::HomeResidentView(ctx.Campaign,slot);
--    if (!view) {ctx.Tracks.clear();return;}
--    // Bound network traffic and do not interpret missing actors as deletion.
--    unsigned budget=4;
--    const auto& candidates=catalog->ResidentCandidates;
--    auto next=candidates.upper_bound(ctx.LastKey);
--    for (size_t checked=0;checked<candidates.size() && budget;++checked)
--    {
--        if (next==candidates.end()) next=candidates.begin();
--        const auto& key=*next++;ctx.LastKey=key;
--        auto state=ObserveResident(key,cell,slots);
--        if (!state) {ctx.Tracks.erase(key);continue;}
--        const auto found=view->find(key);
--        const auto* old=found==view->end()?nullptr:&found->second;
--        auto tracked=ctx.Tracks.find(key);
--        const auto revision=old?old->Revision:0;
--        // Recognize our acknowledged observation before deciding whether a
--        // revision mismatch needs restoration. An ACK is not a new save.
--        if (tracked!=ctx.Tracks.end() && tracked->second.Pending && old &&
--            tracked->second.Revision!=UINT32_MAX && revision==tracked->second.Revision+1 &&
--            old->Value.Encode()==tracked->second.Pending->Encode())
--        {
--            tracked->second.Revision=revision;tracked->second.Pending.reset();
--            tracked->second.Retry=now+15s;
--        }
--        if (old && (tracked==ctx.Tracks.end() || tracked->second.Revision!=revision))
--        {
--            const auto result=RestoreResident(cell,old->Value,*state,slots);
--            if (result==HomeResidents::Recovery::Conflict)
--            {
--                if (ctx.RecoveryConflicts.insert(key).second)
--                    spdlog::warn("STM: residential NPC recovery conflict (slot {}, reference {})",slot,key);
--                ctx.Tracks.erase(key);continue;
--            }
--            if (result!=HomeResidents::Recovery::Matched)
--            {ctx.Tracks.erase(key);continue;}
--            ctx.RecoveryConflicts.erase(key);
--            ctx.Tracks.insert_or_assign(key,ResidentTrack{revision,{},{}});
--            // Never publish a value in the same tick that restores it.
--            continue;
--        }
--        if (tracked==ctx.Tracks.end())
--            tracked=ctx.Tracks.emplace(key,ResidentTrack{revision,{},{}}).first;
--        auto& t=tracked->second;
--        if (now<t.Retry) continue;
--        t.Pending.reset();
--        if (old && (ctx.SaveRevision<old->SaveRevision || old->Value.Base.Encode()!=state->Base.Encode()))
--            continue;
--        if (old && (state->Flags&1u)) state->Transform=old->Value.Transform;
--        if (old && !state->Significant(old->Value)) continue;
--        RequestPartyHome req;auto& e=req.Event;
--        e.House=slot;e.Campaign=ctx.Campaign;e.Character=ctx.Character;
--        e.SaveRevision=ctx.SaveRevision;e.SaveTag=ctx.SaveTag;
--        e.Profile=identity.Profile.c_str();e.Credential=identity.Credential.Secret.c_str();e.Root=root.c_str();
--        e.AccessOp=5;e.AccessRevision=t.Revision;e.Visible=state->Encode().c_str();
--        t.Retry=now+15s;
--        if (world.GetTransport().Send(req)) {t.Pending=*state;--budget;}
--    }
--}
--
 +    if (!actor || actor->formID==0x14 || actor->IsTemporary() ||
 +        actor->IsStillLoading() || !actor->GetExtension() || actor->GetExtension()->IsRemote() ||
 +        actor->GetExtension()->IsPlayer()) return {};
@@ -696,63 +580,28 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +    // pointer to another original cell proves a crossing, not unload.
 +    if (away && (!actor->parentCell || actor->parentCell==&cell ||
 +        HomeInstance::ProjectionForm(actor->parentCell->formID))) return {};
-+    auto* npc=actor->GetLeveledPick();
-+    if (!npc || npc->IsTemporary()) npc=Cast<TESNPC>(actor->baseForm);
-+    if (!npc || npc->IsTemporary()) return {};
-+    auto base=InventoryEvidence::Resolve(npc->formID,slots);
-+    if (!base) return {};
-+    HomeResidents::State s;
-+    s.Reference=*reference;s.Base={base->Plugin,base->Local};
+     auto* npc=actor->GetLeveledPick();
+     if (!npc || npc->IsTemporary()) npc=Cast<TESNPC>(actor->baseForm);
+     if (!npc || npc->IsTemporary()) return {};
+@@ -452,7 +458,7 @@
+     if (!base) return {};
+     HomeResidents::State s;
+     s.Reference=*reference;s.Base={base->Plugin,base->Local};
+-    s.Flags=(actor->IsDisabled()?1u:0u)|(actor->IsDead()?2u:0u)|(actor->IsDeleted()?4u:0u);
 +    s.Flags=(actor->IsDisabled()?1u:0u)|(actor->IsDead()?2u:0u)|(actor->IsDeleted()?4u:0u)|(away?8u:0u);
-+    s.Scale=actor->scale;
-+    s.Transform={std::bit_cast<uint32_t>(actor->position.x),std::bit_cast<uint32_t>(actor->position.y),
-+        std::bit_cast<uint32_t>(actor->position.z),std::bit_cast<uint32_t>(actor->rotation.x),
-+        std::bit_cast<uint32_t>(actor->rotation.y),std::bit_cast<uint32_t>(actor->rotation.z)};
-+    if (!s.Valid()) return {};
-+    return s;
-+}
-+
-+HomeResidents::Recovery RestoreResident(TESObjectCELL& cell,const HomeResidents::State& committed,
-+    const HomeResidents::State& observed,const std::vector<InventoryEvidence::PluginSlot>& slots)
-+{
-+    using HomeResidents::Recovery;
-+    const auto plan=HomeResidents::RecoveryPlan(committed,observed);
-+    if (plan!=Recovery::Restore) return plan;
-+    auto* actor=Cast<Actor>(TESForm::GetById(CatalogForm(committed.Reference)));
-+    if (!actor || actor->formID==0x14 || actor->IsTemporary() || actor->IsDeleted() ||
-+        actor->GetParentCellEx()!=&cell || actor->IsStillLoading() ||
-+        !actor->GetExtension() || actor->GetExtension()->IsRemote()) return Recovery::Conflict;
-+    const bool disabled=(committed.Flags&1u)!=0;
-+    if (actor->IsDisabled()!=disabled)
-+    {if (disabled) actor->Disable();else actor->Enable();}
-+    if (actor->IsDisabled()!=disabled) return Recovery::Restore;
-+    if (!disabled)
-+    {
-+        const auto v=[&](size_t n){return std::bit_cast<float>(committed.Transform[n]);};
-+        actor->SetRotation(v(3),v(4),v(5));
-+        actor->MoveTo(&cell,glm::vec3{v(0),v(1),v(2)});
-+    }
-+    const auto actual=ObserveResident(committed.Reference.Encode(),cell,slots);
-+    return actual?HomeResidents::RecoveryPlan(committed,*actual):Recovery::Restore;
-+}
-+void SyncResidents(World& world,TESObjectCELL& cell,const CampaignAccess::Identity& identity,
-+                   uint32_t slot,const std::string& root,const std::vector<InventoryEvidence::PluginSlot>& slots)
-+{
-+    auto& ctx=residentContext;
-+    if (ctx.Campaign!=identity.Save.Campaign || ctx.Character!=identity.Save.Character ||
-+        ctx.Slot!=slot || ctx.Cell!=cell.formID || ctx.SaveRevision!=identity.Save.Applied.Revision ||
-+        ctx.SaveTag!=identity.Save.Applied.Tag)
-+    {
-+        ctx={};ctx.Campaign=identity.Save.Campaign;ctx.Character=identity.Save.Character;
-+        ctx.Slot=slot;ctx.Cell=cell.formID;ctx.SaveRevision=identity.Save.Applied.Revision;ctx.SaveTag=identity.Save.Applied.Tag;
-+    }
-+    const auto now=Clock::now();
-+    if (now<ctx.Next || !cell.IsAttached()) return;
-+    ctx.Next=now+3s;
-+    const auto* catalog=CatalogCell(cell.formID);
+     s.Scale=actor->scale;
+     s.Transform={std::bit_cast<uint32_t>(actor->position.x),std::bit_cast<uint32_t>(actor->position.y),
+         std::bit_cast<uint32_t>(actor->position.z),std::bit_cast<uint32_t>(actor->rotation.x),
+@@ -499,22 +505,46 @@
+     if (now<ctx.Next || !cell.IsAttached()) return;
+     ctx.Next=now+3s;
+     const auto* catalog=CatalogCell(cell.formID);
+-    if (!catalog || catalog->ResidentCandidates.empty() ||
+-        catalog->ResidentCandidates.size()>HomeResidents::MaxResidents) return;
 +    if (!catalog) return;
-+    const auto view=CampaignAccess::HomeResidentView(ctx.Campaign,slot);
-+    if (!view) {ctx.Tracks.clear();return;}
+     const auto view=CampaignAccess::HomeResidentView(ctx.Campaign,slot);
+     if (!view) {ctx.Tracks.clear();return;}
+-    // Bound network traffic and do not interpret missing actors as deletion.
 +    // Keep immutable static coverage, observe previously admitted occupants
 +    // even after they move away, and discover eligible stable arrivals.
 +    std::set<std::string> candidates;
@@ -762,7 +611,8 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +    if (catalog->Movable && cell.refData.refArray && cell.refData.capacity<=131072)
 +        for (uint32_t i=0;i<cell.refData.capacity;++i)
 +        {
-+            auto* actor=Cast<Actor>(cell.refData.refArray[i].Get());
++            auto* ref=cell.refData.refArray[i].Get();
++            auto* actor=ref?Cast<Actor>(ref):nullptr;
 +            if (!actor || actor->formID==0x14 || actor->IsTemporary() ||
 +                actor->GetParentCellEx()!=&cell || !actor->GetExtension() ||
 +                actor->GetExtension()->IsRemote() || actor->GetExtension()->IsPlayer()) continue;
@@ -773,196 +623,70 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +        }
 +    if (candidates.empty() || candidates.size()>HomeResidents::MaxResidents) return;
 +    // Bound traffic; missing/unloaded references do not establish departure.
-+    unsigned budget=4;
-+    auto next=candidates.upper_bound(ctx.LastKey);
-+    for (size_t checked=0;checked<candidates.size() && budget;++checked)
-+    {
-+        if (next==candidates.end()) next=candidates.begin();
-+        const auto& key=*next++;ctx.LastKey=key;
-+        auto state=ObserveResident(key,cell,slots);
+     unsigned budget=4;
+-    const auto& candidates=catalog->ResidentCandidates;
+     auto next=candidates.upper_bound(ctx.LastKey);
+     for (size_t checked=0;checked<candidates.size() && budget;++checked)
+     {
+         if (next==candidates.end()) next=candidates.begin();
+         const auto& key=*next++;ctx.LastKey=key;
+         auto state=ObserveResident(key,cell,slots);
+-        if (!state) {ctx.Tracks.erase(key);continue;}
 +        if (!state) continue;
 +        const auto* expectedBase=HomeCatalog::ResidentBase(*catalog,key);
 +        if (!expectedBase || state->Base.Encode()!=expectedBase->Encode())
 +        {ctx.Tracks.erase(key);continue;}
-+        const auto found=view->find(key);
-+        const auto* old=found==view->end()?nullptr:&found->second;
+         const auto found=view->find(key);
+         const auto* old=found==view->end()?nullptr:&found->second;
 +        // Do not register an unrelated off-site actor discovered only through
 +        // the global pool. A static binding or prior observation is required.
 +        if (!old && state->Away() && !catalog->ResidentBases.count(key)) continue;
-+        auto tracked=ctx.Tracks.find(key);
-+        const auto revision=old?old->Revision:0;
-+        // Recognize our acknowledged observation before deciding whether a
-+        // revision mismatch needs restoration. An ACK is not a new save.
-+        if (tracked!=ctx.Tracks.end() && tracked->second.Pending && old &&
-+            tracked->second.Revision!=UINT32_MAX && revision==tracked->second.Revision+1 &&
-+            old->Value.Encode()==tracked->second.Pending->Encode())
-+        {
-+            tracked->second.Revision=revision;tracked->second.Pending.reset();
-+            tracked->second.Retry=now+15s;
-+        }
-+        if (old && (tracked==ctx.Tracks.end() || tracked->second.Revision!=revision))
-+        {
+         auto tracked=ctx.Tracks.find(key);
+         const auto revision=old?old->Revision:0;
+         // Recognize our acknowledged observation before deciding whether a
+@@ -528,6 +558,12 @@
+         }
+         if (old && (tracked==ctx.Tracks.end() || tracked->second.Revision!=revision))
+         {
 +            if (HomeResidents::CanObservePresence(*old,ctx.SaveRevision,*state))
 +            {
 +                ctx.RecoveryConflicts.erase(key);
 +                ctx.Tracks.insert_or_assign(key,ResidentTrack{revision,{},{}});
 +                continue;
 +            }
-+            const auto result=RestoreResident(cell,old->Value,*state,slots);
-+            if (result==HomeResidents::Recovery::Conflict)
-+            {
-+                if (ctx.RecoveryConflicts.insert(key).second)
-+                    spdlog::warn("STM: residential NPC recovery conflict (slot {}, reference {})",slot,key);
-+                ctx.Tracks.erase(key);continue;
-+            }
-+            if (result!=HomeResidents::Recovery::Matched)
-+            {ctx.Tracks.erase(key);continue;}
-+            ctx.RecoveryConflicts.erase(key);
-+            ctx.Tracks.insert_or_assign(key,ResidentTrack{revision,{},{}});
-+            // Never publish a value in the same tick that restores it.
-+            continue;
-+        }
-+        if (tracked==ctx.Tracks.end())
-+            tracked=ctx.Tracks.emplace(key,ResidentTrack{revision,{},{}}).first;
-+        auto& t=tracked->second;
-+        if (now<t.Retry) continue;
-+        t.Pending.reset();
-+        if (old && (ctx.SaveRevision<old->SaveRevision || old->Value.Base.Encode()!=state->Base.Encode()))
-+            continue;
+             const auto result=RestoreResident(cell,old->Value,*state,slots);
+             if (result==HomeResidents::Recovery::Conflict)
+             {
+@@ -549,7 +585,7 @@
+         t.Pending.reset();
+         if (old && (ctx.SaveRevision<old->SaveRevision || old->Value.Base.Encode()!=state->Base.Encode()))
+             continue;
+-        if (old && (state->Flags&1u)) state->Transform=old->Value.Transform;
 +        if (old && (state->Flags&9u)) state->Transform=old->Value.Transform;
-+        if (old && !state->Significant(old->Value)) continue;
-+        RequestPartyHome req;auto& e=req.Event;
-+        e.House=slot;e.Campaign=ctx.Campaign;e.Character=ctx.Character;
-+        e.SaveRevision=ctx.SaveRevision;e.SaveTag=ctx.SaveTag;
-+        e.Profile=identity.Profile.c_str();e.Credential=identity.Credential.Secret.c_str();e.Root=root.c_str();
-+        e.AccessOp=5;e.AccessRevision=t.Revision;e.Visible=state->Encode().c_str();
-+        t.Retry=now+15s;
-+        if (world.GetTransport().Send(req)) {t.Pending=*state;--budget;}
-+    }
-+}
-@@ -674,94 +708,113 @@
+         if (old && !state->Significant(old->Value)) continue;
+         RequestPartyHome req;auto& e=req.Event;
+         e.House=slot;e.Campaign=ctx.Campaign;e.Character=ctx.Character;
+@@ -671,7 +707,8 @@
+     bool Confirmed{};
+ };
+ BaselineUpload baselineUpload;
 -std::optional<std::string> CaptureStatic(TESObjectCELL& cell,const std::vector<InventoryEvidence::PluginSlot>& slots)
--{
--    if (!cell.IsAttached() || !cell.refData.refArray || !cell.refData.capacity ||
--        cell.refData.capacity>131072) return {};
--    HomeSnapshot::State state;
--    const auto* catalog=CatalogCell(cell.formID);
--    for (uint32_t i=0;i<cell.refData.capacity;++i)
--    {
--        auto* ref=cell.refData.refArray[i].Get();
--        if (!ref) continue;
--        if (ref->formID==0x14 || NativeTrade::IsProxy(ref) || HomePlacementClient::Tracked(ref)) continue;
--        if (ref->IsTemporary() && !Cast<Actor>(ref) && ref->GetParentCellEx()==&cell)
--        {
--            if (ref->IsDeleted() || ref->IsDisabled()) continue;
--            if (auto item=HomePlacementClient::CaptureLegacy(*ref))
--            {
--                state.Legacy.push_back(std::move(*item));
--                if (state.Legacy.size()>2048) return {};
--                continue;
--            }
--        }
--        if (catalog && Cast<Actor>(ref) && !ref->IsTemporary())
--        {
--            const auto key=InventoryEvidence::Resolve(ref->formID,slots);
--            if (key)
--            {
--                const auto encoded=TradeProperties::FormKey{key->Plugin,key->Local}.Encode();
--                const auto known=catalog->ResidentBases.find(encoded);
--                if (known!=catalog->ResidentBases.end())
--                {
--                    const auto observed=ObserveResident(encoded,cell,slots);
--                    if (!observed || observed->Base.Encode()!=known->second.Encode()) return {};
--                    state.ResidentKeys.insert(encoded);
--                    continue;
--                }
--            }
--        }
--        if (!ref->baseForm || ref->IsTemporary() || ref->baseForm->IsTemporary() ||
--            Cast<Actor>(ref) ||
--            ref->GetParentCellEx()!=&cell)
--        {++state.Omitted;continue;}
--        auto key=InventoryEvidence::Resolve(ref->formID,slots);
--        auto base=InventoryEvidence::Resolve(ref->baseForm->formID,slots);
--        if (!key || !base) {++state.Omitted;continue;}
--        HomeSnapshot::Ref row;
--        row.Key={key->Plugin,key->Local};row.Base={base->Plugin,base->Local};
--        row.Type=static_cast<uint32_t>(ref->baseForm->formType);
--        row.Flags=(ref->IsDisabled()?1u:0u)|(ref->IsDeleted()?2u:0u);
--        row.Scale=ref->scale;
--        if (auto* lock=ref->GetLock())
--        {row.LockState=lock->IsLocked()?2u:1u;row.LockLevel=static_cast<uint8_t>(lock->lockLevel);}
--        row.Transform={std::bit_cast<uint32_t>(ref->position.x),std::bit_cast<uint32_t>(ref->position.y),
--            std::bit_cast<uint32_t>(ref->position.z),std::bit_cast<uint32_t>(ref->rotation.x),
--            std::bit_cast<uint32_t>(ref->rotation.y),std::bit_cast<uint32_t>(ref->rotation.z)};
--        if (ref->baseForm->formType==FormType::Container)
--        {
--            auto items=HomeInventory::Capture(*ref);
--            row.Inventory=items?1:2;
--            if (items) row.Items=std::move(*items);
--        }
--        else if (HomeSnapshot::LooseType(row.Type))
--        {
--            auto items=HomeInventory::CaptureLoose(*ref);
--            if (items) {row.Inventory=3;row.Items=std::move(*items);}
--            else ++state.Omitted;
--        }
--        state.Refs.push_back(std::move(row));
--        if (state.Refs.size()>16384) return {};
--    }
--    if (catalog && state.ResidentKeys.size()!=catalog->ResidentBases.size()) return {};
--    std::sort(state.Refs.begin(),state.Refs.end(),[](const auto& a,const auto& b){return a.Key.Encode()<b.Key.Encode();});
--    std::sort(state.Legacy.begin(),state.Legacy.end(),[](const auto& a,const auto& b){return a.Source<b.Source;});
--    if (!state.Valid()) return {};
--    auto bytes=state.Encode();
--    if (bytes.size()>HomeSnapshot::MaxBytes) return {};
--    return bytes;
--}
--void UploadBaseline(World& world,TESObjectCELL& cell,const CampaignAccess::Identity& identity,
--                    uint32_t slot,const std::string& root,const std::vector<InventoryEvidence::PluginSlot>& slots)
--{
--    auto& u=baselineUpload;
--    if (u.Slot!=slot || u.Campaign!=identity.Save.Campaign || u.Character!=identity.Save.Character)
--    {u={};u.Slot=slot;u.Campaign=identity.Save.Campaign;u.Character=identity.Save.Character;}
--    if (u.Confirmed) return;
--    const auto state=CampaignAccess::HomeBaselineState(u.Campaign,slot);
--    if (state!=0) {u.Bytes.clear();u.Confirmed=true;return;}
--    const auto now=Clock::now();
--    if (now<u.Retry) return;
--    if (!u.Next)
--    {
--        auto observed=CaptureStatic(cell,slots);
 +std::optional<std::string> CaptureStatic(TESObjectCELL& cell,const std::vector<InventoryEvidence::PluginSlot>& slots,
 +    const HomeResidents::Residents& records)
-+{
-+    if (!cell.IsAttached() || !cell.refData.refArray || !cell.refData.capacity ||
-+        cell.refData.capacity>131072) return {};
-+    HomeSnapshot::State state;
-+    const auto* catalog=CatalogCell(cell.formID);
-+    for (uint32_t i=0;i<cell.refData.capacity;++i)
-+    {
-+        auto* ref=cell.refData.refArray[i].Get();
-+        if (!ref) continue;
-+        if (ref->formID==0x14 || NativeTrade::IsProxy(ref) || HomePlacementClient::Tracked(ref)) continue;
-+        if (ref->IsTemporary() && !Cast<Actor>(ref) && ref->GetParentCellEx()==&cell)
-+        {
-+            if (ref->IsDeleted() || ref->IsDisabled()) continue;
-+            if (auto item=HomePlacementClient::CaptureLegacy(*ref))
-+            {
-+                state.Legacy.push_back(std::move(*item));
-+                if (state.Legacy.size()>2048) return {};
-+                continue;
-+            }
-+        }
-+        if (catalog && Cast<Actor>(ref) && !ref->IsTemporary())
-+        {
-+            const auto key=InventoryEvidence::Resolve(ref->formID,slots);
-+            if (key)
-+            {
-+                const auto encoded=TradeProperties::FormKey{key->Plugin,key->Local}.Encode();
+ {
+     if (!cell.IsAttached() || !cell.refData.refArray || !cell.refData.capacity ||
+         cell.refData.capacity>131072) return {};
+@@ -698,12 +735,18 @@
+             if (key)
+             {
+                 const auto encoded=TradeProperties::FormKey{key->Plugin,key->Local}.Encode();
+-                const auto known=catalog->ResidentBases.find(encoded);
+-                if (known!=catalog->ResidentBases.end())
 +                if (const auto* base=HomeCatalog::ResidentBase(*catalog,encoded))
-+                {
-+                    const auto observed=ObserveResident(encoded,cell,slots);
+                 {
+                     const auto observed=ObserveResident(encoded,cell,slots);
+-                    if (!observed || observed->Base.Encode()!=known->second.Encode()) return {};
+-                    state.ResidentKeys.insert(encoded);
 +                    if (!observed || observed->Base.Encode()!=base->Encode()) return {};
 +                    if (catalog->ResidentBases.count(encoded)) state.ResidentKeys.insert(encoded);
 +                    else
@@ -972,42 +696,14 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +                        const auto recorded=records.find(encoded);
 +                        if (recorded==records.end() || !recorded->second.Value.SameStatus(*observed)) return {};
 +                    }
-+                    continue;
-+                }
-+            }
-+        }
-+        if (!ref->baseForm || ref->IsTemporary() || ref->baseForm->IsTemporary() ||
-+            Cast<Actor>(ref) ||
-+            ref->GetParentCellEx()!=&cell)
-+        {++state.Omitted;continue;}
-+        auto key=InventoryEvidence::Resolve(ref->formID,slots);
-+        auto base=InventoryEvidence::Resolve(ref->baseForm->formID,slots);
-+        if (!key || !base) {++state.Omitted;continue;}
-+        HomeSnapshot::Ref row;
-+        row.Key={key->Plugin,key->Local};row.Base={base->Plugin,base->Local};
-+        row.Type=static_cast<uint32_t>(ref->baseForm->formType);
-+        row.Flags=(ref->IsDisabled()?1u:0u)|(ref->IsDeleted()?2u:0u);
-+        row.Scale=ref->scale;
-+        if (auto* lock=ref->GetLock())
-+        {row.LockState=lock->IsLocked()?2u:1u;row.LockLevel=static_cast<uint8_t>(lock->lockLevel);}
-+        row.Transform={std::bit_cast<uint32_t>(ref->position.x),std::bit_cast<uint32_t>(ref->position.y),
-+            std::bit_cast<uint32_t>(ref->position.z),std::bit_cast<uint32_t>(ref->rotation.x),
-+            std::bit_cast<uint32_t>(ref->rotation.y),std::bit_cast<uint32_t>(ref->rotation.z)};
-+        if (ref->baseForm->formType==FormType::Container)
-+        {
-+            auto items=HomeInventory::Capture(*ref);
-+            row.Inventory=items?1:2;
-+            if (items) row.Items=std::move(*items);
-+        }
-+        else if (HomeSnapshot::LooseType(row.Type))
-+        {
-+            auto items=HomeInventory::CaptureLoose(*ref);
-+            if (items) {row.Inventory=3;row.Items=std::move(*items);}
-+            else ++state.Omitted;
-+        }
-+        state.Refs.push_back(std::move(row));
-+        if (state.Refs.size()>16384) return {};
-+    }
+                     continue;
+                 }
+             }
+@@ -740,7 +783,18 @@
+         state.Refs.push_back(std::move(row));
+         if (state.Refs.size()>16384) return {};
+     }
+-    if (catalog && state.ResidentKeys.size()!=catalog->ResidentBases.size()) return {};
 +    if (catalog)
 +        for (const auto& [key,base]:catalog->ResidentBases)
 +        {
@@ -1020,26 +716,14 @@ diff --git a/Code/client/Services/Generic/PartyHome.cpp b/Code/client/Services/G
 +                recorded==records.end() || !recorded->second.Value.SameStatus(*observed)) return {};
 +            state.ResidentKeys.insert(key);
 +        }
-+    std::sort(state.Refs.begin(),state.Refs.end(),[](const auto& a,const auto& b){return a.Key.Encode()<b.Key.Encode();});
-+    std::sort(state.Legacy.begin(),state.Legacy.end(),[](const auto& a,const auto& b){return a.Source<b.Source;});
-+    if (!state.Valid()) return {};
-+    auto bytes=state.Encode();
-+    if (bytes.size()>HomeSnapshot::MaxBytes) return {};
-+    return bytes;
-+}
-+void UploadBaseline(World& world,TESObjectCELL& cell,const CampaignAccess::Identity& identity,
-+                    uint32_t slot,const std::string& root,const std::vector<InventoryEvidence::PluginSlot>& slots)
-+{
-+    auto& u=baselineUpload;
-+    if (u.Slot!=slot || u.Campaign!=identity.Save.Campaign || u.Character!=identity.Save.Character)
-+    {u={};u.Slot=slot;u.Campaign=identity.Save.Campaign;u.Character=identity.Save.Character;}
-+    if (u.Confirmed) return;
-+    const auto state=CampaignAccess::HomeBaselineState(u.Campaign,slot);
-+    if (state!=0) {u.Bytes.clear();u.Confirmed=true;return;}
-+    const auto now=Clock::now();
-+    if (now<u.Retry) return;
-+    if (!u.Next)
-+    {
+     std::sort(state.Refs.begin(),state.Refs.end(),[](const auto& a,const auto& b){return a.Key.Encode()<b.Key.Encode();});
+     std::sort(state.Legacy.begin(),state.Legacy.end(),[](const auto& a,const auto& b){return a.Source<b.Source;});
+     if (!state.Valid()) return {};
+@@ -761,7 +815,8 @@
+     if (now<u.Retry) return;
+     if (!u.Next)
+     {
+-        auto observed=CaptureStatic(cell,slots);
 +        const auto records=CampaignAccess::HomeResidentView(u.Campaign,slot);
 +        auto observed=records?CaptureStatic(cell,slots,*records):std::nullopt;
          if (!observed) {u.Bytes.clear();return;}
