@@ -537,7 +537,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +272,1276 @@
+@@ -221,6 +272,1280 @@
      return 2;
  }
  
@@ -1078,7 +1078,13 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    uint8_t StartType{};
 +    bool CanRestoreStart(uint64_t character) const noexcept
 +    {
-+        return character&&StartedBy&&Generation==1&&!Stopped&&Targets.empty();
++        if (!character||!StartedBy||Generation!=1||!Targets.empty()) return false;
++        if (!Stopped) return true;
++        // A late participant may replay a witnessed completed one-shot run,
++        // but only with its recorded start and final native stage. Never
++        // invent completion from a stop row or reopen a failed/abandoned run.
++        return CompletedRunOnce&&std::any_of(Stages.begin(),Stages.end(),
++            [&](const auto& entry){return entry.first==StopStage;});
 +    }
 +};
 +struct QuestCatchup : QuestReplayState
@@ -1448,7 +1454,6 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +
 +// Session-local suppression of repeated offers. ESS remains the source of
 +// applied stages; no receipt or save cursor is advanced here.
-+std::set<std::tuple<uint32_t,uint32_t,uint32_t,uint8_t,uint16_t>> offeredQuestStages;
 +uint64_t questObservedLoadEpoch{};
 +void ResetQuestReplayForLoad()
 +{
@@ -1456,7 +1461,6 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    if (questObservedLoadEpoch==epoch) return;
 +    questObservedLoadEpoch=epoch;
 +    uniqueRewardEpoch.store(0,std::memory_order_release);uniqueRewardChoices.clear();
-+    offeredQuestStages.clear();
 +    attemptedQuestPickups.clear();
 +    attemptedQuestConsumption.clear();
 +    deferredQuestPickup.reset();
@@ -1472,12 +1476,14 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    nextPull={};
 +}
 +
++template<class CanDispatch>
 +std::vector<NotifyQuestUpdate> MissingActiveQuestStages(World& world,
-+    const CampaignJournal::Journal& journal,uint64_t character)
++    const CampaignJournal::Journal& journal,uint64_t character,CanDispatch canDispatch)
 +{
 +    std::vector<NotifyQuestUpdate> updates;
-+    if (!world.GetPartyService().IsInParty()||!SaveWorldReady()) return updates;
++    if (!world.GetPartyService().IsInParty()||world.IsLoadingSave()||!SaveWorldReady()) return updates;
 +    auto* player=PlayerCharacter::Get();
++    if (!player) return updates;
 +    std::set<uint32_t> localQuests;
 +    for (const auto& objective:player->objectives)
 +        if (objective.instance&&objective.instance->quest)
@@ -1488,12 +1494,14 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    {
 +        const auto form=TradeProperties::DecodeForm(key);
 +        if (!form||!form->Valid()) continue;
-+        auto* mod=ModManager::Get()->GetByName(form->Plugin.c_str());
-+        if (!mod||!mod->IsLoaded()) continue;
++        auto* manager=ModManager::Get();
++        auto* mod=manager?manager->GetByName(form->Plugin.c_str()):nullptr;
++        if (!mod||!mod->IsLoaded()||(mod->IsLite()&&form->Local>0xFFF)) continue;
 +        const auto id=mod->GetFormId(form->Local);
 +        auto* quest=Cast<TESQuest>(TESForm::GetById(id));
 +        if (!quest||QuestService::IsNonSyncableQuest(quest)||
-+            world.GetOverlayService().IsPersonalQuest(id)) continue;
++            world.GetOverlayService().IsPersonalQuest(id)||
++            (quest->flags&TESQuest::Failed)||!canDispatch(id,quest->currentInstanceID)) continue;
 +        const bool sharedStart=latest.CanRestoreStart(character)&&
 +            (quest->flags&TESQuest::RunOnce)&&
 +            !(quest->flags&(TESQuest::Completed|TESQuest::Failed|TESQuest::AllowRepeatStages));
@@ -1501,8 +1509,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        if (!world.GetModSystem().GetServerModId(id,gameId)) continue;
 +        if (quest->IsStopped())
 +        {
-+            if (sharedStart&&offeredQuestStages.emplace(id,latest.Generation,quest->currentInstanceID,
-+                    NotifyQuestUpdate::Started,latest.StartStage).second)
++            if (sharedStart)
 +            {
 +                NotifyQuestUpdate start{};
 +                start.Id=gameId;start.Stage=latest.StartStage;start.ClientQuestType=latest.StartType;
@@ -1532,8 +1539,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        // completed flag or inventory grant from a completion record.
 +        for (const auto& [stage,type]:state.Stages)
 +        {
-+            if (quest->IsStageReached(stage)||
-+                !offeredQuestStages.emplace(id,state.Generation,instance,NotifyQuestUpdate::StageUpdate,stage).second) continue;
++            if (quest->IsStageReached(stage)) continue;
 +            NotifyQuestUpdate update{};
 +            update.Id=gameId;update.Stage=stage;update.ClientQuestType=type;
 +            update.Status=NotifyQuestUpdate::StageUpdate;
@@ -1546,8 +1552,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        }
 +        // Queue an observed stop after the bound run's stages. Existing
 +        // native scene and fragment barriers still govern actual execution.
-+        if (bound&&state.Stopped&&!state.CompletedRunOnce&&
-+            offeredQuestStages.emplace(id,state.Generation,instance,NotifyQuestUpdate::Stopped,state.StopStage).second)
++        if (bound&&state.Stopped&&!state.CompletedRunOnce)
 +        {
 +            NotifyQuestUpdate stop{};
 +            stop.Id=gameId;stop.Stage=state.StopStage;stop.ClientQuestType=state.StopType;
@@ -1797,7 +1802,6 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    if (!m_world.GetTransport().IsOnline()||!m_world.GetPartyService().IsInParty())
 +    {
 +        uniqueRewardEpoch.store(0,std::memory_order_release);uniqueRewardChoices.clear();
-+        offeredQuestStages.clear();
 +        deferredQuestPickup.reset();deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();
 +        questDialogueReady=false;sharedDialogueItems.clear();
 +        attemptedQuestPickups.clear();
@@ -1814,7 +1818,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        deferredQuestPickup.reset();deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();questDialogueReady=false;sharedDialogueItems.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +1571,32 @@
+@@ -250,6 +1575,32 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -1847,7 +1851,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +1622,29 @@
+@@ -275,8 +1626,38 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -1869,7 +1873,16 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +                RefreshSpentDialogueItems(campaignLink.Journal);
 +                RestoreLearnedWords(m_world,campaignLink.Journal,stamp->Character);
 +                RestoreOwnQuestPickups(m_world,campaignLink.Journal,stamp->Character);
-+                for (const auto& update:MissingActiveQuestStages(m_world,campaignLink.Journal,stamp->Character))
++                // Reconcile against observed native state, not a permanent
++                // "offered" set. Do not enqueue duplicates while the native
++                // handler is already waiting on a stage, scene or promotion.
++                const auto canDispatch=[this](uint32_t id,uint32_t instance){
++                    if (m_heldStages.find(id)!=m_heldStages.end()||
++                        m_afterHeldStages.find(id)!=m_afterHeldStages.end()) return false;
++                    const auto conflict=m_branchConflicts.find(id);
++                    return conflict==m_branchConflicts.end()||conflict->second!=instance;
++                };
++                for (const auto& update:MissingActiveQuestStages(m_world,campaignLink.Journal,stamp->Character,canDispatch))
 +                    ReceiveQuestProgress(update);
 +            }
 +            catch (...) {spdlog::warn("STM active quest catch-up failed");}

@@ -337,6 +337,13 @@ int main(){
     ops={{"1","quest-progress-v1","q 1 1 10 6 101"},{"2","quest-progress-v1","q 1 0 80 6 101"},{"3","quest-completed-v1","q 1 2 80 6 101"}};
     history=ActiveQuestHistory(ops);assert(history&&history->at("q").Stopped&&history->at("q").CompletedRunOnce);
     assert(history->at("q").Stages.size()==1&&history->at("q").Stages[0].first==80);
+    assert(history->at("q").CanRestoreStart(101)&&history->at("q").CanRestoreStart(202));
+    auto incomplete=history->at("q");incomplete.StopStage=99;
+    assert(!incomplete.CanRestoreStart(202));
+    incomplete=history->at("q");incomplete.StartedBy=0;
+    assert(!incomplete.CanRestoreStart(202));
+    incomplete=history->at("q");incomplete.Targets="2:r:616263.1;";
+    assert(!incomplete.CanRestoreStart(202));
     ops.push_back({"4","quest-progress-v1","q 2 1 10 6 202"});assert(!ActiveQuestHistory(ops));
     ops={{"1","quest-progress-v1","q 1 1 10 6 101 2:r:616263.1;"},
          {"2","quest-progress-v1","q 1 0 20 6 202 2:r:616263.1;"}};
@@ -357,6 +364,92 @@ int main(){
     assert(QuestRunMember::Bound(latest.Members,202,1,83));
     assert(!latest.CanRestoreStart(101)&&!latest.Prior[0].CanRestoreStart(101));
     ops[6].Payload="q 2 0 20 6 202 2:r:616263.1; @83";assert(!ActiveQuestHistory(ops));
+}
+''', ['-I'+str(code/'common')])
+
+catchup=extract('client/Services/Generic/QuestJournal.cpp',
+    'template<class CanDispatch>\nstd::vector<NotifyQuestUpdate> MissingActiveQuestStages','\n}\n}\n\n// Called by the world runner')+'\n}'
+run('late completed run starts natively and missing stages remain retryable',headers+'''
+#include <QuestRunMember.h>
+#include <TradeProperties.h>
+#include <sstream>
+namespace CampaignJournal {
+struct Operation{std::string Id,Kind,Payload;};
+struct Journal{std::vector<Operation> rows;const auto& Operations() const{return rows;}};
+}
+using GameId=uint32_t;
+struct NotifyQuestUpdate{
+ enum {StageUpdate,Started,Stopped};GameId Id{};uint16_t Stage{};uint8_t ClientQuestType{},Status{};
+ uint32_t SharedRun{},Speaker{},ExpectedInstance{};bool CheckInstance{};std::string Targets;
+};
+struct TESForm{static TESForm* GetById(uint32_t);};
+struct TESQuest:TESForm{
+ enum Flags{RunOnce=256,Completed=2,Failed=64,AllowRepeatStages=8};
+ uint32_t formID=2,currentInstanceID=1;uint16_t flags=RunOnce;
+ bool stopped=true;std::string targets;std::set<uint16_t> reached;
+ bool IsStopped()const{return stopped;}
+ bool IsStageReached(uint16_t s)const{return reached.contains(s);}
+} quest;
+TESForm* TESForm::GetById(uint32_t id){return id==2?&quest:nullptr;}
+template<class T>T* Cast(TESForm* p){return static_cast<T*>(p);}
+struct PlayerCharacter {
+ struct Instance{TESQuest* quest;};struct Objective{Instance* instance;};
+ std::vector<Objective> objectives;
+ static PlayerCharacter* Get(){static PlayerCharacter p;return &p;}
+};
+struct Mod{
+ bool lite=false,loaded=true;bool IsLoaded(){return loaded;}bool IsLite(){return lite;}
+ uint32_t GetFormId(uint32_t local){return local;}
+};
+struct ModManager{
+ Mod mod;static ModManager* Get(){static ModManager m;return &m;}
+ Mod* GetByName(const char* name){return std::string(name)=="abc.esp"?&mod:nullptr;}
+};
+struct World{
+ struct Party{bool joined=true;bool IsInParty(){return joined;}uint32_t GetLeaderPlayerId(){return 9;}} party;
+ struct Overlay{bool personal=false;bool IsPersonalQuest(uint32_t){return personal;}} overlay;
+ struct Mods{bool GetServerModId(uint32_t id,GameId& result){result=id;return true;}} mods;
+ bool loading=false;bool IsLoadingSave(){return loading;}
+ Party& GetPartyService(){return party;}Overlay& GetOverlayService(){return overlay;}Mods& GetModSystem(){return mods;}
+};
+bool ready=true;bool SaveWorldReady(){return ready;}
+struct QuestService{static bool IsNonSyncableQuest(TESQuest*){return false;}
+ static std::string CaptureQuestTargets(TESQuest* q){return q->targets;}};
+'''+history+catchup+'''
+int main(){
+    World world;CampaignJournal::Journal journal;
+    const auto key=TradeProperties::FormKey{"abc.esp",2}.Encode();
+    journal.rows={{"1","quest-progress-v1",key+" 1 1 0 6 101"},
+                  {"2","quest-progress-v1",key+" 1 0 40 6 101"},
+                  {"3","quest-progress-v1",key+" 1 0 20 6 101"},
+                  {"4","quest-completed-v1",key+" 1 2 20 6 101"}};
+    bool busy=false;
+    auto plan=[&]{return MissingActiveQuestStages(world,journal,202,[&](uint32_t id,uint32_t instance){
+        assert(id==2&&instance==quest.currentInstanceID);return !busy;});};
+    auto start=plan();assert(start.size()==1&&start[0].Status==NotifyQuestUpdate::Started&&start[0].Stage==0);
+    // An issued but unapplied update is not a receipt.
+    assert(plan().size()==1);
+    busy=true;assert(plan().empty());busy=false;
+    quest.stopped=false;quest.reached.insert(0);
+    auto stages=plan();assert(stages.size()==2&&stages[0].Stage==40&&stages[1].Stage==20);
+    assert(stages[0].Status==NotifyQuestUpdate::StageUpdate&&stages[1].Status==NotifyQuestUpdate::StageUpdate);
+    quest.reached.insert(40);stages=plan();assert(stages.size()==1&&stages[0].Stage==20);
+    busy=true;assert(plan().empty());busy=false;
+    quest.reached.insert(20);assert(plan().empty());
+    quest.stopped=true;quest.flags=TESQuest::RunOnce|TESQuest::Completed;assert(plan().empty());
+    quest.flags=TESQuest::RunOnce|TESQuest::Failed;assert(plan().empty());
+    quest.flags=TESQuest::RunOnce|TESQuest::AllowRepeatStages;assert(plan().empty());
+    quest.flags=TESQuest::RunOnce;quest.reached.clear();
+    world.overlay.personal=true;assert(plan().empty());world.overlay.personal=false;
+    world.loading=true;assert(plan().empty());world.loading=false;
+    journal.rows.back().Payload=key+" 1 2 99 6 101";assert(plan().empty());
+    journal.rows.pop_back();assert(plan().size()==1);
+    journal.rows.push_back({"4","quest-progress-v1",key+" 1 2 20 6 101"});assert(plan().empty());
+    journal.rows[0].Payload=key+" 1 1 0 6 101 2:r:616263.1;";
+    journal.rows[1].Payload=key+" 1 0 40 6 101 2:r:616263.1;";
+    journal.rows[2].Payload=key+" 1 0 20 6 101 2:r:616263.1;";
+    journal.rows[3]={"4","quest-completed-v1",key+" 1 2 20 6 101 2:r:616263.1;"};
+    assert(plan().empty()); // no fabricated radiant target
 }
 ''', ['-I'+str(code/'common')])
 
