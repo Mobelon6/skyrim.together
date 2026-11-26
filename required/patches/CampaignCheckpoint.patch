@@ -340,7 +340,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 +#include <DragonAbsorption.h>
  #include <Services/CampaignAccess.h>
  #include <Messages/RequestCampaignPull.h>
-@@ -133,11 +136,119 @@
+@@ -133,11 +136,127 @@
          const auto& p=event.Packet;
 -        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64) return;
 -        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
@@ -349,7 +349,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 -        const CampaignIdentity::Stamp stamp{p.Campaign,p.Character,{p.SaveRevision,p.SaveTag}};
 -        if (CampaignAccess::Admit(m_world,*event.pPlayer,stamp,pull.Profile,{p.Credential.data(),p.Credential.size()}))
 -            reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
-+        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64 || p.Checkpoint.size()>1024 || p.LearnedWord.size()>224 || p.AbsorbedDragon.size()>224 || p.PickupClaim.size()>800 || p.QuestReceipt.size()>800) return;
++        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64 || p.Checkpoint.size()>1024 || p.LearnedWord.size()>QuestWordReward::MaxPayload || p.AbsorbedDragon.size()>224 || p.PickupClaim.size()>800 || p.QuestReceipt.size()>800) return;
 +        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
 +        CampaignReplication::Reply reply;
 +        bool pickupPermit=false;
@@ -385,26 +385,34 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 +                        if (!peer||peer==event.pPlayer||peer->GetId()!=p.WordPeer||
 +                            peer->GetCellComponent().Cell!=cell||
 +                            !PartyService::WithinSyncRange(m_world,*event.pPlayer,*peer)) continue;
-+                        QuestWordReward::Grant grant{std::string(p.LearnedWord.data(),p.LearnedWord.size()),
-+                            CampaignAccess::Character(*event.pPlayer),CampaignAccess::Character(*peer)};
-+                        if (!grant.Valid()) break;
-+                        const auto key=TradeProperties::DecodeForm(grant.Word);
++                        const auto batch=QuestWordReward::DecodeBatch({p.LearnedWord.data(),p.LearnedWord.size()});
++                        if (!batch) break;
++                        const auto source=CampaignAccess::Character(*event.pPlayer);
++                        const auto recipient=CampaignAccess::Character(*peer);
++                        if (!source||!recipient||source==recipient) break;
 +                        const auto& mods=m_world.ctx().at<ModsComponent>();
-+                        bool found=false;
-+                        for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
-+                            for (const auto& [name,entry]:*list)
-+                            {
-+                                std::string plugin(name.begin(),name.end());
-+                                for (auto& ch:plugin) if (ch>='A'&&ch<='Z') ch=static_cast<char>(ch-'A'+'a');
-+                                if (plugin==key->Plugin&&(list!=&mods.GetLiteMods()||key->Local<=0xFFF)) found=true;
-+                            }
-+                        if (!found) break;
-+                        const auto grants=QuestWordReward::Read(campaignLink.Journal.Operations());
-+                        if (!grants||QuestWordReward::Entitled(*grants,grant.Word,grant.Source)) break;
-+                        const auto head=campaignLink.Journal.Current();
-+                        if (campaignLink.Journal.Append(head,{"quest-word-"+std::to_string(head.Revision+1),
-+                            "quest-word-v1",grant.Encode()})!=CampaignJournal::Result::Committed)
-+                            spdlog::warn("STM could not persist learned word");
++                        auto grants=QuestWordReward::Read(campaignLink.Journal.Operations());
++                        if (!grants) break;
++                        for (const auto& word:*batch)
++                        {
++                            QuestWordReward::Grant grant{word,source,recipient};
++                            if (!grant.Valid()||QuestWordReward::Entitled(*grants,word,source)) continue;
++                            const auto key=TradeProperties::DecodeForm(word);
++                            bool found=false;
++                            for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
++                                for (const auto& [name,entry]:*list)
++                                {
++                                    std::string plugin(name.begin(),name.end());
++                                    for (auto& ch:plugin) if (ch>='A'&&ch<='Z') ch=static_cast<char>(ch-'A'+'a');
++                                    if (plugin==key->Plugin&&(list!=&mods.GetLiteMods()||key->Local<=0xFFF)) found=true;
++                                }
++                            if (!found) continue;
++                            const auto head=campaignLink.Journal.Current();
++                            if (campaignLink.Journal.Append(head,{"quest-word-"+std::to_string(head.Revision+1),
++                                "quest-word-v1",grant.Encode()})!=CampaignJournal::Result::Committed)
++                            {spdlog::warn("STM could not persist learned word");break;}
++                            grants->push_back(grant);
++                        }
 +                        break;
 +                    }
 +            }
@@ -537,7 +545,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +272,1280 @@
+@@ -221,6 +272,1299 @@
      return 2;
  }
  
@@ -545,10 +553,10 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +{
 +std::optional<QuestWordReward::Sample> wordBaseline;
 +uint64_t wordAttemptCharacter{};
-+std::set<uint32_t> attemptedWords;
++std::map<uint32_t,std::chrono::steady_clock::time_point> attemptedWords;
 +struct PendingWord
 +{
-+    std::string Word;
++    std::set<std::string> Words;
 +    uint64_t Character{};
 +    uint32_t Peer{},Cell{},CellMod{},CellBase{};
 +};
@@ -590,39 +598,51 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +{
 +    auto sample=CaptureWordSample(world,character);
 +    if (!sample) {wordBaseline.reset();pendingWord.reset();return;}
++    const auto grants=QuestWordReward::Read(campaignLink.Journal.Operations());
++    if (!grants) return;
++    if (pendingWord&&(pendingWord->Character!=character||pendingWord->Peer!=sample->Peer||
++        pendingWord->Cell!=sample->Cell)) pendingWord.reset();
 +    if (pendingWord)
 +    {
-+        const auto grants=QuestWordReward::Read(campaignLink.Journal.Operations());
-+        if (!grants||pendingWord->Character!=character||pendingWord->Peer!=sample->Peer||
-+            pendingWord->Cell!=sample->Cell||QuestWordReward::Entitled(*grants,pendingWord->Word,character))
-+            pendingWord.reset();
-+        else
-+        {
-+            request.LearnedWord=pendingWord->Word.c_str();request.WordPeer=pendingWord->Peer;
-+            request.WordCellMod=pendingWord->CellMod;request.WordCellBase=pendingWord->CellBase;
-+            return; // do not advance the baseline before an acknowledged observation
-+        }
++        std::erase_if(pendingWord->Words,[&](const auto& word){
++            return QuestWordReward::Entitled(*grants,word,character);
++        });
++        if (pendingWord->Words.empty()) pendingWord.reset();
 +    }
 +    if (!wordBaseline) return; // seed only after the server confirms a full prefix
-+    const auto word=QuestWordReward::NewWord(*wordBaseline,*sample);
++    const auto words=QuestWordReward::NewWords(*wordBaseline,*sample);
 +    wordBaseline=sample;
-+    if (!word) return;
-+    std::vector<InventoryEvidence::PluginSlot> slots;
-+    for (const auto* mod:ModManager::Get()->mods)
++    if (!words.empty())
 +    {
-+        if (!mod||!mod->IsLoaded()) continue;
-+        const auto* end=std::find(mod->filename,mod->filename+sizeof(mod->filename),'\0');
-+        if (end!=mod->filename+sizeof(mod->filename))
-+            slots.push_back({mod->GetId(),mod->IsLite(),std::string(mod->filename,end)});
++        std::vector<InventoryEvidence::PluginSlot> slots;
++        auto* manager=ModManager::Get();
++        if (!manager) return;
++        for (const auto* mod:manager->mods)
++        {
++            if (!mod||!mod->IsLoaded()) continue;
++            const auto* end=std::find(mod->filename,mod->filename+sizeof(mod->filename),'\0');
++            if (end!=mod->filename+sizeof(mod->filename))
++                slots.push_back({mod->GetId(),mod->IsLite(),std::string(mod->filename,end)});
++        }
++        GameId cell{};
++        if (!world.GetModSystem().GetServerModId(sample->Cell,cell)) return;
++        if (!pendingWord) pendingWord=PendingWord{{},character,sample->Peer,sample->Cell,cell.ModId,cell.BaseId};
++        for (const auto word:words)
++        {
++            const auto stable=InventoryEvidence::Resolve(word,slots);
++            if (!stable) continue;
++            const TradeProperties::FormKey key{stable->Plugin,stable->Local};
++            if (!key.Valid()||QuestWordReward::Entitled(*grants,key.Encode(),character)) continue;
++            pendingWord->Words.insert(key.Encode());
++        }
 +    }
-+    const auto stable=InventoryEvidence::Resolve(*word,slots);
-+    if (!stable) return;
-+    const TradeProperties::FormKey key{stable->Plugin,stable->Local};
-+    GameId cell{};
-+    if (!key.Valid()||!world.GetModSystem().GetServerModId(sample->Cell,cell)) return;
-+    request.LearnedWord=key.Encode().c_str();
-+    pendingWord=PendingWord{key.Encode(),character,sample->Peer,sample->Cell,cell.ModId,cell.BaseId};
-+    request.WordPeer=sample->Peer;request.WordCellMod=cell.ModId;request.WordCellBase=cell.BaseId;
++    if (!pendingWord||pendingWord->Words.empty()) return;
++    // Send all observed words that fit the existing authenticated pull.
++    // Until their individual rows are confirmed, retain them in this exact
++    // context even if another word becomes known in the meantime.
++    request.LearnedWord=QuestWordReward::EncodeBatch(pendingWord->Words).c_str();
++    request.WordPeer=pendingWord->Peer;request.WordCellMod=pendingWord->CellMod;
++    request.WordCellBase=pendingWord->CellBase;
 +}
 +
 +void RestoreLearnedWords(World& world,const CampaignJournal::Journal& journal,uint64_t character)
@@ -640,12 +660,19 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        if (!mod||!mod->IsLoaded()||(mod->IsLite()&&key->Local>0xFFF)) continue;
 +        auto* word=TESForm::GetById(mod->GetFormId(key->Local));
 +        if (!word||static_cast<uint8_t>(word->formType)!=0x76) continue;
-+        if (!IsLearnedWord(word)&&attemptedWords.insert(word->formID).second)
++        if (!IsLearnedWord(word))
 +        {
-+            if (TeachCampaignWord(word)&&IsLearnedWord(word))
-+                spdlog::info("STM restored learned word {:X}",word->formID);
-+            else spdlog::warn("STM native TeachWord failed for {:X}; no unlock or soul change attempted",word->formID);
++            const auto now=std::chrono::steady_clock::now();
++            auto& retry=attemptedWords[word->formID];
++            if (now>=retry)
++            {
++                retry=now+std::chrono::seconds(5);
++                if (TeachCampaignWord(word)&&IsLearnedWord(word))
++                    spdlog::info("STM restored learned word {:X}",word->formID);
++                else spdlog::warn("STM native TeachWord failed for {:X}; retry after cooldown, no unlock or soul change attempted",word->formID);
++            }
 +        }
++        if (IsLearnedWord(word)) attemptedWords.erase(word->formID);
 +        // Never propagate a word applied from the campaign as a new acquisition.
 +        if (IsLearnedWord(word)&&wordBaseline&&wordBaseline->Character==character)
 +            wordBaseline->Known.insert(word->formID);
@@ -1818,7 +1845,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        deferredQuestPickup.reset();deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();questDialogueReady=false;sharedDialogueItems.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +1575,32 @@
+@@ -250,6 +1594,32 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -1851,7 +1878,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +1626,38 @@
+@@ -275,8 +1645,38 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -2480,7 +2507,7 @@ diff --git a/Code/common/QuestWordReward.h b/Code/common/QuestWordReward.h
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/QuestWordReward.h
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,102 @@
 +#pragma once
 +#include <CampaignJournal.h>
 +#include <TradeProperties.h>
@@ -2499,19 +2526,48 @@ new file mode 100644
 +    uint32_t Cell{},Peer{};
 +    std::set<uint32_t> Known;
 +};
-+inline std::optional<uint32_t> NewWord(const Sample& before,const Sample& after)
++inline std::vector<uint32_t> NewWords(const Sample& before,const Sample& after)
 +{
 +    if (!before.Character||!before.Cell||!before.Peer||
 +        before.Character!=after.Character||before.Cell!=after.Cell||before.Peer!=after.Peer||
 +        !std::includes(after.Known.begin(),after.Known.end(),before.Known.begin(),before.Known.end())) return {};
-+    uint32_t word{};
++    std::vector<uint32_t> result;
 +    for (auto id:after.Known)
 +        if (!before.Known.contains(id))
 +        {
-+            if (!id||word) return {};
-+            word=id;
++            if (!id) return {};
++            result.push_back(id);
 +        }
-+    return word?std::optional<uint32_t>(word):std::nullopt;
++    return result;
++}
++inline constexpr size_t MaxBatch=16,MaxPayload=1024;
++inline std::string EncodeBatch(const std::set<std::string>& words)
++{
++    std::string result;
++    size_t count{};
++    for (const auto& word:words)
++    {
++        const auto key=TradeProperties::DecodeForm(word);
++        if (!key||!key->Valid()||key->Encode()!=word) return {};
++        if (count==MaxBatch||result.size()+(count?1:0)+word.size()>MaxPayload) break;
++        if (count++) result+=' ';
++        result+=word;
++    }
++    return result;
++}
++inline std::optional<std::set<std::string>> DecodeBatch(std::string_view input)
++{
++    if (input.empty()||input.size()>MaxPayload) return {};
++    std::istringstream in{std::string(input)};
++    std::set<std::string> words;
++    std::string word;
++    while (in>>word)
++    {
++        const auto key=TradeProperties::DecodeForm(word);
++        if (!key||!key->Valid()||key->Encode()!=word||!words.insert(word).second||words.size()>MaxBatch) return {};
++    }
++    if (EncodeBatch(words)!=input) return {};
++    return words;
 +}
 +struct Grant
 +{
