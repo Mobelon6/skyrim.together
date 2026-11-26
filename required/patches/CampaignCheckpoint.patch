@@ -470,7 +470,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -9,8 +9,47 @@
+@@ -9,8 +9,49 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
@@ -505,6 +505,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +#include <ExtraData/ExtraCount.h>
 +#include <ExtraData/ExtraContainerChanges.h>
 +#include <Forms/TESBoundObject.h>
++#include <Misc/BSScript.h>
++#include <Misc/GameVM.h>
  #include <HomeRegistry.h>
 +
 +bool TeachCampaignWord(TESForm*) noexcept;
@@ -518,7 +520,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
  #include <HomeSnapshot.h>
  #include <HomePermissions.h>
  #include <TradeLedger.h>
-@@ -26,6 +65,16 @@
+@@ -26,6 +67,16 @@
  namespace
  {
  CampaignReplication::Link campaignLink;
@@ -535,7 +537,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +270,1243 @@
+@@ -221,6 +272,1276 @@
      return 2;
  }
  
@@ -1278,6 +1280,13 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    std::chrono::steady_clock::time_point Deadline{};
 +};
 +std::optional<DeferredQuestTurnIn> deferredQuestTurnIn,authorizedQuestTurnIn;
++// Published only after a server permit, before resuming the exact dialogue.
++std::atomic<uint64_t> sharedTurnInNonce{};
++void ClearAuthorizedQuestTurnIn() noexcept
++{
++    sharedTurnInNonce.store(0,std::memory_order_release);
++    authorizedQuestTurnIn.reset();
++}
 +// The campaign update and dialogue run on the game thread. Other engine
 +// condition evaluation threads must not read its mutable journal.
 +thread_local bool questDialogueThread{};
@@ -1364,9 +1373,10 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    {
 +        authorizedQuestTurnIn=pending;
 +        authorizedQuestTurnIn->Deadline=std::chrono::steady_clock::now()+std::chrono::minutes(2);
++        sharedTurnInNonce.store(pending.Nonce,std::memory_order_release);
 +    }
 +    if (!menu->ResumeQuestTurnIn(pending.Npc,pending.Info,pending.QuestForm,pending.BaseForm))
-+        authorizedQuestTurnIn.reset();
++        ClearAuthorizedQuestTurnIn();
 +}
 +
 +void RestoreOwnQuestPickups(World& world,const CampaignJournal::Journal& journal,uint64_t character)
@@ -1451,7 +1461,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    attemptedQuestConsumption.clear();
 +    deferredQuestPickup.reset();
 +    pendingQuestReceipts.clear();
-+    deferredQuestTurnIn.reset();authorizedQuestTurnIn.reset();questDialogueReady=false;sharedDialogueItems.clear();
++    deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();questDialogueReady=false;sharedDialogueItems.clear();
 +    pendingWord.reset();
 +    wordBaseline.reset();
 +    attemptedWords.clear();
@@ -1680,27 +1690,52 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    catch (...) {return -1;}
 +}
 +
-+void ObserveSharedQuestRemoval(uint32_t base) noexcept
++uint64_t SharedTurnInObservationNonce() noexcept
++{
++    return sharedTurnInNonce.load(std::memory_order_acquire);
++}
++
++static bool MatchesNativeRemovalHandle(BSScript::IObjectHandlePolicy* policy,uint64_t handle,TESForm* form)
++{
++    if (!policy||!handle||!form) return false;
++    const auto type=static_cast<uint32_t>(form->formType);
++    return policy->HandleIsType(type,handle)&&policy->IsHandleObjectAvailable(handle)&&
++        policy->GetObjectForHandle(type,handle)==form;
++}
++
++void ObserveSharedQuestRemoval(uint64_t itemHandle,uint64_t callerHandle,uint64_t permit) noexcept
 +{
 +    try
 +    {
 +        const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
-+        World::Get().GetRunner().Queue([base,epoch]{
++        if (!permit||!World::Exists()) return;
++        World::Get().GetRunner().Queue([itemHandle,callerHandle,permit,epoch]{
 +            if (epoch!=dragonLoadEpoch.load(std::memory_order_acquire)||!authorizedQuestTurnIn||
-+                authorizedQuestTurnIn->BaseForm!=base) return;
++                authorizedQuestTurnIn->Nonce!=permit||SharedTurnInObservationNonce()!=permit) return;
 +            const auto pending=*authorizedQuestTurnIn;
-+            if (pending.Deadline<=std::chrono::steady_clock::now()) {authorizedQuestTurnIn.reset();return;}
++            if (pending.Deadline<=std::chrono::steady_clock::now()) {ClearAuthorizedQuestTurnIn();return;}
 +            auto& world=World::Get();
 +            if (world.IsLoadingSave()||!SaveWorldReady()) return;
 +            const auto identity=CampaignAccess::Current(world);
 +            if (!identity||identity->Save.Character!=pending.Character||identity->Save.Campaign!=pending.Campaign) return;
-+            const auto item=FindSharedTurnIn(pending.QuestForm,base);
++            auto* gameVM=GameVM::Get();
++            auto* policy=gameVM&&gameVM->virtualMachine?gameVM->virtualMachine->GetObjectHandlePolicy():nullptr;
++            auto* base=TESForm::GetById(pending.BaseForm);
++            auto* quest=TESForm::GetById(pending.QuestForm);
++            auto* info=TESForm::GetById(pending.Info);
++            auto* player=PlayerCharacter::Get();
++            if (!player||!MatchesNativeRemovalHandle(policy,itemHandle,base)||
++                (!MatchesNativeRemovalHandle(policy,callerHandle,quest)&&!MatchesNativeRemovalHandle(policy,callerHandle,info))||
++                player->GetItemCountInInventory(base)!=0) return;
++            const auto item=FindSharedTurnIn(pending.QuestForm,pending.BaseForm);
 +            if (!item||item->Consumed||item->Character==pending.Character||item->Copies.contains(pending.Character)||
 +                QuestPickupPermit::Claim{item->Quest,item->Reference,item->Item,item->Alias}.Encode()!=pending.Claim.Encode()) return;
-+            // Use the existing authenticated receipt queue. This is a native
-+            // request to consume the shared original, not a local delta.
++            // The Papyrus removal completed even if the empty inventory never
++            // entered TESObjectREFR::RemoveItem. No local delta or copy.
++            if (pendingQuestReceipts.size()>=64)
++            {spdlog::warn("STM pending quest item receipt capacity reached");return;}
 +            pendingQuestReceipts.push_back({{pending.Claim,-1,false,true},pending.Campaign,pending.Character,pending.Deadline});
-+            authorizedQuestTurnIn.reset();nextPull={};
++            ClearAuthorizedQuestTurnIn();nextPull={};
 +        });
 +    }
 +    catch (...) {spdlog::warn("STM shared quest removal observation failed");}
@@ -1727,7 +1762,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        const auto now=std::chrono::steady_clock::now();
 +        if (deferredQuestTurnIn&&deferredQuestTurnIn->Deadline>now) return true;
 +        if (authorizedQuestTurnIn&&authorizedQuestTurnIn->Deadline>now) return true;
-+        authorizedQuestTurnIn.reset();
++        ClearAuthorizedQuestTurnIn();
 +        deferredQuestTurnIn=DeferredQuestTurnIn{{item->Quest,item->Reference,item->Item,item->Alias},
 +            questId,baseId,npc,info,quest->currentInstanceID,identity->Save.Campaign,character,0,now+std::chrono::seconds(8)};
 +        nextPull={};
@@ -1763,7 +1798,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    {
 +        uniqueRewardEpoch.store(0,std::memory_order_release);uniqueRewardChoices.clear();
 +        offeredQuestStages.clear();
-+        deferredQuestPickup.reset();deferredQuestTurnIn.reset();
++        deferredQuestPickup.reset();deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();
 +        questDialogueReady=false;sharedDialogueItems.clear();
 +        attemptedQuestPickups.clear();
 +        attemptedQuestConsumption.clear();
@@ -1776,10 +1811,10 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    {
 +        uniqueRewardEpoch.store(0,std::memory_order_release);
 +        wordBaseline.reset();pendingWord.reset();attemptedWords.clear();wordAttemptCharacter=0;
-+        deferredQuestPickup.reset();deferredQuestTurnIn.reset();questDialogueReady=false;sharedDialogueItems.clear();
++        deferredQuestPickup.reset();deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();questDialogueReady=false;sharedDialogueItems.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +1536,32 @@
+@@ -250,6 +1571,32 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -1812,7 +1847,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +1587,29 @@
+@@ -275,8 +1622,29 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -2097,7 +2132,7 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
  
  TP_THIS_FUNCTION(TRegisterPapyrusFunction, void, BSScript::IVirtualMachine, NativeFunction*);
  TP_THIS_FUNCTION(TBindEverythingToScript, void, BSScript::IVirtualMachine*);
-@@ -20,8 +28,280 @@
+@@ -20,8 +28,317 @@
  TSignaturesMatch* RealSignaturesMatch = nullptr;
  TCompareVariables* RealCompareVariables = nullptr;
  
@@ -2139,7 +2174,7 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +TP_THIS_FUNCTION(TDragonNativeCall, BSScript::CallResult, BSScript::NativeFunctionBase,
 +                 void*, void*, BSScript::IVirtualMachine*, bool);
 +TDragonNativeCall* realDragonNativeCall{};
-+std::atomic<const void*> modActorValueNative{},addItemNative{};
++std::atomic<const void*> modActorValueNative{},addItemNative{},removeItemNative{};
 +thread_local uint32_t nativeUniqueRewardQuest{};
 +thread_local uint16_t nativeUniqueRewardStage{};
 +uint32_t NativeUniqueRewardQuest() noexcept {return nativeUniqueRewardQuest;}
@@ -2283,6 +2318,35 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +    reward=amount;return dragon->formID;
 +}
 +void RecordNativeDragonAbsorption(uint32_t form) noexcept;
++uint64_t SharedTurnInObservationNonce() noexcept;
++void ObserveSharedQuestRemoval(uint64_t itemHandle,uint64_t callerHandle,uint64_t permit) noexcept;
++
++struct NativeSharedRemoval {uint64_t Item{},Caller{};};
++static NativeSharedRemoval ReadNativeSharedRemoval(void* stackArgument)
++{
++    if (!stackArgument) return {};
++    auto* stack=*static_cast<DragonStackView**>(stackArgument);
++    auto* frame=stack?stack->Top:nullptr;
++    auto* caller=frame?frame->Previous:nullptr;
++    auto* player=PlayerCharacter::Get();
++    if (!frame||!frame->Parent||!frame->Function||frame->Function->GetParamCount()!=4||frame->Size<4||
++        !caller||!caller->Parent||!caller->Function||!player||DragonFrameActor(&frame->Self)!=player) return {};
++    auto* nativeFrame=reinterpret_cast<BSScript::StackFrame*>(frame);
++    const auto page=nativeFrame->GetPageForFrame();
++    auto* item=nativeFrame->GetStackFrameVariable(0,page);
++    auto* count=nativeFrame->GetStackFrameVariable(1,page);
++    auto* silent=nativeFrame->GetStackFrameVariable(2,page);
++    auto* destination=nativeFrame->GetStackFrameVariable(3,page);
++    if (!item||!count||!silent||!destination||count->type!=BSScript::Variable::kInteger||count->data.i!=1||
++        silent->type!=BSScript::Variable::kBoolean) return {};
++    // None may have the declared reference type with a null object pointer.
++    if (destination->type!=BSScript::Variable::kEmpty&&
++        !((destination->type==BSScript::Variable::kObject||
++           (destination->type>BSScript::Variable::kMax&&!(destination->type&1)))&&!destination->GetObject())) return {};
++    auto* object=item->GetObject();
++    auto* source=caller->Self.GetObject();
++    return {object?object->GetHandle():0,source?source->GetHandle():0};
++}
 +BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunctionBase,
 +    void* stackArgument, void* logger, BSScript::IVirtualMachine* vm, bool flag)
 +{
@@ -2336,7 +2400,11 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +            }
 +        }
 +    }
++    const auto permit=apThis==removeItemNative.load(std::memory_order_acquire)?SharedTurnInObservationNonce():0;
++    const auto removal=permit?ReadNativeSharedRemoval(stackArgument):NativeSharedRemoval{};
 +    const auto result=TiltedPhoques::ThisCall(realDragonNativeCall,apThis,stackArgument,logger,vm,flag);
++    if (permit&&removal.Item&&removal.Caller&&result==BSScript::CallResult::kCompleted)
++        ObserveSharedQuestRemoval(removal.Item,removal.Caller,permit);
 +    bool paid=false;
 +    if (dragon&&!suppress&&result==BSScript::CallResult::kCompleted&&World::Exists()&&!World::Get().IsLoadingSave())
 +    {
@@ -2368,6 +2436,10 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +        !_stricmp(apFunction->typeName.AsAscii(),"ObjectReference")&&
 +        !_stricmp(apFunction->functionName.AsAscii(),"AddItem"))
 +        addItemNative.store(apFunction,std::memory_order_release);
++    if (apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
++        !_stricmp(apFunction->typeName.AsAscii(),"ObjectReference")&&
++        !_stricmp(apFunction->functionName.AsAscii(),"RemoveItem"))
++        removeItemNative.store(apFunction,std::memory_order_release);
 +#endif
 +    if (apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
 +        !std::strcmp(apFunction->typeName.AsAscii(),"Game")&&
@@ -2380,7 +2452,7 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
      auto& runner = World::Get().GetRunner();
  
      PapyrusFunctionRegisterEvent event(apFunction->functionName.AsAscii(), apFunction->typeName.AsAscii(), apFunction->functionAddress);
-@@ -109,5 +389,10 @@
+@@ -109,5 +426,10 @@
          TP_HOOK(&RealRegisterPapyrusFunction, HookRegisterPapyrusFunction);
          TP_HOOK(&RealBindEverythingToScript, HookBindEverythingToScript);
          TP_HOOK(&RealSignaturesMatch, HookSignaturesMatch);

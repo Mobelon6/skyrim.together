@@ -779,3 +779,73 @@ int main(){
     assert(!Read(ops,azura.Quest));
 }
 ''', ['-I'+str(code/'common')])
+
+# Exercise the exact native argument parser and the handle check independently
+# of the Windows VM ABI. The native call itself is never replaced.
+nativeRemoval=extract('client/Games/Misc/BSScript.cpp','struct NativeSharedRemoval','BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall')
+handleCheck=extract('client/Services/Generic/QuestJournal.cpp','static bool MatchesNativeRemovalHandle','void ObserveSharedQuestRemoval')
+run('authorized Papyrus removal evidence and exact object identity',headers+'''
+struct TESForm{unsigned formType=30;};
+namespace BSScript {
+struct Object{uint64_t handle;uint64_t GetHandle(){return handle;}};
+struct Variable {
+ enum Type:uint64_t{kEmpty,kObject,kString,kInteger,kFloat,kBoolean,kMax=16};
+ Type type=kEmpty;
+ union {int i;bool b;Object* pObj;} data{};
+ Object* GetObject() const {return type==kObject||(type>kMax&&!(type&1))?data.pObj:nullptr;}
+};
+struct IFunction{unsigned params=4;unsigned GetParamCount(){return params;}};
+struct StackFrame {
+ void* Parent;
+ StackFrame* Previous;
+ IFunction* Function;
+ Variable Self;
+ unsigned Size=4;
+ Variable args[4];
+ unsigned GetPageForFrame(){return 0;}
+ Variable* GetStackFrameVariable(unsigned n,unsigned){return &args[n];}
+};
+struct IObjectHandlePolicy{
+ TESForm* expected{};bool available=true,typed=true;
+ bool HandleIsType(unsigned,uint64_t){return typed;}
+ bool IsHandleObjectAvailable(uint64_t){return available;}
+ void* GetObjectForHandle(unsigned,uint64_t h){return h==10?expected:nullptr;}
+};
+}
+using DragonFrameView=BSScript::StackFrame;
+struct DragonStackView{DragonFrameView* Top;};
+struct PlayerCharacter{static PlayerCharacter* Get(){static PlayerCharacter p;return &p;}};
+PlayerCharacter* DragonFrameActor(const BSScript::Variable* v){return v->GetObject()?PlayerCharacter::Get():nullptr;}
+'''+nativeRemoval+handleCheck+'''
+int main(){
+ using namespace BSScript;
+ Object player{1},item{10},caller{20},destination{30};
+ IFunction function;int parent=1;
+ StackFrame source{},frame{};
+ source.Parent=&parent;source.Function=&function;source.Self.type=Variable::kObject;source.Self.data.pObj=&caller;
+ frame.Parent=&parent;frame.Previous=&source;frame.Function=&function;frame.Self.type=Variable::kObject;frame.Self.data.pObj=&player;
+ frame.args[0].type=Variable::kObject;frame.args[0].data.pObj=&item;
+ frame.args[1].type=Variable::kInteger;frame.args[1].data.i=1;
+ frame.args[2].type=Variable::kBoolean;frame.args[2].data.b=false;
+ DragonStackView stack{&frame},*p=&stack;
+ auto read=[&]{return ReadNativeSharedRemoval(&p);};
+ assert(read().Item==10&&read().Caller==20);
+ frame.args[3].type=Variable::kObject;frame.args[3].data.pObj=&destination;assert(!read().Item);
+ frame.args[3].data.pObj=nullptr;assert(read().Item==10);
+ frame.args[3].type=static_cast<Variable::Type>(32);assert(read().Item==10);
+ frame.args[3].type=static_cast<Variable::Type>(33);assert(!read().Item);
+ frame.args[3].type=Variable::kInteger;assert(!read().Item);
+ frame.args[3].type=Variable::kEmpty;
+ frame.args[1].data.i=2;assert(!read().Item);frame.args[1].data.i=1;
+ frame.Size=3;assert(!read().Item);frame.Size=4;
+ frame.Self.data.pObj=nullptr;assert(!read().Item);frame.Self.data.pObj=&player;
+ source.Self.data.pObj=nullptr;assert(!read().Caller);source.Self.data.pObj=&caller;
+ function.params=3;assert(!read().Item);function.params=4;
+ frame.Previous=nullptr;assert(!read().Item);frame.Previous=&source;
+ TESForm exact,other;IObjectHandlePolicy policy;policy.expected=&exact;
+ assert(MatchesNativeRemovalHandle(&policy,10,&exact));
+ assert(!MatchesNativeRemovalHandle(&policy,10,&other)&&!MatchesNativeRemovalHandle(&policy,11,&exact));
+ policy.available=false;assert(!MatchesNativeRemovalHandle(&policy,10,&exact));
+ policy.available=true;policy.typed=false;assert(!MatchesNativeRemovalHandle(&policy,10,&exact));
+}
+''')
