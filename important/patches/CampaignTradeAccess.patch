@@ -268,7 +268,7 @@ new file mode 100644
 diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJournal.cpp
 --- a/Code/server/Services/QuestJournal.cpp
 +++ b/Code/server/Services/QuestJournal.cpp
-@@ -8,126 +8,136 @@
+@@ -8,126 +8,192 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
@@ -455,6 +455,62 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 +{
 +    const auto it=admission.Active().find(player.GetId());
 +    return it==admission.Active().end()?0:it->second;
++}
++
++void RecordCampaignDragonLife(World& world,Player& owner,entt::entity entity,bool dead) noexcept
++{
++    try
++    {
++        auto& link=CampaignAccess::Authority();
++        if (link.State()!=CampaignReplication::Link::Mode::Ready) return;
++        const auto* actor=world.try_get<CharacterComponent>(entity);
++        const auto* reference=world.try_get<FormIdComponent>(entity);
++        const auto* cell=world.try_get<CellIdComponent>(entity);
++        if (!actor||!actor->IsDragon()||!reference||!reference->Id||!cell) return;
++        std::string key;
++        const auto& mods=world.ctx().at<ModsComponent>();
++        for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
++            for (const auto& [name,entry]:*list)
++            {
++                if (entry.id!=reference->Id.ModId) continue;
++                std::string plugin(name.begin(),name.end());
++                for (auto& ch:plugin) if (ch>='A'&&ch<='Z') ch=static_cast<char>(ch-'A'+'a');
++                const TradeProperties::FormKey form{plugin,reference->Id.BaseId};
++                if (form.Valid()&&(list!=&mods.GetLiteMods()||form.Local<=0xFFF)) key=form.Encode();
++            }
++        if (key.empty()) return;
++        const auto history=DragonAbsorption::ReadShared(link.Journal.Operations());
++        if (!history||history->Retired.contains(key)) return;
++        std::string kind,payload;
++        if (history->Kills.contains(key))
++        {
++            kind="dragon-retired-v1";payload=key;
++        }
++        else if (dead)
++        {
++            const auto* party=world.GetPartyService().GetPlayerParty(&owner);
++            uint64_t a{},b{};
++            if (party&&party->Members.size()==2)
++                for (auto* player:party->Members)
++                {
++                    if (!player||!player->GetCharacter()||!cell->IsInRange(player->GetCellComponent(),false)) continue;
++                    const auto* participant=world.try_get<CharacterComponent>(*player->GetCharacter());
++                    const auto character=CampaignAccess::Character(*player);
++                    if (!participant||participant->IsDead()||!character) continue;
++                    if (!a) a=character;else b=character;
++                }
++            DragonAbsorption::Kill kill{key,std::min(a,b),std::max(a,b)};
++            if (kill.Valid()&&kill.Other(CampaignAccess::Character(owner)))
++            {kind="dragon-death-v1";payload=kill.Encode();}
++            else
++            {kind="dragon-retired-v1";payload=key;}
++        }
++        else return;
++        const auto head=link.Journal.Current();
++        if (link.Journal.Append(head,{"dragon-life-"+std::to_string(head.Revision+1),kind,payload})!=CampaignJournal::Result::Committed)
++            spdlog::warn("STM could not persist dragon life");
++    }
++    catch (...) {spdlog::warn("STM dragon life observation failed");}
 +}
 +
 +void QuestService::RecordQuest(Player* player, const NotifyQuestUpdate& event) noexcept

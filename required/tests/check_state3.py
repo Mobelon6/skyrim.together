@@ -532,3 +532,28 @@ int main(){
     ops.pop_back();ops[1].Payload="bad 22";assert(!Read(ops));
 }
 ''', ['-I'+str(code/'common')])
+
+run('shared dragon death cohort and one immutable grant',headers+'''
+#include <DragonAbsorption.h>
+int main(){
+    using namespace DragonAbsorption;
+    const std::string key="736b7972696d2e65736d.123";
+    Kill kill{key,11,22};assert(kill.Valid()&&DecodeKill(kill.Encode()));
+    assert(kill.Other(11)==22&&kill.Other(22)==11&&!kill.Other(33));
+    assert(!DecodeKill(key+" 22 11")&&!DecodeKill(key+" 11 11"));
+    std::vector<CampaignJournal::Operation> ops={{"1","dragon-death-v1",kill.Encode()}};
+    auto h=ReadShared(ops);assert(h&&h->Kills.at(key).Revision==1);
+    assert(!h->Plan({key,33}));const auto grant=h->Plan({key,11});
+    assert(grant&&grant->Recipient==22);
+    ops.push_back({"2","dragon-shared-v1",grant->Encode()});assert(!ReadShared(ops));
+    ops.pop_back();ops.push_back({"2","dragon-absorbed-v1",Receipt{key,11}.Encode()});
+    ops.push_back({"3","dragon-shared-v1",grant->Encode()});
+    h=ReadShared(ops);assert(h&&h->Grants.size()==1&&!h->Plan({key,22}));
+    ops.push_back({"4","dragon-retired-v1",key});h=ReadShared(ops);
+    assert(h&&h->Retired.contains(key)&&h->Grants.size()==1&&!h->Plan({key,11}));
+    ops.push_back({"5","dragon-death-v1",kill.Encode()});assert(!ReadShared(ops));
+    assert(Mask(0.f)==0&&Mask(16777215.f)==16777215u);
+    assert(!Mask(-1.f)&&!Mask(16777216.f)&&!Mask(1.5f));
+    assert(ReceiptBase==0x813&&MaxGrants==768);
+}
+''', ['-I'+str(code/'common')])

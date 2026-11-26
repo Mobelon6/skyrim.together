@@ -23,7 +23,8 @@ records=list(walk(data))
 assert records[0][0]==b"TES4"
 assert struct.unpack_from("<I",records[0][3],10)[0]==len(records)-1
 forms={f:(t,flags,body) for t,flags,f,body in records if f}
-assert set(forms)==set(range(0x01000800,0x01000813))
+assert set(forms)==set(range(0x01000800,0x01000833))
+assert all(forms[i][0]==b"GLOB" for i in range(0x01000813,0x01000833))
 assert all(forms[i][0]==b"GLOB" for i in range(0x01000800,0x01000810))
 assert forms[0x01000810][0]==b"CONT"
 assert forms[0x01000811][0]==b"CELL"

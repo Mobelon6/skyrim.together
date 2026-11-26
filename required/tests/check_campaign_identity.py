@@ -16,7 +16,7 @@ i=end+24
 names=[]
 while i<globals_end:
     kind,length,flags,form,*_=struct.unpack_from("<4sIIIIHH",data,i)
-    assert kind==b"GLOB" and flags==0 and form==0x01000800+len(names)
+    assert kind==b"GLOB" and flags==0 and form==(0x01000800+len(names) if len(names)<16 else 0x01000813+len(names)-16)
     start=i+24;stop=start+length
     fields={}
     while start<stop:
@@ -26,7 +26,7 @@ while i<globals_end:
     names.append(fields[b"EDID"].rstrip(b"\0").decode())
     i=stop
 assert i==globals_end
-assert names==["STRTradeStreamLow","STRTradeStreamMiddle","STRTradeStreamHigh","STRTradeCursor","STRCampaignCampaignLow","STRCampaignCampaignMiddle","STRCampaignCampaignHigh","STRCampaignCharacterLow","STRCampaignCharacterMiddle","STRCampaignCharacterHigh","STRCampaignRevisionLow","STRCampaignRevisionHigh","STRCampaignTagLow","STRCampaignTagMiddle","STRCampaignTagHigh","STRCampaignSchema"]
+assert names==["STRTradeStreamLow","STRTradeStreamMiddle","STRTradeStreamHigh","STRTradeCursor","STRCampaignCampaignLow","STRCampaignCampaignMiddle","STRCampaignCampaignHigh","STRCampaignCharacterLow","STRCampaignCharacterMiddle","STRCampaignCharacterHigh","STRCampaignRevisionLow","STRCampaignRevisionHigh","STRCampaignTagLow","STRCampaignTagMiddle","STRCampaignTagHigh","STRCampaignSchema"]+[f"STRDragonSoulReceipt{i:02d}" for i in range(32)]
 common=Path(sys.argv[1],"Code/common").resolve()
 test=r"""
 #include "CampaignIdentity.h"

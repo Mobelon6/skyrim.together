@@ -336,7 +336,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 +#include <DragonAbsorption.h>
  #include <Services/CampaignAccess.h>
  #include <Messages/RequestCampaignPull.h>
-@@ -133,9 +136,97 @@
+@@ -133,9 +136,112 @@
          const auto& p=event.Packet;
 -        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64) return;
 -        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
@@ -429,12 +429,27 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 +                            if (plugin==key->Plugin&&(list!=&mods.GetLiteMods()||key->Local<=0xFFF)) matches=true;
 +                        }
 +                    const auto receipts=DragonAbsorption::Read(campaignLink.Journal.Operations());
-+                    if (matches&&receipts&&!receipts->contains(receipt.Encode()))
++                    if (matches&&receipts)
 +                    {
-+                        const auto head=campaignLink.Journal.Current();
-+                        if (campaignLink.Journal.Append(head,{"dragon-absorbed-"+std::to_string(head.Revision+1),
-+                            "dragon-absorbed-v1",receipt.Encode()})!=CampaignJournal::Result::Committed)
-+                            spdlog::warn("STM could not persist native dragon absorption");
++                        bool witnessed=receipts->contains(receipt.Encode());
++                        if (!witnessed)
++                        {
++                            const auto head=campaignLink.Journal.Current();
++                            witnessed=campaignLink.Journal.Append(head,{"dragon-absorbed-"+std::to_string(head.Revision+1),
++                                "dragon-absorbed-v1",receipt.Encode()})==CampaignJournal::Result::Committed;
++                        }
++                        if (witnessed)
++                        {
++                            const auto history=DragonAbsorption::ReadShared(campaignLink.Journal.Operations());
++                            const auto grant=history?history->Plan(receipt):std::nullopt;
++                            if (grant)
++                            {
++                                const auto head=campaignLink.Journal.Current();
++                                if (campaignLink.Journal.Append(head,{"dragon-shared-"+std::to_string(head.Revision+1),
++                                    "dragon-shared-v1",grant->Encode()})!=CampaignJournal::Result::Committed)
++                                    spdlog::warn("STM shared dragon grant could not be committed");
++                            }
++                        }
 +                    }
 +                }
 +            }
@@ -444,7 +459,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -9,5 +9,28 @@
+@@ -9,5 +9,34 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
@@ -453,6 +468,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +#include <QuestWordReward.h>
 +#include <DragonAbsorption.h>
 +#include <Utils.h>
++#include <atomic>
 +#include <Services/HomeInstance.h>
 +#include <InventoryEvidence.h>
 +#include <Forms/TESObjectCELL.h>
@@ -473,7 +489,12 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
  #include <HomeRegistry.h>
 +
 +bool TeachCampaignWord(TESForm*) noexcept;
-@@ -26,6 +49,15 @@
++bool DragonAwardHookReady() noexcept;
++void ResetCampaignDragonAwards() noexcept;
++void RefreshCampaignDragonAwards() noexcept;
++void RememberCampaignDragonAward(uint32_t) noexcept;
++int ApplyCampaignDragonAward(uint32_t) noexcept;
+@@ -26,6 +55,16 @@
  namespace
  {
  CampaignReplication::Link campaignLink;
@@ -482,6 +503,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +std::mutex checkpointLoadMutex;
 +std::string loadedDigest;
 +bool confirmedLoad{};
++std::atomic<uint64_t> dragonLoadEpoch{1};
 +std::map<std::string,CampaignCheckpoint::Record> checkpointOutbox;
 +std::string LoadedDigest()
 +{
@@ -489,7 +511,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +253,595 @@
+@@ -221,6 +260,649 @@
      return 2;
  }
  
@@ -610,6 +632,58 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    request.AbsorbedDragon=next.Receipt.Dragon.c_str();request.DragonEntity=next.Entity;
 +}
 +
++uint64_t dragonObservedEpoch{},dragonObservedCharacter{};
++std::optional<uint32_t> dragonSessionStart;
++void ApplySharedDragonGrants(World& world,const CampaignJournal::Journal& journal,uint64_t character)
++{
++    if (!character||!DragonAwardHookReady()||!SaveWorldReady()||world.IsLoadingSave()||
++        !world.GetPartyService().IsInParty()) return;
++    const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
++    if (dragonObservedEpoch!=epoch||dragonObservedCharacter!=character)
++    {
++        dragonSessionStart.reset();dragonObservedEpoch=epoch;dragonObservedCharacter=character;
++    }
++    if (!dragonSessionStart) dragonSessionStart=journal.Current().Revision;
++    const auto history=DragonAbsorption::ReadShared(journal.Operations());
++    if (!history) return;
++    auto* mods=ModManager::Get();
++    auto* plugin=mods?mods->GetByName("SkyrimCoopTrade.esp"):nullptr;
++    const auto* method=world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue");
++    if (!plugin||!plugin->IsLoaded()||!method) return;
++    PapyrusFunction<void,TESGlobal,float> set(method);
++    for (uint32_t i=0;i<history->Grants.size();++i)
++    {
++        const auto& grant=history->Grants[i];
++        if (grant.Recipient!=character||history->Retired.contains(grant.Dragon)) continue;
++        const auto key=TradeProperties::DecodeForm(grant.Dragon);
++        auto* mod=key?mods->GetByName(key->Plugin.c_str()):nullptr;
++        if (!mod||!mod->IsLoaded()||(mod->IsLite()&&key->Local>0xFFF)) continue;
++        const auto form=mod->GetFormId(key->Local);
++        auto* dragon=Cast<Actor>(TESForm::GetById(form));
++        if (!dragon||!dragon->IsDragon()||!dragon->IsDead()||!dragon->GetNiNode()) continue;
++        auto* field=TESForm::GetById(plugin->GetFormId(DragonAbsorption::ReceiptBase+i/DragonAbsorption::BitsPerWord));
++        if (!field||static_cast<unsigned>(field->formType)!=9) continue;
++        auto* global=static_cast<TESGlobal*>(field);
++        const auto mask=DragonAbsorption::Mask(global->f);
++        if (!mask) continue;
++        const uint32_t bit=1u<<(i%DragonAbsorption::BitsPerWord);
++        if (*mask&bit)
++        {
++            RememberCampaignDragonAward(form);continue;
++        }
++        const auto kill=history->Kills.find(grant.Dragon);
++        if (kill==history->Kills.end()||kill->second.Revision<=*dragonSessionStart) continue;
++        const auto result=ApplyCampaignDragonAward(form);
++        if (!result) continue;
++        const auto next=*mask|bit;
++        set(global,static_cast<float>(next));
++        if (DragonAbsorption::Mask(global->f)!=next)
++            spdlog::warn("STM shared dragon receipt could not be persisted for {:X}",form);
++        else if (result==2)
++            spdlog::info("STM shared dragon soul granted for {:X}",form);
++    }
++}
++
 +std::string NextCheckpoint(const CampaignIdentity::Stamp& stamp)
 +{
 +    const auto digest=LoadedDigest();
@@ -688,6 +762,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +}
 +void CampaignCheckpointClient::ForgetLoaded() noexcept
 +{
++    ResetCampaignDragonAwards();dragonLoadEpoch.fetch_add(1,std::memory_order_acq_rel);
 +    std::lock_guard lock(checkpointLoadMutex);loadedDigest.clear();confirmedLoad=false;
 +}
 +void CampaignCheckpointClient::NoteLoadedFile(std::string digest) noexcept
@@ -1071,6 +1146,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +
  void QuestService::PollCampaign(const UpdateEvent&) noexcept
  {
++    if (!m_world.IsLoadingSave()&&SaveWorldReady()) RefreshCampaignDragonAwards();
 +    if (!m_world.GetTransport().IsOnline()||!m_world.GetPartyService().IsInParty())
 +    {
 +        offeredQuestStages.clear();
@@ -1085,7 +1161,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        pendingDragonAbsorptions.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +871,9 @@
+@@ -250,6 +932,9 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -1095,7 +1171,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        ObserveLearnedWord(m_world,stamp->Character,request);
 +        SendDragonAbsorption(stamp->Character,request);
          m_world.GetTransport().Send(request);
-@@ -275,8 +899,21 @@
+@@ -275,8 +960,22 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -1107,6 +1183,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            // Only after the server confirmed the complete prefix for this save.
 +            try
 +            {
++                ApplySharedDragonGrants(m_world,campaignLink.Journal,stamp->Character);
 +                RestoreLearnedWords(m_world,campaignLink.Journal,stamp->Character);
 +                RestoreOwnQuestPickups(m_world,campaignLink.Journal,stamp->Character);
 +                for (const auto& update:MissingActiveQuestStages(m_world,campaignLink.Journal))
@@ -1355,7 +1432,7 @@ diff --git a/Code/client/Games/Skyrim/Misc/NativeFunction.h b/Code/client/Games/
 diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScript.cpp
 --- a/Code/client/Games/Misc/BSScript.cpp
 +++ b/Code/client/Games/Misc/BSScript.cpp
-@@ -8,7 +8,12 @@
+@@ -8,7 +8,13 @@
  #include <Actor.h>
  #include <PlayerCharacter.h>
  #include <Games/ActorExtension.h>
@@ -1364,12 +1441,13 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +#include <mutex>
 +#include <cstring>
 +#include <atomic>
++#include <map>
 +#include <cmath>
 +#include <Forms/ActorValueInfo.h>
  
  TP_THIS_FUNCTION(TRegisterPapyrusFunction, void, BSScript::IVirtualMachine, NativeFunction*);
  TP_THIS_FUNCTION(TBindEverythingToScript, void, BSScript::IVirtualMachine*);
-@@ -20,8 +25,141 @@
+@@ -20,8 +26,236 @@
  TSignaturesMatch* RealSignaturesMatch = nullptr;
  TCompareVariables* RealCompareVariables = nullptr;
  
@@ -1412,6 +1490,85 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +                 void*, void*, BSScript::IVirtualMachine*, bool);
 +TDragonNativeCall* realDragonNativeCall{};
 +std::atomic<const void*> modActorValueNative{};
++namespace
++{
++enum class DragonAwardState { NativePending, NativePaid, SupplementPending, SupplementPaid, Retired };
++std::mutex dragonAwardMutex;
++std::map<uint32_t,DragonAwardState> dragonAwards;
++}
++bool DragonAwardHookReady() noexcept {return realDragonNativeCall&&modActorValueNative.load(std::memory_order_acquire);}
++void ResetCampaignDragonAwards() noexcept
++{
++    std::lock_guard lock(dragonAwardMutex);dragonAwards.clear();
++}
++void RefreshCampaignDragonAwards() noexcept
++{
++    std::lock_guard lock(dragonAwardMutex);
++    for (auto& [form,state]:dragonAwards)
++        if (auto* actor=Cast<Actor>(TESForm::GetById(form));actor&&!actor->IsDead())
++            state=DragonAwardState::Retired;
++}
++void RememberCampaignDragonAward(uint32_t form) noexcept
++{
++    try {std::lock_guard lock(dragonAwardMutex);dragonAwards.try_emplace(form,DragonAwardState::SupplementPaid);}
++    catch (...) {}
++}
++int ApplyCampaignDragonAward(uint32_t form) noexcept
++{
++    try
++    {
++        auto* player=PlayerCharacter::Get();
++        if (!player||!DragonAwardHookReady()) return 0;
++        const float before=player->GetActorValue(ActorValueInfo::kDragonSouls);
++        if (!std::isfinite(before)||before<0.f||before+1.f==before) return 0;
++        {
++            std::lock_guard lock(dragonAwardMutex);
++            const auto it=dragonAwards.find(form);
++            if (it!=dragonAwards.end())
++            {
++                if (it->second==DragonAwardState::NativePaid) return 1;
++                if (it->second==DragonAwardState::SupplementPaid) return 2;
++                return 0;
++            }
++            dragonAwards[form]=DragonAwardState::SupplementPending;
++        }
++        player->actorValueOwner.ModValue(ActorValueInfo::kDragonSouls,1.f);
++        const bool applied=player->GetActorValue(ActorValueInfo::kDragonSouls)==before+1.f;
++        {
++            std::lock_guard lock(dragonAwardMutex);
++            if (applied) dragonAwards[form]=DragonAwardState::SupplementPaid;
++            else dragonAwards.erase(form);
++        }
++        return applied?2:0;
++    }
++    catch (...) {return 0;}
++}
++static bool BeginNativeDragonAward(uint32_t form,bool& suppress) noexcept
++{
++    try
++    {
++        std::lock_guard lock(dragonAwardMutex);
++        const auto it=dragonAwards.find(form);
++        if (it!=dragonAwards.end())
++        {
++            suppress=it->second==DragonAwardState::SupplementPaid||it->second==DragonAwardState::SupplementPending;
++            return false;
++        }
++        dragonAwards.emplace(form,DragonAwardState::NativePending);
++        return true;
++    }
++    catch (...) {return false;}
++}
++static void FinishNativeDragonAward(uint32_t form,bool paid) noexcept
++{
++    std::lock_guard lock(dragonAwardMutex);
++    const auto it=dragonAwards.find(form);
++    if (it!=dragonAwards.end()&&it->second==DragonAwardState::NativePending)
++    {
++        if (paid) it->second=DragonAwardState::NativePaid;
++        else dragonAwards.erase(it);
++    }
++}
 +struct DragonFrameView
 +{
 +    BSScript::Stack* Parent;
@@ -1445,7 +1602,7 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +        !policy->IsHandleObjectAvailable(handle)) return nullptr;
 +    return policy->GetObjectForHandle<Actor>(handle);
 +}
-+static uint32_t NativeDragonSource(void* stackArgument)
++static uint32_t NativeDragonSource(void* stackArgument,BSScript::Variable*& reward)
 +{
 +    if (!stackArgument) return 0;
 +    auto* stack=*static_cast<DragonStackView**>(stackArgument);
@@ -1468,7 +1625,8 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +    auto* player=PlayerCharacter::Get();
 +    if (!player||DragonFrameActor(&frame->Self)!=player) return 0;
 +    auto* dragon=DragonFrameActor(callerFrame->GetStackFrameVariable(0,callerFrame->GetPageForFrame()));
-+    return dragon&&dragon->IsDragon()&&dragon->IsDead()?dragon->formID:0;
++    if (!dragon||!dragon->IsDragon()||!dragon->IsDead()||dragon->IsTemporary()) return 0;
++    reward=amount;return dragon->formID;
 +}
 +void RecordNativeDragonAbsorption(uint32_t form) noexcept;
 +BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunctionBase,
@@ -1476,22 +1634,37 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +{
 +    uint32_t dragon{};
 +    float before{};
++    BSScript::Variable* reward{};
++    bool tracked=false,suppress=false;
 +    if (apThis==modActorValueNative.load(std::memory_order_acquire)&&World::Exists()&&
 +        !World::Get().IsLoadingSave())
 +    {
-+        dragon=NativeDragonSource(stackArgument);
++        dragon=NativeDragonSource(stackArgument,reward);
 +        if (dragon)
++        {
++            tracked=BeginNativeDragonAward(dragon,suppress);
 +            before=PlayerCharacter::Get()->GetActorValue(ActorValueInfo::kDragonSouls);
++            // Only the copied float argument of the exact native award.
++            if (suppress&&reward) reward->data.f=0.f;
++        }
 +    }
 +    const auto result=TiltedPhoques::ThisCall(realDragonNativeCall,apThis,stackArgument,logger,vm,flag);
-+    if (dragon&&result==BSScript::CallResult::kCompleted&&World::Exists()&&!World::Get().IsLoadingSave())
++    bool paid=false;
++    if (dragon&&!suppress&&result==BSScript::CallResult::kCompleted&&World::Exists()&&!World::Get().IsLoadingSave())
 +    {
 +        auto* player=PlayerCharacter::Get();
-+        if (player&&std::isfinite(before)&&player->GetActorValue(ActorValueInfo::kDragonSouls)==before+1.f)
-+            World::Get().GetRunner().Queue([dragon]{RecordNativeDragonAbsorption(dragon);});
++        paid=player&&std::isfinite(before)&&player->GetActorValue(ActorValueInfo::kDragonSouls)==before+1.f;
++        if (paid) World::Get().GetRunner().Queue([dragon]{RecordNativeDragonAbsorption(dragon);});
 +    }
++    if (tracked) FinishNativeDragonAward(dragon,paid);
 +    return result;
 +}
++#else
++bool DragonAwardHookReady() noexcept {return false;}
++void ResetCampaignDragonAwards() noexcept {}
++void RefreshCampaignDragonAwards() noexcept {}
++void RememberCampaignDragonAward(uint32_t) noexcept {}
++int ApplyCampaignDragonAward(uint32_t) noexcept {return 0;}
 +#endif
 +
 +void TP_MAKE_THISCALL(HookRegisterPapyrusFunction, BSScript::IVirtualMachine, NativeFunction* apFunction)
@@ -1513,7 +1686,7 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
      auto& runner = World::Get().GetRunner();
  
      PapyrusFunctionRegisterEvent event(apFunction->functionName.AsAscii(), apFunction->typeName.AsAscii(), apFunction->functionAddress);
-@@ -109,6 +247,11 @@
+@@ -109,6 +343,11 @@
          TP_HOOK(&RealRegisterPapyrusFunction, HookRegisterPapyrusFunction);
          TP_HOOK(&RealBindEverythingToScript, HookBindEverythingToScript);
          TP_HOOK(&RealSignaturesMatch, HookSignaturesMatch);
@@ -1607,11 +1780,14 @@ diff --git a/Code/common/DragonAbsorption.h b/Code/common/DragonAbsorption.h
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/DragonAbsorption.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,134 @@
 +#pragma once
 +#include <CampaignJournal.h>
 +#include <TradeProperties.h>
 +#include <optional>
++#include <cmath>
++#include <map>
++#include <vector>
 +#include <set>
 +#include <sstream>
 +#include <string>
@@ -1652,4 +1828,106 @@ new file mode 100644
 +        }
 +    return receipts;
 +}
++
++inline constexpr uint32_t ReceiptBase=0x813, ReceiptWords=32, BitsPerWord=24;
++inline constexpr uint32_t MaxGrants=ReceiptWords*BitsPerWord;
++inline std::optional<uint32_t> Mask(float value)
++{
++    if (!std::isfinite(value)||value<0.f||value>16777215.f) return {};
++    const auto mask=static_cast<uint32_t>(value);
++    return static_cast<float>(mask)==value?std::optional<uint32_t>(mask):std::nullopt;
 +}
++struct Kill
++{
++    std::string Dragon;
++    uint64_t First{},Second{};
++    uint32_t Revision{};
++    bool Valid() const
++    {
++        const auto key=TradeProperties::DecodeForm(Dragon);
++        return key&&key->Valid()&&key->Encode()==Dragon&&First&&First<Second;
++    }
++    std::string Encode() const {return Dragon+" "+std::to_string(First)+" "+std::to_string(Second);}
++    uint64_t Other(uint64_t c) const {return c==First?Second:c==Second?First:0;}
++};
++inline std::optional<Kill> DecodeKill(const std::string& payload)
++{
++    Kill kill;
++    std::istringstream row(payload);std::string extra;
++    if (!(row>>kill.Dragon>>kill.First>>kill.Second)||row>>extra||!kill.Valid()||kill.Encode()!=payload) return {};
++    return kill;
++}
++struct Grant
++{
++    std::string Dragon;
++    uint64_t Source{},Recipient{};
++    std::string Encode() const {return Dragon+" "+std::to_string(Source)+" "+std::to_string(Recipient);}
++};
++struct SharedHistory
++{
++    std::map<std::string,Kill> Kills;
++    std::set<std::string> Retired;
++    std::vector<Grant> Grants;
++    std::optional<Grant> Plan(const Receipt& receipt) const
++    {
++        if (!receipt.Valid()||Retired.contains(receipt.Dragon)||Grants.size()>=MaxGrants) return {};
++        const auto kill=Kills.find(receipt.Dragon);
++        if (kill==Kills.end()) return {};
++        const auto other=kill->second.Other(receipt.Character);
++        if (!other) return {};
++        for (const auto& grant:Grants) if (grant.Dragon==receipt.Dragon) return {};
++        return Grant{receipt.Dragon,receipt.Character,other};
++    }
++};
++inline std::optional<SharedHistory> ReadShared(const std::vector<CampaignJournal::Operation>& operations)
++{
++    SharedHistory history;
++    std::set<std::string> native;
++    uint32_t revision{};
++    for (const auto& op:operations)
++    {
++        ++revision;
++        if (op.Kind=="dragon-death-v1")
++        {
++            auto kill=DecodeKill(op.Payload);
++            if (!kill||history.Retired.contains(kill->Dragon)||history.Kills.contains(kill->Dragon)) return {};
++            kill->Revision=revision;history.Kills.emplace(kill->Dragon,*kill);
++        }
++        else if (op.Kind=="dragon-retired-v1")
++        {
++            const auto key=TradeProperties::DecodeForm(op.Payload);
++            if (!key||!key->Valid()||key->Encode()!=op.Payload||!history.Retired.insert(op.Payload).second) return {};
++        }
++        else if (op.Kind=="dragon-absorbed-v1")
++        {
++            if (!Decode(op.Payload)||!native.insert(op.Payload).second) return {};
++        }
++        else if (op.Kind=="dragon-shared-v1")
++        {
++            Grant grant;std::string extra;std::istringstream row(op.Payload);
++            if (!(row>>grant.Dragon>>grant.Source>>grant.Recipient)||row>>extra||grant.Encode()!=op.Payload) return {};
++            const Receipt receipt{grant.Dragon,grant.Source};
++            const auto plan=history.Plan(receipt);
++            if (!plan||plan->Encode()!=op.Payload||!native.contains(receipt.Encode())) return {};
++            history.Grants.push_back(std::move(grant));
++        }
++    }
++    return history;
++}
++}
+diff --git a/Code/server/Services/ActorValueService.cpp b/Code/server/Services/ActorValueService.cpp
+--- a/Code/server/Services/ActorValueService.cpp
++++ b/Code/server/Services/ActorValueService.cpp
+@@ -11,3 +11,5 @@
+ #include <Messages/NotifyHealthChangeBroadcast.h>
+ #include <Messages/NotifyDeathStateChange.h>
++void RecordCampaignDragonLife(World&,Player&,entt::entity,bool) noexcept;
++
+ 
+@@ -113,3 +115,6 @@
+     auto& characterComponent = characterView.get<CharacterComponent>(*it);
++    const bool lifeChanged=characterComponent.IsDead()!=message.IsDead;
+     characterComponent.SetDead(message.IsDead);
++    if (lifeChanged&&characterComponent.IsDragon())
++        RecordCampaignDragonLife(m_world,*acMessage.pPlayer,*it,message.IsDead);
+     spdlog::debug("Updating death state {:x}:{}", message.Id, message.IsDead);
