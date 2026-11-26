@@ -588,7 +588,7 @@ new file mode 100644
 diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor.cpp
 --- a/Code/client/Games/Skyrim/Actor.cpp
 +++ b/Code/client/Games/Skyrim/Actor.cpp
-@@ -1129,6 +1129,95 @@
+@@ -1129,6 +1129,94 @@
      TiltedPhoques::ThisCall(RealAddInventoryItem, apThis, apItem, apExtraData, aCount, apOldOwner);
  }
  
@@ -658,12 +658,11 @@ diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor
 +    if (!questId) return;
 +    // In inventory, resolve the exact reference selected by the native alias.
 +    // Do not infer its identity from an ordinary item of the same base type.
-+    if (!object)
-+    {
-+        auto* owner=Cast<TESQuest>(TESForm::GetById(questId));
-+        object=owner&&(allowStopped||!owner->IsStopped())?owner->GetAliasedRef(aliasId):nullptr;
-+    }
-+    if (!object||object->IsTemporary()||object->baseForm!=base) return;
++    auto* owner=Cast<TESQuest>(TESForm::GetById(questId));
++    auto* assigned=owner&&(allowStopped||!owner->IsStopped())?owner->GetAliasedRef(aliasId):nullptr;
++    if (!assigned||(object&&object!=assigned)) return;
++    object=assigned;
++    if (object->IsTemporary()||object->baseForm!=base) return;
 +    GameId quest{},reference{};
 +    auto& mods=World::Get().GetModSystem();
 +    if (!mods.GetServerModId(questId,quest)||!mods.GetServerModId(object->formID,reference)||
@@ -684,7 +683,7 @@ diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor
  void* TP_MAKE_THISCALL(HookPickUpObject, Actor, TESObjectREFR* apObject, int32_t aCount, bool aUnk1, float aUnk2)
  {
      if (!ScopedInventoryOverride::IsOverriden())
-@@ -1142,11 +1231,32 @@
+@@ -1142,11 +1230,32 @@
          if (apObject->GetExtraDataList())
              apThis->GetItemFromExtraData(item, apObject->GetExtraDataList());
  

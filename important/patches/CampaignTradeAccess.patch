@@ -1631,7 +1631,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +#include <Messages/RequestInventoryChanges.h>
  
  #include <Messages/RequestQuestUpdate.h>
-@@ -15,5 +19,194 @@
+@@ -15,5 +19,229 @@
  Console::Setting bEnableMiscQuestSync{"Gameplay:bEnableMiscQuestSync", "(Experimental) Syncs miscellaneous quests when possible", false};
  
 +using QuestRun = PartyService::Party::QuestRun;
@@ -1733,32 +1733,59 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +
 +bool CanRecordQuestPickup(const QuestRun& run,bool initialEvidence,int32_t count)
 +{
-+    if (run.Generation!=1||run.Stopped||run.CompletedRunOnce||count<=0) return false;
-+    return run.Started||!run.OrderedStages.empty()||(initialEvidence&&count==1);
++    if (run.Generation!=1||run.Stopped||run.CompletedRunOnce||count!=1) return false;
++    return run.Started||!run.OrderedStages.empty()||initialEvidence;
 +}
 +
-+enum class QuestItemDecision { Record, Duplicate, Reject };
++enum class QuestItemDecision { Record, Duplicate, Reject, Copy, ConsumeCopy };
++
++// The original pickup fixes the shared reference and its authoritative holder.
++// A second native pickup is evidence of an engine-side replica conflict, not
++// another shared item or a grant. Only an identified actual holder may spend it.
 +QuestItemDecision QuestItemChange(const std::vector<CampaignJournal::Operation>& ops,
 +    const std::string& prefix,const std::string& payload,bool consumed)
 +{
-+    bool pickup=false,spent=false;
++    const auto separator=payload.rfind(' ');
++    if (separator==std::string::npos || separator<prefix.size()) return QuestItemDecision::Reject;
++    const auto identity=payload.substr(0,separator+1);
++    std::string original;
++    bool copy=false,spent=false;
 +    for (const auto& op:ops)
 +    {
 +        if (!op.Payload.starts_with(prefix)) continue;
 +        if (op.Kind=="quest-pickup-v1")
 +        {
-+            if (op.Payload!=payload) return QuestItemDecision::Reject;
-+            pickup=true;
++            if (!op.Payload.starts_with(identity) || (!original.empty() && original!=op.Payload))
++                return QuestItemDecision::Reject;
++            original=op.Payload;
++        }
++        else if (op.Kind=="quest-copy-v1")
++        {
++            if (original.empty() || !op.Payload.starts_with(identity) || op.Payload==original)
++                return QuestItemDecision::Reject;
++            if (op.Payload==payload) copy=true;
 +        }
 +        else if (op.Kind=="quest-consumed-v1")
 +        {
-+            if (op.Payload!=payload) return QuestItemDecision::Reject;
++            if (original.empty() || op.Payload!=original) return QuestItemDecision::Reject;
++            spent=true;
++        }
++        else if (op.Kind=="quest-consumed-v2")
++        {
++            if (original.empty() || !op.Payload.starts_with(identity) || op.Payload==original)
++                return QuestItemDecision::Reject;
++            const auto recorded=std::any_of(ops.begin(),ops.end(),[&](const auto& candidate) {
++                return candidate.Kind=="quest-copy-v1" && candidate.Payload==op.Payload;
++            });
++            if (!recorded) return QuestItemDecision::Reject;
 +            spent=true;
 +        }
 +    }
-+    if (consumed)
-+        return !pickup?QuestItemDecision::Reject:spent?QuestItemDecision::Duplicate:QuestItemDecision::Record;
-+    return pickup?QuestItemDecision::Duplicate:spent?QuestItemDecision::Reject:QuestItemDecision::Record;
++    if (original.empty()) return consumed?QuestItemDecision::Reject:QuestItemDecision::Record;
++    if (payload==original) return consumed&&!spent?QuestItemDecision::Record:QuestItemDecision::Duplicate;
++    if (copy) return consumed&&!spent?QuestItemDecision::ConsumeCopy:QuestItemDecision::Duplicate;
++    if (consumed) return QuestItemDecision::Reject;
++    return QuestItemDecision::Copy;
 +}
 +
 +// A player who has independently accepted this quest may have missed earlier
@@ -1806,27 +1833,35 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        QuestRun run;
 +        if (!RestoreQuestRun(authority.Journal,key,run)||run.Generation!=1) return;
 +        const bool consumed=message.Item.Count<0;
-+        if (!consumed&&!CanRecordQuestPickup(run,message.QuestInitialEvidence,message.Item.Count)) return;
++        if (!consumed&&message.Item.Count!=1) return;
 +        const auto prefix=key+" "+std::to_string(run.Generation)+" "+std::to_string(message.QuestAlias)+" ";
 +        const auto payload=prefix+reference+" "+item+" "+
 +            std::to_string(consumed?1:message.Item.Count)+" "+std::to_string(character);
 +        const auto decision=QuestItemChange(authority.Journal.Operations(),prefix,payload,consumed);
 +        if (decision==QuestItemDecision::Duplicate) return;
++        if (decision==QuestItemDecision::Record && !consumed &&
++            !CanRecordQuestPickup(run,message.QuestInitialEvidence,message.Item.Count)) return;
++        // A later pickup is never a new shared item. Record only an actual
++        // displayed RunOnce quest pickup, not an ambiguous background alias.
++        if (decision==QuestItemDecision::Copy && !message.QuestInitialEvidence) return;
 +        if (decision==QuestItemDecision::Reject)
 +        {
 +            spdlog::warn("Unmatched quest item change for {:X}, alias {}",message.QuestId.LogFormat(),message.QuestAlias);
 +            return;
 +        }
 +        const auto head=authority.Journal.Current();
-+        if (authority.Journal.Append(head,{std::string(consumed?"quest-consumed-":"quest-pickup-")+std::to_string(head.Revision+1),
-+            consumed?"quest-consumed-v1":"quest-pickup-v1",payload})!=CampaignJournal::Result::Committed)
++        const char* kind=decision==QuestItemDecision::Copy?"quest-copy-v1":
++            decision==QuestItemDecision::ConsumeCopy?"quest-consumed-v2":
++            consumed?"quest-consumed-v1":"quest-pickup-v1";
++        if (authority.Journal.Append(head,{std::string("quest-item-")+std::to_string(head.Revision+1),
++            kind,payload})!=CampaignJournal::Result::Committed)
 +            spdlog::error("STM could not persist quest item change");
 +    }
 +    catch (...) {spdlog::error("STM quest item change failed");}
 +}
 +
  QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
-@@ -44,3 +237,40 @@
+@@ -44,3 +272,40 @@
      PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
      const PartyService::Party::Conversation* participants = nullptr;
 +    bool knownSharedQuest = false;
@@ -1867,7 +1902,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        }
 +    }
      if (!pParty) return;
-@@ -61,6 +291,7 @@
+@@ -61,6 +326,7 @@
          // During an interaction, only the quest of the witnessed topic has provenance.
          if (inTalk || inFight) return;
 -        if (!bEnableMiscQuestSync && !(message.JournalObjective && message.Status == RequestQuestUpdate::StageUpdate &&
@@ -1877,7 +1912,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +            !(knownSharedQuest && message.Status == RequestQuestUpdate::Stopped && message.CompletedRunOnce)) return;
      }
  
-@@ -115,39 +346,47 @@
+@@ -115,39 +381,47 @@
 -    auto& run = pParty->QuestRuns[message.Id];
 -    // The sender's local quest log and the party's shared lifecycle are independent.
 -    // A late start from a second client must not clear stages the first client sent.

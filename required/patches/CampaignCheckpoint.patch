@@ -399,7 +399,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +248,393 @@
+@@ -221,6 +248,410 @@
      return 2;
  }
  
@@ -564,6 +564,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    int32_t Count{};
 +    uint64_t Character{};
 +    bool Consumed{};
++    std::set<uint64_t> Copies;
 +};
 +
 +std::optional<std::vector<QuestPickup>> QuestPickupHistory(
@@ -572,7 +573,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    std::vector<QuestPickup> pickups;
 +    for (const auto& op:ops)
 +    {
-+        if (op.Kind!="quest-pickup-v1"&&op.Kind!="quest-consumed-v1") continue;
++        if (op.Kind!="quest-pickup-v1"&&op.Kind!="quest-consumed-v1"&&
++            op.Kind!="quest-copy-v1"&&op.Kind!="quest-consumed-v2") continue;
 +        QuestPickup item;
 +        std::istringstream in(op.Payload);
 +        std::string extra;
@@ -589,8 +591,22 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            continue;
 +        }
 +        if (found->Reference!=item.Reference||found->Item!=item.Item||
-+            found->Count!=item.Count||found->Character!=item.Character) return {};
-+        if (op.Kind=="quest-consumed-v1") found->Consumed=true;
++            found->Count!=item.Count) return {};
++        if (op.Kind=="quest-copy-v1")
++        {
++            if (item.Count!=1||found->Character==item.Character) return {};
++            found->Copies.insert(item.Character);
++        }
++        else if (op.Kind=="quest-consumed-v2")
++        {
++            if (item.Count!=1||!found->Copies.contains(item.Character)) return {};
++            found->Consumed=true;
++        }
++        else
++        {
++            if (found->Character!=item.Character) return {};
++            if (op.Kind=="quest-consumed-v1") found->Consumed=true;
++        }
 +    }
 +    return pickups;
 +}
@@ -604,7 +620,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +bool ShouldReconcileSpentPickup(const QuestPickup& item,uint64_t character,uint32_t generation,
 +    bool completedRunOnce,bool localCompleted)
 +{
-+    return character&&item.Character==character&&item.Consumed&&item.Count==1&&
++    return character&&(item.Character==character||item.Copies.contains(character))&&item.Consumed&&item.Count==1&&
 +        generation==1&&item.Generation==generation&&completedRunOnce&&localCompleted;
 +}
 +
@@ -681,7 +697,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        const auto generation=run==history->end()?1u:run->second.Generation;
 +        const bool stopped=run!=history->end()&&run->second.Stopped;
 +        const bool restore=ShouldRestorePickup(item,character,generation,stopped);
-+        const bool reconcile=item.Consumed&&item.Character==character&&run!=history->end()&&run->second.CompletedRunOnce;
++        const bool reconcile=item.Consumed&&(item.Character==character||item.Copies.contains(character))&&
++            run!=history->end()&&run->second.CompletedRunOnce;
 +        if (!restore&&!reconcile) continue;
 +        const auto questId=LocalQuestForm(item.Quest),referenceId=LocalQuestForm(item.Reference),baseId=LocalQuestForm(item.Item);
 +        if (!questId||!referenceId||!baseId) continue;
@@ -793,7 +810,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        attemptedQuestConsumption.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +664,7 @@
+@@ -250,6 +681,7 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -801,7 +818,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
          request.Credential=credential->Secret.c_str();
 +        request.Checkpoint=NextCheckpoint(*stamp).c_str();
          m_world.GetTransport().Send(request);
-@@ -275,8 +690,20 @@
+@@ -275,8 +707,20 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();

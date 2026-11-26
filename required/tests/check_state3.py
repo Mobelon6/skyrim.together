@@ -290,6 +290,7 @@ int main(){
     QuestRun initial;assert(!CanRecordQuestPickup(initial,false,1));
     assert(CanRecordQuestPickup(initial,true,1)&&!CanRecordQuestPickup(initial,true,2));
     initial.Started=true;assert(CanRecordQuestPickup(initial,false,1));
+    assert(!CanRecordQuestPickup(initial,true,2));
     initial.Stopped=true;assert(!CanRecordQuestPickup(initial,true,1));
     initial.Stopped=false;initial.Generation=2;assert(!CanRecordQuestPickup(initial,true,1));
     initial.Generation=1;initial.CompletedRunOnce=true;assert(!CanRecordQuestPickup(initial,true,1));
@@ -307,6 +308,18 @@ int main(){
     ops.push_back({"2","quest-consumed-v1",pickup});
     assert(QuestItemChange(ops,prefix,pickup,true)==D::Duplicate);
     assert(QuestItemChange(ops,prefix,pickup,false)==D::Duplicate);
+    const std::string second=prefix+"ref item 1 202";
+    assert(QuestItemChange(ops,prefix,second,false)==D::Copy);
+    assert(QuestItemChange(ops,prefix,second,true)==D::Reject);
+    ops.pop_back(); // unspent original
+    ops.push_back({"2","quest-copy-v1",second});
+    assert(QuestItemChange(ops,prefix,second,false)==D::Duplicate);
+    assert(QuestItemChange(ops,prefix,second,true)==D::ConsumeCopy);
+    assert(QuestItemChange(ops,prefix,prefix+"ref item 1 303",true)==D::Reject);
+    ops.push_back({"3","quest-consumed-v2",second});
+    assert(QuestItemChange(ops,prefix,pickup,true)==D::Duplicate);
+    assert(QuestItemChange(ops,prefix,second,true)==D::Duplicate);
+    assert(QuestItemChange(ops,prefix,prefix+"other item 1 303",false)==D::Reject);
 }
 ''')
 
@@ -339,6 +352,20 @@ int main(){
     assert(ShouldRestorePickup(history->at(1),202,1,false));
     ops.push_back({"5","quest-consumed-v1","q 1 4 wrong base2 1 202"});
     assert(!QuestPickupHistory(ops));
+    ops={{"1","quest-pickup-v1","q 1 3 ref base 1 101"},
+         {"2","quest-copy-v1","q 1 3 ref base 1 202"}};
+    history=QuestPickupHistory(ops);assert(history&&history->size()==1);
+    assert(ShouldRestorePickup(history->at(0),101,1,false));
+    assert(!ShouldRestorePickup(history->at(0),202,1,false));
+    assert(!ShouldReconcileSpentPickup(history->at(0),202,1,true,true));
+    ops.push_back({"3","quest-consumed-v2","q 1 3 ref base 1 202"});
+    history=QuestPickupHistory(ops);assert(history&&history->at(0).Consumed);
+    assert(ShouldReconcileSpentPickup(history->at(0),101,1,true,true));
+    assert(ShouldReconcileSpentPickup(history->at(0),202,1,true,true));
+    assert(!ShouldReconcileSpentPickup(history->at(0),303,1,true,true));
+    assert(!ShouldReconcileSpentPickup(history->at(0),202,1,true,false));
+    assert(!ShouldRestorePickup(history->at(0),101,1,false));
+    ops[2].Payload="q 1 3 ref base 1 303";assert(!QuestPickupHistory(ops));
 }
 ''')
 
