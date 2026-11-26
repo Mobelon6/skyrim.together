@@ -470,7 +470,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -9,8 +9,46 @@
+@@ -9,8 +9,47 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
@@ -514,10 +514,11 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +void RememberCampaignDragonAward(uint32_t) noexcept;
 +int ApplyCampaignDragonAward(uint32_t) noexcept;
 +uint32_t NativeUniqueRewardQuest() noexcept;
++uint16_t NativeUniqueRewardStage() noexcept;
  #include <HomeSnapshot.h>
  #include <HomePermissions.h>
  #include <TradeLedger.h>
-@@ -26,6 +64,16 @@
+@@ -26,6 +65,16 @@
  namespace
  {
  CampaignReplication::Link campaignLink;
@@ -534,7 +535,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +269,1241 @@
+@@ -221,6 +270,1243 @@
      return 2;
  }
  
@@ -794,7 +795,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +}
 +void UpdateUniqueRewards(World& world,const CampaignIdentity::Stamp& stamp)
 +{
-+    if (!world.GetPartyService().IsInParty()||world.IsLoadingSave()||!SaveWorldReady()) return;
++    uniqueRewardEpoch.store(0,std::memory_order_release);
++    if (!world.GetTransport().IsOnline()||!world.GetPartyService().IsInParty()||world.IsLoadingSave()||!SaveWorldReady()) return;
 +    auto* player=PlayerCharacter::Get();
 +    if (!player) return;
 +    const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
@@ -1641,7 +1643,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    {
 +        const auto* entry=UniqueQuestReward::Find(item);
 +        const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
-+        if (!entry||NativeUniqueRewardQuest()!=entry->Quest||
++        if (!entry||NativeUniqueRewardQuest()!=entry->Quest||NativeUniqueRewardStage()!=entry->Stage||
 +            uniqueRewardEpoch.load(std::memory_order_acquire)!=epoch||!World::Exists()) return false;
 +        auto& world=World::Get();
 +        if (world.IsLoadingSave()) return false;
@@ -1772,11 +1774,12 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    }
 +    if (!m_world.GetTransport().IsOnline()||m_world.IsLoadingSave()||!SaveWorldReady())
 +    {
++        uniqueRewardEpoch.store(0,std::memory_order_release);
 +        wordBaseline.reset();pendingWord.reset();attemptedWords.clear();wordAttemptCharacter=0;
 +        deferredQuestPickup.reset();deferredQuestTurnIn.reset();questDialogueReady=false;sharedDialogueItems.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +1533,32 @@
+@@ -250,6 +1536,32 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -1809,7 +1812,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +1584,29 @@
+@@ -275,8 +1587,29 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -2077,7 +2080,7 @@ diff --git a/Code/client/Games/Skyrim/Misc/NativeFunction.h b/Code/client/Games/
 diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScript.cpp
 --- a/Code/client/Games/Misc/BSScript.cpp
 +++ b/Code/client/Games/Misc/BSScript.cpp
-@@ -8,7 +8,13 @@
+@@ -8,7 +8,15 @@
  #include <Actor.h>
  #include <PlayerCharacter.h>
  #include <Games/ActorExtension.h>
@@ -2089,10 +2092,12 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +#include <map>
 +#include <cmath>
 +#include <Forms/ActorValueInfo.h>
++#include <Forms/TESQuest.h>
++#include <UniqueQuestReward.h>
  
  TP_THIS_FUNCTION(TRegisterPapyrusFunction, void, BSScript::IVirtualMachine, NativeFunction*);
  TP_THIS_FUNCTION(TBindEverythingToScript, void, BSScript::IVirtualMachine*);
-@@ -20,8 +26,259 @@
+@@ -20,8 +28,280 @@
  TSignaturesMatch* RealSignaturesMatch = nullptr;
  TCompareVariables* RealCompareVariables = nullptr;
  
@@ -2136,7 +2141,9 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +TDragonNativeCall* realDragonNativeCall{};
 +std::atomic<const void*> modActorValueNative{},addItemNative{};
 +thread_local uint32_t nativeUniqueRewardQuest{};
++thread_local uint16_t nativeUniqueRewardStage{};
 +uint32_t NativeUniqueRewardQuest() noexcept {return nativeUniqueRewardQuest;}
++uint16_t NativeUniqueRewardStage() noexcept {return nativeUniqueRewardStage;}
 +namespace
 +{
 +enum class DragonAwardState { NativePending, NativePaid, SupplementPending, SupplementPaid, Retired };
@@ -2295,21 +2302,39 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +            if (suppress&&reward) reward->data.f=0.f;
 +        }
 +    }
-+    // Reuse the already installed native-call hook and the verified frame
-+    // fields. Restrict the inventory interception to the generated DA01
-+    // quest fragment's synchronous ObjectReference.AddItem, not other scripts.
-+    const auto previous=nativeUniqueRewardQuest;
-+    struct RestoreScope {uint32_t Previous;~RestoreScope(){nativeUniqueRewardQuest=Previous;}} restore{previous};
-+    nativeUniqueRewardQuest=0;
++    // Bind AddItem to the actual quest handle and completion fragment,
++    // not merely a QF script name or the quest's maximum stage.
++    struct RestoreScope
++    {
++        uint32_t Quest;uint16_t Stage;
++        ~RestoreScope(){nativeUniqueRewardQuest=Quest;nativeUniqueRewardStage=Stage;}
++    } restore{nativeUniqueRewardQuest,nativeUniqueRewardStage};
++    nativeUniqueRewardQuest=0;nativeUniqueRewardStage=0;
 +    if (apThis==addItemNative.load(std::memory_order_acquire)&&stackArgument)
 +    {
 +        auto* stack=*static_cast<DragonStackView**>(stackArgument);
 +        auto* frame=stack?stack->Top:nullptr;
 +        auto* caller=frame?frame->Previous:nullptr;
-+        if (caller&&caller->Function)
-+            if (const auto* scope=caller->Function->GetObjectTypeName().AsAscii();
-+                scope&&!_stricmp(scope,"QF_DA01_00028AD6"))
-+                nativeUniqueRewardQuest=0x28ad6;
++        if (frame&&frame->Parent&&caller&&caller->Parent&&caller->Function)
++        {
++            auto* gameVM=GameVM::Get();
++            auto* policy=gameVM&&gameVM->virtualMachine?gameVM->virtualMachine->GetObjectHandlePolicy():nullptr;
++            auto* object=caller->Self.GetObject();
++            const auto handle=object?object->GetHandle():0;
++            constexpr auto questType=static_cast<uint32_t>(FormType::QuestItem); // QUST (77)
++            if (policy&&handle&&policy->HandleIsType(questType,handle)&&policy->IsHandleObjectAvailable(handle))
++            {
++                const auto* quest=static_cast<const TESQuest*>(policy->GetObjectForHandle(questType,handle));
++                const auto* script=caller->Function->GetObjectTypeName().AsAscii();
++                const auto* fragment=caller->Function->GetName().AsAscii();
++                if (quest&&quest->formType==FormType::QuestItem&&script&&fragment)
++                    if (const auto* source=UniqueQuestReward::FindSource(quest->formID,script,fragment))
++                    {
++                        nativeUniqueRewardQuest=source->Quest;
++                        nativeUniqueRewardStage=source->Stage;
++                    }
++            }
++        }
 +    }
 +    const auto result=TiltedPhoques::ThisCall(realDragonNativeCall,apThis,stackArgument,logger,vm,flag);
 +    bool paid=false;
@@ -2324,6 +2349,7 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +}
 +#else
 +uint32_t NativeUniqueRewardQuest() noexcept {return 0;}
++uint16_t NativeUniqueRewardStage() noexcept {return 0;}
 +bool DragonAwardHookReady() noexcept {return false;}
 +void ResetCampaignDragonAwards() noexcept {}
 +void RefreshCampaignDragonAwards() noexcept {}
@@ -2354,7 +2380,7 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
      auto& runner = World::Get().GetRunner();
  
      PapyrusFunctionRegisterEvent event(apFunction->functionName.AsAscii(), apFunction->typeName.AsAscii(), apFunction->functionAddress);
-@@ -109,5 +366,10 @@
+@@ -109,5 +389,10 @@
          TP_HOOK(&RealRegisterPapyrusFunction, HookRegisterPapyrusFunction);
          TP_HOOK(&RealBindEverythingToScript, HookBindEverythingToScript);
          TP_HOOK(&RealSignaturesMatch, HookSignaturesMatch);
@@ -3145,7 +3171,7 @@ diff --git a/Code/common/UniqueQuestReward.h b/Code/common/UniqueQuestReward.h
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/UniqueQuestReward.h
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,92 @@
 +#pragma once
 +#include <CampaignJournal.h>
 +#include <TradeProperties.h>
@@ -3157,9 +3183,24 @@ new file mode 100644
 +
 +namespace UniqueQuestReward
 +{
-+struct Entry { uint32_t Quest, Item; uint16_t Stage; uint32_t Receipt; };
-+// Skyrim.esm DA01, mutually exclusive final rewards. Only known base forms.
-+inline constexpr Entry Catalog[]={{0x28ad6,0x63b27,100,0x833},{0x28ad6,0x63b29,110,0x834}};
++struct Entry { uint32_t Quest, Item; uint16_t Stage; uint32_t Receipt; const char* Script; const char* Fragment; };
++// QUST VMAD log-index bindings for DA01, mutually exclusive final rewards.
++inline constexpr Entry Catalog[]={
++    {0x28ad6,0x63b27,100,0x833,"qf_da01_00028ad6","fragment_15"},
++    {0x28ad6,0x63b29,110,0x834,"qf_da01_00028ad6","fragment_17"}};
++inline bool SameName(std::string_view a,std::string_view b)
++{
++    const auto fold=[](char c){return c>='A'&&c<='Z'?static_cast<char>(c-'A'+'a'):c;};
++    if (a.size()!=b.size()) return false;
++    for (size_t i=0;i<a.size();++i) if (fold(a[i])!=fold(b[i])) return false;
++    return true;
++}
++inline const Entry* FindSource(uint32_t quest,std::string_view script,std::string_view fragment)
++{
++    for (const auto& entry:Catalog)
++        if (entry.Quest==quest&&SameName(entry.Script,script)&&SameName(entry.Fragment,fragment)) return &entry;
++    return nullptr;
++}
 +inline const Entry* Find(uint32_t item)
 +{
 +    for (const auto& entry:Catalog) if (entry.Item==item) return &entry;

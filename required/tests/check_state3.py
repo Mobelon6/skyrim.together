@@ -756,6 +756,11 @@ run('one unique quest reward and immutable recipient',headers+'''
 int main(){
     using namespace UniqueQuestReward;
     const auto& azura=Catalog[0];const auto& black=Catalog[1];
+    assert(FindSource(azura.Quest,"QF_DA01_00028AD6","Fragment_15")==&azura);
+    assert(FindSource(black.Quest,"qf_da01_00028ad6","FRAGMENT_17")==&black);
+    assert(!FindSource(azura.Quest,"QF_DA01_00028AD6","Fragment_13"));
+    assert(!FindSource(azura.Quest+1,"QF_DA01_00028AD6","Fragment_15"));
+    assert(!FindSource(azura.Quest,"WrongScript","Fragment_15"));
     const auto key=TradeProperties::FormKey{"skyrim.esm",azura.Quest}.Encode();
     std::vector<CampaignJournal::Operation> ops={{"1","quest-progress-v1",key+" 1 1 0 7 101"},
         {"2","quest-progress-v1",key+" 1 0 100 7 202"}};
