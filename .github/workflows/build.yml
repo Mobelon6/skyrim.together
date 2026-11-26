@@ -318,19 +318,20 @@ jobs:
           cd ..
           7z a -tzip ../Skyrim-Coop-SE-1170-Interaction07-dev-MO2.zip .
           7z t ../Skyrim-Coop-SE-1170-Interaction07-dev-MO2.zip
+      - name: Test interface from the assembled installer
+        working-directory: .
+        run: |
+          set -eu
+          7z x Skyrim-Coop-SE-1170-Interaction07-dev-MO2.zip 'SkyrimTogetherReborn/UI/*' -opackage-test
+          python -m pip install playwright==1.55.0
+          python -m playwright install chromium
+          ui=package-test/SkyrimTogetherReborn/UI
+          python important/tests/check_dialogue_ui.py "$ui"
+          python important/tests/verify_travel_settings.py "$ui"
+          python important/tests/check_party_windows.py "$ui"
       - if: ${{ false }} # Public binary distribution pending license audit.
         uses: actions/upload-artifact@v4
         with:
           name: Skyrim-Coop-SE-1170-Interaction07-dev-MO2
           path: Skyrim-Coop-SE-1170-Interaction07-dev-MO2.zip
           if-no-files-found: error
-
-  packaged-ui:
-    if: ${{ false }} # Requires approved public package artifact.
-    needs: build
-    permissions:
-      contents: read
-      actions: read
-    uses: ./.github/workflows/dialogue-ui-test.yml
-    with:
-      run_id: ${{ format('{0}', github.run_id) }}

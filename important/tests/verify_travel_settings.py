@@ -12,7 +12,7 @@ Thread(target=http.serve_forever,daemon=True).start()
 base=f'http://127.0.0.1:{http.server_port}'
 try:
     with sync_playwright() as p:
-        browser=p.chromium.launch(executable_path=sys.argv[2],args=['--disable-dev-shm-usage'])
+        browser=p.chromium.launch(executable_path=next(iter(sys.argv[2:]), None),args=['--disable-dev-shm-usage'])
         page=browser.new_page(viewport={'width':1920,'height':1080})
         page.add_init_script(BRIDGE)
         page.route('**/*',lambda r:r.continue_() if r.request.url.startswith(base+'/') else r.fulfill(status=200,content_type='application/json',body='[]'))
