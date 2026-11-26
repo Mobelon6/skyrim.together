@@ -76,7 +76,7 @@ template<class T> using Vector=std::vector<T>;
 template<class K,class V> using Map=std::map<K,V>;
 struct UpdateEvent{};struct DisconnectedEvent{};struct PartyLeftEvent{};
 struct ScopedQuestOverride{ScopedQuestOverride(){}};
-struct NotifyQuestUpdate{enum {StageUpdate,Started,Stopped};GameId Id;uint16_t Stage;uint8_t Status;uint8_t ClientQuestType{};std::string Targets{};uint32_t LocalInstance{};};
+struct NotifyQuestUpdate{enum {StageUpdate,Started,Stopped};GameId Id;uint16_t Stage;uint8_t Status;uint8_t ClientQuestType{};std::string Targets{};uint32_t LocalInstance{};bool CheckInstance{};uint32_t ExpectedInstance{};};
 struct TESForm{static TESForm* GetById(uint32_t);};
 template<class T> T* Cast(TESForm* p){return static_cast<T*>(p);}
 struct Conditions{uint16_t wants;};
@@ -115,7 +115,7 @@ template<class...T>void info(T&&...){}
 template<class...T>void error(T&&...){}
 }
 struct QuestService{
-World& m_world=World::Get();struct HeldStages{Vector<uint16_t> Stages,PendingItems;std::chrono::steady_clock::time_point RetryAt{};std::string Targets;uint32_t LocalInstance{};bool BranchConflict{};};
+World& m_world=World::Get();struct HeldStages{Vector<uint16_t> Stages,PendingItems;std::chrono::steady_clock::time_point RetryAt{};std::string Targets;uint32_t LocalInstance{};bool CheckInstance{};bool BranchConflict{};};
 std::map<uint32_t,std::pair<uint32_t,std::string>> m_lastQuestTargets;
 std::map<uint32_t,uint32_t> m_branchConflicts;
 static std::string CaptureQuestTargets(TESQuest* q){return q->targets;}
@@ -126,7 +126,7 @@ void HoldStage(TESQuest*,uint16_t) noexcept;HeldStages* GetHeldStages(uint32_t,T
 void OnQuestUpdate(const NotifyQuestUpdate&) noexcept;static bool StopQuest(uint32_t);
 };
 using HeldStages=QuestService::HeldStages;
-static bool MatchesQuestTargets(TESQuest* q,const NotifyQuestUpdate& u){return q&&(u.Targets.empty()||(!q->stopped&&q->currentInstanceID==u.LocalInstance&&q->targets==u.Targets));}
+static bool MatchesQuestTargets(TESQuest* q,const NotifyQuestUpdate& u){return q&&(!u.CheckInstance||(!q->stopped&&q->currentInstanceID==u.ExpectedInstance))&&(u.Targets.empty()||(!q->stopped&&q->currentInstanceID==u.LocalInstance&&q->targets==u.Targets));}
 static void ReleaseStagesForWaitingPhases(TESQuest*,HeldStages&) noexcept;
 static void ReleaseUncheckedStages(TESQuest*,HeldStages&) noexcept;
 static bool IsCheckedByPlayingScene(TESQuest* q,uint16_t){return !q->scenes.empty()&&q->scenes[0]->isPlaying;}
@@ -256,8 +256,9 @@ int main(){
 }
 ''')
 
-history=extract('client/Services/Generic/QuestJournal.cpp','struct QuestCatchup','struct QuestPickup')
+history=extract('client/Services/Generic/QuestJournal.cpp','struct QuestReplayState','struct QuestPickup')
 run('active quest catch-up from existing campaign history',headers+'''
+#include <QuestRunMember.h>
 #include <sstream>
 namespace CampaignJournal {struct Operation{std::string Id,Kind,Payload;};}
 struct NotifyQuestUpdate{enum {StageUpdate,Started,Stopped};};
@@ -273,7 +274,7 @@ int main(){
     assert((history->at("q").Stages==std::vector<std::pair<uint16_t,uint8_t>>{{100,6},{20,6}}));
     ops.push_back({"5","quest-progress-v1","q 1 2 20 6 202"});
     history=ActiveQuestHistory(ops);
-    assert(history&&history->at("q").Stopped&&history->at("q").Stages.empty());
+    assert(history&&history->at("q").Stopped&&history->at("q").Stages.size()==2);
     ops.push_back({"6","quest-progress-v1","q 2 1 10 6 101"});
     ops.push_back({"7","quest-progress-v1","q 2 0 100 6 101"});
     history=ActiveQuestHistory(ops);
@@ -288,8 +289,54 @@ int main(){
          {"2","quest-progress-v1","q 1 0 20 6 202 2:r:616263.1;"}};
     history=ActiveQuestHistory(ops);assert(history&&history->at("q").Targets=="2:r:616263.1;");
     ops[1].Payload="q 1 0 20 6 202 2:r:616263.2;";assert(!ActiveQuestHistory(ops));
+    ops={{"1","quest-progress-v1","q 1 1 10 6 101 2:r:616263.1; @17"},
+         {"2","quest-binding-v1","q 1 1 10 6 202 2:r:616263.1; @83"},
+         {"3","quest-progress-v1","q 1 0 20 6 202 2:r:616263.1; @83"},
+         {"4","quest-progress-v1","q 1 2 20 6 101 2:r:616263.1; @17"},
+         {"5","quest-progress-v1","q 2 1 10 6 101 2:r:616263.1; @18"},
+         {"6","quest-binding-v1","q 2 1 10 6 202 2:r:616263.1; @84"},
+         {"7","quest-progress-v1","q 2 0 20 6 202 2:r:616263.1; @84"}};
+    history=ActiveQuestHistory(ops);assert(history&&history->at("q").Generation==2);
+    const auto& latest=history->at("q");
+    assert(QuestRunMember::Bound(latest.Members,101,2,18));
+    assert(QuestRunMember::Bound(latest.Members,202,2,84));
+    assert(latest.Prior.size()==1&&latest.Prior[0].Stopped&&latest.Prior[0].Stages.size()==1);
+    assert(QuestRunMember::Bound(latest.Members,202,1,83));
+    ops[6].Payload="q 2 0 20 6 202 2:r:616263.1; @83";assert(!ActiveQuestHistory(ops));
 }
-''')
+''', ['-I'+str(code/'common')])
+
+run('native instance identity across repeated quest generations',headers+'''
+#include <QuestRunMember.h>
+#include <sstream>
+int main(){
+    using namespace QuestRunMember;
+    Members m;
+    assert(Admit(m,101,1,17,false,true,false,false));
+    assert(Remember(m,101,1,17));
+    assert(Admit(m,101,1,17,false,false,true,false));
+    assert(!Admit(m,101,1,18,false,false,true,false));
+    assert(Admit(m,202,1,83,false,false,true,false));
+    assert(Remember(m,202,1,83));
+    assert(!Admit(m,101,1,17,true,true,false,false));
+    assert(Admit(m,101,1,18,true,true,false,false));
+    assert(Remember(m,101,2,18));
+    assert(!Admit(m,101,2,17,true,true,false,false));
+    assert(!Admit(m,202,2,83,false,true,false,false));
+    assert(!Admit(m,202,2,84,false,false,true,false));
+    assert(Admit(m,202,2,84,false,true,false,false));
+    assert(Remember(m,202,2,84)&&Bound(m,202,2,84));
+    assert(!Remember(m,202,2,83)&&!Remember(m,202,3,83));
+    assert(!Admit(m,303,2,1,false,false,true,false));
+    std::string targets;std::optional<uint32_t> id;
+    std::istringstream old("2:r:616263.1;");assert(ReadTail(old,targets,id)&&!id);
+    std::istringstream current("2:r:616263.1; @0");assert(ReadTail(current,targets,id)&&id==0);
+    std::istringstream bare("@42");assert(ReadTail(bare,targets,id)&&targets.empty()&&id==42);
+    std::istringstream wrong("@042");assert(!ReadTail(wrong,targets,id));
+    std::istringstream invalid("@4294967296");assert(!ReadTail(invalid,targets,id));
+    std::istringstream extra("@42 x");assert(!ReadTail(extra,targets,id));
+}
+''', ['-I'+str(code/'common')])
 
 pickup=extract('client/Games/Skyrim/Actor.cpp','void* TP_MAKE_THISCALL(HookPickUpObject','void Actor::PickUpObject(')
 run('native quest pickup requires actual inventory increase',headers+'''

@@ -465,7 +465,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -9,5 +9,36 @@
+@@ -9,5 +9,38 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
@@ -473,6 +473,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +#include <Services/CampaignCheckpointClient.h>
 +#include <QuestWordReward.h>
 +#include <QuestPickupPermit.h>
++#include <QuestRunMember.h>
++#include <tuple>
 +#include <Events/ActivateEvent.h>
 +#include <DragonAbsorption.h>
 +#include <Utils.h>
@@ -502,7 +504,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +void RefreshCampaignDragonAwards() noexcept;
 +void RememberCampaignDragonAward(uint32_t) noexcept;
 +int ApplyCampaignDragonAward(uint32_t) noexcept;
-@@ -26,6 +57,16 @@
+@@ -26,6 +59,16 @@
  namespace
  {
  CampaignReplication::Link campaignLink;
@@ -519,7 +521,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +262,767 @@
+@@ -221,6 +264,810 @@
      return 2;
  }
  
@@ -875,7 +877,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +
 +namespace
 +{
-+struct QuestCatchup
++struct QuestReplayState
 +{
 +    uint32_t Generation{1};
 +    bool Stopped{};
@@ -883,6 +885,13 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    std::string Targets;
 +    bool Seen{};
 +    std::vector<std::pair<uint16_t,uint8_t>> Stages;
++    uint16_t StopStage{};
++    uint8_t StopType{};
++};
++struct QuestCatchup : QuestReplayState
++{
++    QuestRunMember::Members Members;
++    std::vector<QuestReplayState> Prior;
 +};
 +
 +// Read the existing authoritative history, not the numeric maximum stage.
@@ -894,7 +903,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    for (const auto& op:ops)
 +    {
 +        const bool completed=op.Kind=="quest-completed-v1";
-+        if (!completed && op.Kind!="quest-progress-v1") continue;
++        const bool binding=op.Kind=="quest-binding-v1";
++        if (!completed && !binding && op.Kind!="quest-progress-v1") continue;
 +        std::istringstream in(op.Payload);
 +        std::string key,extra;
 +        uint32_t run{},status{},stage{},type{};
@@ -903,23 +913,33 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            !run||!character||status>NotifyQuestUpdate::Stopped||stage>UINT16_MAX||type>UINT8_MAX)
 +            return {};
 +        std::string targets;
-+        if (in>>targets)
-+            if (in>>extra||targets.size()>2048) return {};
++        std::optional<uint32_t> instance;
++        if (!QuestRunMember::ReadTail(in,targets,instance)||targets.size()>2048) return {};
 +        auto& quest=quests[key];
++        if (binding)
++        {
++            if (!instance||!quest.Seen||quest.Stopped||quest.Generation!=run||quest.Targets!=targets||
++                !QuestRunMember::Remember(quest.Members,character,run,*instance)) return {};
++            continue;
++        }
 +        if (quest.CompletedRunOnce || (completed&&(status!=NotifyQuestUpdate::Stopped||run!=1||quest.Stopped))) return {};
 +        if (run!=quest.Generation)
 +        {
 +            if (!quest.Stopped||status!=NotifyQuestUpdate::Started||
 +                quest.Generation==UINT32_MAX||run!=quest.Generation+1) return {};
-+            quest={};quest.Generation=run;
++            quest.Prior.push_back(static_cast<const QuestReplayState&>(quest));
++            static_cast<QuestReplayState&>(quest)={};
++            quest.Generation=run;
 +        }
 +        if (quest.Seen&&quest.Targets!=targets) return {};
 +        quest.Seen=true;quest.Targets=std::move(targets);
++        if (instance&&!QuestRunMember::Remember(quest.Members,character,run,*instance)) return {};
 +        if (status==NotifyQuestUpdate::Stopped)
 +        {
 +            quest.Stopped=true;
 +            quest.CompletedRunOnce=completed;
-+            if (!completed) quest.Stages.clear();
++            quest.StopStage=static_cast<uint16_t>(stage);
++            quest.StopType=static_cast<uint8_t>(type);
 +        }
 +        else if (status==NotifyQuestUpdate::StageUpdate)
 +        {
@@ -1128,7 +1148,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +
 +// Session-local suppression of repeated offers. ESS remains the source of
 +// applied stages; no receipt or save cursor is advanced here.
-+std::set<std::pair<uint32_t,uint16_t>> offeredQuestStages;
++std::set<std::tuple<uint32_t,uint32_t,uint32_t,uint8_t,uint16_t>> offeredQuestStages;
 +uint64_t questObservedLoadEpoch{};
 +void ResetQuestReplayForLoad()
 +{
@@ -1149,7 +1169,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +}
 +
 +std::vector<NotifyQuestUpdate> MissingActiveQuestStages(World& world,
-+    const CampaignJournal::Journal& journal)
++    const CampaignJournal::Journal& journal,uint64_t character)
 +{
 +    std::vector<NotifyQuestUpdate> updates;
 +    if (!world.GetPartyService().IsInParty()||!SaveWorldReady()) return updates;
@@ -1160,9 +1180,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            localQuests.insert(objective.instance->quest->formID);
 +    const auto history=ActiveQuestHistory(journal.Operations());
 +    if (!history) return updates;
-+    for (const auto& [key,state]:*history)
++    for (const auto& [key,latest]:*history)
 +    {
-+        if ((state.Stopped&&!state.CompletedRunOnce)||state.Generation!=1||state.Stages.empty()) continue;
 +        const auto form=TradeProperties::DecodeForm(key);
 +        if (!form||!form->Valid()) continue;
 +        auto* mod=ModManager::Get()->GetByName(form->Plugin.c_str());
@@ -1173,7 +1192,18 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        if (!quest||quest->IsStopped()||QuestService::IsNonSyncableQuest(quest)||
 +            world.GetOverlayService().IsPersonalQuest(id)) continue;
 +        const auto targets=QuestService::CaptureQuestTargets(quest);
-+        if (targets=="!"||targets!=state.Targets) continue;
++        if (targets=="!") continue;
++        const auto instance=quest->currentInstanceID;
++        const QuestReplayState* selected=&latest;
++        bool bound=QuestRunMember::Bound(latest.Members,character,latest.Generation,instance);
++        if (!bound)
++            for (auto it=latest.Prior.rbegin();it!=latest.Prior.rend();++it)
++                if (QuestRunMember::Bound(latest.Members,character,it->Generation,instance))
++                { selected=&*it;bound=true;break; }
++        const auto& state=*selected;
++        if (targets!=state.Targets) continue;
++        if (!bound&&(state.Generation!=1||(state.Stopped&&!state.CompletedRunOnce)||
++            latest.Members.contains(character))) continue;
 +        if (state.CompletedRunOnce && (!(quest->flags & TESQuest::RunOnce) ||
 +            (quest->flags & (TESQuest::Completed|TESQuest::Failed|TESQuest::AllowRepeatStages)))) continue;
 +        // Replay only recorded native stages. Do not synthesize a stop, reward,
@@ -1182,14 +1212,29 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        if (!world.GetModSystem().GetServerModId(id,gameId)) continue;
 +        for (const auto& [stage,type]:state.Stages)
 +        {
-+            if (quest->IsStageReached(stage)||!offeredQuestStages.emplace(id,stage).second) continue;
++            if (quest->IsStageReached(stage)||
++                !offeredQuestStages.emplace(id,state.Generation,instance,NotifyQuestUpdate::StageUpdate,stage).second) continue;
 +            NotifyQuestUpdate update{};
 +            update.Id=gameId;update.Stage=stage;update.ClientQuestType=type;
 +            update.Status=NotifyQuestUpdate::StageUpdate;
 +            update.SharedRun=state.Generation;
++            update.CheckInstance=bound;
++            update.ExpectedInstance=bound?instance:0;
 +            update.Targets=state.Targets.c_str();
 +            update.Speaker=world.GetPartyService().GetLeaderPlayerId();
 +            updates.push_back(update);
++        }
++        // Queue an observed stop after the bound run's stages. Existing
++        // native scene and fragment barriers still govern actual execution.
++        if (bound&&state.Stopped&&!state.CompletedRunOnce&&
++            offeredQuestStages.emplace(id,state.Generation,instance,NotifyQuestUpdate::Stopped,state.StopStage).second)
++        {
++            NotifyQuestUpdate stop{};
++            stop.Id=gameId;stop.Stage=state.StopStage;stop.ClientQuestType=state.StopType;
++            stop.Status=NotifyQuestUpdate::Stopped;stop.SharedRun=state.Generation;
++            stop.Targets=state.Targets.c_str();stop.CheckInstance=true;stop.ExpectedInstance=instance;
++            stop.Speaker=world.GetPartyService().GetLeaderPlayerId();
++            updates.push_back(stop);
 +        }
 +    }
 +    return updates;
@@ -1287,7 +1332,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        pendingDragonAbsorptions.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +1052,19 @@
+@@ -250,6 +1097,19 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -1307,7 +1352,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +1090,24 @@
+@@ -275,8 +1135,24 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -1324,7 +1369,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +                ApplySharedDragonGrants(m_world,campaignLink.Journal,stamp->Character);
 +                RestoreLearnedWords(m_world,campaignLink.Journal,stamp->Character);
 +                RestoreOwnQuestPickups(m_world,campaignLink.Journal,stamp->Character);
-+                for (const auto& update:MissingActiveQuestStages(m_world,campaignLink.Journal))
++                for (const auto& update:MissingActiveQuestStages(m_world,campaignLink.Journal,stamp->Character))
 +                    ReceiveQuestProgress(update);
 +            }
 +            catch (...) {spdlog::warn("STM active quest catch-up failed");}
@@ -2145,4 +2190,78 @@ new file mode 100644
 +        return true;
 +    }
 +};
++}
+
+diff --git a/Code/common/QuestRunMember.h b/Code/common/QuestRunMember.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/QuestRunMember.h
+@@ -0,0 +1,68 @@
++#pragma once
++#include <charconv>
++#include <cstdint>
++#include <istream>
++#include <map>
++#include <optional>
++#include <string>
++#include <utility>
++
++namespace QuestRunMember
++{
++// Keep the full instance history, not just the latest binding. Loading an
++// earlier ESS must not let a previously consumed instance open another run.
++using Members = std::map<uint64_t,std::map<uint32_t,uint32_t>>; // character -> instance -> generation
++inline bool ReadTail(std::istream& in,std::string& targets,std::optional<uint32_t>& instance)
++{
++    targets.clear();instance.reset();
++    std::string token,extra;
++    if (!(in>>token)) return true;
++    if (!token.starts_with('@'))
++    {
++        targets=std::move(token);
++        if (!(in>>token)) return true;
++    }
++    if (!token.starts_with('@')||token.size()<2||in>>extra) return false;
++    uint32_t id{};
++    const auto result=std::from_chars(token.data()+1,token.data()+token.size(),id);
++    if (result.ec!=std::errc{}||result.ptr!=token.data()+token.size()||
++        token!="@"+std::to_string(id)) return false;
++    instance=id;
++    return true;
++}
++inline std::optional<uint32_t> Instance(const Members& members,uint64_t character,uint32_t generation)
++{
++    const auto it=members.find(character);
++    if (it!=members.end())
++        for (const auto& [instance,run]:it->second)
++            if (run==generation) return instance;
++    return {};
++}
++inline bool Bound(const Members& members,uint64_t character,uint32_t generation,uint32_t instance)
++{
++    return Instance(members,character,generation)==instance;
++}
++inline bool Remember(Members& members,uint64_t character,uint32_t generation,uint32_t instance)
++{
++    if (!character||!generation) return false;
++    if (const auto old=Instance(members,character,generation)) return *old==instance;
++    auto& history=members[character];
++    if (history.contains(instance)) return false;
++    for (const auto& [id,run]:history) if (run>generation) return false;
++    history.emplace(instance,generation);
++    return true;
++}
++inline bool Admit(const Members& members,uint64_t character,uint32_t generation,uint32_t instance,
++    bool stopped,bool start,bool stage,bool legacyDifferentTargets)
++{
++    if (!character||!generation) return false;
++    const auto it=members.find(character);
++    const auto current=Instance(members,character,generation);
++    const bool used=it!=members.end()&&it->second.contains(instance);
++    if (stopped)
++        return start&&!used&&(current.has_value()||(members.empty()&&legacyDifferentTargets));
++    if (current) return *current==instance;
++    if (used) return false;
++    return start||(generation==1&&stage);
++}
 +}

@@ -1153,7 +1153,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 diff --git a/Code/client/Services/QuestService.h b/Code/client/Services/QuestService.h
 --- a/Code/client/Services/QuestService.h
 +++ b/Code/client/Services/QuestService.h
-@@ -1,64 +1,79 @@
+@@ -1,64 +1,80 @@
  #pragma once
  #include <chrono>
  struct NotifyQuestJournal;
@@ -1278,6 +1278,7 @@ diff --git a/Code/client/Services/QuestService.h b/Code/client/Services/QuestSer
 +        std::chrono::steady_clock::time_point RetryAt{};
 +        std::string Targets;
 +        uint32_t LocalInstance{};
++        bool CheckInstance{};
 +        bool BranchConflict{};
 +    };
 +
@@ -1291,7 +1292,7 @@ diff --git a/Code/client/Services/QuestService.h b/Code/client/Services/QuestSer
      void PollJournal(const UpdateEvent&) noexcept;
      void OnJournalRecord(const NotifyQuestJournal&) noexcept;
      uint64_t m_journalStream{};
-@@ -90,6 +105,7 @@
+@@ -90,6 +106,7 @@
      Map<uint32_t, HeldStages> m_heldStages{};
      // From the first deferred stop through any events belonging to the next run of this quest.
      Map<uint32_t, Vector<NotifyQuestUpdate>> m_afterHeldStages{};
@@ -1302,7 +1303,7 @@ diff --git a/Code/client/Services/QuestService.h b/Code/client/Services/QuestSer
 diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Services/Generic/QuestService.cpp
 --- a/Code/client/Services/Generic/QuestService.cpp
 +++ b/Code/client/Services/Generic/QuestService.cpp
-@@ -23,55 +23,187 @@
+@@ -23,55 +23,190 @@
  #include <Messages/RequestQuestUpdate.h>
  #include <Messages/NotifyQuestUpdate.h>
  #include <Messages/NotifyQuestJournal.h>
@@ -1491,6 +1492,8 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +        if (update.Status!=RequestQuestUpdate::Stopped)
 +            m_lastQuestTargets[form]={instance,targets};
 +        update.Targets=targets.c_str();
++        update.BindInstance=!(quest->flags&TESQuest::RunOnce);
++        update.Instance=update.BindInstance?instance:0;
 +        return true;
 +    }
 +    catch (...) {return false;}
@@ -1499,6 +1502,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +static bool MatchesQuestTargets(TESQuest* quest,const NotifyQuestUpdate& update)
 +{
 +    if (!quest) return false;
++    if (update.CheckInstance&&(quest->IsStopped()||quest->currentInstanceID!=update.ExpectedInstance)) return false;
 +    if (update.Targets.empty()) return true;
 +    if (quest->IsStopped() || quest->currentInstanceID!=update.LocalInstance) return false;
 +    try {return QuestService::CaptureQuestTargets(quest)==std::string(update.Targets.data(),update.Targets.size());}
@@ -1539,17 +1543,17 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
      m_journalClock = aDispatcher.sink<UpdateEvent>().connect<&QuestService::PollJournal>(this);
      m_journalRecords = aDispatcher.sink<NotifyQuestJournal>().connect<&QuestService::OnJournalRecord>(this);
      m_joinedConnection = aDispatcher.sink<ConnectedEvent>().connect<&QuestService::OnConnected>(this);
-@@ -127,6 +259,32 @@
+@@ -127,6 +262,32 @@
          TESQuest* pQuest = Cast<TESQuest>(TESForm::GetById(questFormId));
          if (HeldStages* pHeld = GetHeldStages(questFormId, pQuest))
          {
-+            if (!pHeld->Targets.empty())
++            if (pHeld->CheckInstance||!pHeld->Targets.empty())
 +            {
 +                bool matches=false;
 +                try
 +                {
 +                    matches=pQuest->currentInstanceID==pHeld->LocalInstance&&
-+                        CaptureQuestTargets(pQuest)==pHeld->Targets;
++                        (pHeld->Targets.empty()||CaptureQuestTargets(pQuest)==pHeld->Targets);
 +                }
 +                catch (...) {}
 +                if (!matches)
@@ -1572,7 +1576,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +                if (retry!=m_questRetryAt.end()) m_questRetryAt.erase(retry);
 +            }
          }
-@@ -136,13 +294,20 @@
+@@ -136,13 +297,20 @@
      // Dispatching may start a new run and defer its own stop, so detach each batch before dispatch.
      Vector<uint32_t> ready;
      for (const auto& [formId, events] : m_afterHeldStages)
@@ -1594,7 +1598,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
          for (const auto& update : events)
              OnQuestUpdate(update);
      }
-@@ -152,10 +317,16 @@
+@@ -152,10 +320,16 @@
  {
      m_afterHeldStages.clear();
      m_heldStages.clear();
@@ -1611,7 +1615,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +    m_lastQuestTargets.clear();
 +    m_branchConflicts.clear();
  }
-@@ -498,13 +669,87 @@
+@@ -498,13 +672,87 @@
 +// TESQuestStageItem::objConditions is the first member (CommonLibSSE-NG).
 +// Only prove exclusion from a reached stage in this same native instance.
 +// Unknown conditions, OR alternatives and unfilled conditions are NOT proof
@@ -1703,7 +1707,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 -    if (!aHeld.PendingItems.empty())
 +    if (aHeld.BranchConflict || !aHeld.PendingItems.empty() || std::chrono::steady_clock::now() < aHeld.RetryAt)
          return;
-@@ -543,8 +788,11 @@
+@@ -543,8 +791,11 @@
  static void ReleaseUncheckedStages(TESQuest* apQuest, HeldStages& aHeld) noexcept
  {
 -    while (!aHeld.Stages.empty() && aHeld.PendingItems.empty() && !IsCheckedByPlayingScene(apQuest, aHeld.Stages.front()))
@@ -1717,7 +1721,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +            return;
      }
  }
-@@ -602,12 +850,32 @@ void QuestService::OnQuestUpdate(const NotifyQuestUpdate& aUpdate) noexcept
+@@ -602,12 +853,33 @@ void QuestService::OnQuestUpdate(const NotifyQuestUpdate& aUpdate) noexcept
 +    if (!MatchesQuestTargets(pQuest,aUpdate)) return;
 +    const auto conflict=m_branchConflicts.find(formId);
 +    if (conflict!=m_branchConflicts.end())
@@ -1743,11 +1747,12 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +    HeldStages* pHeld = stageUpdate || aUpdate.Status == NotifyQuestUpdate::Stopped ? GetHeldStages(formId, pQuest) : nullptr;
 +    if (stageUpdate && (pHeld || IsCheckedByPlayingScene(pQuest, aUpdate.Stage)))
      {
-+        if (!aUpdate.Targets.empty())
++        if (aUpdate.CheckInstance||!aUpdate.Targets.empty())
 +        {
 +            auto& held=m_heldStages[formId];
 +            held.Targets.assign(aUpdate.Targets.data(),aUpdate.Targets.size());
 +            held.LocalInstance=aUpdate.LocalInstance;
++            held.CheckInstance=aUpdate.CheckInstance;
 +        }
          HoldStage(pQuest, aUpdate.Stage);
          return;
@@ -1755,7 +1760,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
  
      // Let the scene and its running fragments finish before stopping. A restart received
      // meanwhile belongs behind this stop, even if it uses the same form and stage numbers.
-@@ -645,15 +913,70 @@
+@@ -645,15 +917,72 @@
      case NotifyQuestUpdate::Started:
      {
 +        if (!pQuest->IsStageReached(aUpdate.Stage)&&StageExcludedByLocalBranch(pQuest,aUpdate.Stage))
@@ -1793,7 +1798,8 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +                    auto& held=m_heldStages[formId];
 +                    held.PendingItems.insert(held.PendingItems.end(),pending,aUpdate.Stage);
 +                    held.Targets.assign(aUpdate.Targets.data(),aUpdate.Targets.size());
-+                    held.LocalInstance=aUpdate.LocalInstance;
++                    held.LocalInstance=pQuest->currentInstanceID;
++                    held.CheckInstance=aUpdate.CheckInstance;
 +                }
 +            }
 +            pQuest->SetActive(true);
@@ -1824,7 +1830,8 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +                    auto& held=m_heldStages[formId];
 +                    held.PendingItems.insert(held.PendingItems.end(),pending,aUpdate.Stage);
 +                    held.Targets.assign(aUpdate.Targets.data(),aUpdate.Targets.size());
-+                    held.LocalInstance=aUpdate.LocalInstance;
++                    held.LocalInstance=pQuest->currentInstanceID;
++                    held.CheckInstance=aUpdate.CheckInstance;
 +                }
 +            }
 +            spdlog::info("Remote quest updated: {:X}, stage: {}", formId, aUpdate.Stage);
@@ -1833,7 +1840,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +    }
      case NotifyQuestUpdate::Stopped:
          bResult = StopQuest(formId);
-@@ -663,5 +986,12 @@
+@@ -663,5 +992,12 @@
      }
  
      if (!bResult)

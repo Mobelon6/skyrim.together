@@ -594,23 +594,28 @@ diff --git a/Code/encoding/Messages/NotifyQuestUpdate.cpp b/Code/encoding/Messag
 index 66b870e..8c38849 100644
 --- a/Code/encoding/Messages/NotifyQuestUpdate.cpp
 +++ b/Code/encoding/Messages/NotifyQuestUpdate.cpp
-@@ -10,6 +10,9 @@ void NotifyQuestUpdate::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) con
+@@ -10,6 +10,11 @@ void NotifyQuestUpdate::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) con
      aWriter.WriteBits(ClientQuestType, 8);
      TiltedPhoques::Serialization::WriteVarInt(aWriter, SharedRun);
      TiltedPhoques::Serialization::WriteVarInt(aWriter, Speaker);
 +    TiltedPhoques::Serialization::WriteVarInt(aWriter, Encounter);
 +    if (Encounter) Subject.Serialize(aWriter);
 +    TiltedPhoques::Serialization::WriteString(aWriter, Targets);
++    aWriter.WriteBits(CheckInstance,1);
++    TiltedPhoques::Serialization::WriteVarInt(aWriter,ExpectedInstance);
  }
  
  void NotifyQuestUpdate::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept
-@@ -28,4 +31,7 @@ void NotifyQuestUpdate::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) n
+@@ -28,4 +33,10 @@ void NotifyQuestUpdate::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) n
      ClientQuestType = tmp & 0xFF;
      SharedRun = static_cast<uint32_t>(TiltedPhoques::Serialization::ReadVarInt(aReader));
      Speaker = static_cast<uint32_t>(TiltedPhoques::Serialization::ReadVarInt(aReader));
 +    Encounter = static_cast<uint32_t>(TiltedPhoques::Serialization::ReadVarInt(aReader));
 +    if (Encounter) Subject.Deserialize(aReader);
 +    Targets = TiltedPhoques::Serialization::ReadString(aReader);
++    aReader.ReadBits(tmp,1);
++    CheckInstance=tmp!=0;
++    ExpectedInstance=static_cast<uint32_t>(TiltedPhoques::Serialization::ReadVarInt(aReader));
  }
 diff --git a/Code/encoding/Messages/NotifyQuestUpdate.h b/Code/encoding/Messages/NotifyQuestUpdate.h
 index 31dc675..03a2de3 100644
@@ -621,11 +626,11 @@ index 31dc675..03a2de3 100644
      void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
  
 -    bool operator==(const NotifyQuestUpdate& acRhs) const noexcept { return GetOpcode() == acRhs.GetOpcode() && Id == acRhs.Id && Stage == acRhs.Stage && Status == acRhs.Status && ClientQuestType == acRhs.ClientQuestType && SharedRun == acRhs.SharedRun && Speaker == acRhs.Speaker; }
-+    bool operator==(const NotifyQuestUpdate& acRhs) const noexcept { return GetOpcode() == acRhs.GetOpcode() && Id == acRhs.Id && Stage == acRhs.Stage && Status == acRhs.Status && ClientQuestType == acRhs.ClientQuestType && SharedRun == acRhs.SharedRun && Speaker == acRhs.Speaker && Encounter == acRhs.Encounter && Subject == acRhs.Subject && Targets == acRhs.Targets; }
++    bool operator==(const NotifyQuestUpdate& acRhs) const noexcept { return GetOpcode() == acRhs.GetOpcode() && Id == acRhs.Id && Stage == acRhs.Stage && Status == acRhs.Status && ClientQuestType == acRhs.ClientQuestType && SharedRun == acRhs.SharedRun && Speaker == acRhs.Speaker && Encounter == acRhs.Encounter && Subject == acRhs.Subject && Targets == acRhs.Targets && CheckInstance == acRhs.CheckInstance && ExpectedInstance == acRhs.ExpectedInstance; }
  
      enum StatusCode : uint8_t
      {
-@@ -24,7 +24,10 @@ struct NotifyQuestUpdate final : ServerMessage
+@@ -24,7 +24,12 @@ struct NotifyQuestUpdate final : ServerMessage
          Stopped
      };
  
@@ -634,6 +639,8 @@ index 31dc675..03a2de3 100644
 +    GameId Subject{};
 +    String Targets{};
 +    uint32_t LocalInstance{}; // client only; never serialized
++    bool CheckInstance{};
++    uint32_t ExpectedInstance{};
      GameId Id;
      uint16_t Stage;
      uint8_t Status;
