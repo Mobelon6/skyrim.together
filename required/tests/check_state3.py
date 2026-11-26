@@ -64,50 +64,6 @@ int main(){
 ''', ['-I'+str(code/'encoding')])
 
 qs='client/Services/Generic/QuestService.cpp'
-radiant=extract(qs,'bool IsPersonalRadiantQuest(TESQuest* quest)','std::string QuestService::CaptureQuestTargets')
-radiantMatch=extract(qs,'static bool MatchesQuestTargets','void QuestService::ReceiveQuestProgress')
-run('personal radiant classification is independent of native fill state',headers+'''
-#include <string_view>
-struct TESQuest;
-struct NativeQuestAlias {
- struct TypeName{const char* value;const char* AsAscii()const{return value;}} type{"Ref"};
- TESQuest* Owner{};uint16_t FillType{1};
- const TypeName& QType()const{return type;}
-};
-struct TESQuest{
- enum Flags{RunOnce=256};uint16_t flags{};
- struct Aliases {void** data{};size_t length{},capacity{};
- void** begin()const{return data;}void** end()const{return data?data+length:nullptr;}} aliases;
- bool stopped{};uint32_t currentInstanceID{5};
- bool IsStopped()const{return stopped;}
-};
-struct NotifyQuestUpdate{
- std::string Targets;bool CheckInstance{};uint32_t ExpectedInstance{};
-};
-'''+radiant+radiantMatch+'''
-int main(){
- TESQuest q,other;NativeQuestAlias a,b;
- a.Owner=b.Owner=&q;void* slots[]={&a,&b};
- q.aliases={slots,2,2};
- assert(!IsPersonalRadiantQuest(&q));
- for(uint16_t fill:{0,2,3,4,5,6,7,8}){
-    a.FillType=fill;assert(IsPersonalRadiantQuest(&q));
-    q.stopped=true;assert(IsPersonalRadiantQuest(&q));q.stopped=false;
-    q.flags=TESQuest::RunOnce;assert(!IsPersonalRadiantQuest(&q));q.flags=0;
- }
- a.FillType=1;b.type.value="Loc";assert(IsPersonalRadiantQuest(&q));
- b.type.value=nullptr;assert(IsPersonalRadiantQuest(&q));b.type.value="Ref";
- b.Owner=&other;assert(IsPersonalRadiantQuest(&q));b.Owner=&q;
- q.aliases.capacity=1;assert(IsPersonalRadiantQuest(&q));q.aliases.capacity=2;
- slots[1]=nullptr;assert(IsPersonalRadiantQuest(&q));slots[1]=&b;
- NotifyQuestUpdate u;assert(MatchesQuestTargets(&q,u));
- a.FillType=0;assert(!MatchesQuestTargets(&q,u));a.FillType=1;
- u.Targets="2:r:616263.1;";assert(!MatchesQuestTargets(&q,u));
- u.Targets.clear();u.CheckInstance=true;u.ExpectedInstance=4;assert(!MatchesQuestTargets(&q,u));
- u.ExpectedInstance=5;assert(MatchesQuestTargets(&q,u));
- q.stopped=true;assert(!MatchesQuestTargets(&q,u));
-}
-''')
 receive=extract(qs,'void QuestService::ReceiveQuestProgress','QuestService::QuestService')
 run('automatic accepted party quest dispatch',headers+'''
 struct NotifyQuestUpdate {uint32_t Id{},LocalInstance{},SharedRun{},Encounter{};};
@@ -391,7 +347,7 @@ int main(){
     ops.push_back({"4","quest-progress-v1","q 2 1 10 6 202"});assert(!ActiveQuestHistory(ops));
     ops={{"1","quest-progress-v1","q 1 1 10 6 101 2:r:616263.1;"},
          {"2","quest-progress-v1","q 1 0 20 6 202 2:r:616263.1;"}};
-    history=ActiveQuestHistory(ops);assert(history&&history->at("q").Targets=="2:r:616263.1;");
+    history=ActiveQuestHistory(ops);assert(history&&history->at("q~legacy").Targets=="2:r:616263.1;");
     ops[1].Payload="q 1 0 20 6 202 2:r:616263.2;";assert(!ActiveQuestHistory(ops));
     ops={{"1","quest-progress-v1","q 1 1 10 6 101 2:r:616263.1; @17"},
          {"2","quest-binding-v1","q 1 1 10 6 202 2:r:616263.1; @83"},
@@ -400,14 +356,29 @@ int main(){
          {"5","quest-progress-v1","q 2 1 10 6 101 2:r:616263.1; @18"},
          {"6","quest-binding-v1","q 2 1 10 6 202 2:r:616263.1; @84"},
          {"7","quest-progress-v1","q 2 0 20 6 202 2:r:616263.1; @84"}};
-    history=ActiveQuestHistory(ops);assert(history&&history->at("q").Generation==2);
-    const auto& latest=history->at("q");
+    history=ActiveQuestHistory(ops);assert(history&&history->at("q~legacy").Generation==2);
+    const auto& latest=history->at("q~legacy");
     assert(QuestRunMember::Bound(latest.Members,101,2,18));
     assert(QuestRunMember::Bound(latest.Members,202,2,84));
     assert(latest.Prior.size()==1&&latest.Prior[0].Stopped&&latest.Prior[0].Stages.size()==1);
     assert(QuestRunMember::Bound(latest.Members,202,1,83));
     assert(!latest.CanRestoreStart(101)&&!latest.Prior[0].CanRestoreStart(101));
     ops[6].Payload="q 2 0 20 6 202 2:r:616263.1; @83";assert(!ActiveQuestHistory(ops));
+    ops={{"1","quest-progress-v1","q~ 1 1 10 6 101 2:r:616263.1; @17"},
+         {"2","quest-progress-v1","q~ 1 1 10 6 202 2:r:616263.2; @83"},
+         {"3","quest-progress-v1","q~ 1 0 20 6 101 2:r:616263.1; @17"},
+         {"4","quest-progress-v1","q~ 1 0 20 6 202 2:r:616263.2; @83"},
+         {"5","quest-progress-v1","q~ 1 2 20 6 101 2:r:616263.1; @17"},
+         {"6","quest-progress-v1","q~ 1 0 30 6 202 2:r:616263.2; @83"}};
+    history=ActiveQuestHistory(ops);assert(history&&history->size()==2);
+    const auto& left=history->at("q~2:r:616263.1;");
+    const auto& right=history->at("q~2:r:616263.2;");
+    assert(left.Stopped&&!right.Stopped&&left.Stages.size()==1&&right.Stages.size()==2);
+    assert(QuestRunMember::Bound(left.Members,101,1,17)&&!QuestRunMember::Instance(left.Members,202,1));
+    assert(QuestRunMember::Bound(right.Members,202,1,83)&&!QuestRunMember::Instance(right.Members,101,1));
+    assert(QuestRunMember::BaseKey("q~2:r:616263.1;")=="q");
+    ops.push_back({"7","quest-progress-v1","q~ 2 1 10 6 202 2:r:616263.1; @84"});
+    history=ActiveQuestHistory(ops);assert(history&&history->at("q~2:r:616263.1;").Generation==2&&history->at("q~2:r:616263.2;").Generation==1);
 }
 ''', ['-I'+str(code/'common')])
 
@@ -560,6 +531,10 @@ int main(){
     assert(Remember(m,202,2,84)&&Bound(m,202,2,84));
     assert(!Remember(m,202,2,83)&&!Remember(m,202,3,83));
     assert(!Admit(m,303,2,1,false,false,true,false));
+    assert(Admit(m,303,2,1,true,true,false,false,true));
+    assert(!Admit(m,101,2,17,true,true,false,false,true));
+    assert(ScopeKey("q","2:r:616263.1;")!=ScopeKey("q","2:r:616263.2;"));
+    assert(RecordKey("q","")=="q"&&RecordKey("q","2:r:616263.1;")=="q~");
     assert(CanAttach(m,303,2,2,1,true,false));
     assert(!CanAttach(m,303,3,2,1,true,false)&&!CanAttach(m,303,2,2,1,true,true));
     assert(!CanAttach(m,303,2,2,1,false,false));

@@ -546,7 +546,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +273,1427 @@
+@@ -221,6 +273,1437 @@
      return 2;
  }
  
@@ -1142,6 +1142,15 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        std::string targets;
 +        std::optional<uint32_t> instance;
 +        if (!QuestRunMember::ReadTail(in,targets,instance)||targets.size()>2048) return {};
++        // Scoped rows use the existing canonical target tail for identity.
++        // Keep legacy variable history isolated as well.
++        if (key.ends_with('~'))
++        {
++            if (targets.empty()) return {};
++            key=QuestRunMember::ScopeKey(key.substr(0,key.size()-1),targets);
++        }
++        else if (!targets.empty())
++            key+="~legacy"; // old unscoped rows retained, never replayed
 +        auto& quest=quests[key];
 +        if (binding)
 +        {
@@ -1539,7 +1548,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    const auto now=std::chrono::steady_clock::now();
 +    for (const auto& [key,run]:*history)
 +    {
-+        if (!run.Targets.empty()) continue; // historical radiant run, no replay
++        if (!run.Targets.empty()) continue; // wait for actual local selection; no forced aliases
 +        const auto id=LocalQuestForm(key);
 +        auto* quest=id?Cast<TESQuest>(TESForm::GetById(id)):nullptr;
 +        if (!quest||QuestService::IsNonSyncableQuest(quest)||
@@ -1617,7 +1626,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    if (!history) return updates;
 +    for (const auto& [key,latest]:*history)
 +    {
-+        const auto form=TradeProperties::DecodeForm(key);
++        if (key.ends_with("~legacy")) continue;
++        const auto form=TradeProperties::DecodeForm(QuestRunMember::BaseKey(key));
 +        if (!form||!form->Valid()) continue;
 +        auto* manager=ModManager::Get();
 +        auto* mod=manager?manager->GetByName(form->Plugin.c_str()):nullptr;
@@ -1654,7 +1664,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +                if (QuestRunMember::Bound(latest.Members,character,it->Generation,instance))
 +                { selected=&*it;bound=true;break; }
 +        const auto& state=*selected;
-+        if (!state.Targets.empty()||targets!=state.Targets) continue;
++        if (targets!=state.Targets) continue;
 +        if (!(quest->flags&TESQuest::RunOnce)&&!bound) continue;
 +        if (!bound&&!localQuests.contains(id)&&!sharedStart) continue;
 +        if (!bound&&(state.Generation!=1||(state.Stopped&&!state.CompletedRunOnce)||
@@ -1974,7 +1984,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        deferredQuestPickup.reset();deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();questDialogueReady=false;sharedDialogueItems.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +1723,32 @@
+@@ -250,6 +1733,32 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -2007,7 +2017,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +1774,39 @@
+@@ -275,8 +1784,39 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -3115,7 +3125,7 @@ diff --git a/Code/common/QuestRunMember.h b/Code/common/QuestRunMember.h
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/QuestRunMember.h
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,103 @@
 +#pragma once
 +#include <charconv>
 +#include <cstdint>
@@ -3123,6 +3133,7 @@ new file mode 100644
 +#include <map>
 +#include <optional>
 +#include <string>
++#include <string_view>
 +#include <utility>
 +
 +namespace QuestRunMember
@@ -3130,6 +3141,20 @@ new file mode 100644
 +// Keep the full instance history, not just the latest binding. Loading an
 +// earlier ESS must not let a previously consumed instance open another run.
 +using Members = std::map<uint64_t,std::map<uint32_t,uint32_t>>; // character -> instance -> generation
++// Form keys contain hex digits and a dot, never '~'. The exact canonical
++// target tuple distinguishes runs without hash collisions.
++inline std::string RecordKey(const std::string& form,std::string_view targets)
++{
++    return targets.empty()?form:form+"~";
++}
++inline std::string ScopeKey(const std::string& form,std::string_view targets)
++{
++    return RecordKey(form,targets)+std::string(targets);
++}
++inline std::string BaseKey(std::string_view scope)
++{
++    return std::string(scope.substr(0,scope.find('~')));
++}
 +inline bool ReadTail(std::istream& in,std::string& targets,std::optional<uint32_t>& instance)
 +{
 +    targets.clear();instance.reset();
@@ -3191,14 +3216,14 @@ new file mode 100644
 +    return prior!=it->second.end()&&prior->second<generation;
 +}
 +inline bool Admit(const Members& members,uint64_t character,uint32_t generation,uint32_t instance,
-+    bool stopped,bool start,bool stage,bool legacyDifferentTargets)
++    bool stopped,bool start,bool stage,bool legacyDifferentTargets,bool scoped=false)
 +{
 +    if (!character||!generation) return false;
 +    const auto it=members.find(character);
 +    const auto current=Instance(members,character,generation);
 +    const bool used=it!=members.end()&&it->second.contains(instance);
 +    if (stopped)
-+        return start&&!used&&(current.has_value()||(members.empty()&&legacyDifferentTargets));
++        return start&&!used&&(scoped||current.has_value()||(members.empty()&&legacyDifferentTargets));
 +    if (current) return *current==instance;
 +    if (used) return false;
 +    return start||(generation==1&&stage);

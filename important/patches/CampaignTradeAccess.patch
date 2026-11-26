@@ -1692,7 +1692,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +#include <Messages/RequestInventoryChanges.h>
  
  #include <Messages/RequestQuestUpdate.h>
-@@ -15,5 +22,402 @@
+@@ -15,5 +22,404 @@
  Console::Setting bEnableMiscQuestSync{"Gameplay:bEnableMiscQuestSync", "(Experimental) Syncs miscellaneous quests when possible", false};
  
 +using QuestRun = PartyService::Party::QuestRun;
@@ -1784,7 +1784,8 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +    return {};
 +}
 +
-+bool RestoreQuestRun(const CampaignJournal::Journal& journal, const std::string& key, QuestRun& run)
++bool RestoreQuestRun(const CampaignJournal::Journal& journal, const std::string& key, QuestRun& run,
++    std::string_view scope={})
 +{
 +    if (key.empty() || !journal.Ready()) return false;
 +    QuestRun restored;
@@ -1796,7 +1797,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        std::istringstream row(op.Payload);
 +        std::string form, extra;
 +        if (!(row >> form)) return false;
-+        if (form != key) continue;
++        if (form != QuestRunMember::RecordKey(key,scope)) continue;
 +        uint32_t generation{}, status{}, stage{}, type{};
 +        uint64_t character{};
 +        if (!(row >> generation >> status >> stage >> type >> character) ||
@@ -1805,6 +1806,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        std::string targets;
 +        std::optional<uint32_t> instance;
 +        if (!QuestRunMember::ReadTail(row,targets,instance)||!ValidQuestTargets(targets)) return false;
++        if (targets!=scope) continue;
 +        if (binding)
 +        {
 +            if (!instance||restored.Stopped||restored.Generation!=generation||
@@ -1831,7 +1833,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +{
 +    if (!character || key.empty()) return false;
 +    const auto head = journal.Current();
-+    auto payload = key + " " + std::to_string(run.Generation) + " " +
++    auto payload = QuestRunMember::RecordKey(key,run.Targets) + " " + std::to_string(run.Generation) + " " +
 +        std::to_string(event.Status) + " " + std::to_string(event.Stage) + " " +
 +        std::to_string(event.ClientQuestType) + " " + std::to_string(character);
 +    if (!run.Targets.empty()) payload+=" "+run.Targets;
@@ -2095,13 +2097,11 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +}
 +
  QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
-@@ -44,3 +448,74 @@
+@@ -44,3 +450,81 @@
      PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
      const PartyService::Party::Conversation* participants = nullptr;
 +    const std::string targets(message.Targets.data(),message.Targets.size());
-+    // Variable-target quest progress is personal. Keep the historical
-+    // journal reader intact, but never accept or relay new radiant rows.
-+    if (!targets.empty()) return;
++    if (!ValidQuestTargets(targets)) return;
 +    notify.Targets=message.Targets;
 +    // A replay-created native instance can attach only to the generation it
 +    // was started for. A stale attachment must never create a new run.
@@ -2115,7 +2115,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +                authority.State()!=CampaignReplication::Link::Mode::Ready) return;
 +            const auto key=QuestKey(m_world,message.Id);
 +            QuestRun run;
-+            if (!RestoreQuestRun(authority.Journal,key,run)||run.Targets!=targets||
++            if (!RestoreQuestRun(authority.Journal,key,run,targets)||run.Targets!=targets||
 +                !QuestRunMember::CanAttach(run.Members,character,run.Generation,message.ExpectedRun,
 +                    message.Instance,run.Started,run.Stopped)||run.CompletedRunOnce) return;
 +            if (QuestRunMember::Bound(run.Members,character,run.Generation,message.Instance)) return;
@@ -2139,11 +2139,20 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +            QuestRun run;
 +            bool known = false;
 +            if (authority.State() == Mode::Ready && CampaignAccess::Character(*pPlayer))
-+                known = RestoreQuestRun(authority.Journal, QuestKey(m_world, message.Id), run);
++                known = RestoreQuestRun(authority.Journal, QuestKey(m_world, message.Id), run,targets);
 +            else if (authority.State() == Mode::Disabled)
 +            {
-+                const auto found = pParty->QuestRuns.find(message.Id);
-+                if (found != pParty->QuestRuns.end()) { run = found.value(); known = true; }
++                if (targets.empty())
++                {
++                    const auto found=pParty->QuestRuns.find(message.Id);
++                    if (found!=pParty->QuestRuns.end()) {run=found.value();known=true;}
++                }
++                else
++                {
++                    const auto key=QuestRunMember::ScopeKey(QuestKey(m_world,message.Id),targets);
++                    const auto found=pParty->TargetQuestRuns.find(key);
++                    if (found!=pParty->TargetQuestRuns.end()) {run=found->second;known=true;}
++                }
 +            }
 +            if (known && (run.Started||!run.OrderedStages.empty()||run.Stopped) &&
 +                !(run.Stopped&&message.Status==RequestQuestUpdate::Started)&&run.Targets!=targets) return;
@@ -2170,7 +2179,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        }
 +    }
      if (!pParty) return;
-@@ -61,6 +536,8 @@
+@@ -61,6 +545,8 @@
          // During an interaction, only the quest of the witnessed topic has provenance.
          if (inTalk || inFight) return;
 -        if (!bEnableMiscQuestSync && !(message.JournalObjective && message.Status == RequestQuestUpdate::StageUpdate &&
@@ -2181,7 +2190,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +            !(knownSharedQuest && message.Status == RequestQuestUpdate::Stopped)) return;
      }
  
-@@ -115,39 +592,86 @@
+@@ -115,39 +601,89 @@
 -    auto& run = pParty->QuestRuns[message.Id];
 -    // The sender's local quest log and the party's shared lifecycle are independent.
 -    // A late start from a second client must not clear stages the first client sent.
@@ -2222,7 +2231,10 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 -            guest->Send(notify);
 +    try
 +    {
-+        auto& run = pParty->QuestRuns[message.Id];
++        const auto formKey=QuestKey(m_world,message.Id);
++        if (!targets.empty()&&formKey.empty()) return;
++        auto& run=targets.empty()?pParty->QuestRuns[message.Id]:
++            pParty->TargetQuestRuns[QuestRunMember::ScopeKey(formKey,targets)];
 +        auto& authority = CampaignAccess::Authority();
 +        using Mode = CampaignReplication::Link::Mode;
 +        const bool durable = authority.State() == Mode::Ready;
@@ -2231,7 +2243,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        if (durable)
 +        {
 +            key = QuestKey(m_world, message.Id);
-+            if (!character || !RestoreQuestRun(authority.Journal, key, run)) return;
++            if (!character || !RestoreQuestRun(authority.Journal, key, run,targets)) return;
 +        }
 +        else if (authority.State() != Mode::Disabled)
 +            return;
@@ -2243,7 +2255,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        if (message.ExpectedRun&&(!bind||run.Stopped||run.Generation!=message.ExpectedRun||
 +            !QuestRunMember::Bound(run.Members,character,run.Generation,message.Instance))) return;
 +        if (bind&&!QuestRunMember::Admit(run.Members,character,run.Generation,message.Instance,
-+            run.Stopped,start,stage,!targets.empty()&&run.Targets!=targets)) return;
++            run.Stopped,start,stage,!targets.empty()&&run.Targets!=targets,!targets.empty())) return;
 +        // Do not mutate the accepted run until its authoritative row is stored.
 +        auto next = run;
 +        notify.Status = message.Status;
@@ -2314,7 +2326,7 @@ diff --git a/Code/server/Services/PartyService.h b/Code/server/Services/PartySer
  #include <Events/PacketEvent.h>
 +#include <QuestRunMember.h>
  
-@@ -31,9 +32,13 @@
+@@ -31,9 +32,14 @@
          struct QuestRun
          {
              TiltedPhoques::Set<uint16_t> Stages;
@@ -2326,5 +2338,6 @@ diff --git a/Code/server/Services/PartyService.h b/Code/server/Services/PartySer
 +            std::string Targets;
 +            QuestRunMember::Members Members;
          };
++        std::map<std::string,QuestRun> TargetQuestRuns; // same QUST, different actual targets
  
          struct Conversation
