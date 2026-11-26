@@ -368,7 +368,7 @@ int main(){
 ''', ['-I'+str(code/'common')])
 
 catchup=extract('client/Services/Generic/QuestJournal.cpp',
-    'template<class CanDispatch>\nstd::vector<NotifyQuestUpdate> MissingActiveQuestStages','\n}\n}\n\n// Called by the world runner')+'\n}'
+    'template<class CanDispatch>\nvoid ReconcileRepeatStarts','\n}\n}\n\nuint32_t ExpectedRepeatRun')+'\n}'
 run('late completed run starts natively and missing stages remain retryable',headers+'''
 #include <QuestRunMember.h>
 #include <TradeProperties.h>
@@ -382,11 +382,20 @@ struct NotifyQuestUpdate{
  enum {StageUpdate,Started,Stopped};GameId Id{};uint16_t Stage{};uint8_t ClientQuestType{},Status{};
  uint32_t SharedRun{},Speaker{},ExpectedInstance{};bool CheckInstance{};std::string Targets;
 };
+struct RequestQuestUpdate{
+ enum {StageUpdate,Started,Stopped};GameId Id{};uint16_t Stage{};uint8_t ClientQuestType{},Status{};
+ bool BindInstance{};uint32_t Instance{},ExpectedRun{};std::string Targets;
+};
+struct ScopedQuestOverride{};
 struct TESForm{static TESForm* GetById(uint32_t);};
 struct TESQuest:TESForm{
  enum Flags{RunOnce=256,Completed=2,Failed=64,AllowRepeatStages=8};
  uint32_t formID=2,currentInstanceID=1;uint16_t flags=RunOnce;
  bool stopped=true;std::string targets;std::set<uint16_t> reached;
+ uint16_t currentStage{};int starts{};bool promotion{};
+ enum class State{WaitingPromotion,Stopped,Running};
+ State getState(){return promotion?State::WaitingPromotion:stopped?State::Stopped:State::Running;}
+ bool EnsureQuestStarted(bool& success,bool force){assert(!force);++starts;stopped=false;++currentInstanceID;success=true;reached={0};currentStage=0;return true;}
  bool IsStopped()const{return stopped;}
  bool IsStageReached(uint16_t s)const{return reached.contains(s);}
 } quest;
@@ -409,12 +418,18 @@ struct World{
  struct Party{bool joined=true;bool IsInParty(){return joined;}uint32_t GetLeaderPlayerId(){return 9;}} party;
  struct Overlay{bool personal=false;bool IsPersonalQuest(uint32_t){return personal;}} overlay;
  struct Mods{bool GetServerModId(uint32_t id,GameId& result){result=id;return true;}} mods;
+ struct Transport{std::vector<RequestQuestUpdate> sent;void Send(const RequestQuestUpdate& update){sent.push_back(update);}} transport;
+ Transport& GetTransport(){return transport;}
  bool loading=false;bool IsLoadingSave(){return loading;}
  Party& GetPartyService(){return party;}Overlay& GetOverlayService(){return overlay;}Mods& GetModSystem(){return mods;}
 };
 bool ready=true;bool SaveWorldReady(){return ready;}
 struct QuestService{static bool IsNonSyncableQuest(TESQuest*){return false;}
  static std::string CaptureQuestTargets(TESQuest* q){return q->targets;}};
+uint32_t LocalQuestForm(const std::string& value){const auto key=TradeProperties::DecodeForm(value);return key?key->Local:0;}
+struct RepeatJoin{uint64_t Campaign{},Character{};uint32_t Run{},Before{};
+ std::chrono::steady_clock::time_point RetryAt{};bool SawRunning{};};
+std::map<uint32_t,RepeatJoin> repeatJoins;
 '''+history+catchup+'''
 int main(){
     World world;CampaignJournal::Journal journal;
@@ -450,6 +465,32 @@ int main(){
     journal.rows[2].Payload=key+" 1 0 20 6 101 2:r:616263.1;";
     journal.rows[3]={"4","quest-completed-v1",key+" 1 2 20 6 101 2:r:616263.1;"};
     assert(plan().empty()); // no fabricated radiant target
+    // A late second participant joins a witnessed fixed-target generation.
+    quest.flags=0;quest.stopped=true;quest.targets.clear();quest.currentInstanceID=80;quest.reached.clear();
+    journal.rows={{"1","quest-progress-v1",key+" 1 1 0 6 101 @17"},
+                  {"2","quest-progress-v1",key+" 1 0 40 6 101 @17"}};
+    auto join=[&]{ReconcileRepeatStarts(world,journal,55,202,[&](uint32_t,uint32_t){return !busy;});};
+    busy=true;join();assert(!quest.starts);busy=false;
+    join();assert(quest.starts==1&&quest.currentInstanceID==81&&world.transport.sent.empty());
+    assert(plan().empty()); // no stage before an authoritative bind
+    join();assert(world.transport.sent.size()==1&&world.transport.sent.back().ExpectedRun==1&&world.transport.sent.back().Instance==81);
+    journal.rows.push_back({"3","quest-binding-v1",key+" 1 1 0 6 202 @81"});
+    join();assert(repeatJoins.empty());stages=plan();
+    assert(stages.size()==1&&stages[0].Stage==40&&stages[0].CheckInstance&&stages[0].ExpectedInstance==81);
+    // Closed generation and a new start require a new native instance.
+    journal.rows.push_back({"4","quest-progress-v1",key+" 1 2 40 6 101 @17"});
+    journal.rows.push_back({"5","quest-progress-v1",key+" 2 1 0 6 101 @18"});
+    quest.stopped=true;quest.currentInstanceID=79;join();assert(quest.starts==1);
+    quest.currentInstanceID=81;join();assert(quest.starts==2&&quest.currentInstanceID==82);
+    join();assert(world.transport.sent.back().ExpectedRun==2&&world.transport.sent.back().Instance==82);
+    // A racing stop cannot turn the pending instance into generation three.
+    journal.rows.push_back({"6","quest-progress-v1",key+" 2 2 0 6 101 @18"});
+    journal.rows.push_back({"7","quest-progress-v1",key+" 3 1 0 6 101 @19"});
+    const auto sent=world.transport.sent.size();join();assert(world.transport.sent.size()==sent&&repeatJoins.at(2).Run==2);
+    // Nonempty targets must never be filled by a fabricated native start.
+    repeatJoins.clear();quest.stopped=true;quest.targets="2:r:616263.1;";
+    journal.rows={{"1","quest-progress-v1",key+" 1 1 0 6 101 2:r:616263.1; @17"}};
+    join();assert(quest.starts==2);
 }
 ''', ['-I'+str(code/'common')])
 
@@ -475,6 +516,12 @@ int main(){
     assert(Remember(m,202,2,84)&&Bound(m,202,2,84));
     assert(!Remember(m,202,2,83)&&!Remember(m,202,3,83));
     assert(!Admit(m,303,2,1,false,false,true,false));
+    assert(CanAttach(m,303,2,2,1,true,false));
+    assert(!CanAttach(m,303,3,2,1,true,false)&&!CanAttach(m,303,2,2,1,true,true));
+    assert(!CanAttach(m,303,2,2,1,false,false));
+    assert(CanAttach(m,202,2,2,84,true,false)&&!CanAttach(m,202,2,2,83,true,false));
+    assert(CanStartMissing(m,303,3,1)&&CanStartMissing(m,202,3,84));
+    assert(!CanStartMissing(m,202,3,99)&&!CanStartMissing(m,202,2,84));
     std::string targets;std::optional<uint32_t> id;
     std::istringstream old("2:r:616263.1;");assert(ReadTail(old,targets,id)&&!id);
     std::istringstream current("2:r:616263.1; @0");assert(ReadTail(current,targets,id)&&id==0);

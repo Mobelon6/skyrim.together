@@ -1001,7 +1001,7 @@ diff --git a/Code/encoding/Messages/RequestQuestUpdate.cpp b/Code/encoding/Messa
 index 7efdfd7..ab43380 100644
 --- a/Code/encoding/Messages/RequestQuestUpdate.cpp
 +++ b/Code/encoding/Messages/RequestQuestUpdate.cpp
-@@ -8,6 +8,11 @@ void RequestQuestUpdate::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) co
+@@ -8,6 +8,12 @@ void RequestQuestUpdate::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) co
      aWriter.WriteBits(Stage, 16);
      aWriter.WriteBits(Status, 8);
      aWriter.WriteBits(ClientQuestType, 8);
@@ -1010,10 +1010,11 @@ index 7efdfd7..ab43380 100644
 +    TiltedPhoques::Serialization::WriteString(aWriter, Targets);
 +    aWriter.WriteBits(BindInstance,1);
 +    TiltedPhoques::Serialization::WriteVarInt(aWriter,Instance);
++    TiltedPhoques::Serialization::WriteVarInt(aWriter,ExpectedRun);
  }
  
  void RequestQuestUpdate::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept
-@@ -24,4 +29,12 @@ void RequestQuestUpdate::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader)
+@@ -24,4 +30,13 @@ void RequestQuestUpdate::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader)
  
      aReader.ReadBits(tmp, 8);
      ClientQuestType = tmp & 0xFF;
@@ -1025,6 +1026,7 @@ index 7efdfd7..ab43380 100644
 +    aReader.ReadBits(tmp,1);
 +    BindInstance=tmp!=0;
 +    Instance=static_cast<uint32_t>(TiltedPhoques::Serialization::ReadVarInt(aReader));
++    ExpectedRun=static_cast<uint32_t>(TiltedPhoques::Serialization::ReadVarInt(aReader));
  }
 diff --git a/Code/encoding/Messages/RequestQuestUpdate.h b/Code/encoding/Messages/RequestQuestUpdate.h
 index 5ebe835..8731c87 100644
@@ -1035,11 +1037,11 @@ index 5ebe835..8731c87 100644
      void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
  
 -    bool operator==(const RequestQuestUpdate& acRhs) const noexcept { return GetOpcode() == acRhs.GetOpcode() && Id == acRhs.Id && Stage == acRhs.Stage && Status == acRhs.Status && ClientQuestType == acRhs.ClientQuestType; }
-+    bool operator==(const RequestQuestUpdate& acRhs) const noexcept { return GetOpcode() == acRhs.GetOpcode() && Id == acRhs.Id && Stage == acRhs.Stage && Status == acRhs.Status && ClientQuestType == acRhs.ClientQuestType && JournalObjective == acRhs.JournalObjective && CompletedRunOnce == acRhs.CompletedRunOnce && Targets == acRhs.Targets && BindInstance == acRhs.BindInstance && Instance == acRhs.Instance; }
++    bool operator==(const RequestQuestUpdate& acRhs) const noexcept { return GetOpcode() == acRhs.GetOpcode() && Id == acRhs.Id && Stage == acRhs.Stage && Status == acRhs.Status && ClientQuestType == acRhs.ClientQuestType && JournalObjective == acRhs.JournalObjective && CompletedRunOnce == acRhs.CompletedRunOnce && Targets == acRhs.Targets && BindInstance == acRhs.BindInstance && Instance == acRhs.Instance && ExpectedRun == acRhs.ExpectedRun; }
  
      enum StatusCode : uint8_t
      {
-@@ -24,6 +24,11 @@ struct RequestQuestUpdate final : ClientMessage
+@@ -24,6 +24,12 @@ struct RequestQuestUpdate final : ClientMessage
          Stopped
      };
  
@@ -1048,6 +1050,7 @@ index 5ebe835..8731c87 100644
 +    String Targets{};
 +    bool BindInstance{};
 +    uint32_t Instance{};
++    uint32_t ExpectedRun{}; // nonzero: join/progress only in this already accepted generation
      GameId Id;
      uint16_t Stage;
      uint8_t Status;

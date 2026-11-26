@@ -2095,12 +2095,36 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +}
 +
  QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
-@@ -44,3 +448,48 @@
+@@ -44,3 +448,72 @@
      PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
      const PartyService::Party::Conversation* participants = nullptr;
 +    const std::string targets(message.Targets.data(),message.Targets.size());
 +    if (!ValidQuestTargets(targets)) return;
 +    notify.Targets=message.Targets;
++    // A replay-created native instance can attach only to the generation it
++    // was started for. A stale attachment must never create a new run.
++    if (message.ExpectedRun&&message.Status==RequestQuestUpdate::Started)
++    {
++        try
++        {
++            auto& authority=CampaignAccess::Authority();
++            const auto character=CampaignAccess::Character(*pPlayer);
++            if (!pParty||!message.BindInstance||message.CompletedRunOnce||!character||
++                authority.State()!=CampaignReplication::Link::Mode::Ready) return;
++            const auto key=QuestKey(m_world,message.Id);
++            QuestRun run;
++            if (!RestoreQuestRun(authority.Journal,key,run)||run.Targets!=targets||
++                !QuestRunMember::CanAttach(run.Members,character,run.Generation,message.ExpectedRun,
++                    message.Instance,run.Started,run.Stopped)||run.CompletedRunOnce) return;
++            if (QuestRunMember::Bound(run.Members,character,run.Generation,message.Instance)) return;
++            if (!QuestRunMember::Remember(run.Members,character,run.Generation,message.Instance)) return;
++            notify.Status=NotifyQuestUpdate::Started;
++            if (!StoreQuestRun(authority.Journal,key,character,run,notify,message.Instance,true))
++                spdlog::warn("STM could not attach native repeat quest instance");
++        }
++        catch (...) {spdlog::warn("STM repeat quest attachment failed");}
++        return;
++    }
 +    bool knownSharedQuest = false, knownRepeatStart=false;
 +    if (pParty && (message.JournalObjective || message.CompletedRunOnce ||
 +        message.Status == RequestQuestUpdate::Stopped ||
@@ -2144,7 +2168,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        }
 +    }
      if (!pParty) return;
-@@ -61,6 +510,8 @@
+@@ -61,6 +534,8 @@
          // During an interaction, only the quest of the witnessed topic has provenance.
          if (inTalk || inFight) return;
 -        if (!bEnableMiscQuestSync && !(message.JournalObjective && message.Status == RequestQuestUpdate::StageUpdate &&
@@ -2155,7 +2179,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +            !(knownSharedQuest && message.Status == RequestQuestUpdate::Stopped)) return;
      }
  
-@@ -115,39 +566,84 @@
+@@ -115,39 +590,86 @@
 -    auto& run = pParty->QuestRuns[message.Id];
 -    // The sender's local quest log and the party's shared lifecycle are independent.
 -    // A late start from a second client must not clear stages the first client sent.
@@ -2214,6 +2238,8 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        const bool stage=message.Status==RequestQuestUpdate::StageUpdate;
 +        const bool bind=durable&&message.BindInstance;
 +        if (durable&&!bind&&(!run.Members.empty()||run.Generation>1)) return;
++        if (message.ExpectedRun&&(!bind||run.Stopped||run.Generation!=message.ExpectedRun||
++            !QuestRunMember::Bound(run.Members,character,run.Generation,message.Instance))) return;
 +        if (bind&&!QuestRunMember::Admit(run.Members,character,run.Generation,message.Instance,
 +            run.Stopped,start,stage,!targets.empty()&&run.Targets!=targets)) return;
 +        // Do not mutate the accepted run until its authoritative row is stored.
@@ -2268,7 +2294,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +                        outgoing.CheckInstance=true;
 +                        outgoing.ExpectedInstance=*instance;
 +                    }
-+                    else if (run.Generation>1) continue;
++                    else continue; // wait for the journal-confirmed native instance, even in generation one
 +                }
 +                guest->Send(outgoing);
 +            }
@@ -2286,7 +2312,7 @@ diff --git a/Code/server/Services/PartyService.h b/Code/server/Services/PartySer
  #include <Events/PacketEvent.h>
 +#include <QuestRunMember.h>
  
-@@ -31,9 +31,13 @@
+@@ -31,9 +32,13 @@
          struct QuestRun
          {
              TiltedPhoques::Set<uint16_t> Stages;

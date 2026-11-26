@@ -478,7 +478,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -9,8 +9,49 @@
+@@ -9,8 +9,50 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
@@ -489,6 +489,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +#include <Components.h>
 +#include <QuestPickupPermit.h>
 +#include <Messages/RequestInventoryChanges.h>
++#include <Messages/RequestQuestUpdate.h>
 +#include <Games/Misc/MenuTopicManager.h>
 +#include <QuestRunMember.h>
 +#include <tuple>
@@ -528,7 +529,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
  #include <HomeSnapshot.h>
  #include <HomePermissions.h>
  #include <TradeLedger.h>
-@@ -26,6 +67,16 @@
+@@ -26,6 +68,16 @@
  namespace
  {
  CampaignReplication::Link campaignLink;
@@ -545,7 +546,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +272,1332 @@
+@@ -221,6 +273,1426 @@
      return 2;
  }
  
@@ -1494,11 +1495,20 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +// Session-local suppression of repeated offers. ESS remains the source of
 +// applied stages; no receipt or save cursor is advanced here.
 +uint64_t questObservedLoadEpoch{};
++struct RepeatJoin
++{
++    uint64_t Campaign{},Character{};
++    uint32_t Run{},Before{};
++    std::chrono::steady_clock::time_point RetryAt{};
++    bool SawRunning{};
++};
++std::map<uint32_t,RepeatJoin> repeatJoins;
 +void ResetQuestReplayForLoad()
 +{
 +    const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
 +    if (questObservedLoadEpoch==epoch) return;
 +    questObservedLoadEpoch=epoch;
++    repeatJoins.clear();
 +    uniqueRewardEpoch.store(0,std::memory_order_release);uniqueRewardChoices.clear();
 +    attemptedQuestPickups.clear();
 +    attemptedQuestConsumption.clear();
@@ -1513,6 +1523,81 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    pending={};
 +    pendingSave={};
 +    nextPull={};
++}
++
++// Start only a repeatable quest with no variable alias definitions to
++// resolve. Never replace aliases after startup: fragments/AI may have
++// already acted on them. A generation-scoped bind must be confirmed before
++// replay of later stages. Keep the guard across a temporary disconnect.
++template<class CanDispatch>
++void ReconcileRepeatStarts(World& world,const CampaignJournal::Journal& journal,
++    uint64_t campaign,uint64_t character,CanDispatch canDispatch)
++{
++    if (!campaign||!character||!world.GetPartyService().IsInParty()||world.IsLoadingSave()||!SaveWorldReady()) return;
++    const auto history=ActiveQuestHistory(journal.Operations());
++    if (!history) return;
++    const auto now=std::chrono::steady_clock::now();
++    for (const auto& [key,run]:*history)
++    {
++        const auto id=LocalQuestForm(key);
++        auto* quest=id?Cast<TESQuest>(TESForm::GetById(id)):nullptr;
++        if (!quest||QuestService::IsNonSyncableQuest(quest)||
++            (quest->flags&(TESQuest::RunOnce|TESQuest::Failed|TESQuest::AllowRepeatStages))||
++            world.GetOverlayService().IsPersonalQuest(id)) continue;
++        const auto instance=quest->currentInstanceID;
++        auto pending=repeatJoins.find(id);
++        if (pending!=repeatJoins.end()&&QuestRunMember::Bound(run.Members,character,pending->second.Run,instance))
++        {
++            repeatJoins.erase(pending);
++            pending=repeatJoins.end();
++        }
++        // A server stop or next generation while the native start was
++        // pending must not reassign the resulting instance to that new run.
++        if (pending!=repeatJoins.end()&&(pending->second.Run!=run.Generation||
++            pending->second.Character!=character||pending->second.Campaign!=campaign||run.Stopped))
++            continue;
++        if (run.Stopped||!run.StartedBy||!QuestRunMember::Instance(run.Members,run.StartedBy,run.Generation)||
++            QuestRunMember::Instance(run.Members,character,run.Generation)||!canDispatch(id,instance)) continue;
++        const auto targets=QuestService::CaptureQuestTargets(quest);
++        if (targets=="!"||targets!=run.Targets) continue;
++        if (pending==repeatJoins.end())
++        {
++            if (quest->IsStopped())
++            {
++                if (!targets.empty()||!QuestRunMember::CanStartMissing(run.Members,character,run.Generation,instance)) continue;
++            }
++            else
++            {
++                // Generation-one late adoption is limited to a real native
++                // start with the exact accepted targets and start stage.
++                // Never infer a later generation from coincidentally equal aliases.
++                if (run.Generation!=1||run.Members.contains(character)||!quest->IsStageReached(run.StartStage)) continue;
++            }
++            pending=repeatJoins.emplace(id,RepeatJoin{campaign,character,run.Generation,instance,{},!quest->IsStopped()}).first;
++        }
++        auto& join=pending->second;
++        if (quest->IsStopped())
++        {
++            if (join.SawRunning||instance!=join.Before||!targets.empty()||now<join.RetryAt||
++                quest->getState()==TESQuest::State::WaitingPromotion) continue;
++            join.RetryAt=now+std::chrono::seconds(5);
++            ScopedQuestOverride scope;
++            bool started=false;
++            quest->EnsureQuestStarted(started,false);
++            // Read back on the next confirmed pull; startup may be asynchronous.
++            continue;
++        }
++        if (!join.SawRunning&&instance==join.Before) continue;
++        join.SawRunning=true;
++        if (!QuestRunMember::CanAttach(run.Members,character,run.Generation,join.Run,instance,true,false)) continue;
++        GameId gameId{};
++        if (!world.GetModSystem().GetServerModId(id,gameId)) continue;
++        RequestQuestUpdate bind{};
++        bind.Id=gameId;bind.Stage=quest->currentStage;bind.ClientQuestType=run.StartType;
++        bind.Status=RequestQuestUpdate::Started;bind.BindInstance=true;bind.Instance=instance;
++        bind.ExpectedRun=join.Run;bind.Targets=targets.c_str();
++        world.GetTransport().Send(bind);
++    }
 +}
 +
 +template<class CanDispatch>
@@ -1558,7 +1643,6 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +            continue; // wait for a real native start before replaying stages
 +        }
-+        if (!localQuests.contains(id)&&!sharedStart) continue;
 +        const auto targets=QuestService::CaptureQuestTargets(quest);
 +        if (targets=="!") continue;
 +        const auto instance=quest->currentInstanceID;
@@ -1570,13 +1654,18 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +                { selected=&*it;bound=true;break; }
 +        const auto& state=*selected;
 +        if (targets!=state.Targets) continue;
++        if (!(quest->flags&TESQuest::RunOnce)&&!bound) continue;
++        if (!bound&&!localQuests.contains(id)&&!sharedStart) continue;
 +        if (!bound&&(state.Generation!=1||(state.Stopped&&!state.CompletedRunOnce)||
 +            latest.Members.contains(character))) continue;
 +        if (state.CompletedRunOnce && (!(quest->flags & TESQuest::RunOnce) ||
 +            (quest->flags & (TESQuest::Completed|TESQuest::Failed|TESQuest::AllowRepeatStages)))) continue;
 +        // Replay only recorded native stages. Do not synthesize a stop, reward,
 +        // completed flag or inventory grant from a completion record.
-+        for (const auto& [stage,type]:state.Stages)
++        auto stages=state.Stages;
++        if (bound&&state.StartedBy&&!quest->IsStageReached(state.StartStage))
++            stages.insert(stages.begin(),{state.StartStage,state.StartType});
++        for (const auto& [stage,type]:stages)
 +        {
 +            if (quest->IsStageReached(stage)) continue;
 +            NotifyQuestUpdate update{};
@@ -1603,6 +1692,12 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    }
 +    return updates;
 +}
++}
++
++uint32_t ExpectedRepeatRun(uint32_t form) noexcept
++{
++    const auto it=repeatJoins.find(form);
++    return it==repeatJoins.end()?0:it->second.Run;
 +}
 +
 +// Called by the world runner after the exact native script call returned.
@@ -1878,7 +1973,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        deferredQuestPickup.reset();deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();questDialogueReady=false;sharedDialogueItems.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +1627,32 @@
+@@ -250,6 +1722,32 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -1911,7 +2006,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +1678,38 @@
+@@ -275,8 +1773,39 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -1942,6 +2037,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +                    const auto conflict=m_branchConflicts.find(id);
 +                    return conflict==m_branchConflicts.end()||conflict->second!=instance;
 +                };
++                ReconcileRepeatStarts(m_world,campaignLink.Journal,stamp->Campaign,stamp->Character,canDispatch);
 +                for (const auto& update:MissingActiveQuestStages(m_world,campaignLink.Journal,stamp->Character,canDispatch))
 +                    ReceiveQuestProgress(update);
 +            }
@@ -3018,7 +3114,7 @@ diff --git a/Code/common/QuestRunMember.h b/Code/common/QuestRunMember.h
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/QuestRunMember.h
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,88 @@
 +#pragma once
 +#include <charconv>
 +#include <cstdint>
@@ -3072,6 +3168,26 @@ new file mode 100644
 +    for (const auto& [id,run]:history) if (run>generation) return false;
 +    history.emplace(instance,generation);
 +    return true;
++}
++inline bool CanAttach(const Members& members,uint64_t character,uint32_t generation,uint32_t expected,
++    uint32_t instance,bool started,bool stopped)
++{
++    if (!character||!generation||generation!=expected||!started||stopped) return false;
++    const auto current=Instance(members,character,generation);
++    if (current) return *current==instance;
++    const auto it=members.find(character);
++    if (it==members.end()) return true;
++    if (it->second.contains(instance)) return false;
++    for (const auto& [id,run]:it->second) if (run>=generation) return false;
++    return true;
++}
++inline bool CanStartMissing(const Members& members,uint64_t character,uint32_t generation,uint32_t stoppedInstance)
++{
++    if (!character||!generation||Instance(members,character,generation)) return false;
++    const auto it=members.find(character);
++    if (it==members.end()) return true;
++    const auto prior=it->second.find(stoppedInstance);
++    return prior!=it->second.end()&&prior->second<generation;
 +}
 +inline bool Admit(const Members& members,uint64_t character,uint32_t generation,uint32_t instance,
 +    bool stopped,bool start,bool stage,bool legacyDifferentTargets)
