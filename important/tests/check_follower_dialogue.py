@@ -6,6 +6,8 @@ root = Path(sys.argv[1], "Code/client/Games")
 src = (root / "Misc/MenuTopicManager.cpp").read_text()
 cond = (root / "Skyrim/Components/TESCondition.h").read_text().split("#pragma once")[1]
 selection = src[src.index("namespace\n{"):src.index("static TiltedPhoques::Initializer")]
+permit = (root.parent.parent / "common/QuestPickupPermit.h").read_text()
+predicate = permit[permit.index("inline bool PositiveSingleItem"):permit.index("\n}", permit.index("inline bool PositiveSingleItem"))+2]
 mocks = r"""
 #include <cassert>
 #include <cstdint>
@@ -17,9 +19,17 @@ struct Handle{struct {unsigned iBits{};}handle;explicit operator bool()const{ret
 struct TESObjectREFR: TESForm {unsigned handle{};Handle GetHandle(){return {{handle}};}
  static TESObjectREFR* pick;static TESObjectREFR* GetByHandle(unsigned value){return pick && pick->handle==value?pick:nullptr;}};
 TESObjectREFR* TESObjectREFR::pick=nullptr;
+struct PlayerCharacter:TESObjectREFR{static PlayerCharacter* Get(){static PlayerCharacter p;return &p;}};
+struct TESQuest:TESForm{};
+static bool spent=false,defer=false;
+bool IsSpentSharedDialogueItem(uint32_t quest,uint32_t item) noexcept{return spent&&quest==100&&item==200;}
+bool DeferSharedQuestTurnIn(uint32_t quest,uint32_t item,uint32_t npc,uint32_t info) noexcept{return defer&&quest==100&&item==200&&npc==10&&info==49;}
+namespace QuestPickupPermit { PREDICATE }
 struct TESTopicInfo:TESForm{TESForm* parentTopic{};TESCondition conditions;};
 struct MenuTopicManager{struct Opt{const char* text;TESTopicInfo* info;TESForm* quest{};};std::vector<Opt*>* pOptions;Handle speaker;bool menuOpen{};
- static MenuTopicManager* Get(){static MenuTopicManager m{};return &m;}bool IsDialogueOpen() const noexcept{return menuOpen;}bool OffersHire()const noexcept;bool ResumeHire(int32_t,uint32_t,uint32_t) noexcept;};
+ static MenuTopicManager* Get(){static MenuTopicManager m{};return &m;}bool IsDialogueOpen() const noexcept{return menuOpen;}bool IsCurrentSpeaker(const Handle& h)const noexcept{return menuOpen&&h.handle.iBits==speaker.handle.iBits;}
+ bool OffersHire()const noexcept;bool ResumeHire(int32_t,uint32_t,uint32_t) noexcept;
+ bool ResumeQuestTurnIn(uint32_t,uint32_t,uint32_t,uint32_t) noexcept;};
 struct PlayerDialogueEvent{std::string text;unsigned handle;unsigned info;unsigned quest;};
 struct OverlayService{static inline unsigned holder{};static bool FollowerBusy(unsigned id){return holder==id;}
  static inline int hires{};bool BeginHire(unsigned,unsigned,int){++hires;return true;}};
@@ -54,11 +64,20 @@ int main(){
  // Ordinary responses and the full-group refusal use the original once.
  item.flags=0;item.comparisonValue=1;assert(HookPlayDialogueOption(m,0));
  assert(played==2&&w.sent.size()==2&&w.overlay.hires==1);
+ TESQuest quest;quest.formID=100;TESForm base{200};
+ hire.quest=&quest;item.function=47;item.params[0]=&base;item.object=1;item.comparisonValue=1.f;
+ context.quest=&quest;context.target=PlayerCharacter::Get();
+ nextCondition=[](TESConditionItem*,ConditionContext&){return true;};
+ spent=true;assert(!CheckFollowerCondition(&item,context));
+ spent=false;assert(CheckFollowerCondition(&item,context));
+ defer=true;assert(!HookPlayDialogueOption(m,0)&&played==2);
+ assert(!m->ResumeQuestTurnIn(10,49,100,201)&&played==2);
+ assert(m->ResumeQuestTurnIn(10,49,100,200)&&played==3);
 }
 """
 with tempfile.TemporaryDirectory() as folder:
     binary = Path(folder, "follower")
-    cpp = mocks.replace("struct TESTopicInfo:", cond+"\nstruct TESTopicInfo:")
+    cpp = mocks.replace("PREDICATE",predicate).replace("struct TESTopicInfo:", cond+"\nstruct TESTopicInfo:")
     subprocess.run(["g++","-std=c++20","-x","c++","-","-o",binary],input=cpp+selection+checks,text=True,check=True)
     subprocess.run([binary],check=True)
 print("PASS actual response predicates and native dispatch: empty/full slot, foreign follower, unrelated conditions, stale grants, single playback")

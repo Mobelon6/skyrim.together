@@ -950,7 +950,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    uint8_t StartType{};
 +    bool CanRestoreStart(uint64_t character) const noexcept
 +    {
-+        return character&&StartedBy==character&&Generation==1&&!Stopped&&Targets.empty();
++        return character&&StartedBy&&Generation==1&&!Stopped&&Targets.empty();
 +    }
 +};
 +struct QuestCatchup : QuestReplayState
@@ -1348,14 +1348,14 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        auto* quest=Cast<TESQuest>(TESForm::GetById(id));
 +        if (!quest||QuestService::IsNonSyncableQuest(quest)||
 +            world.GetOverlayService().IsPersonalQuest(id)) continue;
-+        const bool ownStart=latest.CanRestoreStart(character)&&
++        const bool sharedStart=latest.CanRestoreStart(character)&&
 +            (quest->flags&TESQuest::RunOnce)&&
 +            !(quest->flags&(TESQuest::Completed|TESQuest::Failed|TESQuest::AllowRepeatStages));
 +        GameId gameId{};
 +        if (!world.GetModSystem().GetServerModId(id,gameId)) continue;
 +        if (quest->IsStopped())
 +        {
-+            if (ownStart&&offeredQuestStages.emplace(id,latest.Generation,quest->currentInstanceID,
++            if (sharedStart&&offeredQuestStages.emplace(id,latest.Generation,quest->currentInstanceID,
 +                    NotifyQuestUpdate::Started,latest.StartStage).second)
 +            {
 +                NotifyQuestUpdate start{};
@@ -1366,7 +1366,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +            continue; // wait for a real native start before replaying stages
 +        }
-+        if (!localQuests.contains(id)&&!ownStart) continue;
++        if (!localQuests.contains(id)&&!sharedStart) continue;
 +        const auto targets=QuestService::CaptureQuestTargets(quest);
 +        if (targets=="!") continue;
 +        const auto instance=quest->currentInstanceID;

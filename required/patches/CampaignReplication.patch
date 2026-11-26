@@ -1303,7 +1303,7 @@ diff --git a/Code/client/Services/QuestService.h b/Code/client/Services/QuestSer
 diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Services/Generic/QuestService.cpp
 --- a/Code/client/Services/Generic/QuestService.cpp
 +++ b/Code/client/Services/Generic/QuestService.cpp
-@@ -20,61 +20,196 @@
+@@ -20,61 +20,185 @@
  
  #include <Events/EventDispatcher.h>
  
@@ -1521,21 +1521,10 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +    if (!quest || IsNonSyncableQuest(quest)) return;
 +    update.LocalInstance=quest->currentInstanceID;
 +    if (!MatchesQuestTargets(quest,update)) return;
-+    if (!update.SharedRun) { OnQuestUpdate(update); return; }
-+    auto needed = [form, update] {
-+        auto* current = Cast<TESQuest>(TESForm::GetById(form));
-+        if (!MatchesQuestTargets(current,update)) return false;
-+        if (update.Status == NotifyQuestUpdate::Stopped) return !current->IsStopped();
-+        if (update.Status == NotifyQuestUpdate::Started)
-+            return current->IsStopped() && !((current->flags & TESQuest::RunOnce) && (current->flags & TESQuest::Completed));
-+        return update.Status == NotifyQuestUpdate::StageUpdate && !current->IsStageReached(update.Stage);
-+    };
-+    const uint32_t subject = update.Encounter ? m_world.GetModSystem().GetGameId(update.Subject) : 0;
-+    if (update.Encounter && !subject) return;
-+    auto* npc = subject ? Cast<Actor>(TESForm::GetById(subject)) : nullptr;
-+    const char* label = npc && npc->baseForm ? npc->baseForm->GetName() : quest->fullName.value.AsAscii();
-+    m_world.GetOverlayService().QueueProgress(true, form, update.Speaker, update.SharedRun, label,
-+        [this, update] { OnQuestUpdate(update); }, needed, subject, update.Encounter);
++    // The accepted party quest is already shared. Use STR's existing native
++    // start/stage/stop handler, including its scene and fragment ordering.
++    // Observer/follower consent remains independent of quest progression.
++    OnQuestUpdate(update);
 +}
 +
 +QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
@@ -1549,7 +1538,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
      m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&QuestService::OnUpdate>(this);
      m_disconnectedConnection = aDispatcher.sink<DisconnectedEvent>().connect<&QuestService::OnDisconnected>(this);
      m_leftConnection = aDispatcher.sink<PartyLeftEvent>().connect<&QuestService::OnPartyLeft>(this);
-@@ -126,40 +261,83 @@
+@@ -126,40 +250,83 @@
  
      for (uint32_t questFormId : questFormIds)
      {
@@ -1634,7 +1623,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
  
  BSTEventResult QuestService::OnEvent(const TESQuestStartStopEvent* apEvent, const EventDispatcher<TESQuestStartStopEvent>*)
  {
-@@ -508,19 +686,105 @@
+@@ -508,19 +675,105 @@
      spdlog::info("Holding member quest stage {} for {:X} until no playing scene of it checks it", aStage, apQuest->formID);
  }
  
@@ -1744,7 +1733,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
  
      // A phase whose own actions are done and whose completion conditions want a held stage only moves on with it.
      // Advance the queue in arrival order until the phase can progress.
-@@ -553,14 +817,17 @@
+@@ -553,14 +806,17 @@
  
  // Applies held stages in order while no playing scene checks the next one, e.g. once the scenes that did have ended.
  // Waits for the fragments of the stages it applied first.
@@ -1764,7 +1753,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
  
  HeldStages* QuestService::GetHeldStages(uint32_t aQuestFormId, TESQuest* apQuest) noexcept
  {
-@@ -624,21 +891,45 @@
+@@ -624,21 +880,45 @@
          return;
      }
  
@@ -1817,7 +1806,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
          return;
      }
  
-@@ -655,29 +946,93 @@
+@@ -655,29 +935,93 @@
      bool bResult = false;
      switch (aUpdate.Status)
      {

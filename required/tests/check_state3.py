@@ -64,6 +64,43 @@ int main(){
 ''', ['-I'+str(code/'encoding')])
 
 qs='client/Services/Generic/QuestService.cpp'
+receive=extract(qs,'void QuestService::ReceiveQuestProgress','QuestService::QuestService')
+run('automatic accepted party quest dispatch',headers+'''
+struct NotifyQuestUpdate {uint32_t Id{},LocalInstance{},SharedRun{},Encounter{};};
+struct TESForm { static TESForm* GetById(uint32_t); };
+struct TESQuest:TESForm {uint32_t currentInstanceID{17};bool personal{};} quest;
+TESForm* TESForm::GetById(uint32_t id){return id==10?&quest:nullptr;}
+template<class T>T* Cast(TESForm* form){return static_cast<T*>(form);}
+struct World {
+    struct Party {bool joined{true};bool IsInParty(){return joined;}} party;
+    struct Mods {uint32_t GetGameId(uint32_t id){return id;}} mods;
+    Party& GetPartyService(){return party;}
+    Mods& GetModSystem(){return mods;}
+};
+bool matching=true;
+bool MatchesQuestTargets(TESQuest*,const NotifyQuestUpdate&){return matching;}
+struct QuestService {
+    World m_world;std::vector<NotifyQuestUpdate> applied;
+    static bool IsNonSyncableQuest(TESQuest* q){return q->personal;}
+    void OnQuestUpdate(const NotifyQuestUpdate& u){applied.push_back(u);}
+    void ReceiveQuestProgress(const NotifyQuestUpdate&) noexcept;
+};
+'''+receive+'''
+int main(){
+    QuestService service;
+    NotifyQuestUpdate notice{10,0,1,99};
+    service.ReceiveQuestProgress(notice);
+    assert(service.applied.size()==1&&service.applied.back().LocalInstance==17);
+    assert(service.applied.back().Encounter==99);
+    service.m_world.party.joined=false;service.ReceiveQuestProgress(notice);
+    service.m_world.party.joined=true;quest.personal=true;service.ReceiveQuestProgress(notice);
+    quest.personal=false;matching=false;service.ReceiveQuestProgress(notice);
+    matching=true;notice.Id=11;service.ReceiveQuestProgress(notice);
+    assert(service.applied.size()==1);
+    notice.Id=10;notice.SharedRun=0;service.ReceiveQuestProgress(notice);
+    assert(service.applied.size()==2);
+}
+''')
 bodies = (extract(qs,'void QuestService::OnUpdate(', 'BSTEventResult QuestService::OnEvent(')
         +extract(qs,'void QuestService::HoldStage','void QuestService::NotifyOverlayOfQuestUpdate')
         +extract(qs,'bool QuestService::StopQuest','static constexpr std::array kNonSyncableQuestIds'))
@@ -283,7 +320,8 @@ int main(){
     auto history=ActiveQuestHistory(ops);
     assert(history&&history->at("q").Generation==1&&!history->at("q").Stopped);
     assert((history->at("q").Stages==std::vector<std::pair<uint16_t,uint8_t>>{{100,6},{20,6}}));
-    assert(history->at("q").CanRestoreStart(101)&&!history->at("q").CanRestoreStart(202));
+    assert(history->at("q").CanRestoreStart(101)&&history->at("q").CanRestoreStart(202));
+    assert(!history->at("q").CanRestoreStart(0));
     assert(history->at("q").StartStage==10&&history->at("q").StartType==6);
     ops.push_back({"5","quest-progress-v1","q 1 2 20 6 202"});
     history=ActiveQuestHistory(ops);

@@ -1898,8 +1898,8 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +
 +// A player who has independently accepted this quest may have missed earlier
 +// shared stages (e.g. because the unique pickup happened before acceptance).
-+// Offer them through the existing consent path; never replay another run or
-+// force a completed quest to start on the basis of old history alone.
++// Offer them through the existing native quest path; never replay another run
++// or force a completed quest to start on the basis of old history alone.
 +void OfferKnownStages(Player& player, const PartyService::Party& party,
 +                      const QuestRun& run, const NotifyQuestUpdate& notice)
 +{
@@ -2111,7 +2111,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +            !(knownSharedQuest && message.Status == RequestQuestUpdate::Stopped)) return;
      }
  
-@@ -115,39 +522,83 @@
+@@ -115,39 +522,84 @@
 -    auto& run = pParty->QuestRuns[message.Id];
 -    // The sender's local quest log and the party's shared lifecycle are independent.
 -    // A late start from a second client must not clear stages the first client sent.
@@ -2211,8 +2211,9 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        if (durable || notify.Speaker == pParty->LeaderPlayerId)
 +            notify.SharedRun = run.Generation;
 +        for (auto* guest : pParty->Members)
-+            if (guest != pPlayer && PartyService::WithinSyncRange(m_world, *pPlayer, *guest) &&
-+                (!participants || participants->ChoiceListeners.count(guest->GetId())))
++            if (guest != pPlayer &&
++                (durable || (PartyService::WithinSyncRange(m_world, *pPlayer, *guest) &&
++                    (!participants || participants->ChoiceListeners.count(guest->GetId())))))
 +            {
 +                auto outgoing=notify;
 +                if (bind)
