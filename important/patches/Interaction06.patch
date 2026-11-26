@@ -1891,7 +1891,7 @@ index a91490e..e1716c6 100644
 @@ -39,6 +39,9 @@ export class ClientService implements OnDestroy {
    public readonly syncRange = new BehaviorSubject<Record<number, boolean>>({});
    public readonly observerMode = new BehaviorSubject(false);
-   public readonly progressOffer = new BehaviorSubject<{token: number; label: string} | null>(null);
+   public readonly progressOffer = new BehaviorSubject<{token: number; label: string; selfName?: string; peerName?: string} | null>(null);
 +  readonly home = new BehaviorSubject<{token: number;names: string[]} | null>(null);
 +  readonly trade = new BehaviorSubject<{session: number; name: string; open: boolean;
 +    pocket: {id: number; name: string; count: number}[]; buffer: {id: number; name: string; count: number}[]} | null>(null);
@@ -1900,7 +1900,7 @@ index a91490e..e1716c6 100644
  
 @@ -153,6 +156,12 @@ export class ClientService implements OnDestroy {
      skyrimtogether.on('observerMode', watch => this.zone.run(() => this.observerMode.next(watch)));
-     skyrimtogether.on('offerProgress', (token, label) => this.zone.run(() => this.progressOffer.next({token, label})));
+     skyrimtogether.on('offerProgress', (token, label, selfName, peerName) => this.zone.run(() => this.progressOffer.next({token, label, selfName, peerName})));
      skyrimtogether.on('hideProgress', () => this.zone.run(() => this.progressOffer.next(null)));
 +    skyrimtogether.on('offerHome', (token,names) => this.zone.run(() => this.home.next({token,names:names.split('\n')})));
 +    skyrimtogether.on('hideHome', () => this.zone.run(() => this.home.next(null)));
