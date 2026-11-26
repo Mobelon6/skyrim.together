@@ -221,6 +221,17 @@ int main(){
     send(30,0);send(40,0);send(40,2);quest.reached.insert(5);scene.isPlaying=false;
     service.OnUpdate({});assert(quest.actions.empty()&&!quest.stopped&&service.m_branchConflicts.count(2));
     assert(service.m_heldStages.empty()&&service.m_afterHeldStages.empty());
+    service.OnPartyLeft({});quest.stages.clear();quest.reached.clear();quest.actions.clear();
+    quest.stopped=false;scene.isPlaying=true;scene.ready=false;
+    send(20,2);
+    assert(!quest.stopped&&service.m_afterHeldStages.count(2)&&service.m_heldStages.empty());
+    service.OnUpdate({});assert(!quest.stopped);
+    scene.ready=true;service.m_questRetryAt.at(2)={};service.OnUpdate({});
+    assert(quest.stopped&&quest.actions==Vector<int>{-1});
+    quest.stopped=false;quest.actions.clear();scene.ready=false;send(20,2);
+    assert(service.m_afterHeldStages.count(2));
+    ++quest.currentInstanceID;scene.isPlaying=false;service.m_questRetryAt.at(2)={};
+    service.OnUpdate({});assert(!quest.stopped&&quest.actions.empty()&&service.m_afterHeldStages.empty());
 }
 ''')
 
@@ -272,13 +283,17 @@ int main(){
     auto history=ActiveQuestHistory(ops);
     assert(history&&history->at("q").Generation==1&&!history->at("q").Stopped);
     assert((history->at("q").Stages==std::vector<std::pair<uint16_t,uint8_t>>{{100,6},{20,6}}));
+    assert(history->at("q").CanRestoreStart(101)&&!history->at("q").CanRestoreStart(202));
+    assert(history->at("q").StartStage==10&&history->at("q").StartType==6);
     ops.push_back({"5","quest-progress-v1","q 1 2 20 6 202"});
     history=ActiveQuestHistory(ops);
     assert(history&&history->at("q").Stopped&&history->at("q").Stages.size()==2);
+    assert(!history->at("q").CanRestoreStart(101));
     ops.push_back({"6","quest-progress-v1","q 2 1 10 6 101"});
     ops.push_back({"7","quest-progress-v1","q 2 0 100 6 101"});
     history=ActiveQuestHistory(ops);
     assert(history&&history->at("q").Generation==2&&!history->at("q").Stopped);
+    assert(!history->at("q").CanRestoreStart(101));
     ops.push_back({"8","quest-progress-v1","q 4 0 90 6 101"});
     assert(!ActiveQuestHistory(ops));
     ops={{"1","quest-progress-v1","q 1 1 10 6 101"},{"2","quest-progress-v1","q 1 0 80 6 101"},{"3","quest-completed-v1","q 1 2 80 6 101"}};
@@ -302,6 +317,7 @@ int main(){
     assert(QuestRunMember::Bound(latest.Members,202,2,84));
     assert(latest.Prior.size()==1&&latest.Prior[0].Stopped&&latest.Prior[0].Stages.size()==1);
     assert(QuestRunMember::Bound(latest.Members,202,1,83));
+    assert(!latest.CanRestoreStart(101)&&!latest.Prior[0].CanRestoreStart(101));
     ops[6].Payload="q 2 0 20 6 202 2:r:616263.1; @83";assert(!ActiveQuestHistory(ops));
 }
 ''', ['-I'+str(code/'common')])

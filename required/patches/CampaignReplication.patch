@@ -1549,7 +1549,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
      m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&QuestService::OnUpdate>(this);
      m_disconnectedConnection = aDispatcher.sink<DisconnectedEvent>().connect<&QuestService::OnDisconnected>(this);
      m_leftConnection = aDispatcher.sink<PartyLeftEvent>().connect<&QuestService::OnPartyLeft>(this);
-@@ -126,40 +261,79 @@
+@@ -126,40 +261,83 @@
  
      for (uint32_t questFormId : questFormIds)
      {
@@ -1569,6 +1569,10 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +                {
 +                    auto stale=m_heldStages.find(questFormId);
 +                    if (stale!=m_heldStages.end()) m_heldStages.erase(stale);
++                    auto deferred=m_afterHeldStages.find(questFormId);
++                    if (deferred!=m_afterHeldStages.end()) m_afterHeldStages.erase(deferred);
++                    auto retry=m_questRetryAt.find(questFormId);
++                    if (retry!=m_questRetryAt.end()) m_questRetryAt.erase(retry);
 +                    continue;
 +                }
 +            }
@@ -1630,7 +1634,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
  
  BSTEventResult QuestService::OnEvent(const TESQuestStartStopEvent* apEvent, const EventDispatcher<TESQuestStartStopEvent>*)
  {
-@@ -508,19 +682,93 @@
+@@ -508,19 +686,105 @@
      spdlog::info("Holding member quest stage {} for {:X} until no playing scene of it checks it", aStage, apQuest->formID);
  }
  
@@ -1666,6 +1670,18 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +            if (groupExcluded) return true;
 +            groupExcluded=true;
 +        }
++    }
++    return false;
++}
++
++static bool SceneBlocksQuestStop(TESQuest* quest) noexcept
++{
++    for (auto* scene:quest->scenes)
++    {
++        if (!scene||!scene->isPlaying) continue;
++        const auto phase=static_cast<uint32_t>(scene->currentPhaseIndex);
++        if (phase>=static_cast<uint32_t>(scene->phases.length)||
++            !IsPhaseWaitingOnConditions(scene,phase)) return true;
 +    }
 +    return false;
 +}
@@ -1728,7 +1744,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
  
      // A phase whose own actions are done and whose completion conditions want a held stage only moves on with it.
      // Advance the queue in arrival order until the phase can progress.
-@@ -553,14 +801,17 @@
+@@ -553,14 +817,17 @@
  
  // Applies held stages in order while no playing scene checks the next one, e.g. once the scenes that did have ended.
  // Waits for the fragments of the stages it applied first.
@@ -1748,7 +1764,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
  
  HeldStages* QuestService::GetHeldStages(uint32_t aQuestFormId, TESQuest* apQuest) noexcept
  {
-@@ -624,18 +875,39 @@
+@@ -624,21 +891,45 @@
          return;
      }
  
@@ -1777,23 +1793,31 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +    HeldStages* pHeld = stageUpdate || aUpdate.Status == NotifyQuestUpdate::Stopped ? GetHeldStages(formId, pQuest) : nullptr;
 +    if (stageUpdate && (pHeld || IsCheckedByPlayingScene(pQuest, aUpdate.Stage)))
      {
-+        if (aUpdate.CheckInstance||!aUpdate.Targets.empty())
-+        {
-+            auto& held=m_heldStages[formId];
-+            held.Targets.assign(aUpdate.Targets.data(),aUpdate.Targets.size());
-+            held.LocalInstance=aUpdate.LocalInstance;
-+            held.CheckInstance=aUpdate.CheckInstance;
-+        }
++        auto& held=m_heldStages[formId];
++        held.Targets.assign(aUpdate.Targets.data(),aUpdate.Targets.size());
++        held.LocalInstance=pQuest->currentInstanceID;
++        held.CheckInstance=!pQuest->IsStopped();
          HoldStage(pQuest, aUpdate.Stage);
          return;
      }
  
      // Let the scene and its running fragments finish before stopping. A restart received
      // meanwhile belongs behind this stop, even if it uses the same form and stage numbers.
-     if (aUpdate.Status == NotifyQuestUpdate::Stopped && pHeld)
++    if (aUpdate.Status==NotifyQuestUpdate::Stopped&&pQuest->IsStopped()) return;
+-    if (aUpdate.Status == NotifyQuestUpdate::Stopped && pHeld)
++    if (aUpdate.Status == NotifyQuestUpdate::Stopped && (pHeld||SceneBlocksQuestStop(pQuest)))
      {
-         m_afterHeldStages[formId].push_back(aUpdate);
-@@ -655,29 +927,93 @@
+-        m_afterHeldStages[formId].push_back(aUpdate);
++        auto stop=aUpdate;
++        stop.CheckInstance=true;
++        stop.ExpectedInstance=pQuest->currentInstanceID;
++        stop.LocalInstance=pQuest->currentInstanceID;
++        m_afterHeldStages[formId].push_back(stop);
++        if (!pHeld) m_questRetryAt[formId]=std::chrono::steady_clock::now()+std::chrono::milliseconds(250);
+         return;
+     }
+ 
+@@ -655,29 +946,93 @@
      bool bResult = false;
      switch (aUpdate.Status)
      {
@@ -1835,7 +1859,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +                    held.PendingItems.insert(held.PendingItems.end(),pending,aUpdate.Stage);
 +                    held.Targets.assign(aUpdate.Targets.data(),aUpdate.Targets.size());
 +                    held.LocalInstance=pQuest->currentInstanceID;
-+                    held.CheckInstance=aUpdate.CheckInstance;
++                    held.CheckInstance=true;
 +                }
 +            }
 +            pQuest->SetActive(true);
@@ -1867,7 +1891,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +                    held.PendingItems.insert(held.PendingItems.end(),pending,aUpdate.Stage);
 +                    held.Targets.assign(aUpdate.Targets.data(),aUpdate.Targets.size());
 +                    held.LocalInstance=pQuest->currentInstanceID;
-+                    held.CheckInstance=aUpdate.CheckInstance;
++                    held.CheckInstance=true;
 +                }
 +            }
 +            spdlog::info("Remote quest updated: {:X}, stage: {}", formId, aUpdate.Stage);

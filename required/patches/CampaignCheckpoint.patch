@@ -510,9 +510,9 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +void RefreshCampaignDragonAwards() noexcept;
 +void RememberCampaignDragonAward(uint32_t) noexcept;
 +int ApplyCampaignDragonAward(uint32_t) noexcept;
- #include <Services/PapyrusService.h>
- #include <PlayerCharacter.h>
- #include <Forms/TESGlobal.h>
+ #include <HomeSnapshot.h>
+ #include <HomePermissions.h>
+ #include <TradeLedger.h>
 @@ -26,6 +60,16 @@
  namespace
  {
@@ -530,7 +530,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +265,894 @@
+@@ -221,6 +265,925 @@
      return 2;
  }
  
@@ -944,6 +944,13 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    std::vector<std::pair<uint16_t,uint8_t>> Stages;
 +    uint16_t StopStage{};
 +    uint8_t StopType{};
++    uint64_t StartedBy{};
++    uint16_t StartStage{};
++    uint8_t StartType{};
++    bool CanRestoreStart(uint64_t character) const noexcept
++    {
++        return character&&StartedBy==character&&Generation==1&&!Stopped&&Targets.empty();
++    }
 +};
 +struct QuestCatchup : QuestReplayState
 +{
@@ -991,8 +998,16 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        if (quest.Seen&&quest.Targets!=targets) return {};
 +        quest.Seen=true;quest.Targets=std::move(targets);
 +        if (instance&&!QuestRunMember::Remember(quest.Members,character,run,*instance)) return {};
-+        if (status==NotifyQuestUpdate::Stopped)
++        if (status==NotifyQuestUpdate::Started)
 +        {
++            if (quest.Stopped||quest.StartedBy) return {};
++            quest.StartedBy=character;
++            quest.StartStage=static_cast<uint16_t>(stage);
++            quest.StartType=static_cast<uint8_t>(type);
++        }
++        else if (status==NotifyQuestUpdate::Stopped)
++        {
++            if (quest.Stopped) return {};
 +            quest.Stopped=true;
 +            quest.CompletedRunOnce=completed;
 +            quest.StopStage=static_cast<uint16_t>(stage);
@@ -1246,10 +1261,28 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        auto* mod=ModManager::Get()->GetByName(form->Plugin.c_str());
 +        if (!mod||!mod->IsLoaded()) continue;
 +        const auto id=mod->GetFormId(form->Local);
-+        if (!localQuests.contains(id)) continue;
 +        auto* quest=Cast<TESQuest>(TESForm::GetById(id));
-+        if (!quest||quest->IsStopped()||QuestService::IsNonSyncableQuest(quest)||
++        if (!quest||QuestService::IsNonSyncableQuest(quest)||
 +            world.GetOverlayService().IsPersonalQuest(id)) continue;
++        const bool ownStart=latest.CanRestoreStart(character)&&
++            (quest->flags&TESQuest::RunOnce)&&
++            !(quest->flags&(TESQuest::Completed|TESQuest::Failed|TESQuest::AllowRepeatStages));
++        GameId gameId{};
++        if (!world.GetModSystem().GetServerModId(id,gameId)) continue;
++        if (quest->IsStopped())
++        {
++            if (ownStart&&offeredQuestStages.emplace(id,latest.Generation,quest->currentInstanceID,
++                    NotifyQuestUpdate::Started,latest.StartStage).second)
++            {
++                NotifyQuestUpdate start{};
++                start.Id=gameId;start.Stage=latest.StartStage;start.ClientQuestType=latest.StartType;
++                start.Status=NotifyQuestUpdate::Started;start.SharedRun=latest.Generation;
++                start.Speaker=world.GetPartyService().GetLeaderPlayerId();
++                updates.push_back(start);
++            }
++            continue; // wait for a real native start before replaying stages
++        }
++        if (!localQuests.contains(id)&&!ownStart) continue;
 +        const auto targets=QuestService::CaptureQuestTargets(quest);
 +        if (targets=="!") continue;
 +        const auto instance=quest->currentInstanceID;
@@ -1267,8 +1300,6 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            (quest->flags & (TESQuest::Completed|TESQuest::Failed|TESQuest::AllowRepeatStages)))) continue;
 +        // Replay only recorded native stages. Do not synthesize a stop, reward,
 +        // completed flag or inventory grant from a completion record.
-+        GameId gameId{};
-+        if (!world.GetModSystem().GetServerModId(id,gameId)) continue;
 +        for (const auto& [stage,type]:state.Stages)
 +        {
 +            if (quest->IsStageReached(stage)||
@@ -1425,7 +1456,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        deferredQuestPickup.reset();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +1182,20 @@
+@@ -250,6 +1213,20 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -1446,7 +1477,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +1221,24 @@
+@@ -275,8 +1252,24 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -1963,7 +1994,7 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
      auto& runner = World::Get().GetRunner();
  
      PapyrusFunctionRegisterEvent event(apFunction->functionName.AsAscii(), apFunction->typeName.AsAscii(), apFunction->functionAddress);
-@@ -109,6 +343,11 @@
+@@ -109,5 +343,10 @@
          TP_HOOK(&RealRegisterPapyrusFunction, HookRegisterPapyrusFunction);
          TP_HOOK(&RealBindEverythingToScript, HookBindEverythingToScript);
          TP_HOOK(&RealSignaturesMatch, HookSignaturesMatch);
@@ -1974,7 +2005,6 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +#endif
          // TP_HOOK(&RealCompareVariables, HookCompareVariables);
      });
- 
 diff --git a/Code/common/QuestWordReward.h b/Code/common/QuestWordReward.h
 new file mode 100644
 --- /dev/null
