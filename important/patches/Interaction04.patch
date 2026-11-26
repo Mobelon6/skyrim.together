@@ -515,12 +515,12 @@ index 9792a30..f169919 100644
          m_world.GetRunner().Queue(
 -            [&, formId = pQuest->formID, stageId = pQuest->currentStage, stopped = pQuest->IsStopped(), type = pQuest->type, journal = !pQuest->objectives.Empty()]()
 +            [&, formId = pQuest->formID, stageId = pQuest->currentStage, stopped = pQuest->IsStopped(), type = pQuest->type,
-+                completedRunOnce = pQuest->IsStopped() && (pQuest->flags & TESQuest::RunOnce) &&
++                instance = pQuest->currentInstanceID, completedRunOnce = pQuest->IsStopped() && (pQuest->flags & TESQuest::RunOnce) &&
 +                    (pQuest->flags & TESQuest::Completed) && !(pQuest->flags & (TESQuest::Failed | TESQuest::AllowRepeatStages))]()
              {
                  GameId Id;
                  auto& modSys = m_world.GetModSystem();
-@@ -187,7 +209,8 @@ BSTEventResult QuestService::OnEvent(const TESQuestStartStopEvent* apEvent, cons
+@@ -187,7 +209,9 @@ BSTEventResult QuestService::OnEvent(const TESQuestStartStopEvent* apEvent, cons
                  {
                      if (m_world.GetOverlayService().IsPersonalQuest(formId)) return;
                      RequestQuestUpdate update;
@@ -530,16 +530,17 @@ index 9792a30..f169919 100644
                      update.Id = Id;
                      update.Stage = stageId;
                      update.Status = stopped ? RequestQuestUpdate::Stopped : RequestQuestUpdate::Started;
-@@ -237,7 +260,7 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageEvent* apEvent, const Ev
++                    if (!FillQuestTargets(formId, instance, update)) return;
+@@ -237,7 +261,7 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageEvent* apEvent, const Ev
          }
  
          m_world.GetRunner().Queue(
 -            [&, formId = apEvent->formId, stageId = apEvent->stageId, type = pQuest->type, journal = !pQuest->objectives.Empty()]()
-+            [&, formId = apEvent->formId, stageId = apEvent->stageId, type = pQuest->type]()
++            [&, formId = apEvent->formId, stageId = apEvent->stageId, type = pQuest->type, instance = pQuest->currentInstanceID]()
              {
                  // Observe the actual opponent picked by the vanilla brawl quest without changing its scripts.
                  if (formId == 0x47AE6)
-@@ -257,7 +280,7 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageEvent* apEvent, const Ev
+@@ -257,7 +281,8 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageEvent* apEvent, const Ev
                  {
                      if (m_world.GetOverlayService().IsPersonalQuest(formId)) return;
                      RequestQuestUpdate update;
@@ -548,6 +549,7 @@ index 9792a30..f169919 100644
                      update.Id = Id;
                      update.Stage = stageId;
                      update.Status = RequestQuestUpdate::StageUpdate;
++                    if (!FillQuestTargets(formId, instance, update)) return;
 diff --git a/Code/client/Services/OverlayService.h b/Code/client/Services/OverlayService.h
 index 0638d84..f966037 100644
 --- a/Code/client/Services/OverlayService.h
@@ -592,21 +594,23 @@ diff --git a/Code/encoding/Messages/NotifyQuestUpdate.cpp b/Code/encoding/Messag
 index 66b870e..8c38849 100644
 --- a/Code/encoding/Messages/NotifyQuestUpdate.cpp
 +++ b/Code/encoding/Messages/NotifyQuestUpdate.cpp
-@@ -10,6 +10,8 @@ void NotifyQuestUpdate::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) con
+@@ -10,6 +10,9 @@ void NotifyQuestUpdate::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) con
      aWriter.WriteBits(ClientQuestType, 8);
      TiltedPhoques::Serialization::WriteVarInt(aWriter, SharedRun);
      TiltedPhoques::Serialization::WriteVarInt(aWriter, Speaker);
 +    TiltedPhoques::Serialization::WriteVarInt(aWriter, Encounter);
 +    if (Encounter) Subject.Serialize(aWriter);
++    TiltedPhoques::Serialization::WriteString(aWriter, Targets);
  }
  
  void NotifyQuestUpdate::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept
-@@ -28,4 +30,6 @@ void NotifyQuestUpdate::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) n
+@@ -28,4 +31,7 @@ void NotifyQuestUpdate::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) n
      ClientQuestType = tmp & 0xFF;
      SharedRun = static_cast<uint32_t>(TiltedPhoques::Serialization::ReadVarInt(aReader));
      Speaker = static_cast<uint32_t>(TiltedPhoques::Serialization::ReadVarInt(aReader));
 +    Encounter = static_cast<uint32_t>(TiltedPhoques::Serialization::ReadVarInt(aReader));
 +    if (Encounter) Subject.Deserialize(aReader);
++    Targets = TiltedPhoques::Serialization::ReadString(aReader);
  }
 diff --git a/Code/encoding/Messages/NotifyQuestUpdate.h b/Code/encoding/Messages/NotifyQuestUpdate.h
 index 31dc675..03a2de3 100644
@@ -617,17 +621,19 @@ index 31dc675..03a2de3 100644
      void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
  
 -    bool operator==(const NotifyQuestUpdate& acRhs) const noexcept { return GetOpcode() == acRhs.GetOpcode() && Id == acRhs.Id && Stage == acRhs.Stage && Status == acRhs.Status && ClientQuestType == acRhs.ClientQuestType && SharedRun == acRhs.SharedRun && Speaker == acRhs.Speaker; }
-+    bool operator==(const NotifyQuestUpdate& acRhs) const noexcept { return GetOpcode() == acRhs.GetOpcode() && Id == acRhs.Id && Stage == acRhs.Stage && Status == acRhs.Status && ClientQuestType == acRhs.ClientQuestType && SharedRun == acRhs.SharedRun && Speaker == acRhs.Speaker && Encounter == acRhs.Encounter && Subject == acRhs.Subject; }
++    bool operator==(const NotifyQuestUpdate& acRhs) const noexcept { return GetOpcode() == acRhs.GetOpcode() && Id == acRhs.Id && Stage == acRhs.Stage && Status == acRhs.Status && ClientQuestType == acRhs.ClientQuestType && SharedRun == acRhs.SharedRun && Speaker == acRhs.Speaker && Encounter == acRhs.Encounter && Subject == acRhs.Subject && Targets == acRhs.Targets; }
  
      enum StatusCode : uint8_t
      {
-@@ -24,7 +24,8 @@ struct NotifyQuestUpdate final : ServerMessage
+@@ -24,7 +24,10 @@ struct NotifyQuestUpdate final : ServerMessage
          Stopped
      };
  
 -    uint32_t SharedRun{}, Speaker{};
 +    uint32_t SharedRun{}, Speaker{}, Encounter{};
 +    GameId Subject{};
++    String Targets{};
++    uint32_t LocalInstance{}; // client only; never serialized
      GameId Id;
      uint16_t Stage;
      uint8_t Status;

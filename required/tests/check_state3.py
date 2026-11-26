@@ -76,7 +76,7 @@ template<class T> using Vector=std::vector<T>;
 template<class K,class V> using Map=std::map<K,V>;
 struct UpdateEvent{};struct DisconnectedEvent{};struct PartyLeftEvent{};
 struct ScopedQuestOverride{ScopedQuestOverride(){}};
-struct NotifyQuestUpdate{enum {StageUpdate,Started,Stopped};GameId Id;uint16_t Stage;uint8_t Status;uint8_t ClientQuestType{};};
+struct NotifyQuestUpdate{enum {StageUpdate,Started,Stopped};GameId Id;uint16_t Stage;uint8_t Status;uint8_t ClientQuestType{};std::string Targets{};uint32_t LocalInstance{};};
 struct TESForm{static TESForm* GetById(uint32_t);};
 template<class T> T* Cast(TESForm* p){return static_cast<T*>(p);}
 struct Conditions{uint16_t wants;};
@@ -85,7 +85,7 @@ struct PhaseList{int length=1;BGSScenePhase* phase;auto operator[](int)const{ret
 struct BGSScene{bool isPlaying=true;int currentPhaseIndex=0;PhaseList phases;int formID=44;bool ready=false;};
 struct TESQuest:TESForm{
 struct{struct{const char* AsAscii(){return "Quest";}}value;}fullName;enum class Type{Other,None,Miscellaneous};Type type=Type::Other;
-uint32_t formID=2;uint16_t currentStage=0;bool stopped=false;
+uint32_t formID=2,currentInstanceID=1;uint16_t currentStage=0;bool stopped=false;std::string targets;
 enum Flags{RunOnce=256,Completed=2};uint16_t flags{};
 enum class State{WaitingPromotion,Running,Stopped};bool pendingPromotion=false;int nativeStarts=0;
 State getState(){return pendingPromotion?State::WaitingPromotion:stopped?State::Stopped:State::Running;}
@@ -107,7 +107,9 @@ template<class...T>void info(T&&...){}
 template<class...T>void error(T&&...){}
 }
 struct QuestService{
-World& m_world=World::Get();struct HeldStages{Vector<uint16_t> Stages,PendingItems;std::chrono::steady_clock::time_point RetryAt{};};
+World& m_world=World::Get();struct HeldStages{Vector<uint16_t> Stages,PendingItems;std::chrono::steady_clock::time_point RetryAt{};std::string Targets;uint32_t LocalInstance{};};
+std::map<uint32_t,std::pair<uint32_t,std::string>> m_lastQuestTargets;
+static std::string CaptureQuestTargets(TESQuest* q){return q->targets;}
 Map<uint32_t,HeldStages> m_heldStages; Map<uint32_t,Vector<NotifyQuestUpdate>> m_afterHeldStages;
 Map<uint32_t,std::chrono::steady_clock::time_point> m_questRetryAt;
 void OnUpdate(const UpdateEvent&) noexcept;void OnDisconnected(const DisconnectedEvent&) noexcept;void OnPartyLeft(const PartyLeftEvent&) noexcept;
@@ -115,6 +117,7 @@ void HoldStage(TESQuest*,uint16_t) noexcept;HeldStages* GetHeldStages(uint32_t,T
 void OnQuestUpdate(const NotifyQuestUpdate&) noexcept;static bool StopQuest(uint32_t);
 };
 using HeldStages=QuestService::HeldStages;
+static bool MatchesQuestTargets(TESQuest* q,const NotifyQuestUpdate& u){return q&&(u.Targets.empty()||(!q->stopped&&q->currentInstanceID==u.LocalInstance&&q->targets==u.Targets));}
 static void ReleaseStagesForWaitingPhases(TESQuest*,HeldStages&) noexcept;
 static void ReleaseUncheckedStages(TESQuest*,HeldStages&) noexcept;
 static bool IsCheckedByPlayingScene(TESQuest* q,uint16_t){return !q->scenes.empty()&&q->scenes[0]->isPlaying;}
@@ -180,13 +183,26 @@ int main(){
     service.m_heldStages.at(2).PendingItems.clear();
     service.OnUpdate({});service.OnUpdate({});
     assert((quest.actions==Vector<int>{100,20,-1}));
+    // A queued result must not survive a change of native quest instance.
+    quest.stopped=false;quest.reached.clear();quest.actions.clear();quest.targets="2:r:616263.1;";
+    quest.currentInstanceID=7;scene.isPlaying=true;scene.ready=false;
+    service.OnQuestUpdate({2,100,0,0,quest.targets,7});
+    assert(service.m_heldStages.count(2));quest.currentInstanceID=8;
+    scene.isPlaying=false;service.OnUpdate({});
+    assert(quest.actions.empty()&&service.m_heldStages.empty());
+    service.OnQuestUpdate({2,20,0,0,"2:r:616263.2;",8});
+    assert(quest.actions.empty());
+    service.OnQuestUpdate({2,20,0,0,quest.targets,8});
+    assert((quest.actions==Vector<int>{20}));
 }
 ''')
 
 server=extract('server/Services/QuestService.cpp','bool AdvanceQuestRun(', 'std::string QuestKey(')
 run('party quest lifecycle and ordered catch-up history',headers+'''
-struct NotifyQuestUpdate{enum {StageUpdate,Started,Stopped};uint16_t Stage;uint8_t Status;};
-struct QuestRun{unsigned Generation{1};std::set<uint16_t> Stages;std::vector<uint16_t> OrderedStages; bool Stopped=false;bool Started=false;bool CompletedRunOnce=false;};
+struct NotifyQuestUpdate{enum {StageUpdate,Started,Stopped};uint16_t Stage;uint8_t Status;std::string Targets{};};
+// The target format is checked separately; this harness exercises actual run transitions.
+bool ValidQuestTargets(std::string_view value){return value.size()<=2048&&value!="!";}
+struct QuestRun{unsigned Generation{1};std::set<uint16_t> Stages;std::vector<uint16_t> OrderedStages; bool Stopped=false;bool Started=false;bool CompletedRunOnce=false;std::string Targets;};
 '''+server+'''
 int main(){
     QuestRun run;
@@ -205,6 +221,11 @@ int main(){
     assert(finished.CompletedRunOnce&&finished.Stopped&&finished.OrderedStages==std::vector<uint16_t>{80});
     assert(!AdvanceQuestRun(finished,start)&&!AdvanceQuestRun(finished,stage)&&!AdvanceQuestRun(finished,stop,true));
     QuestRun unknown;assert(!AdvanceQuestRun(unknown,stop,true));
+    QuestRun radiant;NotifyQuestUpdate a{10,1,"2:r:616263.1;"},wrong{20,0,"2:r:616263.2;"},right{20,0,a.Targets};
+    assert(AdvanceQuestRun(radiant,a));assert(!AdvanceQuestRun(radiant,wrong));assert(AdvanceQuestRun(radiant,right));
+    NotifyQuestUpdate done{20,2,a.Targets};assert(AdvanceQuestRun(radiant,done));
+    wrong.Status=1;assert(AdvanceQuestRun(radiant,wrong)&&radiant.Generation==2&&radiant.Targets==wrong.Targets);
+    assert(!AdvanceQuestRun(radiant,right));
 }
 ''')
 
@@ -236,6 +257,10 @@ int main(){
     history=ActiveQuestHistory(ops);assert(history&&history->at("q").Stopped&&history->at("q").CompletedRunOnce);
     assert(history->at("q").Stages.size()==1&&history->at("q").Stages[0].first==80);
     ops.push_back({"4","quest-progress-v1","q 2 1 10 6 202"});assert(!ActiveQuestHistory(ops));
+    ops={{"1","quest-progress-v1","q 1 1 10 6 101 2:r:616263.1;"},
+         {"2","quest-progress-v1","q 1 0 20 6 202 2:r:616263.1;"}};
+    history=ActiveQuestHistory(ops);assert(history&&history->at("q").Targets=="2:r:616263.1;");
+    ops[1].Payload="q 1 0 20 6 202 2:r:616263.2;";assert(!ActiveQuestHistory(ops));
 }
 ''')
 

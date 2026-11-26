@@ -1631,14 +1631,44 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +#include <Messages/RequestInventoryChanges.h>
  
  #include <Messages/RequestQuestUpdate.h>
-@@ -15,5 +19,229 @@
+@@ -15,5 +19,267 @@
  Console::Setting bEnableMiscQuestSync{"Gameplay:bEnableMiscQuestSync", "(Experimental) Syncs miscellaneous quests when possible", false};
  
 +using QuestRun = PartyService::Party::QuestRun;
 +
++bool ValidQuestTargets(std::string_view value)
++{
++    if (value.empty()) return true;
++    if (value.size()>2048) return false;
++    uint32_t previous{};
++    bool first=true;
++    while (!value.empty())
++    {
++        const auto end=value.find(';');
++        if (end==std::string_view::npos) return false;
++        const auto entry=value.substr(0,end);
++        const auto colon=entry.find(':');
++        uint32_t id{};
++        if (colon==std::string_view::npos || !TradeProperties::Number(entry.substr(0,colon),id) ||
++            (!first&&id<=previous) || colon+3>=entry.size() || entry[colon+2]!=':') return false;
++        const char kind=entry[colon+1];
++        const auto key=entry.substr(colon+3);
++        if (kind!='r'&&kind!='l') return false;
++        const auto form=TradeProperties::DecodeForm(key);
++        if (!form||!form->Valid()||form->Encode()!=key) return false;
++        first=false;previous=id;value.remove_prefix(end+1);
++    }
++    return !first;
++}
++
 +bool AdvanceQuestRun(QuestRun& run, NotifyQuestUpdate& notify, bool completedRunOnce=false)
 +{
 +    if (run.CompletedRunOnce) return false;
++    const std::string targets(notify.Targets.data(),notify.Targets.size());
++    if (!ValidQuestTargets(targets)) return false;
++    const bool newRun=run.Stopped&&notify.Status==NotifyQuestUpdate::Started;
++    const bool hasRun=run.Started||!run.OrderedStages.empty()||run.Stopped;
++    if (hasRun&&!newRun&&run.Targets!=targets) return false;
 +    if (completedRunOnce && (notify.Status!=NotifyQuestUpdate::Stopped || run.Generation!=1 ||
 +        (!run.Started && run.Stages.empty()))) return false;
 +    switch (notify.Status)
@@ -1651,12 +1681,14 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +            if (run.Generation == UINT32_MAX) return false;
 +            ++run.Generation;
 +        }
++        run.Targets=targets;
 +        run.Started = true;
 +        run.Stopped = false;
 +        return true;
 +    case NotifyQuestUpdate::StageUpdate:
 +        if (run.Stopped || !run.Stages.insert(notify.Stage).second)
 +            return false;
++        run.Targets=targets;
 +        run.OrderedStages.push_back(notify.Stage);
 +        return true;
 +    case NotifyQuestUpdate::Stopped:
@@ -1705,10 +1737,14 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        if (form != key) continue;
 +        uint32_t generation{}, status{}, stage{}, type{};
 +        uint64_t character{};
-+        if (!(row >> generation >> status >> stage >> type >> character) || row >> extra ||
++        if (!(row >> generation >> status >> stage >> type >> character) ||
 +            !character || status > NotifyQuestUpdate::Stopped || stage > UINT16_MAX || type > UINT8_MAX)
 +            return false;
++        std::string targets;
++        if (row >> targets)
++            if (row >> extra || !ValidQuestTargets(targets)) return false;
 +        NotifyQuestUpdate event{};
++        event.Targets=targets.c_str();
 +        event.Status = static_cast<uint8_t>(status);
 +        event.Stage = static_cast<uint16_t>(stage);
 +        event.ClientQuestType = static_cast<uint8_t>(type);
@@ -1724,9 +1760,10 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +{
 +    if (!character || key.empty()) return false;
 +    const auto head = journal.Current();
-+    const auto payload = key + " " + std::to_string(run.Generation) + " " +
++    auto payload = key + " " + std::to_string(run.Generation) + " " +
 +        std::to_string(event.Status) + " " + std::to_string(event.Stage) + " " +
 +        std::to_string(event.ClientQuestType) + " " + std::to_string(character);
++    if (!run.Targets.empty()) payload+=" "+run.Targets;
 +    return journal.Append(head, {"quest-progress-" + std::to_string(head.Revision + 1),
 +        run.CompletedRunOnce?"quest-completed-v1":"quest-progress-v1", payload}) == CampaignJournal::Result::Committed;
 +}
@@ -1807,6 +1844,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +    update.Status = NotifyQuestUpdate::StageUpdate;
 +    update.Speaker = speaker;
 +    update.SharedRun = run.Generation;
++    update.Targets=run.Targets.c_str();
 +    for (auto stage : run.OrderedStages)
 +    {
 +        update.Stage = stage;
@@ -1861,9 +1899,12 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +}
 +
  QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
-@@ -44,3 +272,40 @@
+@@ -44,3 +310,45 @@
      PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
      const PartyService::Party::Conversation* participants = nullptr;
++    const std::string targets(message.Targets.data(),message.Targets.size());
++    if (!ValidQuestTargets(targets)) return;
++    notify.Targets=message.Targets;
 +    bool knownSharedQuest = false;
 +    if (pParty && (message.JournalObjective || message.CompletedRunOnce) &&
 +        (message.Status == RequestQuestUpdate::Started || message.Status == RequestQuestUpdate::StageUpdate ||
@@ -1882,6 +1923,8 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +                const auto found = pParty->QuestRuns.find(message.Id);
 +                if (found != pParty->QuestRuns.end()) { run = found.value(); known = true; }
 +            }
++            if (known && (run.Started||!run.OrderedStages.empty()||run.Stopped) &&
++                !(run.Stopped&&message.Status==RequestQuestUpdate::Started)&&run.Targets!=targets) return;
 +            if (known && run.CompletedRunOnce)
 +            {
 +                // Late acceptance may happen while the rest of the party is
@@ -1902,7 +1945,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        }
 +    }
      if (!pParty) return;
-@@ -61,6 +326,7 @@
+@@ -61,6 +369,7 @@
          // During an interaction, only the quest of the witnessed topic has provenance.
          if (inTalk || inFight) return;
 -        if (!bEnableMiscQuestSync && !(message.JournalObjective && message.Status == RequestQuestUpdate::StageUpdate &&
@@ -1912,7 +1955,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +            !(knownSharedQuest && message.Status == RequestQuestUpdate::Stopped && message.CompletedRunOnce)) return;
      }
  
-@@ -115,39 +381,47 @@
+@@ -115,39 +424,47 @@
 -    auto& run = pParty->QuestRuns[message.Id];
 -    // The sender's local quest log and the party's shared lifecycle are independent.
 -    // A late start from a second client must not clear stages the first client sent.
@@ -2001,7 +2044,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 diff --git a/Code/server/Services/PartyService.h b/Code/server/Services/PartyService.h
 --- a/Code/server/Services/PartyService.h
 +++ b/Code/server/Services/PartyService.h
-@@ -31,9 +31,11 @@
+@@ -31,9 +31,12 @@
          struct QuestRun
          {
              TiltedPhoques::Set<uint16_t> Stages;
@@ -2010,6 +2053,7 @@ diff --git a/Code/server/Services/PartyService.h b/Code/server/Services/PartySer
              bool Stopped = false;
              bool Started = false;
 +            bool CompletedRunOnce = false;
++            std::string Targets;
          };
  
          struct Conversation

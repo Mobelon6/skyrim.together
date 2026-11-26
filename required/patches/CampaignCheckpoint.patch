@@ -399,7 +399,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +248,410 @@
+@@ -221,6 +248,420 @@
      return 2;
  }
  
@@ -514,6 +514,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    uint32_t Generation{1};
 +    bool Stopped{};
 +    bool CompletedRunOnce{};
++    std::string Targets;
++    bool Seen{};
 +    std::vector<std::pair<uint16_t,uint8_t>> Stages;
 +};
 +
@@ -531,9 +533,12 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        std::string key,extra;
 +        uint32_t run{},status{},stage{},type{};
 +        uint64_t character{};
-+        if (!(in>>key>>run>>status>>stage>>type>>character)||in>>extra||
++        if (!(in>>key>>run>>status>>stage>>type>>character)||
 +            !run||!character||status>NotifyQuestUpdate::Stopped||stage>UINT16_MAX||type>UINT8_MAX)
 +            return {};
++        std::string targets;
++        if (in>>targets)
++            if (in>>extra||targets.size()>2048) return {};
 +        auto& quest=quests[key];
 +        if (quest.CompletedRunOnce || (completed&&(status!=NotifyQuestUpdate::Stopped||run!=1||quest.Stopped))) return {};
 +        if (run!=quest.Generation)
@@ -542,6 +547,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +                quest.Generation==UINT32_MAX||run!=quest.Generation+1) return {};
 +            quest={};quest.Generation=run;
 +        }
++        if (quest.Seen&&quest.Targets!=targets) return {};
++        quest.Seen=true;quest.Targets=std::move(targets);
 +        if (status==NotifyQuestUpdate::Stopped)
 +        {
 +            quest.Stopped=true;
@@ -780,6 +787,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        auto* quest=Cast<TESQuest>(TESForm::GetById(id));
 +        if (!quest||quest->IsStopped()||QuestService::IsNonSyncableQuest(quest)||
 +            world.GetOverlayService().IsPersonalQuest(id)) continue;
++        const auto targets=QuestService::CaptureQuestTargets(quest);
++        if (targets=="!"||targets!=state.Targets) continue;
 +        if (state.CompletedRunOnce && (!(quest->flags & TESQuest::RunOnce) ||
 +            (quest->flags & (TESQuest::Completed|TESQuest::Failed|TESQuest::AllowRepeatStages)))) continue;
 +        // Replay only recorded native stages. Do not synthesize a stop, reward,
@@ -793,6 +802,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            update.Id=gameId;update.Stage=stage;update.ClientQuestType=type;
 +            update.Status=NotifyQuestUpdate::StageUpdate;
 +            update.SharedRun=state.Generation;
++            update.Targets=state.Targets.c_str();
 +            update.Speaker=world.GetPartyService().GetLeaderPlayerId();
 +            updates.push_back(update);
 +        }
@@ -810,7 +820,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        attemptedQuestConsumption.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +681,7 @@
+@@ -250,6 +691,7 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -818,7 +828,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
          request.Credential=credential->Secret.c_str();
 +        request.Checkpoint=NextCheckpoint(*stamp).c_str();
          m_world.GetTransport().Send(request);
-@@ -275,8 +707,20 @@
+@@ -275,8 +717,20 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
