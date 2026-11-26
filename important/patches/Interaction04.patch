@@ -469,7 +469,7 @@ index 0cd799f..f65a5cb 100644
  }
  
  void OverlayService::ClearProgress() noexcept
-@@ -83,7 +111,20 @@ void OverlayService::UpdateProgress() noexcept
+@@ -83,10 +111,23 @@ void OverlayService::UpdateProgress() noexcept
          auto* threat = player->GetCombatTarget();
          if (threat && (!m_peaceSession.count(threat->formID) || threat->IsInCombat())) return;
      }
@@ -491,6 +491,9 @@ index 0cd799f..f65a5cb 100644
 +        args->SetString(2,item.SelfName);
 +        args->SetString(3,item.PeerName);
 +    }
+     m_showingProgress = true;
+     m_pOverlay->ExecuteAsync("offerProgress", args);
+     m_gameOverlayClient->SetUIVisible(true);
 diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Services/Generic/QuestService.cpp
 --- a/Code/client/Services/Generic/QuestService.cpp
 +++ b/Code/client/Services/Generic/QuestService.cpp
