@@ -628,7 +628,7 @@ diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor
 +
 +}
 +
-+void CaptureQuestItem(ExtraDataList* extra,TESObjectREFR* object,TESForm* base,InventoryChangeEvent& event)
++void CaptureQuestItem(ExtraDataList* extra,TESObjectREFR* object,TESForm* base,InventoryChangeEvent& event,bool allowStopped)
 +{
 +    if (!extra||!base||ScopedExtraDataOverride::IsOverriden()) return;
 +    if (object&&object->IsTemporary()) return;
@@ -647,7 +647,7 @@ diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor
 +        {
 +            if (!instance||!instance->Quest||!instance->Alias) continue;
 +            const auto* alias=instance->Alias;
-+            if (alias->Owner!=instance->Quest||!(alias->Flags&4u)||instance->Quest->IsStopped()) continue;
++            if (alias->Owner!=instance->Quest||!(alias->Flags&4u)||(!allowStopped&&instance->Quest->IsStopped())) continue;
 +            const auto id=instance->Quest->formID;
 +            if (!id) continue;
 +            // Do not choose arbitrarily between different active quest aliases.
@@ -661,7 +661,7 @@ diff --git a/Code/client/Games/Skyrim/Actor.cpp b/Code/client/Games/Skyrim/Actor
 +    if (!object)
 +    {
 +        auto* owner=Cast<TESQuest>(TESForm::GetById(questId));
-+        object=owner&&!owner->IsStopped()?owner->GetAliasedRef(aliasId):nullptr;
++        object=owner&&(allowStopped||!owner->IsStopped())?owner->GetAliasedRef(aliasId):nullptr;
 +    }
 +    if (!object||object->IsTemporary()||object->baseForm!=base) return;
 +    GameId quest{},reference{};
@@ -726,14 +726,15 @@ diff --git a/Code/client/Events/InventoryChangeEvent.h b/Code/client/Events/Inve
 +    GameId QuestId{}, QuestRef{};
 +    uint32_t QuestAlias{};
      bool Drop = false;
-@@ -37,3 +39,7 @@
+@@ -37,3 +39,8 @@
      // The item moved to or from the local player, e.g. looting or pickpocketing an actor owned by someone else
      bool IsPlayerTransfer = false;
  };
 +
 +// Copy a stable quest/alias/reference identity before the native operation.
 +// An absent or ambiguous alias leaves all identity fields empty.
-+void CaptureQuestItem(ExtraDataList*,TESObjectREFR*,TESForm*,InventoryChangeEvent&);
++// allowStopped is only for reconciling an already confirmed consumption.
++void CaptureQuestItem(ExtraDataList*,TESObjectREFR*,TESForm*,InventoryChangeEvent&,bool allowStopped=false);
 diff --git a/Code/encoding/Messages/RequestInventoryChanges.h b/Code/encoding/Messages/RequestInventoryChanges.h
 --- a/Code/encoding/Messages/RequestInventoryChanges.h
 +++ b/Code/encoding/Messages/RequestInventoryChanges.h

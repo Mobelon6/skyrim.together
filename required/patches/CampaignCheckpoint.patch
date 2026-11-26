@@ -359,7 +359,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -9,5 +9,20 @@
+@@ -9,5 +9,23 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
@@ -379,8 +379,11 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +#include <sstream>
 +#include <Events/InventoryChangeEvent.h>
 +#include <Games/Overrides.h>
++#include <ExtraData/ExtraCount.h>
++#include <ExtraData/ExtraContainerChanges.h>
++#include <Forms/TESBoundObject.h>
  #include <HomeRegistry.h>
-@@ -26,6 +41,15 @@
+@@ -26,6 +44,15 @@
  namespace
  {
  CampaignReplication::Link campaignLink;
@@ -396,7 +399,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +245,317 @@
+@@ -221,6 +248,393 @@
      return 2;
  }
  
@@ -598,9 +601,60 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        !stopped&&!item.Consumed&&item.Count==1;
 +}
 +
++bool ShouldReconcileSpentPickup(const QuestPickup& item,uint64_t character,uint32_t generation,
++    bool completedRunOnce,bool localCompleted)
++{
++    return character&&item.Character==character&&item.Consumed&&item.Count==1&&
++        generation==1&&item.Generation==generation&&completedRunOnce&&localCompleted;
++}
++
++// Return only a single unambiguous native inventory stack bearing the
++// exact quest alias and reference. A base-form match alone is never enough.
++ExtraDataList* FindSpentQuestStack(PlayerCharacter& player,TESBoundObject* base,
++    const GameId& questNet,const GameId& refNet,uint32_t alias)
++{
++    auto* changes=player.GetContainerChanges();
++    if (!changes||!changes->entries||!base) return nullptr;
++    ExtraDataList* match=nullptr;
++    for (auto* entry:*changes->entries)
++    {
++        if (!entry||entry->form!=base||entry->count<=0||!entry->dataList) continue;
++        for (auto* extra:*entry->dataList)
++        {
++            if (!extra) continue;
++            InventoryChangeEvent identity(player.formID,Inventory::Entry{});
++            CaptureQuestItem(extra,nullptr,base,identity,true);
++            if (identity.QuestId!=questNet||identity.QuestRef!=refNet||identity.QuestAlias!=alias) continue;
++            auto* stackCount=Cast<ExtraCount>(extra->GetByType(ExtraDataType::Count));
++            if (match||(stackCount&&stackCount->count!=1)) return nullptr;
++            match=extra;
++        }
++    }
++    return match;
++}
++
++bool ReconcileSpentQuestStack(PlayerCharacter& player,TESBoundObject* base,
++    const GameId& questNet,const GameId& refNet,uint32_t alias)
++{
++    if (!base||!player.GetContainer()||!player.GetContainerChanges()||
++        !player.GetContainerChanges()->entries) return false;
++    auto* stack=FindSpentQuestStack(player,base,questNet,refNet,alias);
++    if (!stack) return false;
++    const auto before=player.GetItemCountInInventory(base);
++    if (before<=0) return false;
++    {
++        ScopedInventoryOverride inventory;
++        ScopedQuestOverride quest;
++        ScopedEquipOverride equip;
++        player.RemoveItem(base,1,ITEM_REMOVE_REASON::kRemove,stack,nullptr);
++    }
++    return player.GetItemCountInInventory(base)==before-1&&
++        !FindSpentQuestStack(player,base,questNet,refNet,alias);
++}
++
 +// Keep attempts local to the current loaded world. A failed native operation
 +// must not be invoked every time a journal reply arrives.
-+std::set<std::pair<uint32_t,uint32_t>> attemptedQuestPickups;
++std::set<std::pair<uint32_t,uint32_t>> attemptedQuestPickups,attemptedQuestConsumption;
 +uint32_t LocalQuestForm(const std::string& key)
 +{
 +    const auto form=TradeProperties::DecodeForm(key);
@@ -626,12 +680,36 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        auto run=history->find(item.Quest);
 +        const auto generation=run==history->end()?1u:run->second.Generation;
 +        const bool stopped=run!=history->end()&&run->second.Stopped;
-+        if (!ShouldRestorePickup(item,character,generation,stopped)) continue;
++        const bool restore=ShouldRestorePickup(item,character,generation,stopped);
++        const bool reconcile=item.Consumed&&item.Character==character&&run!=history->end()&&run->second.CompletedRunOnce;
++        if (!restore&&!reconcile) continue;
 +        const auto questId=LocalQuestForm(item.Quest),referenceId=LocalQuestForm(item.Reference),baseId=LocalQuestForm(item.Item);
 +        if (!questId||!referenceId||!baseId) continue;
 +        auto* quest=Cast<TESQuest>(TESForm::GetById(questId));
-+        if (!quest||quest->IsStopped()||QuestService::IsNonSyncableQuest(quest)||
++        if (!quest||QuestService::IsNonSyncableQuest(quest)||
 +            world.GetOverlayService().IsPersonalQuest(questId)) continue;
++        if (reconcile)
++        {
++            const bool localCompleted=(quest->flags&TESQuest::RunOnce)&&(quest->flags&TESQuest::Completed)&&
++                !(quest->flags&(TESQuest::Failed|TESQuest::AllowRepeatStages));
++            if (!ShouldReconcileSpentPickup(item,character,generation,run->second.CompletedRunOnce,localCompleted)) continue;
++            if (!std::all_of(run->second.Stages.begin(),run->second.Stages.end(),
++                [quest](const auto& stage){return quest->IsStageReached(stage.first);})) continue;
++            if (std::any_of(quest->scenes.begin(),quest->scenes.end(),
++                [](const auto* scene){return scene&&scene->isPlaying;})) continue;
++            auto* base=Cast<TESBoundObject>(TESForm::GetById(baseId));
++            GameId questNet{},refNet{};
++            if (!base||!world.GetModSystem().GetServerModId(questId,questNet)||
++                !world.GetModSystem().GetServerModId(referenceId,refNet)) continue;
++            if (!FindSpentQuestStack(*player,base,questNet,refNet,item.Alias)||
++                !attemptedQuestConsumption.emplace(questId,referenceId).second) continue;
++            if (ReconcileSpentQuestStack(*player,base,questNet,refNet,item.Alias))
++                spdlog::info("STM reconciled spent quest item {:X} for character {}",referenceId,character);
++            else
++                spdlog::warn("STM could not reconcile spent quest item {:X}",referenceId);
++            continue;
++        }
++        if (quest->IsStopped()) continue;
 +        // Never add a base form as a substitute for a missing reference.
 +        // A native pickup is possible only if this exact alias is still
 +        // bound to its original, loaded, available world object.
@@ -712,9 +790,10 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    {
 +        offeredQuestStages.clear();
 +        attemptedQuestPickups.clear();
++        attemptedQuestConsumption.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +585,7 @@
+@@ -250,6 +664,7 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -722,7 +801,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
          request.Credential=credential->Secret.c_str();
 +        request.Checkpoint=NextCheckpoint(*stamp).c_str();
          m_world.GetTransport().Send(request);
-@@ -275,8 +611,20 @@
+@@ -275,8 +690,20 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();

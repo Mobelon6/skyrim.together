@@ -279,7 +279,7 @@ int main(){
 }
 ''')
 
-pickup_history=extract('client/Services/Generic/QuestJournal.cpp','struct QuestPickup','// Keep attempts local')
+pickup_history=extract('client/Services/Generic/QuestJournal.cpp','struct QuestPickup','// Return only a single unambiguous')
 run('recovery selects only unconsumed original pickups of the loaded character',headers+'''
 #include <sstream>
 namespace CampaignJournal {struct Operation{std::string Id,Kind,Payload;};}
@@ -299,9 +299,57 @@ int main(){
     ops.push_back({"4","quest-consumed-v1","q 1 3 ref base 1 101"});
     history=QuestPickupHistory(ops);assert(history);
     assert(!ShouldRestorePickup(history->at(0),101,1,false));
+    assert(ShouldReconcileSpentPickup(history->at(0),101,1,true,true));
+    assert(!ShouldReconcileSpentPickup(history->at(0),202,1,true,true));
+    assert(!ShouldReconcileSpentPickup(history->at(0),101,2,true,true));
+    assert(!ShouldReconcileSpentPickup(history->at(0),101,1,false,true));
+    assert(!ShouldReconcileSpentPickup(history->at(0),101,1,true,false));
+    assert(!ShouldReconcileSpentPickup(history->at(1),202,1,true,true));
     assert(ShouldRestorePickup(history->at(1),202,1,false));
     ops.push_back({"5","quest-consumed-v1","q 1 4 wrong base2 1 202"});
     assert(!QuestPickupHistory(ops));
+}
+''')
+
+spent=extract('client/Services/Generic/QuestJournal.cpp','ExtraDataList* FindSpentQuestStack','// Keep attempts local')
+run('exact native stack reconciliation after confirmed consumption',headers+'''
+using GameId=unsigned;
+struct TESBoundObject{};
+enum class ExtraDataType{Count};
+struct ExtraCount{int count=1;};
+struct ExtraDataList{unsigned quest=10,ref=20,alias=3;ExtraCount count;void* GetByType(ExtraDataType){return &count;}};
+template<class T>T* Cast(void* p){return static_cast<T*>(p);}
+struct Inventory{struct Entry{};};
+struct InventoryChangeEvent{unsigned FormId;Inventory::Entry Item;GameId QuestId{},QuestRef{};unsigned QuestAlias{};};
+void CaptureQuestItem(ExtraDataList* extra,void*,TESBoundObject*,InventoryChangeEvent& e,bool allowStopped){assert(allowStopped);e.QuestId=extra->quest;e.QuestRef=extra->ref;e.QuestAlias=extra->alias;}
+enum class ITEM_REMOVE_REASON{kRemove};
+struct ScopedInventoryOverride{};struct ScopedQuestOverride{};struct ScopedEquipOverride{};
+struct Entry{TESBoundObject* form;int count;std::vector<ExtraDataList*>* dataList;};
+struct Changes{std::vector<Entry*>* entries;};
+struct PlayerCharacter{
+ unsigned formID=14;std::vector<Entry*> entries;Changes changes{&entries};bool reject=false;int removals=0;
+ void* GetContainer(){return this;}Changes* GetContainerChanges(){return &changes;}
+ int GetItemCountInInventory(TESBoundObject* base){int n=0;for(auto* e:entries)if(e&&e->form==base)n+=e->count;return n;}
+ void RemoveItem(TESBoundObject* base,int n,ITEM_REMOVE_REASON,ExtraDataList* stack,void*){
+  assert(n==1&&stack);++removals;if(reject)return;
+  for(auto* e:entries)if(e&&e->form==base&&e->dataList){
+   auto it=std::find(e->dataList->begin(),e->dataList->end(),stack);
+   if(it!=e->dataList->end()){e->dataList->erase(it);--e->count;return;}
+  }
+ }
+};
+'''+spent+'''
+int main(){
+ TESBoundObject base,other;ExtraDataList exact,ordinary,duplicate,wrong;ordinary.quest=0;wrong.ref=21;
+ std::vector<ExtraDataList*> stacks{&ordinary,&exact,&wrong},otherStacks{&duplicate};
+ Entry a{&base,3,&stacks},b{&other,1,&otherStacks};PlayerCharacter player;player.entries={&a,&b};
+ assert(FindSpentQuestStack(player,&base,10,20,3)==&exact);
+ exact.count.count=2;assert(!FindSpentQuestStack(player,&base,10,20,3));exact.count.count=1;
+ stacks.push_back(&duplicate);++a.count;assert(!ReconcileSpentQuestStack(player,&base,10,20,3)&&!player.removals);stacks.pop_back();--a.count;
+ player.reject=true;assert(!ReconcileSpentQuestStack(player,&base,10,20,3)&&player.removals==1);
+ player.reject=false;assert(ReconcileSpentQuestStack(player,&base,10,20,3)&&player.removals==2);
+ assert(a.count==2&&stacks.size()==2&&stacks[0]==&ordinary&&stacks[1]==&wrong&&b.count==1);
+ assert(!ReconcileSpentQuestStack(player,&base,10,20,3)&&player.removals==2);
 }
 ''')
 
