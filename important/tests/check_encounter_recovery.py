@@ -8,7 +8,9 @@ root = Path(sys.argv[1], "Code")
 actor = (root / "client/Services/Generic/CoopInteraction.cpp").read_text()
 server = (root / "server/Services/QuestService.cpp").read_text()
 reconcile = actor[actor.index("struct PeaceSnapshot"):actor.index("void ApplyPeace")]
-scope = server[server.index("    if (!pParty) return;"):server.index("    if (message.Status == RequestQuestUpdate::Started")]
+scope_start = server.index("    if (!pParty) return;")
+scope = server[scope_start:server.index("    if (message.Status == RequestQuestUpdate::Started", scope_start)]
+assert "SharesQuest" in scope and "knownRepeatStart" in scope
 party = (root / "server/Services/PartyService.h").read_text()
 conversation = party[party.index("        struct Conversation"):party.index("        struct Follower")]
 fixture = r"""
@@ -101,7 +103,7 @@ struct Player {unsigned id=1;unsigned GetId(){return id;}} owner;
 struct RequestQuestUpdate {enum {StageUpdate,Started,Stopped};unsigned Id{}, Status{};bool JournalObjective{},CompletedRunOnce{};};
 struct Notice {unsigned ClientQuestType{},Subject{},Encounter{};};
 bool bEnableMiscQuestSync=false;
-void route(Party* pParty, Player* pPlayer, RequestQuestUpdate message, Notice& notify, int& sent,bool knownSharedQuest=false){
+void route(Party* pParty, Player* pPlayer, RequestQuestUpdate message, Notice& notify, int& sent,bool knownSharedQuest=false,bool knownRepeatStart=false){
  const Party::Conversation* participants=nullptr;
 FILTER
  ++sent;
@@ -116,12 +118,14 @@ int main(){
  talk.ChoiceListeners.clear();assert(!sends(100,0,true,e));
  data.Brawls[1]=talk;data.Talks.clear();assert(!sends(200,0,true,e));
  data.Brawls.clear();assert(sends(200,0,true,e)==1 && !e);assert(!sends(200,0,false,e));
- assert(!sends(200,1,true,e)&&!sends(200,2,true,e));
+ assert(sends(200,1,true,e)&&!sends(200,2,true,e));
  owner.id=2;
  auto guest=[&](unsigned status,bool inJournal,bool known,bool completed=false){Notice n{6};int sent=0;route(&data,&owner,{200,status,inJournal,completed},n,sent,known);return sent;};
  assert(guest(0,true,false));assert(guest(0,true,true));assert(!guest(0,false,true));
- assert(!guest(1,true,true)&&!guest(2,true,true));
+ assert(guest(1,true,true)&&guest(2,true,true));
  assert(guest(2,false,true,true)&&!guest(2,false,false,true));
+ Notice repeat{6};int repeated=0;route(&data,&owner,{200,1,false,false},repeat,repeated,false,true);
+ assert(repeated==1);
  data.Brawls[2]=talk;assert(!guest(0,true,true));
 }
 """

@@ -349,7 +349,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 -        const CampaignIdentity::Stamp stamp{p.Campaign,p.Character,{p.SaveRevision,p.SaveTag}};
 -        if (CampaignAccess::Admit(m_world,*event.pPlayer,stamp,pull.Profile,{p.Credential.data(),p.Credential.size()}))
 -            reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
-+        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64 || p.Checkpoint.size()>1024 || p.LearnedWord.size()>224 || p.AbsorbedDragon.size()>224 || p.PickupClaim.size()>768 || p.QuestReceipt.size()>800) return;
++        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64 || p.Checkpoint.size()>1024 || p.LearnedWord.size()>224 || p.AbsorbedDragon.size()>224 || p.PickupClaim.size()>800 || p.QuestReceipt.size()>800) return;
 +        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
 +        CampaignReplication::Reply reply;
 +        bool pickupPermit=false;
@@ -461,7 +461,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 +                }
 +            reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
 +            if (!p.PickupClaim.empty()&&(reply.State==CampaignReplication::Status::Current||reply.State==CampaignReplication::Status::Record))
-+                pickupPermit=CampaignAccess::ReserveQuestPickup(m_world,*event.pPlayer,{p.PickupClaim.data(),p.PickupClaim.size()});
++                pickupPermit=CampaignAccess::ReserveQuestPickup(m_world,*event.pPlayer,{p.PickupClaim.data(),p.PickupClaim.size()},p.Nonce);
 +        }
          NotifyCampaignRecord out;
 +        out.PickupPermit=pickupPermit;
@@ -470,7 +470,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -9,8 +9,42 @@
+@@ -9,8 +9,43 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
@@ -479,6 +479,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +#include <QuestWordReward.h>
 +#include <QuestPickupPermit.h>
 +#include <Messages/RequestInventoryChanges.h>
++#include <Misc/MenuTopicManager.h>
 +#include <QuestRunMember.h>
 +#include <tuple>
 +#include <Events/ActivateEvent.h>
@@ -513,7 +514,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
  #include <HomeSnapshot.h>
  #include <HomePermissions.h>
  #include <TradeLedger.h>
-@@ -26,6 +60,16 @@
+@@ -26,6 +61,16 @@
  namespace
  {
  CampaignReplication::Link campaignLink;
@@ -530,7 +531,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +265,925 @@
+@@ -221,6 +266,1052 @@
      return 2;
  }
  
@@ -1141,7 +1142,89 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    const auto form=TradeProperties::DecodeForm(key);
 +    if (!form||!form->Valid()) return 0;
 +    auto* mod=ModManager::Get()->GetByName(form->Plugin.c_str());
-+    return mod&&mod->IsLoaded()?mod->GetFormId(form->Local):0;
++    return mod&&mod->IsLoaded()&&(!mod->IsLite()||form->Local<=0xfff)?mod->GetFormId(form->Local):0;
++}
++
++struct DeferredQuestTurnIn
++{
++    QuestPickupPermit::Claim Claim;
++    uint32_t QuestForm{},BaseForm{},Npc{},Info{},Instance{};
++    uint64_t Campaign{},Character{},Nonce{};
++    std::chrono::steady_clock::time_point Deadline{};
++};
++std::optional<DeferredQuestTurnIn> deferredQuestTurnIn;
++// The campaign update and dialogue run on the game thread. Other engine
++// condition evaluation threads must not read its mutable journal.
++thread_local bool questDialogueThread{};
++thread_local bool questDialogueReady{};
++thread_local std::set<std::pair<uint32_t,uint32_t>> spentDialogueItems;
++
++std::optional<QuestPickup> FindSharedTurnIn(uint32_t questId,uint32_t baseId)
++{
++    const auto questKey=StablePickupKey(questId),baseKey=StablePickupKey(baseId);
++    if (questKey.empty()||baseKey.empty()) return {};
++    const auto items=QuestPickupHistory(campaignLink.Journal.Operations());
++    if (!items) return {};
++    std::optional<QuestPickup> match;
++    for (const auto& item:*items)
++        if (item.Quest==questKey&&item.Item==baseKey&&item.Generation==1&&item.Count==1)
++        {
++            if (match) return {}; // the condition does not distinguish aliases
++            match=item;
++        }
++    return match;
++}
++void RefreshSpentDialogueItems(const CampaignJournal::Journal& journal)
++{
++    spentDialogueItems.clear();questDialogueReady=false;
++    const auto items=QuestPickupHistory(journal.Operations());
++    if (!items) return;
++    std::map<std::pair<uint32_t,uint32_t>,std::pair<unsigned,bool>> counts;
++    for (const auto& item:*items)
++        if (item.Generation==1&&item.Count==1)
++        {
++            const auto quest=LocalQuestForm(item.Quest),base=LocalQuestForm(item.Item);
++            if (!quest||!base) continue;
++            auto& state=counts[{quest,base}];++state.first;state.second=item.Consumed;
++        }
++    for (const auto& [key,state]:counts)
++        if (state.first==1&&state.second) spentDialogueItems.insert(key);
++    questDialogueReady=true;
++}
++bool HasNativeTurnInStack(World& world,const QuestPickup& item,uint32_t questId,uint32_t baseId)
++{
++    auto* player=PlayerCharacter::Get();
++    auto* quest=Cast<TESQuest>(TESForm::GetById(questId));
++    auto* base=Cast<TESBoundObject>(TESForm::GetById(baseId));
++    const auto refId=LocalQuestForm(item.Reference);
++    if (!player||!quest||quest->IsStopped()||!(quest->flags&TESQuest::RunOnce)||
++        (quest->flags&(TESQuest::Failed|TESQuest::Completed|TESQuest::AllowRepeatStages))||
++        !base||!refId||player->GetItemCountInInventory(base)!=1) return false;
++    auto* ref=quest->GetAliasedRef(item.Alias);
++    if (!ref||ref->formID!=refId||!ref->baseForm||ref->baseForm!=base) return false;
++    GameId questNet{},refNet{};
++    return world.GetModSystem().GetServerModId(questId,questNet)&&
++        world.GetModSystem().GetServerModId(refId,refNet)&&
++        FindSpentQuestStack(*player,base,questNet,refNet,item.Alias);
++}
++void ResolveQuestTurnIn(World& world,uint64_t nonce,bool permitted,uint64_t character)
++{
++    if (!deferredQuestTurnIn||deferredQuestTurnIn->Nonce!=nonce) return;
++    const auto pending=std::move(*deferredQuestTurnIn);deferredQuestTurnIn.reset();
++    if (!permitted)
++    {Utils::ShowHudMessage("Общий предмет уже сдан или сдача занята.");return;}
++    if (pending.Character!=character||pending.Campaign!=campaignLink.Campaign||
++        pending.Deadline<=std::chrono::steady_clock::now()||
++        !world.GetPartyService().IsInParty()||world.IsLoadingSave()||!SaveWorldReady()) return;
++    auto* quest=Cast<TESQuest>(TESForm::GetById(pending.QuestForm));
++    const auto item=FindSharedTurnIn(pending.QuestForm,pending.BaseForm);
++    if (!quest||quest->currentInstanceID!=pending.Instance||!item||item->Consumed||
++        world.GetOverlayService().IsPersonalQuest(pending.QuestForm)||
++        (item->Character!=character&&!item->Copies.contains(character))||
++        QuestPickupPermit::Claim{item->Quest,item->Reference,item->Item,item->Alias}.Encode()!=pending.Claim.Encode()||
++        !HasNativeTurnInStack(world,*item,pending.QuestForm,pending.BaseForm)) return;
++    auto* menu=MenuTopicManager::Get();
++    if (menu) menu->ResumeQuestTurnIn(pending.Npc,pending.Info,pending.QuestForm,pending.BaseForm);
 +}
 +
 +void RestoreOwnQuestPickups(World& world,const CampaignJournal::Journal& journal,uint64_t character)
@@ -1232,6 +1315,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    attemptedQuestConsumption.clear();
 +    deferredQuestPickup.reset();
 +    pendingQuestReceipts.clear();
++    deferredQuestTurnIn.reset();questDialogueReady=false;spentDialogueItems.clear();
 +    pendingWord.reset();
 +    wordBaseline.reset();
 +    attemptedWords.clear();
@@ -1417,6 +1501,48 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    catch (...) {spdlog::warn("STM could not queue quest item receipt");}
 +}
 +
++bool IsSpentSharedDialogueItem(uint32_t quest,uint32_t base) noexcept
++{
++    try
++    {
++        if (!questDialogueThread||!questDialogueReady||questObservedLoadEpoch!=dragonLoadEpoch.load(std::memory_order_acquire)||
++            !World::Exists()) return false;
++        auto& world=World::Get();
++        return !world.IsLoadingSave()&&world.GetTransport().IsOnline()&&world.GetPartyService().IsInParty()&&
++            !world.GetOverlayService().IsPersonalQuest(quest)&&spentDialogueItems.contains({quest,base});
++    }
++    catch (...) {return false;}
++}
++
++bool DeferSharedQuestTurnIn(uint32_t questId,uint32_t baseId,uint32_t npc,uint32_t info) noexcept
++{
++    try
++    {
++        auto& world=World::Get();
++        if (!questDialogueThread||!world.GetTransport().IsOnline()||!world.GetPartyService().IsInParty()||
++            world.IsLoadingSave()||!SaveWorldReady()||world.GetOverlayService().IsPersonalQuest(questId)) return false;
++        const auto identity=CampaignAccess::Current(world);
++        if (!identity) return false;
++        auto* quest=Cast<TESQuest>(TESForm::GetById(questId));
++        if (!quest||!(quest->flags&TESQuest::RunOnce)||QuestService::IsNonSyncableQuest(quest)) return false;
++        const auto item=FindSharedTurnIn(questId,baseId);
++        if (!item) return false; // unrelated, personal or ambiguous native condition
++        if (item->Consumed)
++        {Utils::ShowHudMessage("Общий квестовый предмет уже сдан.");return true;}
++        const auto character=identity->Save.Character;
++        if ((item->Character!=character&&!item->Copies.contains(character))||
++            !HasNativeTurnInStack(world,*item,questId,baseId))
++        {Utils::ShowHudMessage("Не подтверждён исходный квестовый предмет.");return true;}
++        const auto now=std::chrono::steady_clock::now();
++        if (deferredQuestTurnIn&&deferredQuestTurnIn->Deadline>now) return true;
++        deferredQuestTurnIn=DeferredQuestTurnIn{{item->Quest,item->Reference,item->Item,item->Alias},
++            questId,baseId,npc,info,quest->currentInstanceID,identity->Save.Campaign,character,0,now+std::chrono::seconds(8)};
++        nextPull={};
++        return true;
++    }
++    catch (...) {return false;}
++}
++
 +bool DeferSharedQuestPickup(TESObjectREFR* ref,uint8_t unk,char processing) noexcept
 +{
 +    try
@@ -1438,11 +1564,13 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
  void QuestService::PollCampaign(const UpdateEvent&) noexcept
  {
 +    ResetQuestReplayForLoad();
++    questDialogueThread=true;
 +    if (!m_world.IsLoadingSave()&&SaveWorldReady()) RefreshCampaignDragonAwards();
 +    if (!m_world.GetTransport().IsOnline()||!m_world.GetPartyService().IsInParty())
 +    {
 +        offeredQuestStages.clear();
-+        deferredQuestPickup.reset();
++        deferredQuestPickup.reset();deferredQuestTurnIn.reset();
++        questDialogueReady=false;spentDialogueItems.clear();
 +        attemptedQuestPickups.clear();
 +        attemptedQuestConsumption.clear();
 +        wordBaseline.reset();
@@ -1453,10 +1581,10 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    if (!m_world.GetTransport().IsOnline()||m_world.IsLoadingSave()||!SaveWorldReady())
 +    {
 +        wordBaseline.reset();pendingWord.reset();attemptedWords.clear();wordAttemptCharacter=0;
-+        deferredQuestPickup.reset();
++        deferredQuestPickup.reset();deferredQuestTurnIn.reset();questDialogueReady=false;spentDialogueItems.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +1213,20 @@
+@@ -250,6 +1341,31 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -1476,15 +1604,29 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +                deferredQuestPickup->Nonce=request.Nonce;
 +            }
 +        }
++        else if (deferredQuestTurnIn)
++        {
++            if (deferredQuestTurnIn->Deadline<=std::chrono::steady_clock::now()||
++                deferredQuestTurnIn->Character!=stamp->Character||deferredQuestTurnIn->Campaign!=stamp->Campaign)
++                deferredQuestTurnIn.reset();
++            else
++            {
++                request.PickupClaim=("turnin "+deferredQuestTurnIn->Claim.Encode()).c_str();
++                deferredQuestTurnIn->Nonce=request.Nonce;
++            }
++        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +1252,24 @@
+@@ -275,8 +1391,28 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
              spdlog::error("Campaign replica refused server history; restart after resolving configuration/history");
          }
 +        if (result==CampaignJournal::Result::Committed||result==CampaignJournal::Result::Duplicate)
++        {
 +            ResolveQuestPickup(m_world,packet.Nonce,packet.PickupPermit,stamp->Character);
++            ResolveQuestTurnIn(m_world,packet.Nonce,packet.PickupPermit,stamp->Character);
++        }
 +        if ((result==CampaignJournal::Result::Committed||result==CampaignJournal::Result::Duplicate)&&
 +            campaignLink.Journal.Current().Revision==reply.Total)
 +        {
@@ -1492,6 +1634,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            try
 +            {
 +                ApplySharedDragonGrants(m_world,campaignLink.Journal,stamp->Character);
++                RefreshSpentDialogueItems(campaignLink.Journal);
 +                RestoreLearnedWords(m_world,campaignLink.Journal,stamp->Character);
 +                RestoreOwnQuestPickups(m_world,campaignLink.Journal,stamp->Character);
 +                for (const auto& update:MissingActiveQuestStages(m_world,campaignLink.Journal,stamp->Character))
@@ -2262,7 +2405,7 @@ diff --git a/Code/common/QuestPickupPermit.h b/Code/common/QuestPickupPermit.h
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/QuestPickupPermit.h
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,140 @@
 +#pragma once
 +#include <CampaignJournal.h>
 +#include <TradeProperties.h>
@@ -2374,6 +2517,34 @@ new file mode 100644
 +        return true;
 +    }
 +};
++struct TurnInLeases
++{
++    using Clock=Leases::Clock;
++    struct Lease {std::string Key;uint64_t Character{},Nonce{};uint32_t Peer{};Clock::time_point Until;};
++    std::map<std::string,Lease> Active;
++    bool Acquire(const Claim& claim,uint64_t character,uint32_t peer,uint64_t nonce,Clock::time_point now)
++    {
++        if (!claim.Valid()||!character||!peer||!nonce) return false;
++        for (auto it=Active.begin();it!=Active.end();)
++            if (it->second.Until<=now) it=Active.erase(it);else ++it;
++        const auto key=claim.Encode();
++        const auto alias=claim.Quest+" "+std::to_string(claim.Alias)+" ";
++        for (const auto& [ref,lease]:Active)
++            if (ref==claim.Reference||lease.Key.starts_with(alias))
++                return lease.Key==key&&lease.Character==character&&lease.Peer==peer&&lease.Nonce==nonce;
++        if (Active.size()>=64) return false;
++        Active.emplace(claim.Reference,Lease{key,character,nonce,peer,now+std::chrono::minutes(2)});
++        return true;
++    }
++};
++// CTDA comparison opcodes, restricted to a mandatory requirement satisfied
++// by exactly one item. Never change global/alias/package operands or OR terms.
++inline bool PositiveSingleItem(uint8_t flags,float value)
++{
++    if (flags&0x1f) return false;
++    const auto op=flags>>5;
++    return ((op==0||op==3)&&value==1.f)||((op==1||op==2)&&value==0.f);
++}
 +}
 
 diff --git a/Code/common/QuestRunMember.h b/Code/common/QuestRunMember.h
@@ -2449,3 +2620,281 @@ new file mode 100644
 +    return start||(generation==1&&stage);
 +}
 +}
+diff --git a/Code/client/Games/Misc/MenuTopicManager.cpp b/Code/client/Games/Misc/MenuTopicManager.cpp
+--- a/Code/client/Games/Misc/MenuTopicManager.cpp
++++ b/Code/client/Games/Misc/MenuTopicManager.cpp
+@@ -1,157 +1,220 @@
+ #include "MenuTopicManager.h"
+ 
+ #include <Events/PlayerDialogueEvent.h>
+ #include <TESObjectREFR.h>
+ #include <Forms/TESTopicInfo.h>
+ #include <World.h>
+-#include <Interface/UI.h>
++#include <Interface/UI.h>
++#include <Forms/TESQuest.h>
++#include <PlayerCharacter.h>
++#include <QuestPickupPermit.h>
++
++bool IsSpentSharedDialogueItem(uint32_t,uint32_t) noexcept;
++bool DeferSharedQuestTurnIn(uint32_t,uint32_t,uint32_t,uint32_t) noexcept;
+ 
+ TP_THIS_FUNCTION(TPlayDialogueOption, bool, MenuTopicManager, int32_t aIndex);
+ static TPlayDialogueOption* RealPlayDialogueOption = nullptr;
+ 
+ MenuTopicManager* MenuTopicManager::Get() noexcept
+ {
+     POINTER_SKYRIMSE(MenuTopicManager*, s_singleton, 401099);
+     return *s_singleton.Get();
+ }
+ 
+ bool MenuTopicManager::IsPlayerDialogueSpeaker(const TESObjectREFR* apSpeaker) noexcept
+ {
+     if (!apSpeaker)
+         return false;
+ 
+     const auto* pManager = Get();
+     // lastSpeaker survives menu closure; using it here would also capture
+     // subsequent ambient speech from a remotely owned NPC.
+     return pManager && pManager->IsCurrentSpeaker(apSpeaker->GetHandle());
+ }
+ 
+ bool MenuTopicManager::IsDialogueOpen() const noexcept
+ {
+     static const BSFixedString dialogue("Dialogue Menu");
+     auto* ui = UI::Get();
+     return ui && ui->GetMenuOpen(dialogue);
+ }
+ namespace
+ {
+-bool IsHireOption(const TESTopicInfo* info)
++// Reuse the existing condition hook. Only a native, non-OR player
++// item-count requirement which exactly one item can satisfy is relevant.
++uint32_t PositivePlayerItem(const TESConditionItem& condition)
++{
++    if (condition.function!=47||!condition.params[0]||
++        !QuestPickupPermit::PositiveSingleItem(condition.flags,condition.comparisonValue)) return 0;
++    if (condition.object!=1&&
++        (condition.object!=2||TESObjectREFR::GetByHandle(condition.runOnRef)!=PlayerCharacter::Get())) return 0;
++    return static_cast<const TESForm*>(condition.params[0])->formID;
++}
++uint32_t TurnInBase(const TESTopicInfo* info)
++{
++    if (!info) return 0;
++    uint32_t base{};bool previousOr=false;unsigned visited=0;
++    for (const auto* c=info->conditions.pHead;c;c=c->pNext)
++    {
++        if (++visited>1024) return 0;
++        if (!previousOr)
++            if (const auto item=PositivePlayerItem(*c))
++            {
++                if (base&&base!=item) return 0;
++                base=item;
++            }
++        previousOr=(c->flags&1)!=0;
++    }
++    return base;
++}
++
++bool IsHireOption(const TESTopicInfo* info)
+ {
+     if (!info)
+         return false;
+     bool requiresFreeSlot = false;
+     bool requiresPotentialFollower = false;
+     for (const auto* c = info->conditions.pHead; c; c = c->pNext)
+     {
+         if ((c->function != 74 && c->function != 71) || !c->params[0] || (c->flags & 0x1E) ||
+             c->object != 0 || c->GetOpCode() != TESConditionItem::OpCode::kEqualTo)
+             continue;
+         const auto form = static_cast<const TESForm*>(c->params[0])->formID;
+         if (c->function == 74 && form == 0xBCC98 && c->comparisonValue == 0.f)
+             requiresFreeSlot = true;
+         if (c->function == 71 && form == 0x5C84D && c->comparisonValue == 1.f)
+             requiresPotentialFollower = true;
+     }
+     // Generic recruitment plus standard paid hire / re-hire dialogues. A quest requiring
+     // the player to arrive alone can also test PlayerFollowerCount, without recruiting anyone.
+     const auto topic = info->parentTopic ? info->parentTopic->formID : 0;
+     return requiresFreeSlot && (requiresPotentialFollower || topic == 0xB0EE6 ||
+         topic == 0xBCC84 || topic == 0x104F1B || topic == 0x9BE49);
+ }
+ }
+ 
+ bool MenuTopicManager::OffersHire() const noexcept
+ {
+     if (!pOptions || !IsDialogueOpen())
+         return false;
+     for (auto* opt : *pOptions)
+         if (opt && opt->text && IsHireOption(opt->info))
+             return true;
+     return false;
+ }
+ 
+ bool MenuTopicManager::ResumeHire(int32_t index, uint32_t target, uint32_t info) noexcept
+ {
+     const auto* npc = TESObjectREFR::GetByHandle(speaker.handle.iBits);
+     if (!IsDialogueOpen() || !pOptions || !npc || npc->formID != target)
+         return false;
+     int current = -1;
+     for (auto* opt : *pOptions)
+     {
+         ++current;
+         if (opt && opt->info && opt->info->formID == info && opt->text)
+         {
+             World::Get().GetRunner().Trigger(PlayerDialogueEvent(opt->text, speaker.handle.iBits, info, opt->quest ? opt->quest->formID : 0));
+             return TiltedPhoques::ThisCall(RealPlayDialogueOption, this, current);
+         }
+     }
+     return false;
+ }
+ 
+-bool TP_MAKE_THISCALL(HookPlayDialogueOption, MenuTopicManager, int32_t aIndex)
++bool MenuTopicManager::ResumeQuestTurnIn(uint32_t target,uint32_t info,uint32_t quest,uint32_t base) noexcept
++{
++    const auto* npc=TESObjectREFR::GetByHandle(speaker.handle.iBits);
++    if (!IsDialogueOpen()||!pOptions||!npc||npc->formID!=target) return false;
++    int current=-1;
++    for (auto* opt:*pOptions)
++    {
++        ++current;
++        if (opt&&opt->info&&opt->quest&&opt->text&&opt->info->formID==info&&
++            opt->quest->formID==quest&&TurnInBase(opt->info)==base)
++        {
++            World::Get().GetRunner().Trigger(PlayerDialogueEvent(opt->text,speaker.handle.iBits,info,quest));
++            return TiltedPhoques::ThisCall(RealPlayDialogueOption,this,current);
++        }
++    }
++    return false;
++}
++
++bool TP_MAKE_THISCALL(HookPlayDialogueOption, MenuTopicManager, int32_t aIndex)
+ {
+     if (apThis->pOptions)
+     {
+         int i = 0;
+         const char* pText = nullptr;
+         uint32_t info{}, quest{};
+         for (auto option : *apThis->pOptions)
+         {
+             if (i == aIndex)
+             {
+                 if (!option)
+                     break;
+                 if (IsHireOption(option->info))
+                     if (const auto* npc = TESObjectREFR::GetByHandle(apThis->speaker.handle.iBits))
+                         if (World::Get().GetOverlayService().BeginHire(npc->formID, option->info->formID, aIndex))
+                             return false;
+-                pText = option->text;
++                if (option->quest&&option->info&&apThis->IsDialogueOpen())
++                    if (const auto base=TurnInBase(option->info))
++                        if (const auto* npc=TESObjectREFR::GetByHandle(apThis->speaker.handle.iBits))
++                            if (DeferSharedQuestTurnIn(option->quest->formID,base,npc->formID,option->info->formID))
++                                return false;
++                pText = option->text;
+                 info = option->info ? option->info->formID : 0;
+                 quest = option->quest ? option->quest->formID : 0;
+                 break;
+             }
+             i++;
+         }
+ 
+         if (pText != nullptr)
+             World::Get().GetRunner().Trigger(PlayerDialogueEvent(pText, apThis->speaker.handle.iBits, info, quest));
+     }
+ 
+     return TiltedPhoques::ThisCall(RealPlayDialogueOption, apThis, aIndex);
+ }
+ 
+ namespace
+ {
+ // CommonLibSSE-NG: TESConditionItem::IsTrue(ConditionCheckParams&), AE 29924.
+ // Read only the first two references from the solution. Never change the global or the NPC faction.
+-struct ConditionContext { TESObjectREFR* action; TESObjectREFR* target; };
++struct ConditionContext { TESObjectREFR* action; TESObjectREFR* target; TESQuest* quest; };
++static_assert(offsetof(ConditionContext,quest)==0x10);
+ TP_THIS_FUNCTION(TCheckCondition, bool, TESConditionItem, ConditionContext&);
+ TCheckCondition* nextCondition{};
+ bool TP_MAKE_THISCALL(CheckFollowerCondition, TESConditionItem, ConditionContext& context)
+ {
+-    const auto fn = apThis->function;
++    const auto fn = apThis->function;
++    if (fn==47&&context.quest&&context.action&&context.target==PlayerCharacter::Get())
++        if (const auto item=PositivePlayerItem(*apThis))
++            if (const auto* menu=MenuTopicManager::Get();menu&&menu->IsCurrentSpeaker(context.action->GetHandle()))
++                if (IsSpentSharedDialogueItem(context.quest->formID,item))
++                    return false;
+     const auto* param = static_cast<const TESForm*>(apThis->params[0]);
+     // Alias and package-data operands can be numeric slots instead of TESForm pointers.
+     if ((fn == 74 || fn == 71) && param && !(apThis->flags & 0x1E) && apThis->object == 0 &&
+         apThis->GetOpCode() == TESConditionItem::OpCode::kEqualTo && context.action &&
+         OverlayService::FollowerBusy(context.action->formID) &&
+         ((fn == 74 && param->formID == 0xBCC98) || (fn == 71 && param->formID == 0x5C84E)))
+     {
+         const auto* menu = MenuTopicManager::Get();
+         if (menu && menu->speaker && context.action->GetHandle().handle.iBits == menu->speaker.handle.iBits)
+             return apThis->comparisonValue == (fn == 74 ? 1.f : 0.f);
+     }
+     return TiltedPhoques::ThisCall(nextCondition, apThis, context);
+ }
+ }
+ static TiltedPhoques::Initializer s_menuTopicHooks(
+     []()
+     {
+         POINTER_SKYRIMSE(TPlayDialogueOption, s_playDialogueOption, 35269);
+ 
+         POINTER_SKYRIMSE(TCheckCondition, checkCondition, 29924);
+         nextCondition = checkCondition.Get();
+         TP_HOOK(&nextCondition, CheckFollowerCondition);
+         RealPlayDialogueOption = s_playDialogueOption.Get();
+ 
+         TP_HOOK(&RealPlayDialogueOption, HookPlayDialogueOption);
+     });
+diff --git a/Code/client/Games/Misc/MenuTopicManager.h b/Code/client/Games/Misc/MenuTopicManager.h
+--- a/Code/client/Games/Misc/MenuTopicManager.h
++++ b/Code/client/Games/Misc/MenuTopicManager.h
+@@ -1,42 +1,43 @@
+ #pragma once
+ 
+ struct TESObjectREFR;
+ struct TESForm;
+ struct TESTopicInfo;
+ 
+ struct MenuTopicManager
+ {
+     static MenuTopicManager* Get() noexcept;
+     static bool IsPlayerDialogueSpeaker(const TESObjectREFR* apSpeaker) noexcept;
+ 
+     bool IsDialogueOpen() const noexcept;
+     bool IsCurrentSpeaker(const BSPointerHandle<TESObjectREFR>& acHandle) const noexcept
+     {
+         return IsDialogueOpen() && acHandle && speaker.handle.iBits == acHandle.handle.iBits;
+     }
+ 
+     struct DialogueOption
+     {
+         const char* text;
+         uint8_t padding[0x28 - sizeof(text)];
+         TESForm* quest; // MenuTopicManager::Dialogue::parentQuest
+         TESTopicInfo* info; // CommonLibSSE MenuTopicManager::Dialogue::parentTopicInfo
+ 
+     };
+ 
+     static_assert(offsetof(DialogueOption, info) == 0x30);
+     bool OffersHire() const noexcept;
+-    bool ResumeHire(int32_t index, uint32_t target, uint32_t info) noexcept;
++    bool ResumeHire(int32_t index, uint32_t target, uint32_t info) noexcept;
++    bool ResumeQuestTurnIn(uint32_t target,uint32_t info,uint32_t quest,uint32_t base) noexcept;
+ 
+     uint8_t pad0[0x20];
+     GameList<DialogueOption>* pOptions;
+ 
+     uint8_t pad28[0x68 - 0x28];
+     BSPointerHandle<TESObjectREFR> speaker;
+     uint8_t pad6C[0xB1 - 0x6C];
+     bool menuOpen;
+ };
+ 
+ static_assert(offsetof(MenuTopicManager, pOptions) == 0x20);
+ static_assert(offsetof(MenuTopicManager, speaker) == 0x68);
+ static_assert(offsetof(MenuTopicManager, menuOpen) == 0xB1);

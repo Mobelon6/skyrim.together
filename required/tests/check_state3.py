@@ -640,6 +640,17 @@ int main(){
     assert(!leases.Acquire(d,202,now));
     d=c;d.Alias=4;assert(!leases.Acquire(d,202,now));
     assert(leases.Acquire(c,202,now+std::chrono::seconds(31)));
+    TurnInLeases turnIns;
+    assert(turnIns.Acquire(c,101,1,7,now));
+    assert(turnIns.Acquire(c,101,1,7,now));
+    assert(!turnIns.Acquire(c,101,1,8,now));
+    assert(!turnIns.Acquire(c,101,2,7,now));
+    assert(!turnIns.Acquire(c,202,2,7,now));
+    assert(!turnIns.Acquire(d,202,2,7,now));
+    assert(turnIns.Acquire(c,202,2,9,now+std::chrono::seconds(121)));
+    assert(PositiveSingleItem(0,1.f)&&PositiveSingleItem(3<<5,1.f));
+    assert(PositiveSingleItem(1<<5,0.f)&&PositiveSingleItem(2<<5,0.f));
+    assert(!PositiveSingleItem(1,1.f)&&!PositiveSingleItem(4,1.f)&&!PositiveSingleItem(0,2.f));
     std::vector<CampaignJournal::Operation> ops={{"1","quest-pickup-v1",
         c.Quest+" 1 3 "+c.Reference+" "+c.Item+" 1 101"}};
     assert(AlreadyTaken(ops,c));assert(AlreadyTaken(ops,d));
