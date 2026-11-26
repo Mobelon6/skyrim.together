@@ -355,8 +355,48 @@ diff --git a/Code/client/Games/Skyrim/Components/TESContainer.cpp b/Code/client/
 diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyrim/TESObjectREFR.cpp
 --- a/Code/client/Games/Skyrim/TESObjectREFR.cpp
 +++ b/Code/client/Games/Skyrim/TESObjectREFR.cpp
-@@ -476,20 +476,15 @@
+@@ -476,20 +476,55 @@
  
++// A Papyrus RemoveItem(base, 1) can omit the extra-data pointer. Resolve
++// it only when the ENTIRE local base-form count is one and its single
++// inventory stack carries the native, exact quest alias. Do not select a
++// stack when the engine could remove an ordinary item of the same type.
++static bool IdentifyQuestRemoval(TESObjectREFR& owner,TESForm* base,ExtraDataList* supplied,
++    InventoryChangeEvent& change)
++{
++    if (!base) return false;
++    auto* stack=supplied;
++    if (!stack)
++    {
++        if (owner.GetItemCountInInventory(base)!=1) return false;
++        const auto* changes=owner.GetContainerChanges();
++        if (!changes||!changes->entries) return false;
++        for (const auto* entry:*changes->entries)
++        {
++            if (!entry||entry->form!=base) continue;
++            if (!entry->dataList) continue;
++            for (auto* extra:*entry->dataList)
++            {
++                if (!extra) continue;
++                if (stack) return false;
++                stack=extra;
++            }
++        }
++    }
++    if (!stack) return false;
++    const auto* count=Cast<ExtraCount>(stack->GetByType(ExtraDataType::Count));
++    if (count&&count->count!=1) return false;
++    CaptureQuestItem(stack,nullptr,base,change);
++    if (!change.QuestId||!change.QuestRef) return false;
++    // Preserve the original inventory metadata for the exact object.
++    {
++        ScopedExtraDataOverride scope;
++        owner.GetItemFromExtraData(change.Item,stack);
++    }
++    change.Item.Count=-1;
++    return change.Item.IsQuestItem;
++}
++
  int64_t TESObjectREFR::GetItemCountInInventory(TESForm* apItem) const noexcept
  {
 +    if (!apItem) return 0;
@@ -384,7 +424,7 @@ diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyr
  
      return count;
  }
-@@ -1080,7 +1075,30 @@
+@@ -1080,7 +1115,29 @@
          }
  
          item.Count = -aCount;
@@ -392,12 +432,11 @@ diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyr
 +        // A unique quest object removed by the player's native script is
 +        // observed only after the real inventory count has decreased.
 +        // Transfers, drops and sales are not evidence of consumption.
-+        if (item.IsQuestItem && apThis==PlayerCharacter::Get() && aCount==1 &&
++        if (apThis==PlayerCharacter::Get() && aCount==1 &&
 +            !apMoveToRef && aReason==ITEM_REMOVE_REASON::kRemove)
 +        {
 +            InventoryChangeEvent change(apThis->formID,item);
-+            CaptureQuestItem(apExtraList,nullptr,apItem,change);
-+            if (change.QuestId && change.QuestRef)
++            if (IdentifyQuestRemoval(*apThis,apItem,apExtraList,change))
 +            {
 +                const auto before=apThis->GetItemCountInInventory(apItem);
 +                ScopedEquipOverride equip;

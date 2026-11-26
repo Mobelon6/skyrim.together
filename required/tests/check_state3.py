@@ -579,3 +579,43 @@ int main(){
     d.Reference="736b7972696d2e65736d.457";assert(!AlreadyTaken(ops,d));
 }
 ''', ['-I'+str(code/'common')])
+
+removal=extract('client/Games/Skyrim/TESObjectREFR.cpp','static bool IdentifyQuestRemoval','int64_t TESObjectREFR::GetItemCountInInventory')
+run('native quest removal without an explicit extra-data stack',headers+'''
+using GameId=unsigned;
+struct TESForm{};
+enum class ExtraDataType{Count};
+struct ExtraCount{int count=1;};
+struct ExtraDataList{unsigned quest=10,ref=20,alias=3;ExtraCount count;bool hasCount=true;bool questItem=true;void* GetByType(ExtraDataType){return hasCount?&count:nullptr;}};
+template<class T>T* Cast(void* p){return static_cast<T*>(p);}
+struct Inventory{struct Entry{int Count=-1;bool IsQuestItem=false;};};
+struct InventoryChangeEvent{unsigned FormId;Inventory::Entry Item;GameId QuestId{},QuestRef{};unsigned QuestAlias{};};
+struct ScopedExtraDataOverride{};
+void CaptureQuestItem(ExtraDataList* extra,void*,TESForm*,InventoryChangeEvent& e){e.QuestId=extra->quest;e.QuestRef=extra->ref;e.QuestAlias=extra->alias;}
+struct Entry{TESForm* form;std::vector<ExtraDataList*>* dataList;};
+struct Changes{std::vector<Entry*>* entries;};
+struct TESObjectREFR{
+ int64_t total=1;std::vector<Entry*> entries;Changes changes{&entries};
+ const Changes* GetContainerChanges(){return &changes;}
+ int64_t GetItemCountInInventory(TESForm*){return total;}
+ void GetItemFromExtraData(Inventory::Entry& entry,ExtraDataList* stack){entry.Count=stack->count.count;entry.IsQuestItem=stack->questItem;}
+};
+'''+removal+'''
+int main(){
+ TESForm base,other;ExtraDataList exact,ordinary,duplicate;
+ ordinary.quest=0;ordinary.questItem=false;
+ std::vector<ExtraDataList*> stacks{&exact},otherStacks{&ordinary};
+ Entry a{&base,&stacks},b{&other,&otherStacks};TESObjectREFR player;player.entries={&a,&b};
+ auto probe=[&](ExtraDataList* stack=nullptr){InventoryChangeEvent result{14,{}};return IdentifyQuestRemoval(player,&base,stack,result);};
+ InventoryChangeEvent result{14,{}};
+ assert(IdentifyQuestRemoval(player,&base,nullptr,result)&&result.Item.Count==-1&&result.Item.IsQuestItem&&result.QuestRef==20);
+ player.total=2;assert(!probe());assert(probe(&exact));
+ player.total=0;assert(!probe());player.total=1;
+ stacks.push_back(&duplicate);assert(!probe());stacks.pop_back();
+ exact.count.count=2;assert(!probe()&&!probe(&exact));exact.count.count=1;
+ exact.hasCount=false;assert(probe());
+ exact.questItem=false;assert(!probe());exact.questItem=true;
+ stacks={&ordinary};assert(!probe());stacks.clear();assert(!probe());
+ player.changes.entries=nullptr;assert(!probe());
+}
+''')
