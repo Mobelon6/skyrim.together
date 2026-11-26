@@ -479,7 +479,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +#include <QuestWordReward.h>
 +#include <QuestPickupPermit.h>
 +#include <Messages/RequestInventoryChanges.h>
-+#include <Misc/MenuTopicManager.h>
++#include <Games/Misc/MenuTopicManager.h>
 +#include <QuestRunMember.h>
 +#include <tuple>
 +#include <Events/ActivateEvent.h>
