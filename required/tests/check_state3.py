@@ -516,3 +516,19 @@ int main(){
     ops.pop_back();ops.push_back({"2","quest-word-v1",g.Word+" 33 22"});assert(Read(ops));
 }
 ''', ['-I'+str(code/'common')])
+
+run('native dragon absorption receipt identity and duplicates',headers+'''
+#include <DragonAbsorption.h>
+int main(){
+    using namespace DragonAbsorption;
+    Receipt a{"736b7972696d2e65736d.123",11},b{a.Dragon,22};
+    assert(a.Valid()&&b.Valid()&&Decode(a.Encode())&&Decode(b.Encode()));
+    assert(!Decode(a.Encode()+" ")&&!Decode("bad 11")&&!Decode(a.Dragon+" 0"));
+    std::vector<CampaignJournal::Operation> ops={{"1","dragon-absorbed-v1",a.Encode()}};
+    auto receipts=Read(ops);assert(receipts&&receipts->contains(a.Encode())&&!receipts->contains(b.Encode()));
+    ops.push_back({"2","dragon-absorbed-v1",b.Encode()});
+    receipts=Read(ops);assert(receipts&&receipts->size()==2);
+    ops.push_back({"3","dragon-absorbed-v1",a.Encode()});assert(!Read(ops));
+    ops.pop_back();ops[1].Payload="bad 22";assert(!Read(ops));
+}
+''', ['-I'+str(code/'common')])

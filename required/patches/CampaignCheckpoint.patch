@@ -278,21 +278,22 @@ diff --git a/Code/client/xmake.lua b/Code/client/xmake.lua
 diff --git a/Code/encoding/Messages/RequestCampaignPull.h b/Code/encoding/Messages/RequestCampaignPull.h
 --- a/Code/encoding/Messages/RequestCampaignPull.h
 +++ b/Code/encoding/Messages/RequestCampaignPull.h
-@@ -12,6 +12,7 @@
+@@ -12,6 +12,8 @@
      uint64_t Character{}, SaveTag{};
      uint32_t SaveRevision{};
 -    String Credential{};
 -    bool operator==(const RequestCampaignPull& o) const noexcept
 -    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile && Character==o.Character && SaveTag==o.SaveTag && SaveRevision==o.SaveRevision && Credential==o.Credential; }
-+    String Credential{}, Checkpoint{}, LearnedWord{};
++    String Credential{}, Checkpoint{}, LearnedWord{}, AbsorbedDragon{};
++    uint32_t DragonEntity{};
 +    uint32_t WordPeer{}, WordCellMod{}, WordCellBase{};
 +    bool operator==(const RequestCampaignPull& o) const noexcept
-+    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile && Character==o.Character && SaveTag==o.SaveTag && SaveRevision==o.SaveRevision && Credential==o.Credential && Checkpoint==o.Checkpoint && LearnedWord==o.LearnedWord && WordPeer==o.WordPeer && WordCellMod==o.WordCellMod && WordCellBase==o.WordCellBase; }
++    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile && Character==o.Character && SaveTag==o.SaveTag && SaveRevision==o.SaveRevision && Credential==o.Credential && Checkpoint==o.Checkpoint && LearnedWord==o.LearnedWord && WordPeer==o.WordPeer && WordCellMod==o.WordCellMod && WordCellBase==o.WordCellBase && AbsorbedDragon==o.AbsorbedDragon && DragonEntity==o.DragonEntity; }
  };
 diff --git a/Code/encoding/Messages/RequestCampaignPull.cpp b/Code/encoding/Messages/RequestCampaignPull.cpp
 --- a/Code/encoding/Messages/RequestCampaignPull.cpp
 +++ b/Code/encoding/Messages/RequestCampaignPull.cpp
-@@ -6,13 +6,19 @@
+@@ -6,13 +6,21 @@
      Serialization::WriteString(w,Profile);
      Serialization::WriteVarInt(w,Character);Serialization::WriteVarInt(w,SaveTag);
      Serialization::WriteVarInt(w,SaveRevision);Serialization::WriteString(w,Credential);
@@ -308,6 +309,7 @@ diff --git a/Code/encoding/Messages/RequestCampaignPull.cpp b/Code/encoding/Mess
 +    Serialization::WriteString(w,Checkpoint);
 +    Serialization::WriteString(w,LearnedWord);Serialization::WriteVarInt(w,WordPeer);
 +    Serialization::WriteVarInt(w,WordCellMod);Serialization::WriteVarInt(w,WordCellBase);
++    Serialization::WriteString(w,AbsorbedDragon);Serialization::WriteVarInt(w,DragonEntity);
 +}
 +void RequestCampaignPull::DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept
 +{
@@ -320,19 +322,21 @@ diff --git a/Code/encoding/Messages/RequestCampaignPull.cpp b/Code/encoding/Mess
 +    Checkpoint=Serialization::ReadString(r);
 +    LearnedWord=Serialization::ReadString(r);WordPeer=Serialization::ReadVarInt(r)&0xffffffff;
 +    WordCellMod=Serialization::ReadVarInt(r)&0xffffffff;WordCellBase=Serialization::ReadVarInt(r)&0xffffffff;
++    AbsorbedDragon=Serialization::ReadString(r);DragonEntity=Serialization::ReadVarInt(r)&0xffffffff;
  }
 diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJournal.cpp
 --- a/Code/server/Services/QuestJournal.cpp
 +++ b/Code/server/Services/QuestJournal.cpp
-@@ -8,5 +8,7 @@
+@@ -8,5 +8,8 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
 +#include <CampaignCheckpoint.h>
 +#include <QuestWordReward.h>
++#include <DragonAbsorption.h>
  #include <Services/CampaignAccess.h>
  #include <Messages/RequestCampaignPull.h>
-@@ -133,9 +135,59 @@
+@@ -133,9 +136,97 @@
          const auto& p=event.Packet;
 -        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64) return;
 -        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
@@ -341,7 +345,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 -        const CampaignIdentity::Stamp stamp{p.Campaign,p.Character,{p.SaveRevision,p.SaveTag}};
 -        if (CampaignAccess::Admit(m_world,*event.pPlayer,stamp,pull.Profile,{p.Credential.data(),p.Credential.size()}))
 -            reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
-+        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64 || p.Checkpoint.size()>1024 || p.LearnedWord.size()>224) return;
++        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64 || p.Checkpoint.size()>1024 || p.LearnedWord.size()>224 || p.AbsorbedDragon.size()>224) return;
 +        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
 +        CampaignReplication::Reply reply;
 +        reply.Campaign=p.Campaign;reply.Nonce=p.Nonce;reply.Base=pull.Base;
@@ -396,19 +400,59 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 +                        break;
 +                    }
 +            }
++            // Only evidence of a native award from the matching live network
++            // dragon can become an absorption receipt; no soul is awarded here.
++            if (!p.AbsorbedDragon.empty()&&
++                CampaignIdentity::Known(campaignLink.Journal,campaignLink.Campaign,
++                    {p.Campaign,p.Character,{p.Revision,p.Tag}}))
++            {
++                const auto entity=static_cast<entt::entity>(p.DragonEntity);
++                const auto* actor=m_world.try_get<CharacterComponent>(entity);
++                const auto* reference=m_world.try_get<FormIdComponent>(entity);
++                const auto* cell=m_world.try_get<CellIdComponent>(entity);
++                DragonAbsorption::Receipt receipt{std::string(p.AbsorbedDragon.data(),p.AbsorbedDragon.size()),
++                    CampaignAccess::Character(*event.pPlayer)};
++                if (receipt.Valid()&&actor&&actor->IsDragon()&&actor->IsDead()&&
++                    reference&&reference->Id&&cell&&
++                    cell->IsInRange(event.pPlayer->GetCellComponent(),true)&&
++                    m_world.GetPartyService().GetPlayerParty(event.pPlayer))
++                {
++                    const auto key=TradeProperties::DecodeForm(receipt.Dragon);
++                    const auto& mods=m_world.ctx().at<ModsComponent>();
++                    bool matches=false;
++                    for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
++                        for (const auto& [name,entry]:*list)
++                        {
++                            if (entry.id!=reference->Id.ModId||reference->Id.BaseId!=key->Local) continue;
++                            std::string plugin(name.begin(),name.end());
++                            for (auto& ch:plugin) if (ch>='A'&&ch<='Z') ch=static_cast<char>(ch-'A'+'a');
++                            if (plugin==key->Plugin&&(list!=&mods.GetLiteMods()||key->Local<=0xFFF)) matches=true;
++                        }
++                    const auto receipts=DragonAbsorption::Read(campaignLink.Journal.Operations());
++                    if (matches&&receipts&&!receipts->contains(receipt.Encode()))
++                    {
++                        const auto head=campaignLink.Journal.Current();
++                        if (campaignLink.Journal.Append(head,{"dragon-absorbed-"+std::to_string(head.Revision+1),
++                            "dragon-absorbed-v1",receipt.Encode()})!=CampaignJournal::Result::Committed)
++                            spdlog::warn("STM could not persist native dragon absorption");
++                    }
++                }
++            }
 +            reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
 +        }
          NotifyCampaignRecord out;
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -9,5 +9,26 @@
+@@ -9,5 +9,28 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
  #include <Services/CampaignAccess.h>
 +#include <Services/CampaignCheckpointClient.h>
 +#include <QuestWordReward.h>
++#include <DragonAbsorption.h>
++#include <Utils.h>
 +#include <Services/HomeInstance.h>
 +#include <InventoryEvidence.h>
 +#include <Forms/TESObjectCELL.h>
@@ -429,7 +473,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
  #include <HomeRegistry.h>
 +
 +bool TeachCampaignWord(TESForm*) noexcept;
-@@ -26,6 +47,15 @@
+@@ -26,6 +49,15 @@
  namespace
  {
  CampaignReplication::Link campaignLink;
@@ -445,7 +489,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +251,518 @@
+@@ -221,6 +253,595 @@
      return 2;
  }
  
@@ -542,6 +586,28 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    else if (!wordBaseline||wordBaseline->Character!=character||
 +             wordBaseline->Cell!=current->Cell||wordBaseline->Peer!=current->Peer)
 +        wordBaseline=std::move(current);
++}
++
++struct PendingDragonAbsorption
++{
++    DragonAbsorption::Receipt Receipt;
++    uint32_t Entity{};
++    std::chrono::steady_clock::time_point Deadline{};
++};
++std::vector<PendingDragonAbsorption> pendingDragonAbsorptions;
++
++void SendDragonAbsorption(uint64_t character,RequestCampaignPull& request)
++{
++    const auto receipts=DragonAbsorption::Read(campaignLink.Journal.Operations());
++    if (!receipts) {pendingDragonAbsorptions.clear();return;}
++    const auto now=std::chrono::steady_clock::now();
++    std::erase_if(pendingDragonAbsorptions,[&](const auto& entry){
++        return entry.Receipt.Character!=character||entry.Deadline<=now||
++            receipts->contains(entry.Receipt.Encode());
++    });
++    if (pendingDragonAbsorptions.empty()) return;
++    const auto& next=pendingDragonAbsorptions.front();
++    request.AbsorbedDragon=next.Receipt.Dragon.c_str();request.DragonEntity=next.Entity;
 +}
 +
 +std::string NextCheckpoint(const CampaignIdentity::Stamp& stamp)
@@ -950,6 +1016,59 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +}
 +}
 +
++// Called by the world runner after the exact native script call returned.
++// Resolve the actor anew: the VM thread never retains a world/actor pointer.
++void RecordNativeDragonAbsorption(uint32_t form) noexcept
++{
++    try
++    {
++        auto& world=World::Get();
++        if (world.IsLoadingSave()||!SaveWorldReady()||
++            !world.GetTransport().IsOnline()||!world.GetPartyService().IsInParty()) return;
++        const auto identity=CampaignAccess::Current(world);
++        if (!identity) return;
++        auto* dragon=Cast<Actor>(TESForm::GetById(form));
++        if (!dragon||!dragon->IsDragon()||!dragon->IsDead()) return;
++        if (dragon->IsTemporary())
++        {
++            spdlog::debug("STM dragon absorption {:X}: native award observed, dynamic life identity not durable",form);
++            return;
++        }
++        std::vector<InventoryEvidence::PluginSlot> slots;
++        auto* mods=ModManager::Get();
++        if (!mods) return;
++        for (const auto* mod:mods->mods)
++        {
++            if (!mod||!mod->IsLoaded()) continue;
++            const auto* end=std::find(mod->filename,mod->filename+sizeof(mod->filename),'\0');
++            if (end!=mod->filename+sizeof(mod->filename))
++                slots.push_back({mod->GetId(),mod->IsLite(),std::string(mod->filename,end)});
++        }
++        const auto stable=InventoryEvidence::Resolve(form,slots);
++        if (!stable) return;
++        const TradeProperties::FormKey key{stable->Plugin,stable->Local};
++        DragonAbsorption::Receipt receipt{key.Encode(),identity->Save.Character};
++        if (!receipt.Valid()) return;
++        const auto receipts=DragonAbsorption::Read(campaignLink.Journal.Operations());
++        if (!receipts||receipts->contains(receipt.Encode())) return;
++        if (std::any_of(pendingDragonAbsorptions.begin(),pendingDragonAbsorptions.end(),
++                [&](const auto& entry){return entry.Receipt.Encode()==receipt.Encode();})) return;
++        const auto view=world.view<FormIdComponent>();
++        for (const auto entity:view)
++            if (view.get<FormIdComponent>(entity).Id==form)
++            {
++                const auto id=Utils::GetServerId(entity);
++                if (!id||pendingDragonAbsorptions.size()>=16) return;
++                pendingDragonAbsorptions.push_back({receipt,*id,
++                    std::chrono::steady_clock::now()+std::chrono::seconds(30)});
++                nextPull={};
++                spdlog::info("STM native dragon absorption {:X}, character {}",form,receipt.Character);
++                return;
++            }
++    }
++    catch (...) {spdlog::warn("STM native dragon absorption observation failed");}
++}
++
  void QuestService::PollCampaign(const UpdateEvent&) noexcept
  {
 +    if (!m_world.GetTransport().IsOnline()||!m_world.GetPartyService().IsInParty())
@@ -958,13 +1077,15 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        attemptedQuestPickups.clear();
 +        attemptedQuestConsumption.clear();
 +        wordBaseline.reset();
++        pendingDragonAbsorptions.clear();
 +    }
 +    if (!m_world.GetTransport().IsOnline()||m_world.IsLoadingSave()||!SaveWorldReady())
 +    {
 +        wordBaseline.reset();attemptedWords.clear();wordAttemptCharacter=0;
++        pendingDragonAbsorptions.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +792,8 @@
+@@ -250,6 +871,9 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -972,8 +1093,9 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
          request.Credential=credential->Secret.c_str();
 +        request.Checkpoint=NextCheckpoint(*stamp).c_str();
 +        ObserveLearnedWord(m_world,stamp->Character,request);
++        SendDragonAbsorption(stamp->Character,request);
          m_world.GetTransport().Send(request);
-@@ -275,8 +819,21 @@
+@@ -275,8 +899,21 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -1233,7 +1355,7 @@ diff --git a/Code/client/Games/Skyrim/Misc/NativeFunction.h b/Code/client/Games/
 diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScript.cpp
 --- a/Code/client/Games/Misc/BSScript.cpp
 +++ b/Code/client/Games/Misc/BSScript.cpp
-@@ -8,7 +8,9 @@
+@@ -8,7 +8,12 @@
  #include <Actor.h>
  #include <PlayerCharacter.h>
  #include <Games/ActorExtension.h>
@@ -1241,10 +1363,13 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +#include <Games/PapyrusFunctions.h>
 +#include <mutex>
 +#include <cstring>
++#include <atomic>
++#include <cmath>
++#include <Forms/ActorValueInfo.h>
  
  TP_THIS_FUNCTION(TRegisterPapyrusFunction, void, BSScript::IVirtualMachine, NativeFunction*);
  TP_THIS_FUNCTION(TBindEverythingToScript, void, BSScript::IVirtualMachine*);
-@@ -20,8 +22,44 @@
+@@ -20,8 +25,141 @@
  TSignaturesMatch* RealSignaturesMatch = nullptr;
  TCompareVariables* RealCompareVariables = nullptr;
  
@@ -1278,8 +1403,105 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +    return (word->flags&0x40u)!=0;
 +}
 +
++// Skyrim 1.6.1170: CommonLibSSE-NG Stack::top/StackFrame fields and
++// STR's existing NativeFunctionBase::Call (AE ID 104651).
++// Inspect only the exact Actor.ModActorValue registration and its immediate
++// MQKillDragonScript.DeathSequence caller; never alter the VM frame.
++#ifdef TP_SKYRIM_1_6_1170
++TP_THIS_FUNCTION(TDragonNativeCall, BSScript::CallResult, BSScript::NativeFunctionBase,
++                 void*, void*, BSScript::IVirtualMachine*, bool);
++TDragonNativeCall* realDragonNativeCall{};
++std::atomic<const void*> modActorValueNative{};
++struct DragonFrameView
++{
++    BSScript::Stack* Parent;
++    DragonFrameView* Previous;
++    BSScript::IFunction* Function;
++    void* ObjectType;
++    uint32_t Ip,Pad24;
++    BSScript::Variable Self;
++    uint32_t Size;
++    uint8_t Pad3C[4];
++};
++static_assert(offsetof(DragonFrameView,Previous)==0x08);
++static_assert(offsetof(DragonFrameView,Self)==0x28);
++static_assert(offsetof(DragonFrameView,Size)==0x38);
++static_assert(sizeof(DragonFrameView)==0x40);
++struct DragonStackView
++{
++    uint8_t Pad[0x60];
++    DragonFrameView* Top;
++};
++static_assert(offsetof(DragonStackView,Top)==0x60);
++
++static Actor* DragonFrameActor(const BSScript::Variable* variable)
++{
++    auto* vm=GameVM::Get();
++    auto* policy=vm&&vm->virtualMachine?vm->virtualMachine->GetObjectHandlePolicy():nullptr;
++    auto* object=variable?variable->GetObject():nullptr;
++    if (!policy||!object) return nullptr;
++    const auto handle=object->GetHandle();
++    if (!handle||!policy->HandleIsType(static_cast<uint32_t>(Actor::Type),handle)||
++        !policy->IsHandleObjectAvailable(handle)) return nullptr;
++    return policy->GetObjectForHandle<Actor>(handle);
++}
++static uint32_t NativeDragonSource(void* stackArgument)
++{
++    if (!stackArgument) return 0;
++    auto* stack=*static_cast<DragonStackView**>(stackArgument);
++    auto* frame=stack?stack->Top:nullptr;
++    auto* caller=frame?frame->Previous:nullptr;
++    if (!frame||!frame->Parent||frame->Size<2||!caller||!caller->Parent||
++        !caller->Function||caller->Size<1) return 0;
++    const auto* scope=caller->Function->GetObjectTypeName().AsAscii();
++    const auto* name=caller->Function->GetName().AsAscii();
++    if (!scope||!name||_stricmp(scope,"MQKillDragonScript")||
++        _stricmp(name,"DeathSequence")||caller->Function->GetParamCount()<1) return 0;
++    auto* nativeFrame=reinterpret_cast<BSScript::StackFrame*>(frame);
++    auto* callerFrame=reinterpret_cast<BSScript::StackFrame*>(caller);
++    const auto page=nativeFrame->GetPageForFrame();
++    auto* av=nativeFrame->GetStackFrameVariable(0,page);
++    auto* amount=nativeFrame->GetStackFrameVariable(1,page);
++    if (!av||av->type!=BSScript::Variable::kString||!av->data.s||
++        _stricmp(av->data.s,"DragonSouls")||!amount||
++        amount->type!=BSScript::Variable::kFloat||amount->data.f!=1.f) return 0;
++    auto* player=PlayerCharacter::Get();
++    if (!player||DragonFrameActor(&frame->Self)!=player) return 0;
++    auto* dragon=DragonFrameActor(callerFrame->GetStackFrameVariable(0,callerFrame->GetPageForFrame()));
++    return dragon&&dragon->IsDragon()&&dragon->IsDead()?dragon->formID:0;
++}
++void RecordNativeDragonAbsorption(uint32_t form) noexcept;
++BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunctionBase,
++    void* stackArgument, void* logger, BSScript::IVirtualMachine* vm, bool flag)
++{
++    uint32_t dragon{};
++    float before{};
++    if (apThis==modActorValueNative.load(std::memory_order_acquire)&&World::Exists()&&
++        !World::Get().IsLoadingSave())
++    {
++        dragon=NativeDragonSource(stackArgument);
++        if (dragon)
++            before=PlayerCharacter::Get()->GetActorValue(ActorValueInfo::kDragonSouls);
++    }
++    const auto result=TiltedPhoques::ThisCall(realDragonNativeCall,apThis,stackArgument,logger,vm,flag);
++    if (dragon&&result==BSScript::CallResult::kCompleted&&World::Exists()&&!World::Get().IsLoadingSave())
++    {
++        auto* player=PlayerCharacter::Get();
++        if (player&&std::isfinite(before)&&player->GetActorValue(ActorValueInfo::kDragonSouls)==before+1.f)
++            World::Get().GetRunner().Queue([dragon]{RecordNativeDragonAbsorption(dragon);});
++    }
++    return result;
++}
++#endif
++
 +void TP_MAKE_THISCALL(HookRegisterPapyrusFunction, BSScript::IVirtualMachine, NativeFunction* apFunction)
 +{
++#ifdef TP_SKYRIM_1_6_1170
++    if (apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
++        !_stricmp(apFunction->typeName.AsAscii(),"Actor")&&
++        !_stricmp(apFunction->functionName.AsAscii(),"ModActorValue"))
++        modActorValueNative.store(apFunction,std::memory_order_release);
++#endif
 +    if (apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
 +        !std::strcmp(apFunction->typeName.AsAscii(),"Game")&&
 +        !std::strcmp(apFunction->functionName.AsAscii(),"TeachWord"))
@@ -1291,6 +1513,18 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
      auto& runner = World::Get().GetRunner();
  
      PapyrusFunctionRegisterEvent event(apFunction->functionName.AsAscii(), apFunction->typeName.AsAscii(), apFunction->functionAddress);
+@@ -109,6 +247,11 @@
+         TP_HOOK(&RealRegisterPapyrusFunction, HookRegisterPapyrusFunction);
+         TP_HOOK(&RealBindEverythingToScript, HookBindEverythingToScript);
+         TP_HOOK(&RealSignaturesMatch, HookSignaturesMatch);
++#ifdef TP_SKYRIM_1_6_1170
++        POINTER_SKYRIMSE(TDragonNativeCall, s_dragonNativeCall, 104651);
++        realDragonNativeCall=s_dragonNativeCall.Get();
++        TP_HOOK(&realDragonNativeCall, HookDragonNativeCall);
++#endif
+         // TP_HOOK(&RealCompareVariables, HookCompareVariables);
+     });
+ 
 diff --git a/Code/common/QuestWordReward.h b/Code/common/QuestWordReward.h
 new file mode 100644
 --- /dev/null
@@ -1367,5 +1601,55 @@ new file mode 100644
 +    return std::any_of(grants.begin(),grants.end(),[&](const auto& grant){
 +        return grant.Word==word&&grant.Entitles(character);
 +    });
++}
++}
+diff --git a/Code/common/DragonAbsorption.h b/Code/common/DragonAbsorption.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/DragonAbsorption.h
+@@ -0,0 +1,45 @@
++#pragma once
++#include <CampaignJournal.h>
++#include <TradeProperties.h>
++#include <optional>
++#include <set>
++#include <sstream>
++#include <string>
++
++namespace DragonAbsorption
++{
++// This is a receipt for a witnessed native award, NOT permission to award
++// another soul. Death, a change of balance or a dragon skeleton alone cannot
++// create this receipt. Static reference identity is deliberately conservative
++// until repeated/dynamic dragon lives can be distinguished durably.
++struct Receipt
++{
++    std::string Dragon;
++    uint64_t Character{};
++    bool Valid() const
++    {
++        const auto key=TradeProperties::DecodeForm(Dragon);
++        return key&&key->Valid()&&key->Encode()==Dragon&&Character;
++    }
++    std::string Encode() const {return Dragon+" "+std::to_string(Character);}
++};
++inline std::optional<Receipt> Decode(const std::string& payload)
++{
++    Receipt receipt;
++    std::istringstream row(payload);
++    std::string extra;
++    if (!(row>>receipt.Dragon>>receipt.Character)||row>>extra||
++        !receipt.Valid()||receipt.Encode()!=payload) return {};
++    return receipt;
++}
++inline std::optional<std::set<std::string>> Read(const std::vector<CampaignJournal::Operation>& operations)
++{
++    std::set<std::string> receipts;
++    for (const auto& op:operations)
++        if (op.Kind=="dragon-absorbed-v1")
++        {
++            if (!Decode(op.Payload)||!receipts.insert(op.Payload).second) return {};
++        }
++    return receipts;
 +}
 +}
