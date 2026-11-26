@@ -7,9 +7,11 @@ src = (root / "Misc/MenuTopicManager.cpp").read_text()
 cond = (root / "Skyrim/Components/TESCondition.h").read_text().split("#pragma once")[1]
 selection = src[src.index("namespace\n{"):src.index("static TiltedPhoques::Initializer")]
 permit = (root.parent.parent / "common/QuestPickupPermit.h").read_text()
-predicate = permit[permit.index("inline bool PositiveSingleItem"):permit.index("\n}", permit.index("inline bool PositiveSingleItem"))+2]
+predicate = permit[permit.index("inline std::optional<bool> CompareSingleItem"):permit.index("\n}", permit.index("inline bool PositiveSingleItem"))+2]
 mocks = r"""
 #include <cassert>
+#include <cmath>
+#include <optional>
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -74,6 +76,14 @@ int main(){
  sharedState=-1;assert(!CheckFollowerCondition(&item,context));
  nextCondition=[](TESConditionItem*,ConditionContext&){return true;};
  sharedState=0;assert(!CheckFollowerCondition(&item,context));
+ // The mutually exclusive absence response follows the same group state.
+ item.comparisonValue=0;
+ sharedState=1;assert(!CheckFollowerCondition(&item,context));
+ sharedState=0;assert(CheckFollowerCondition(&item,context));
+ item.flags=5<<5;assert(CheckFollowerCondition(&item,context));
+ sharedState=1;assert(!CheckFollowerCondition(&item,context));
+ item.flags=2<<5;assert(CheckFollowerCondition(&item,context));
+ item.flags=0;item.comparisonValue=1;
  sharedState=-1;assert(CheckFollowerCondition(&item,context));
  defer=true;assert(!HookPlayDialogueOption(m,0)&&played==2);
  assert(!m->ResumeQuestTurnIn(10,49,100,201)&&played==2);

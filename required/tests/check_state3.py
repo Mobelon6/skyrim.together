@@ -800,6 +800,19 @@ int main(){
     assert(PositiveSingleItem(0,1.f)&&PositiveSingleItem(3<<5,1.f));
     assert(PositiveSingleItem(1<<5,0.f)&&PositiveSingleItem(2<<5,0.f));
     assert(!PositiveSingleItem(1,1.f)&&!PositiveSingleItem(4,1.f)&&!PositiveSingleItem(0,2.f));
+    assert(CompareSingleItem(0,0.f,0)==true&&CompareSingleItem(0,0.f,1)==false);
+    assert(CompareSingleItem(1<<5,0.f,0)==false&&CompareSingleItem(1<<5,0.f,1)==true);
+    assert(CompareSingleItem(2<<5,0.f,1)==true&&CompareSingleItem(3<<5,1.f,1)==true);
+    assert(CompareSingleItem(4<<5,1.f,0)==true&&CompareSingleItem(5<<5,0.f,1)==false);
+    assert(!CompareSingleItem(6<<5,1.f,1)&&!CompareSingleItem(4,1.f,1)&&!CompareSingleItem(0,1.f,2));
+    assert(SharedSingleItemCount(0,false,false,false)==1);
+    assert(SharedSingleItemCount(0,false,true,false)==-1);
+    assert(SharedSingleItemCount(1,false,true,true)==1);
+    assert(SharedSingleItemCount(1,true,true,true)==0);
+    assert(SharedSingleItemCount(1,true,false,false)==-1);
+    assert(SharedSingleItemCount(1,true,true,false)==-1);
+    assert(SharedSingleItemCount(0,true,false,false)==0);
+    assert(SharedSingleItemCount(2,true,true,true)==-1);
     std::vector<CampaignJournal::Operation> ops={{"1","quest-pickup-v1",
         c.Quest+" 1 3 "+c.Reference+" "+c.Item+" 1 101"}};
     assert(AlreadyTaken(ops,c));assert(AlreadyTaken(ops,d));

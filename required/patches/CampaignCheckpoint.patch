@@ -545,7 +545,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +272,1299 @@
+@@ -221,6 +272,1332 @@
      return 2;
  }
  
@@ -1326,7 +1326,12 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +thread_local bool questDialogueReady{};
 +// Use the native quest pointer only as an opaque lookup key, not a
 +// dereference of an undocumented condition-context member.
-+thread_local std::map<std::pair<const void*,uint32_t>,std::pair<uint32_t,bool>> sharedDialogueItems;
++struct SharedDialogueItem
++{
++    uint32_t Quest{},Instance{},Reference{},Alias{};
++    bool Consumed{},LocalHolder{};
++};
++thread_local std::map<std::pair<const void*,uint32_t>,SharedDialogueItem> sharedDialogueItems;
 +
 +std::optional<QuestPickup> FindSharedTurnIn(uint32_t questId,uint32_t baseId)
 +{
@@ -1343,24 +1348,31 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        }
 +    return match;
 +}
-+void RefreshSpentDialogueItems(const CampaignJournal::Journal& journal)
++void RefreshSpentDialogueItems(const CampaignJournal::Journal& journal,uint64_t character)
 +{
 +    sharedDialogueItems.clear();questDialogueReady=false;
 +    const auto items=QuestPickupHistory(journal.Operations());
-+    if (!items) return;
-+    std::map<std::pair<uint32_t,uint32_t>,std::pair<unsigned,bool>> counts;
++    if (!items||!character) return;
++    std::map<std::pair<uint32_t,uint32_t>,std::pair<unsigned,const QuestPickup*>> counts;
 +    for (const auto& item:*items)
 +        if (item.Generation==1&&item.Count==1)
 +        {
 +            const auto quest=LocalQuestForm(item.Quest),base=LocalQuestForm(item.Item);
 +            if (!quest||!base) continue;
-+            auto& state=counts[{quest,base}];++state.first;state.second=item.Consumed;
++            auto& state=counts[{quest,base}];++state.first;state.second=&item;
 +        }
 +    for (const auto& [key,state]:counts)
-+        if (state.first==1)
-+            if (auto* quest=Cast<TESQuest>(TESForm::GetById(key.first));quest&&!quest->IsStopped()&&
-+                (quest->flags&TESQuest::RunOnce)&&!QuestService::IsNonSyncableQuest(quest))
-+                sharedDialogueItems[{quest,key.second}]={key.first,state.second};
++    {
++        if (state.first!=1) continue; // GetItemCount cannot distinguish aliases
++        const auto& item=*state.second;
++        const auto reference=LocalQuestForm(item.Reference);
++        auto* quest=Cast<TESQuest>(TESForm::GetById(key.first));
++        if (!reference||!quest||quest->IsStopped()||!(quest->flags&TESQuest::RunOnce)||
++            (quest->flags&(TESQuest::Failed|TESQuest::Completed|TESQuest::AllowRepeatStages))||
++            QuestService::IsNonSyncableQuest(quest)) continue;
++        sharedDialogueItems[{quest,key.second}]={key.first,quest->currentInstanceID,reference,item.Alias,
++            item.Consumed,item.Character==character||item.Copies.contains(character)};
++    }
 +    questDialogueReady=true;
 +}
 +bool CanUseSharedTurnIn(World& world,const QuestPickup& item,uint32_t questId,uint32_t baseId,uint64_t character)
@@ -1716,8 +1728,29 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        auto& world=World::Get();
 +        if (world.IsLoadingSave()||!world.GetTransport().IsOnline()||!world.GetPartyService().IsInParty()) return -1;
 +        const auto it=sharedDialogueItems.find({nativeQuest,base});
-+        if (it==sharedDialogueItems.end()||world.GetOverlayService().IsPersonalQuest(it->second.first)) return -1;
-+        return it->second.second?0:1;
++        if (it==sharedDialogueItems.end()) return -1;
++        const auto& item=it->second;
++        auto* quest=Cast<TESQuest>(TESForm::GetById(item.Quest));
++        auto* object=Cast<TESBoundObject>(TESForm::GetById(base));
++        auto* player=PlayerCharacter::Get();
++        if (!quest||quest!=nativeQuest||quest->currentInstanceID!=item.Instance||quest->IsStopped()||
++            !(quest->flags&TESQuest::RunOnce)||(quest->flags&(TESQuest::Failed|TESQuest::Completed|TESQuest::AllowRepeatStages))||
++            !object||!player||world.GetOverlayService().IsPersonalQuest(item.Quest)) return -1;
++        const auto count=player->GetItemCountInInventory(object);
++        // A spent item with no physical local copy needs no override. An
++        // available original must still match the active native alias.
++        if (item.Consumed&&count==0) return 0;
++        auto* assigned=quest->GetAliasedRef(item.Alias);
++        if (!assigned||assigned->formID!=item.Reference||assigned->baseForm!=object) return -1;
++        bool exact=false;
++        if (count==1&&item.LocalHolder)
++        {
++            GameId questNet{},refNet{};
++            exact=world.GetModSystem().GetServerModId(item.Quest,questNet)&&
++                world.GetModSystem().GetServerModId(item.Reference,refNet)&&
++                FindSpentQuestStack(*player,object,questNet,refNet,item.Alias)!=nullptr;
++        }
++        return QuestPickupPermit::SharedSingleItemCount(count,item.Consumed,item.LocalHolder,exact);
 +    }
 +    catch (...) {return -1;}
 +}
@@ -1845,7 +1878,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        deferredQuestPickup.reset();deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();questDialogueReady=false;sharedDialogueItems.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +1594,32 @@
+@@ -250,6 +1627,32 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -1878,7 +1911,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +1645,38 @@
+@@ -275,8 +1678,38 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -1897,7 +1930,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            {
 +                ApplySharedDragonGrants(m_world,campaignLink.Journal,stamp->Character);
 +                UpdateUniqueRewards(m_world,*stamp);
-+                RefreshSpentDialogueItems(campaignLink.Journal);
++                RefreshSpentDialogueItems(campaignLink.Journal,stamp->Character);
 +                RestoreLearnedWords(m_world,campaignLink.Journal,stamp->Character);
 +                RestoreOwnQuestPickups(m_world,campaignLink.Journal,stamp->Character);
 +                // Reconcile against observed native state, not a permanent
@@ -2789,11 +2822,12 @@ diff --git a/Code/common/QuestPickupPermit.h b/Code/common/QuestPickupPermit.h
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/QuestPickupPermit.h
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,190 @@
 +#pragma once
 +#include <CampaignJournal.h>
 +#include <TradeProperties.h>
 +#include <chrono>
++#include <cmath>
 +#include <map>
 +#include <optional>
 +#include <sstream>
@@ -2948,11 +2982,35 @@ new file mode 100644
 +};
 +// CTDA comparison opcodes, restricted to a mandatory requirement satisfied
 +// by exactly one item. Never change global/alias/package operands or OR terms.
++// Only literal, non-OR GetItemCount conditions with the six native
++// comparison operators. Do not interpret global/alias/package parameters.
++inline std::optional<bool> CompareSingleItem(uint8_t flags,float value,int count)
++{
++    if ((flags&0x1f)||!std::isfinite(value)||(count!=0&&count!=1)) return {};
++    const auto n=static_cast<float>(count);
++    switch (flags>>5)
++    {
++    case 0:return n==value;
++    case 1:return n!=value;
++    case 2:return n>value;
++    case 3:return n>=value;
++    case 4:return n<value;
++    case 5:return n<=value;
++    default:return {};
++    }
++}
 +inline bool PositiveSingleItem(uint8_t flags,float value)
 +{
-+    if (flags&0x1f) return false;
-+    const auto op=flags>>5;
-+    return ((op==0||op==3)&&value==1.f)||((op==1||op==2)&&value==0.f);
++    return CompareSingleItem(flags,value,0)==false&&CompareSingleItem(flags,value,1)==true;
++}
++// A local ordinary item sharing the base form is not the tracked original.
++// Only substitute a binary group count if the native inventory is unambiguous.
++inline int SharedSingleItemCount(int64_t local,bool consumed,bool holder,bool exact)
++{
++    if (local<0||local>1) return -1;
++    if (!local) return consumed?0:holder?-1:1;
++    if (!holder||!exact) return -1;
++    return consumed?0:1;
 +}
 +}
 
@@ -3032,7 +3090,7 @@ new file mode 100644
 diff --git a/Code/client/Games/Misc/MenuTopicManager.cpp b/Code/client/Games/Misc/MenuTopicManager.cpp
 --- a/Code/client/Games/Misc/MenuTopicManager.cpp
 +++ b/Code/client/Games/Misc/MenuTopicManager.cpp
-@@ -1,157 +1,220 @@
+@@ -1,157 +1,227 @@
  #include "MenuTopicManager.h"
  
  #include <Events/PlayerDialogueEvent.h>
@@ -3079,13 +3137,19 @@ diff --git a/Code/client/Games/Misc/MenuTopicManager.cpp b/Code/client/Games/Mis
 -bool IsHireOption(const TESTopicInfo* info)
 +// Reuse the existing condition hook. Only a native, non-OR player
 +// item-count requirement which exactly one item can satisfy is relevant.
-+uint32_t PositivePlayerItem(const TESConditionItem& condition)
++uint32_t PlayerItemCondition(const TESConditionItem& condition)
 +{
 +    if (condition.function!=47||!condition.params[0]||
-+        !QuestPickupPermit::PositiveSingleItem(condition.flags,condition.comparisonValue)) return 0;
-+    if (condition.object!=1&&
-+        (condition.object!=2||TESObjectREFR::GetByHandle(condition.runOnRef)!=PlayerCharacter::Get())) return 0;
++        !QuestPickupPermit::CompareSingleItem(condition.flags,condition.comparisonValue,0)) return 0;
++    auto* player=PlayerCharacter::Get();
++    if (!player||(condition.object!=1&&
++        (condition.object!=2||TESObjectREFR::GetByHandle(condition.runOnRef)!=player))) return 0;
 +    return static_cast<const TESForm*>(condition.params[0])->formID;
++}
++uint32_t PositivePlayerItem(const TESConditionItem& condition)
++{
++    return QuestPickupPermit::PositiveSingleItem(condition.flags,condition.comparisonValue)?
++        PlayerItemCondition(condition):0;
 +}
 +uint32_t TurnInBase(const TESTopicInfo* info)
 +{
@@ -3229,10 +3293,11 @@ diff --git a/Code/client/Games/Misc/MenuTopicManager.cpp b/Code/client/Games/Mis
 -    const auto fn = apThis->function;
 +    const auto fn = apThis->function;
 +    if (fn==47&&context.quest&&context.action&&context.target==PlayerCharacter::Get())
-+        if (const auto item=PositivePlayerItem(*apThis))
++        if (const auto item=PlayerItemCondition(*apThis))
 +            if (const auto* menu=MenuTopicManager::Get();menu&&menu->IsCurrentSpeaker(context.action->GetHandle()))
 +                if (const auto state=SharedDialogueItemState(context.quest,item);state>=0)
-+                    return state==1;
++                    if (const auto result=QuestPickupPermit::CompareSingleItem(apThis->flags,apThis->comparisonValue,state))
++                        return *result;
      const auto* param = static_cast<const TESForm*>(apThis->params[0]);
      // Alias and package-data operands can be numeric slots instead of TESForm pointers.
      if ((fn == 74 || fn == 71) && param && !(apThis->flags & 0x1E) && apThis->object == 0 &&
