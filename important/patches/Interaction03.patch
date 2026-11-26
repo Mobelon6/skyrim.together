@@ -812,11 +812,14 @@ index 69dd328..9792a30 100644
                      update.Id = Id;
                      update.Stage = stageId;
                      update.Status = RequestQuestUpdate::StageUpdate;
-@@ -676,7 +692,7 @@ bool QuestService::IsNonSyncableQuest(TESQuest* apQuest)
+@@ -676,7 +692,10 @@ bool QuestService::IsNonSyncableQuest(TESQuest* apQuest)
  {
      // These framework quests own local-player and follower aliases. Replaying their fragments
      // would give a listener a second follower or make the listener the brawl challenger.
 -    if (apQuest && (apQuest->formID == 0x750BA || apQuest->formID == 0x47AE6))
++    extern bool IsPersonalRadiantQuest(TESQuest*) noexcept;
++    if (IsPersonalRadiantQuest(apQuest))
++        return true;
 +    if (apQuest && (apQuest->formID == 0xCA210 || apQuest->formID == 0x750BA || apQuest->formID == 0x47AE6))
          return true;
      // Quests with no quest stages are never synced. Most TESQues::Type:: quests should

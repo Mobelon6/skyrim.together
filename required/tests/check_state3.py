@@ -64,6 +64,50 @@ int main(){
 ''', ['-I'+str(code/'encoding')])
 
 qs='client/Services/Generic/QuestService.cpp'
+radiant=extract(qs,'bool IsPersonalRadiantQuest(TESQuest* quest)','std::string QuestService::CaptureQuestTargets')
+radiantMatch=extract(qs,'static bool MatchesQuestTargets','void QuestService::ReceiveQuestProgress')
+run('personal radiant classification is independent of native fill state',headers+'''
+#include <string_view>
+struct TESQuest;
+struct NativeQuestAlias {
+ struct TypeName{const char* value;const char* AsAscii()const{return value;}} type{"Ref"};
+ TESQuest* Owner{};uint16_t FillType{1};
+ const TypeName& QType()const{return type;}
+};
+struct TESQuest{
+ enum Flags{RunOnce=256};uint16_t flags{};
+ struct Aliases {void** data{};size_t length{},capacity{};
+ void** begin()const{return data;}void** end()const{return data?data+length:nullptr;}} aliases;
+ bool stopped{};uint32_t currentInstanceID{5};
+ bool IsStopped()const{return stopped;}
+};
+struct NotifyQuestUpdate{
+ std::string Targets;bool CheckInstance{};uint32_t ExpectedInstance{};
+};
+'''+radiant+radiantMatch+'''
+int main(){
+ TESQuest q,other;NativeQuestAlias a,b;
+ a.Owner=b.Owner=&q;void* slots[]={&a,&b};
+ q.aliases={slots,2,2};
+ assert(!IsPersonalRadiantQuest(&q));
+ for(uint16_t fill:{0,2,3,4,5,6,7,8}){
+    a.FillType=fill;assert(IsPersonalRadiantQuest(&q));
+    q.stopped=true;assert(IsPersonalRadiantQuest(&q));q.stopped=false;
+    q.flags=TESQuest::RunOnce;assert(!IsPersonalRadiantQuest(&q));q.flags=0;
+ }
+ a.FillType=1;b.type.value="Loc";assert(IsPersonalRadiantQuest(&q));
+ b.type.value=nullptr;assert(IsPersonalRadiantQuest(&q));b.type.value="Ref";
+ b.Owner=&other;assert(IsPersonalRadiantQuest(&q));b.Owner=&q;
+ q.aliases.capacity=1;assert(IsPersonalRadiantQuest(&q));q.aliases.capacity=2;
+ slots[1]=nullptr;assert(IsPersonalRadiantQuest(&q));slots[1]=&b;
+ NotifyQuestUpdate u;assert(MatchesQuestTargets(&q,u));
+ a.FillType=0;assert(!MatchesQuestTargets(&q,u));a.FillType=1;
+ u.Targets="2:r:616263.1;";assert(!MatchesQuestTargets(&q,u));
+ u.Targets.clear();u.CheckInstance=true;u.ExpectedInstance=4;assert(!MatchesQuestTargets(&q,u));
+ u.ExpectedInstance=5;assert(MatchesQuestTargets(&q,u));
+ q.stopped=true;assert(!MatchesQuestTargets(&q,u));
+}
+''')
 receive=extract(qs,'void QuestService::ReceiveQuestProgress','QuestService::QuestService')
 run('automatic accepted party quest dispatch',headers+'''
 struct NotifyQuestUpdate {uint32_t Id{},LocalInstance{},SharedRun{},Encounter{};};

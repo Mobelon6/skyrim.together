@@ -2095,11 +2095,13 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +}
 +
  QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
-@@ -44,3 +448,72 @@
+@@ -44,3 +448,74 @@
      PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
      const PartyService::Party::Conversation* participants = nullptr;
 +    const std::string targets(message.Targets.data(),message.Targets.size());
-+    if (!ValidQuestTargets(targets)) return;
++    // Variable-target quest progress is personal. Keep the historical
++    // journal reader intact, but never accept or relay new radiant rows.
++    if (!targets.empty()) return;
 +    notify.Targets=message.Targets;
 +    // A replay-created native instance can attach only to the generation it
 +    // was started for. A stale attachment must never create a new run.
@@ -2168,7 +2170,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        }
 +    }
      if (!pParty) return;
-@@ -61,6 +534,8 @@
+@@ -61,6 +536,8 @@
          // During an interaction, only the quest of the witnessed topic has provenance.
          if (inTalk || inFight) return;
 -        if (!bEnableMiscQuestSync && !(message.JournalObjective && message.Status == RequestQuestUpdate::StageUpdate &&
@@ -2179,7 +2181,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +            !(knownSharedQuest && message.Status == RequestQuestUpdate::Stopped)) return;
      }
  
-@@ -115,39 +590,86 @@
+@@ -115,39 +592,86 @@
 -    auto& run = pParty->QuestRuns[message.Id];
 -    // The sender's local quest log and the party's shared lifecycle are independent.
 -    // A late start from a second client must not clear stages the first client sent.

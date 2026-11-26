@@ -1303,7 +1303,7 @@ diff --git a/Code/client/Services/QuestService.h b/Code/client/Services/QuestSer
 diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Services/Generic/QuestService.cpp
 --- a/Code/client/Services/Generic/QuestService.cpp
 +++ b/Code/client/Services/Generic/QuestService.cpp
-@@ -20,61 +20,188 @@
+@@ -20,61 +20,205 @@
  
  #include <Events/EventDispatcher.h>
  
@@ -1404,6 +1404,26 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +static_assert(offsetof(NativeQuestAlias, Id)==0x18);
 +static_assert(sizeof(NativeQuestAlias)==0x28);
 +
++// There is no universal QUST radiant flag. Keep repeatable quests with
++// variable/unknown alias definitions personal, even if an optional alias
++// happens to be empty. Preserve authored one-shot quests and repeatable
++// quests with only fixed reference aliases. Inspect definitions, not the
++// currently filled targets, so both clients make the same decision.
++bool IsPersonalRadiantQuest(TESQuest* quest) noexcept
++{
++    if (!quest||(quest->flags&TESQuest::RunOnce)) return false;
++    if (quest->aliases.length>quest->aliases.capacity||quest->aliases.length>128||
++        (quest->aliases.length&&!quest->aliases.data)) return true;
++    for (auto* raw:quest->aliases)
++    {
++        const auto* alias=static_cast<const NativeQuestAlias*>(raw);
++        if (!alias||alias->Owner!=quest) return true;
++        const auto* type=alias->QType().AsAscii();
++        if (!type||std::string_view(type)!="Ref"||alias->FillType!=1) return true;
++    }
++    return false;
++}
++
 +std::string QuestService::CaptureQuestTargets(TESQuest* quest)
 +{
 +    if (!quest || (quest->flags&TESQuest::RunOnce)) return {};
@@ -1477,7 +1497,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +    try
 +    {
 +        auto* quest=Cast<TESQuest>(TESForm::GetById(form));
-+        if (!quest||quest->currentInstanceID!=instance) return false;
++        if (!quest||quest->currentInstanceID!=instance||IsPersonalRadiantQuest(quest)) return false;
 +        // Publish observed results, not a failed/obsolete native stage request.
 +        if (update.Status==RequestQuestUpdate::StageUpdate&&!quest->IsStageReached(update.Stage)) return false;
 +        std::string targets;
@@ -1507,12 +1527,9 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +
 +static bool MatchesQuestTargets(TESQuest* quest,const NotifyQuestUpdate& update)
 +{
-+    if (!quest) return false;
++    if (!quest||IsPersonalRadiantQuest(quest)||!update.Targets.empty()) return false;
 +    if (update.CheckInstance&&(quest->IsStopped()||quest->currentInstanceID!=update.ExpectedInstance)) return false;
-+    if (update.Targets.empty()) return true;
-+    if (quest->IsStopped() || quest->currentInstanceID!=update.LocalInstance) return false;
-+    try {return QuestService::CaptureQuestTargets(quest)==std::string(update.Targets.data(),update.Targets.size());}
-+    catch (...) {return false;}
++    return true;
 +}
 +
 +void QuestService::ReceiveQuestProgress(const NotifyQuestUpdate& notice) noexcept
@@ -1541,7 +1558,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
      m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&QuestService::OnUpdate>(this);
      m_disconnectedConnection = aDispatcher.sink<DisconnectedEvent>().connect<&QuestService::OnDisconnected>(this);
      m_leftConnection = aDispatcher.sink<PartyLeftEvent>().connect<&QuestService::OnPartyLeft>(this);
-@@ -126,40 +253,83 @@
+@@ -126,40 +270,83 @@
  
      for (uint32_t questFormId : questFormIds)
      {
@@ -1626,7 +1643,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
  
  BSTEventResult QuestService::OnEvent(const TESQuestStartStopEvent* apEvent, const EventDispatcher<TESQuestStartStopEvent>*)
  {
-@@ -508,19 +678,105 @@
+@@ -508,19 +695,105 @@
      spdlog::info("Holding member quest stage {} for {:X} until no playing scene of it checks it", aStage, apQuest->formID);
  }
  
@@ -1736,7 +1753,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
  
      // A phase whose own actions are done and whose completion conditions want a held stage only moves on with it.
      // Advance the queue in arrival order until the phase can progress.
-@@ -553,14 +809,17 @@
+@@ -553,14 +826,17 @@
  
  // Applies held stages in order while no playing scene checks the next one, e.g. once the scenes that did have ended.
  // Waits for the fragments of the stages it applied first.
@@ -1756,7 +1773,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
  
  HeldStages* QuestService::GetHeldStages(uint32_t aQuestFormId, TESQuest* apQuest) noexcept
  {
-@@ -624,21 +883,45 @@
+@@ -624,21 +900,45 @@
          return;
      }
  
@@ -1809,7 +1826,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
          return;
      }
  
-@@ -655,29 +938,93 @@
+@@ -655,29 +955,93 @@
      bool bResult = false;
      switch (aUpdate.Status)
      {

@@ -546,7 +546,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +273,1426 @@
+@@ -221,6 +273,1427 @@
      return 2;
  }
  
@@ -1539,6 +1539,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    const auto now=std::chrono::steady_clock::now();
 +    for (const auto& [key,run]:*history)
 +    {
++        if (!run.Targets.empty()) continue; // historical radiant run, no replay
 +        const auto id=LocalQuestForm(key);
 +        auto* quest=id?Cast<TESQuest>(TESForm::GetById(id)):nullptr;
 +        if (!quest||QuestService::IsNonSyncableQuest(quest)||
@@ -1653,7 +1654,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +                if (QuestRunMember::Bound(latest.Members,character,it->Generation,instance))
 +                { selected=&*it;bound=true;break; }
 +        const auto& state=*selected;
-+        if (targets!=state.Targets) continue;
++        if (!state.Targets.empty()||targets!=state.Targets) continue;
 +        if (!(quest->flags&TESQuest::RunOnce)&&!bound) continue;
 +        if (!bound&&!localQuests.contains(id)&&!sharedStart) continue;
 +        if (!bound&&(state.Generation!=1||(state.Stopped&&!state.CompletedRunOnce)||
@@ -1973,7 +1974,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        deferredQuestPickup.reset();deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();questDialogueReady=false;sharedDialogueItems.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +1722,32 @@
+@@ -250,6 +1723,32 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -2006,7 +2007,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +1773,39 @@
+@@ -275,8 +1774,39 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
