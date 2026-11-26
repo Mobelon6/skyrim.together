@@ -1942,7 +1942,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        if (!durable)
 +            RecordQuest(pPlayer, notify);
 +        notify.Speaker = pPlayer->GetId();
-+        if (notify.Speaker == pParty->LeaderPlayerId)
++        if (durable || notify.Speaker == pParty->LeaderPlayerId)
 +            notify.SharedRun = run.Generation;
 +        for (auto* guest : pParty->Members)
 +            if (guest != pPlayer && PartyService::WithinSyncRange(m_world, *pPlayer, *guest) &&

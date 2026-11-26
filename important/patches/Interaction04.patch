@@ -413,7 +413,7 @@ index 0cd799f..f65a5cb 100644
      if (!m_world.GetPartyService().IsInParty()) return;
 -    ProgressKey key{quest, form, speaker, session};
 +    ProgressKey key = subject && encounter ? ProgressKey{false, subject, speaker, encounter} :
-+                                            ProgressKey{quest, form, speaker, session};
++                                            ProgressKey{quest, form, quest ? 0u : speaker, session};
 +    auto it = std::find_if(m_progress.begin(), m_progress.end(), [&](const auto& item){ return item.Key == key; });
 +    const bool different = !needed || needed();
 +    // A later stop may become effective only after an earlier, still-pending start.

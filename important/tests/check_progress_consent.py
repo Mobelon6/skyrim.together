@@ -65,6 +65,27 @@ int main() {
     assert(!running && applied.back()==77 && !s.IsPersonalQuest(61));
     s.QueueProgress(false,81,2,12,"actor",[&]{applied.push_back(88);});
     assert(s.m_progress.empty() && applied.back()==88);
+    // The general quest run is shared even when the speaking player or
+    // leader changes. Encounter results still belong to their speaker.
+    s.ClearProgress();applied.clear();
+    auto stage=[&](unsigned speaker,unsigned run,int value){
+        s.QueueProgress(true,70,speaker,run,"quest",[&,value]{applied.push_back(value);});
+    };
+    stage(1,1,10);stage(2,1,20);
+    assert(s.m_progress.size()==1 && s.IsPersonalQuest(70));
+    s.m_showingProgress=true;s.AnswerProgress(s.m_progress.front().Token,true);
+    assert((applied==std::vector<int>{10,20}));
+    stage(3,1,30);assert(s.m_progress.empty()&&applied.back()==30);
+    stage(2,2,40);assert(s.m_progress.size()==1&&s.IsPersonalQuest(70));
+    s.m_showingProgress=true;s.AnswerProgress(s.m_progress.front().Token,false);
+    stage(1,2,50);assert(s.m_progress.empty()&&s.IsPersonalQuest(70)&&applied.back()==30);
+    s.ClearProgress();stage(2,2,50);
+    assert(s.m_progress.size()==1&&s.IsPersonalQuest(70));
+    s.ClearProgress();
+    s.QueueProgress(true,70,1,2,"actor",[]{}, {},81,12);
+    s.QueueProgress(true,70,2,2,"actor",[]{}, {},81,12);
+    assert(s.m_progress.size()==2);
+    s.ClearProgress();
     s.m_world.p.in=false;add(true,99,5,8);assert(s.m_progress.empty());
 }
 """
