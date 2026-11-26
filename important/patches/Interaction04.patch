@@ -466,10 +466,12 @@ index 0cd799f..f65a5cb 100644
      args->SetInt(0, item.Token);
      args->SetString(1, item.Label);
 diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Services/Generic/QuestService.cpp
-index 9792a30..f169919 100644
 --- a/Code/client/Services/Generic/QuestService.cpp
 +++ b/Code/client/Services/Generic/QuestService.cpp
-@@ -37,6 +37,15 @@ using HeldStages = QuestService::HeldStages;
+@@ -34,22 +34,42 @@
+ 
+ using HeldStages = QuestService::HeldStages;
+ 
  static void ReleaseStagesForWaitingPhases(TESQuest* apQuest, HeldStages& aHeld) noexcept;
  static void ReleaseUncheckedStages(TESQuest* apQuest, HeldStages& aHeld) noexcept;
  
@@ -485,7 +487,7 @@ index 9792a30..f169919 100644
  void QuestService::ReceiveQuestProgress(const NotifyQuestUpdate& update) noexcept
  {
      if (!m_world.GetPartyService().IsInParty()) return;
-@@ -44,9 +53,20 @@ void QuestService::ReceiveQuestProgress(const NotifyQuestUpdate& update) noexcep
+     if (!update.SharedRun) { OnQuestUpdate(update); return; }
      auto form = m_world.GetModSystem().GetGameId(update.Id);
      auto* quest = Cast<TESQuest>(TESForm::GetById(form));
      if (!quest || IsNonSyncableQuest(quest)) return;
@@ -509,7 +511,13 @@ index 9792a30..f169919 100644
  }
  
  QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
-@@ -179,7 +199,9 @@ BSTEventResult QuestService::OnEvent(const TESQuestStartStopEvent* apEvent, cons
+     : m_world(aWorld)
+ {
+     m_journalClock = aDispatcher.sink<UpdateEvent>().connect<&QuestService::PollJournal>(this);
+@@ -176,21 +196,25 @@
+                              static_cast<std::underlying_type_t<TESQuest::Type>>(pQuest->type), 
+                              pQuest->formID, pQuest->fullName.value.AsAscii());
+             }
          }
          
          m_world.GetRunner().Queue(
@@ -520,7 +528,7 @@ index 9792a30..f169919 100644
              {
                  GameId Id;
                  auto& modSys = m_world.GetModSystem();
-@@ -187,7 +209,9 @@ BSTEventResult QuestService::OnEvent(const TESQuestStartStopEvent* apEvent, cons
+                 if (modSys.GetServerModId(formId, Id))
                  {
                      if (m_world.GetOverlayService().IsPersonalQuest(formId)) return;
                      RequestQuestUpdate update;
@@ -531,7 +539,13 @@ index 9792a30..f169919 100644
                      update.Stage = stageId;
                      update.Status = stopped ? RequestQuestUpdate::Stopped : RequestQuestUpdate::Started;
 +                    if (!FillQuestTargets(formId, instance, update)) return;
-@@ -237,7 +261,7 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageEvent* apEvent, const Ev
+                     update.ClientQuestType = static_cast<std::underlying_type_t<TESQuest::Type>>(type); 
+ 
+                     m_world.GetTransport().Send(update);
+@@ -234,13 +258,13 @@
+                              static_cast<std::underlying_type_t<TESQuest::Type>>(pQuest->type),
+                              pQuest->formID, pQuest->fullName.value.AsAscii());
+             }
          }
  
          m_world.GetRunner().Queue(
@@ -540,7 +554,13 @@ index 9792a30..f169919 100644
              {
                  // Observe the actual opponent picked by the vanilla brawl quest without changing its scripts.
                  if (formId == 0x47AE6)
-@@ -257,7 +281,8 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageEvent* apEvent, const Ev
+                 {
+                     auto* pBrawl = Cast<TESQuest>(TESForm::GetById(formId));
+                     auto* pOpponent = pBrawl ? Cast<Actor>(pBrawl->GetAliasedRef(0)) : nullptr;
+@@ -254,13 +278,14 @@
+                 GameId Id;
+                 auto& modSys = m_world.GetModSystem();
+                 if (modSys.GetServerModId(formId, Id))
                  {
                      if (m_world.GetOverlayService().IsPersonalQuest(formId)) return;
                      RequestQuestUpdate update;
@@ -550,6 +570,9 @@ index 9792a30..f169919 100644
                      update.Stage = stageId;
                      update.Status = RequestQuestUpdate::StageUpdate;
 +                    if (!FillQuestTargets(formId, instance, update)) return;
+                     update.ClientQuestType = static_cast<std::underlying_type_t<TESQuest::Type>>(type);
+ 
+                     m_world.GetTransport().Send(update);
 diff --git a/Code/client/Services/OverlayService.h b/Code/client/Services/OverlayService.h
 index 0638d84..f966037 100644
 --- a/Code/client/Services/OverlayService.h

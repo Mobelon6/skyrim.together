@@ -216,7 +216,7 @@ diff --git a/Code/client/Services/Generic/InventoryService.cpp b/Code/client/Ser
  void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEvent) noexcept
  {
      if (!m_transport.IsConnected())
-@@ -92,10 +286,49 @@
+@@ -92,10 +286,55 @@
      request.Item = acEvent.Item;
      request.Drop = acEvent.Drop;
      request.UpdateClients = acEvent.UpdateClients;
@@ -230,6 +230,7 @@ diff --git a/Code/client/Services/Generic/InventoryService.cpp b/Code/client/Ser
 +        const auto form=m_world.GetModSystem().GetGameId(request.QuestId);
 +        auto* quest=Cast<TESQuest>(TESForm::GetById(form));
 +        if (!quest||QuestService::IsNonSyncableQuest(quest)||
++            !(quest->flags&TESQuest::RunOnce)||(quest->flags&TESQuest::AllowRepeatStages)||
 +            m_world.GetOverlayService().IsPersonalQuest(form))
 +        {
 +            request.QuestId={};request.QuestRef={};request.QuestAlias=0;
@@ -257,6 +258,11 @@ diff --git a/Code/client/Services/Generic/InventoryService.cpp b/Code/client/Ser
 +        }
 +    }
  
++    if (request.QuestId&&request.QuestRef&&PlayerCharacter::Get()&&acEvent.FormId==PlayerCharacter::Get()->formID)
++    {
++        extern void QueueQuestItemReceipt(World&,const RequestInventoryChanges&) noexcept;
++        QueueQuestItemReceipt(m_world,request);
++    }
      m_transport.Send(request);
 +    // Inventory evidence is sent first. If the native stage event already
 +    // arrived, the existing server deduplicator ignores this observation.
@@ -355,7 +361,7 @@ diff --git a/Code/client/Games/Skyrim/Components/TESContainer.cpp b/Code/client/
 diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyrim/TESObjectREFR.cpp
 --- a/Code/client/Games/Skyrim/TESObjectREFR.cpp
 +++ b/Code/client/Games/Skyrim/TESObjectREFR.cpp
-@@ -476,20 +476,55 @@
+@@ -476,20 +476,57 @@
  
 +// A Papyrus RemoveItem(base, 1) can omit the extra-data pointer. Resolve
 +// it only when the ENTIRE local base-form count is one and its single
@@ -387,6 +393,8 @@ diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyr
 +    const auto* count=Cast<ExtraCount>(stack->GetByType(ExtraDataType::Count));
 +    if (count&&count->count!=1) return false;
 +    CaptureQuestItem(stack,nullptr,base,change);
++    if (!change.QuestId||!change.QuestRef)
++        CaptureQuestItem(stack,nullptr,base,change,true);
 +    if (!change.QuestId||!change.QuestRef) return false;
 +    // Preserve the original inventory metadata for the exact object.
 +    {
@@ -424,7 +432,7 @@ diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyr
  
      return count;
  }
-@@ -1080,7 +1115,29 @@
+@@ -1080,7 +1117,29 @@
          }
  
          item.Count = -aCount;

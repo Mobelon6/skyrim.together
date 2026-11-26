@@ -591,11 +591,15 @@ int main(){
     std::vector<CampaignJournal::Operation> ops={{"1","dragon-death-v1",kill.Encode()}};
     auto h=ReadShared(ops);assert(h&&h->Kills.at(key).Revision==1);
     assert(!h->Plan({key,33}));const auto grant=h->Plan({key,11});
+    assert(h->Eligible({key,11})&&h->Eligible({key,22})&&!h->Eligible({key,33}));
     assert(grant&&grant->Recipient==22);
     ops.push_back({"2","dragon-shared-v1",grant->Encode()});assert(!ReadShared(ops));
     ops.pop_back();ops.push_back({"2","dragon-absorbed-v1",Receipt{key,11}.Encode()});
+    h=ReadShared(ops);assert(h&&MissingGrants(*h,ops).size()==1);
+    assert(MissingGrants(*h,ops)[0].Encode()==grant->Encode());
     ops.push_back({"3","dragon-shared-v1",grant->Encode()});
     h=ReadShared(ops);assert(h&&h->Grants.size()==1&&!h->Plan({key,22}));
+    assert(MissingGrants(*h,ops).empty());
     ops.push_back({"4","dragon-retired-v1",key});h=ReadShared(ops);
     assert(h&&h->Retired.contains(key)&&h->Grants.size()==1&&!h->Plan({key,11}));
     ops.push_back({"5","dragon-death-v1",kill.Encode()});assert(!ReadShared(ops));
@@ -623,6 +627,15 @@ int main(){
     std::vector<CampaignJournal::Operation> ops={{"1","quest-pickup-v1",
         c.Quest+" 1 3 "+c.Reference+" "+c.Item+" 1 101"}};
     assert(AlreadyTaken(ops,c));assert(AlreadyTaken(ops,d));
+    Receipt pickup{c,1,true},remove{c,-1,false};
+    assert(DecodeReceipt(pickup.Encode())&&DecodeReceipt(remove.Encode()));
+    assert(!DecodeReceipt(remove.Encode()+" ")&&!DecodeReceipt(c.Encode()+" -1 1"));
+    assert(Acknowledged(ops,pickup,101)&&!Acknowledged(ops,pickup,202));
+    assert(!Acknowledged(ops,remove,101));
+    ops.push_back({"2","quest-copy-v1",Payload(c,202)});
+    ops.push_back({"3","quest-consumed-v2",Payload(c,202)});
+    assert(Acknowledged(ops,pickup,202)&&Acknowledged(ops,remove,101)&&Acknowledged(ops,remove,202));
+    assert(!Acknowledged(ops,remove,303));
     d.Reference="736b7972696d2e65736d.457";assert(!AlreadyTaken(ops,d));
 }
 ''', ['-I'+str(code/'common')])
@@ -633,12 +646,12 @@ using GameId=unsigned;
 struct TESForm{};
 enum class ExtraDataType{Count};
 struct ExtraCount{int count=1;};
-struct ExtraDataList{unsigned quest=10,ref=20,alias=3;ExtraCount count;bool hasCount=true;bool questItem=true;void* GetByType(ExtraDataType){return hasCount?&count:nullptr;}};
+struct ExtraDataList{unsigned quest=10,ref=20,alias=3;ExtraCount count;bool hasCount=true;bool questItem=true;bool stopped=false;void* GetByType(ExtraDataType){return hasCount?&count:nullptr;}};
 template<class T>T* Cast(void* p){return static_cast<T*>(p);}
 struct Inventory{struct Entry{int Count=-1;bool IsQuestItem=false;};};
 struct InventoryChangeEvent{unsigned FormId;Inventory::Entry Item;GameId QuestId{},QuestRef{};unsigned QuestAlias{};};
 struct ScopedExtraDataOverride{};
-void CaptureQuestItem(ExtraDataList* extra,void*,TESForm*,InventoryChangeEvent& e){e.QuestId=extra->quest;e.QuestRef=extra->ref;e.QuestAlias=extra->alias;}
+void CaptureQuestItem(ExtraDataList* extra,void*,TESForm*,InventoryChangeEvent& e,bool allowStopped=false){if(extra->stopped&&!allowStopped)return;e.QuestId=extra->quest;e.QuestRef=extra->ref;e.QuestAlias=extra->alias;}
 struct Entry{TESForm* form;std::vector<ExtraDataList*>* dataList;};
 struct Changes{std::vector<Entry*>* entries;};
 struct TESObjectREFR{
@@ -661,6 +674,7 @@ int main(){
  stacks.push_back(&duplicate);assert(!probe());stacks.pop_back();
  exact.count.count=2;assert(!probe()&&!probe(&exact));exact.count.count=1;
  exact.hasCount=false;assert(probe());
+ exact.stopped=true;assert(probe());exact.stopped=false;
  exact.questItem=false;assert(!probe());exact.questItem=true;
  stacks={&ordinary};assert(!probe());stacks.clear();assert(!probe());
  player.changes.entries=nullptr;assert(!probe());

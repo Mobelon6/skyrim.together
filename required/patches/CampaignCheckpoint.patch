@@ -284,16 +284,16 @@ diff --git a/Code/encoding/Messages/RequestCampaignPull.h b/Code/encoding/Messag
 -    String Credential{};
 -    bool operator==(const RequestCampaignPull& o) const noexcept
 -    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile && Character==o.Character && SaveTag==o.SaveTag && SaveRevision==o.SaveRevision && Credential==o.Credential; }
-+    String Credential{}, Checkpoint{}, LearnedWord{}, AbsorbedDragon{}, PickupClaim{};
++    String Credential{}, Checkpoint{}, LearnedWord{}, AbsorbedDragon{}, PickupClaim{}, QuestReceipt{};
 +    uint32_t DragonEntity{};
 +    uint32_t WordPeer{}, WordCellMod{}, WordCellBase{};
 +    bool operator==(const RequestCampaignPull& o) const noexcept
-+    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile && Character==o.Character && SaveTag==o.SaveTag && SaveRevision==o.SaveRevision && Credential==o.Credential && Checkpoint==o.Checkpoint && LearnedWord==o.LearnedWord && WordPeer==o.WordPeer && WordCellMod==o.WordCellMod && WordCellBase==o.WordCellBase && AbsorbedDragon==o.AbsorbedDragon && DragonEntity==o.DragonEntity && PickupClaim==o.PickupClaim; }
++    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile && Character==o.Character && SaveTag==o.SaveTag && SaveRevision==o.SaveRevision && Credential==o.Credential && Checkpoint==o.Checkpoint && LearnedWord==o.LearnedWord && WordPeer==o.WordPeer && WordCellMod==o.WordCellMod && WordCellBase==o.WordCellBase && AbsorbedDragon==o.AbsorbedDragon && DragonEntity==o.DragonEntity && PickupClaim==o.PickupClaim && QuestReceipt==o.QuestReceipt; }
  };
 diff --git a/Code/encoding/Messages/RequestCampaignPull.cpp b/Code/encoding/Messages/RequestCampaignPull.cpp
 --- a/Code/encoding/Messages/RequestCampaignPull.cpp
 +++ b/Code/encoding/Messages/RequestCampaignPull.cpp
-@@ -6,13 +6,23 @@
+@@ -6,13 +6,25 @@
      Serialization::WriteString(w,Profile);
      Serialization::WriteVarInt(w,Character);Serialization::WriteVarInt(w,SaveTag);
      Serialization::WriteVarInt(w,SaveRevision);Serialization::WriteString(w,Credential);
@@ -311,6 +311,7 @@ diff --git a/Code/encoding/Messages/RequestCampaignPull.cpp b/Code/encoding/Mess
 +    Serialization::WriteVarInt(w,WordCellMod);Serialization::WriteVarInt(w,WordCellBase);
 +    Serialization::WriteString(w,AbsorbedDragon);Serialization::WriteVarInt(w,DragonEntity);
 +    Serialization::WriteString(w,PickupClaim);
++    Serialization::WriteString(w,QuestReceipt);
 +}
 +void RequestCampaignPull::DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept
 +{
@@ -325,6 +326,7 @@ diff --git a/Code/encoding/Messages/RequestCampaignPull.cpp b/Code/encoding/Mess
 +    WordCellMod=Serialization::ReadVarInt(r)&0xffffffff;WordCellBase=Serialization::ReadVarInt(r)&0xffffffff;
 +    AbsorbedDragon=Serialization::ReadString(r);DragonEntity=Serialization::ReadVarInt(r)&0xffffffff;
 +    PickupClaim=Serialization::ReadString(r);
++    QuestReceipt=Serialization::ReadString(r);
  }
 diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJournal.cpp
 --- a/Code/server/Services/QuestJournal.cpp
@@ -338,7 +340,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 +#include <DragonAbsorption.h>
  #include <Services/CampaignAccess.h>
  #include <Messages/RequestCampaignPull.h>
-@@ -133,9 +136,116 @@
+@@ -133,11 +136,119 @@
          const auto& p=event.Packet;
 -        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64) return;
 -        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
@@ -347,7 +349,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 -        const CampaignIdentity::Stamp stamp{p.Campaign,p.Character,{p.SaveRevision,p.SaveTag}};
 -        if (CampaignAccess::Admit(m_world,*event.pPlayer,stamp,pull.Profile,{p.Credential.data(),p.Credential.size()}))
 -            reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
-+        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64 || p.Checkpoint.size()>1024 || p.LearnedWord.size()>224 || p.AbsorbedDragon.size()>224 || p.PickupClaim.size()>768) return;
++        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64 || p.Checkpoint.size()>1024 || p.LearnedWord.size()>224 || p.AbsorbedDragon.size()>224 || p.PickupClaim.size()>768 || p.QuestReceipt.size()>800) return;
 +        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
 +        CampaignReplication::Reply reply;
 +        bool pickupPermit=false;
@@ -355,6 +357,9 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 +        const CampaignIdentity::Stamp stamp{p.Campaign,p.Character,{p.SaveRevision,p.SaveTag}};
 +        if (CampaignAccess::Admit(m_world,*event.pPlayer,stamp,pull.Profile,{p.Credential.data(),p.Credential.size()}))
 +        {
++            if (!p.QuestReceipt.empty()&&CampaignIdentity::Known(campaignLink.Journal,campaignLink.Campaign,
++                {p.Campaign,p.Character,{p.Revision,p.Tag}}))
++                CampaignAccess::ReplayQuestReceipt(m_world,*event.pPlayer,{p.QuestReceipt.data(),p.QuestReceipt.size()});
 +            if (!p.Checkpoint.empty())
 +            {
 +                const auto record=CampaignCheckpoint::Decode({p.Checkpoint.data(),p.Checkpoint.size()});
@@ -403,8 +408,8 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 +                        break;
 +                    }
 +            }
-+            // Only evidence of a native award from the matching live network
-+            // dragon can become an absorption receipt; no soul is awarded here.
++            // A witnessed native award can be retried against the durable
++            // death cohort even after its transient network actor disappears.
 +            if (!p.AbsorbedDragon.empty()&&
 +                CampaignIdentity::Known(campaignLink.Journal,campaignLink.Campaign,
 +                    {p.Campaign,p.Character,{p.Revision,p.Tag}}))
@@ -415,57 +420,57 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 +                const auto* cell=m_world.try_get<CellIdComponent>(entity);
 +                DragonAbsorption::Receipt receipt{std::string(p.AbsorbedDragon.data(),p.AbsorbedDragon.size()),
 +                    CampaignAccess::Character(*event.pPlayer)};
-+                if (receipt.Valid()&&actor&&actor->IsDragon()&&actor->IsDead()&&
-+                    reference&&reference->Id&&cell&&
-+                    cell->IsInRange(event.pPlayer->GetCellComponent(),true)&&
++                const auto history=DragonAbsorption::ReadShared(campaignLink.Journal.Operations());
++                if (receipt.Valid()&&history&&!history->Retired.contains(receipt.Dragon)&&
 +                    m_world.GetPartyService().GetPlayerParty(event.pPlayer))
 +                {
-+                    const auto key=TradeProperties::DecodeForm(receipt.Dragon);
-+                    const auto& mods=m_world.ctx().at<ModsComponent>();
-+                    bool matches=false;
-+                    for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
-+                        for (const auto& [name,entry]:*list)
-+                        {
-+                            if (entry.id!=reference->Id.ModId||reference->Id.BaseId!=key->Local) continue;
-+                            std::string plugin(name.begin(),name.end());
-+                            for (auto& ch:plugin) if (ch>='A'&&ch<='Z') ch=static_cast<char>(ch-'A'+'a');
-+                            if (plugin==key->Plugin&&(list!=&mods.GetLiteMods()||key->Local<=0xFFF)) matches=true;
-+                        }
-+                    const auto receipts=DragonAbsorption::Read(campaignLink.Journal.Operations());
-+                    if (matches&&receipts)
++                    bool matches=history->Eligible(receipt);
++                    if (!matches&&actor&&actor->IsDragon()&&actor->IsDead()&&reference&&reference->Id&&cell&&
++                        cell->IsInRange(event.pPlayer->GetCellComponent(),true))
 +                    {
-+                        bool witnessed=receipts->contains(receipt.Encode());
-+                        if (!witnessed)
-+                        {
-+                            const auto head=campaignLink.Journal.Current();
-+                            witnessed=campaignLink.Journal.Append(head,{"dragon-absorbed-"+std::to_string(head.Revision+1),
-+                                "dragon-absorbed-v1",receipt.Encode()})==CampaignJournal::Result::Committed;
-+                        }
-+                        if (witnessed)
-+                        {
-+                            const auto history=DragonAbsorption::ReadShared(campaignLink.Journal.Operations());
-+                            const auto grant=history?history->Plan(receipt):std::nullopt;
-+                            if (grant)
++                        const auto key=TradeProperties::DecodeForm(receipt.Dragon);
++                        const auto& mods=m_world.ctx().at<ModsComponent>();
++                        for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
++                            for (const auto& [name,entry]:*list)
 +                            {
-+                                const auto head=campaignLink.Journal.Current();
-+                                if (campaignLink.Journal.Append(head,{"dragon-shared-"+std::to_string(head.Revision+1),
-+                                    "dragon-shared-v1",grant->Encode()})!=CampaignJournal::Result::Committed)
-+                                    spdlog::warn("STM shared dragon grant could not be committed");
++                                if (entry.id!=reference->Id.ModId||reference->Id.BaseId!=key->Local) continue;
++                                std::string plugin(name.begin(),name.end());
++                                for (auto& ch:plugin) if (ch>='A'&&ch<='Z') ch=static_cast<char>(ch-'A'+'a');
++                                if (plugin==key->Plugin&&(list!=&mods.GetLiteMods()||key->Local<=0xFFF)) matches=true;
 +                            }
-+                        }
++                    }
++                    const auto receipts=DragonAbsorption::Read(campaignLink.Journal.Operations());
++                    if (matches&&receipts&&!receipts->contains(receipt.Encode()))
++                    {
++                        const auto head=campaignLink.Journal.Current();
++                        if (campaignLink.Journal.Append(head,{"dragon-absorbed-"+std::to_string(head.Revision+1),
++                            "dragon-absorbed-v1",receipt.Encode()})!=CampaignJournal::Result::Committed)
++                            spdlog::warn("STM native dragon receipt could not be committed");
 +                    }
 +                }
 +            }
++            // A crash between the receipt and grant append must not strand
++            // the other eligible player. Reconcile the existing journal on pull.
++            if (const auto history=DragonAbsorption::ReadShared(campaignLink.Journal.Operations()))
++                for (const auto& grant:DragonAbsorption::MissingGrants(*history,campaignLink.Journal.Operations()))
++                {
++                    const auto head=campaignLink.Journal.Current();
++                    if (campaignLink.Journal.Append(head,{"dragon-shared-"+std::to_string(head.Revision+1),
++                        "dragon-shared-v1",grant.Encode()})!=CampaignJournal::Result::Committed)
++                    {spdlog::warn("STM shared dragon grant could not be committed");break;}
++                }
 +            reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
 +            if (!p.PickupClaim.empty()&&(reply.State==CampaignReplication::Status::Current||reply.State==CampaignReplication::Status::Record))
 +                pickupPermit=CampaignAccess::ReserveQuestPickup(m_world,*event.pPlayer,{p.PickupClaim.data(),p.PickupClaim.size()});
 +        }
          NotifyCampaignRecord out;
 +        out.PickupPermit=pickupPermit;
+         out.Campaign=reply.Campaign;out.Nonce=reply.Nonce;out.BaseRevision=reply.Base.Revision;out.BaseTag=reply.Base.Tag;
+         out.TargetRevision=reply.Target.Revision;out.TargetTag=reply.Target.Tag;out.Total=reply.Total;
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -9,5 +9,38 @@
+@@ -9,8 +9,42 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
@@ -473,6 +478,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +#include <Services/CampaignCheckpointClient.h>
 +#include <QuestWordReward.h>
 +#include <QuestPickupPermit.h>
++#include <Messages/RequestInventoryChanges.h>
 +#include <QuestRunMember.h>
 +#include <tuple>
 +#include <Events/ActivateEvent.h>
@@ -504,7 +510,10 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +void RefreshCampaignDragonAwards() noexcept;
 +void RememberCampaignDragonAward(uint32_t) noexcept;
 +int ApplyCampaignDragonAward(uint32_t) noexcept;
-@@ -26,6 +59,16 @@
+ #include <Services/PapyrusService.h>
+ #include <PlayerCharacter.h>
+ #include <Forms/TESGlobal.h>
+@@ -26,6 +60,16 @@
  namespace
  {
  CampaignReplication::Link campaignLink;
@@ -521,7 +530,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +264,810 @@
+@@ -221,6 +265,894 @@
      return 2;
  }
  
@@ -530,6 +539,13 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +std::optional<QuestWordReward::Sample> wordBaseline;
 +uint64_t wordAttemptCharacter{};
 +std::set<uint32_t> attemptedWords;
++struct PendingWord
++{
++    std::string Word;
++    uint64_t Character{};
++    uint32_t Peer{},Cell{},CellMod{},CellBase{};
++};
++std::optional<PendingWord> pendingWord;
 +
 +bool IsLearnedWord(const TESForm* form)
 +{
@@ -566,7 +582,20 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +void ObserveLearnedWord(World& world,uint64_t character,RequestCampaignPull& request)
 +{
 +    auto sample=CaptureWordSample(world,character);
-+    if (!sample) {wordBaseline.reset();return;}
++    if (!sample) {wordBaseline.reset();pendingWord.reset();return;}
++    if (pendingWord)
++    {
++        const auto grants=QuestWordReward::Read(campaignLink.Journal.Operations());
++        if (!grants||pendingWord->Character!=character||pendingWord->Peer!=sample->Peer||
++            pendingWord->Cell!=sample->Cell||QuestWordReward::Entitled(*grants,pendingWord->Word,character))
++            pendingWord.reset();
++        else
++        {
++            request.LearnedWord=pendingWord->Word.c_str();request.WordPeer=pendingWord->Peer;
++            request.WordCellMod=pendingWord->CellMod;request.WordCellBase=pendingWord->CellBase;
++            return; // do not advance the baseline before an acknowledged observation
++        }
++    }
 +    if (!wordBaseline) return; // seed only after the server confirms a full prefix
 +    const auto word=QuestWordReward::NewWord(*wordBaseline,*sample);
 +    wordBaseline=sample;
@@ -585,6 +614,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    GameId cell{};
 +    if (!key.Valid()||!world.GetModSystem().GetServerModId(sample->Cell,cell)) return;
 +    request.LearnedWord=key.Encode().c_str();
++    pendingWord=PendingWord{key.Encode(),character,sample->Peer,sample->Cell,cell.ModId,cell.BaseId};
 +    request.WordPeer=sample->Peer;request.WordCellMod=cell.ModId;request.WordCellBase=cell.BaseId;
 +}
 +
@@ -623,23 +653,25 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +struct PendingDragonAbsorption
 +{
 +    DragonAbsorption::Receipt Receipt;
++    uint64_t Campaign{};
 +    uint32_t Entity{};
 +    std::chrono::steady_clock::time_point Deadline{};
 +};
 +std::vector<PendingDragonAbsorption> pendingDragonAbsorptions;
 +
-+void SendDragonAbsorption(uint64_t character,RequestCampaignPull& request)
++void SendDragonAbsorption(const CampaignIdentity::Stamp& stamp,RequestCampaignPull& request)
 +{
 +    const auto receipts=DragonAbsorption::Read(campaignLink.Journal.Operations());
 +    if (!receipts) {pendingDragonAbsorptions.clear();return;}
 +    const auto now=std::chrono::steady_clock::now();
 +    std::erase_if(pendingDragonAbsorptions,[&](const auto& entry){
-+        return entry.Receipt.Character!=character||entry.Deadline<=now||
++        return entry.Campaign!=stamp.Campaign||entry.Receipt.Character!=stamp.Character||entry.Deadline<=now||
 +            receipts->contains(entry.Receipt.Encode());
 +    });
 +    if (pendingDragonAbsorptions.empty()) return;
 +    const auto& next=pendingDragonAbsorptions.front();
 +    request.AbsorbedDragon=next.Receipt.Dragon.c_str();request.DragonEntity=next.Entity;
++    std::rotate(pendingDragonAbsorptions.begin(),pendingDragonAbsorptions.begin()+1,pendingDragonAbsorptions.end());
 +}
 +
 +uint64_t dragonObservedEpoch{},dragonObservedCharacter{};
@@ -721,6 +753,31 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    if (!stable) return {};
 +    const TradeProperties::FormKey key{stable->Plugin,stable->Local};
 +    return key.Valid()?key.Encode():std::string{};
++}
++struct PendingQuestReceipt
++{
++    QuestPickupPermit::Receipt Receipt;
++    uint64_t Campaign{},Character{};
++    std::chrono::steady_clock::time_point Deadline{};
++};
++std::vector<PendingQuestReceipt> pendingQuestReceipts;
++void SendQuestReceipt(const CampaignIdentity::Stamp& stamp,RequestCampaignPull& request)
++{
++    const auto now=std::chrono::steady_clock::now();
++    std::erase_if(pendingQuestReceipts,[&](const auto& entry){
++        if (entry.Campaign!=stamp.Campaign||entry.Character!=stamp.Character) return true;
++        if (QuestPickupPermit::Acknowledged(campaignLink.Journal.Operations(),entry.Receipt,stamp.Character)) return true;
++        if (entry.Deadline<=now)
++        {
++            spdlog::warn("STM quest item receipt not confirmed before retry deadline");
++            return true;
++        }
++        return false;
++    });
++    if (pendingQuestReceipts.empty()) return;
++    request.QuestReceipt=pendingQuestReceipts.front().Receipt.Encode().c_str();
++    // Do not let one unresolved receipt prevent retry of other actual events.
++    std::rotate(pendingQuestReceipts.begin(),pendingQuestReceipts.begin()+1,pendingQuestReceipts.end());
 +}
 +std::optional<DeferredQuestPickup> DescribeQuestPickup(World& world,TESObjectREFR* ref)
 +{
@@ -1159,6 +1216,8 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    attemptedQuestPickups.clear();
 +    attemptedQuestConsumption.clear();
 +    deferredQuestPickup.reset();
++    pendingQuestReceipts.clear();
++    pendingWord.reset();
 +    wordBaseline.reset();
 +    attemptedWords.clear();
 +    wordAttemptCharacter=0;
@@ -1278,20 +1337,53 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        if (!receipts||receipts->contains(receipt.Encode())) return;
 +        if (std::any_of(pendingDragonAbsorptions.begin(),pendingDragonAbsorptions.end(),
 +                [&](const auto& entry){return entry.Receipt.Encode()==receipt.Encode();})) return;
++        uint32_t serverId{};
 +        const auto view=world.view<FormIdComponent>();
 +        for (const auto entity:view)
 +            if (view.get<FormIdComponent>(entity).Id==form)
 +            {
 +                const auto id=Utils::GetServerId(entity);
-+                if (!id||pendingDragonAbsorptions.size()>=16) return;
-+                pendingDragonAbsorptions.push_back({receipt,*id,
-+                    std::chrono::steady_clock::now()+std::chrono::seconds(30)});
-+                nextPull={};
-+                spdlog::info("STM native dragon absorption {:X}, character {}",form,receipt.Character);
-+                return;
++                if (id) serverId=*id;
++                break;
 +            }
++        if (pendingDragonAbsorptions.size()>=16) return;
++        // A disappeared network entity is not a new identity. The server
++        // may already have the exact stable death cohort in its journal.
++        pendingDragonAbsorptions.push_back({receipt,identity->Save.Campaign,serverId,
++            std::chrono::steady_clock::now()+std::chrono::minutes(2)});
++        nextPull={};
++        spdlog::info("STM native dragon absorption {:X}, character {}",form,receipt.Character);
 +    }
 +    catch (...) {spdlog::warn("STM native dragon absorption observation failed");}
++}
++
++void QueueQuestItemReceipt(World& world,const RequestInventoryChanges& message) noexcept
++{
++    try
++    {
++        if (!world.GetTransport().IsOnline()||!world.GetPartyService().IsInParty()||
++            world.IsLoadingSave()||!SaveWorldReady()||message.Drop||!message.Item.IsQuestItem||
++            !message.QuestId||!message.QuestRef||
++            (message.Item.Count!=1&&message.Item.Count!=-1)) return;
++        const auto identity=CampaignAccess::Current(world);
++        if (!identity) return;
++        auto& mods=world.GetModSystem();
++        QuestPickupPermit::Receipt receipt{
++            {StablePickupKey(mods.GetGameId(message.QuestId)),StablePickupKey(mods.GetGameId(message.QuestRef)),
++             StablePickupKey(mods.GetGameId(message.Item.BaseId)),message.QuestAlias},
++            message.Item.Count,message.QuestInitialEvidence&&message.Item.Count==1};
++        if (!receipt.Valid()||QuestPickupPermit::Acknowledged(campaignLink.Journal.Operations(),receipt,identity->Save.Character)) return;
++        const auto encoded=receipt.Encode();
++        for (const auto& entry:pendingQuestReceipts)
++            if (entry.Campaign==identity->Save.Campaign&&entry.Character==identity->Save.Character&&
++                entry.Receipt.Encode()==encoded) return;
++        if (pendingQuestReceipts.size()>=64)
++        {spdlog::warn("STM pending quest item receipt capacity reached");return;}
++        pendingQuestReceipts.push_back({std::move(receipt),identity->Save.Campaign,identity->Save.Character,
++            std::chrono::steady_clock::now()+std::chrono::minutes(2)});
++        nextPull={};
++    }
++    catch (...) {spdlog::warn("STM could not queue quest item receipt");}
 +}
 +
 +bool DeferSharedQuestPickup(TESObjectREFR* ref,uint8_t unk,char processing) noexcept
@@ -1323,24 +1415,26 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        attemptedQuestPickups.clear();
 +        attemptedQuestConsumption.clear();
 +        wordBaseline.reset();
-+        pendingDragonAbsorptions.clear();
++        pendingWord.reset(); // a transient peer ID is not durable identity
++        // Keep already observed native receipts across a brief transport
++        // break. ResetQuestReplayForLoad still clears them on a new ESS.
 +    }
 +    if (!m_world.GetTransport().IsOnline()||m_world.IsLoadingSave()||!SaveWorldReady())
 +    {
-+        wordBaseline.reset();attemptedWords.clear();wordAttemptCharacter=0;
++        wordBaseline.reset();pendingWord.reset();attemptedWords.clear();wordAttemptCharacter=0;
 +        deferredQuestPickup.reset();
-+        pendingDragonAbsorptions.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +1097,19 @@
+@@ -250,6 +1182,20 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
          request.Character=stamp->Character;request.SaveRevision=stamp->Applied.Revision;request.SaveTag=stamp->Applied.Tag;
          request.Credential=credential->Secret.c_str();
 +        request.Checkpoint=NextCheckpoint(*stamp).c_str();
++        SendQuestReceipt(*stamp,request);
 +        ObserveLearnedWord(m_world,stamp->Character,request);
-+        SendDragonAbsorption(stamp->Character,request);
++        SendDragonAbsorption(*stamp,request);
 +        if (deferredQuestPickup)
 +        {
 +            if (deferredQuestPickup->Deadline<=std::chrono::steady_clock::now()||deferredQuestPickup->Character!=stamp->Character)
@@ -1352,7 +1446,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +1135,24 @@
+@@ -275,8 +1221,24 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -1963,7 +2057,7 @@ diff --git a/Code/common/DragonAbsorption.h b/Code/common/DragonAbsorption.h
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/DragonAbsorption.h
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,154 @@
 +#pragma once
 +#include <CampaignJournal.h>
 +#include <TradeProperties.h>
@@ -2051,9 +2145,15 @@ new file mode 100644
 +    std::map<std::string,Kill> Kills;
 +    std::set<std::string> Retired;
 +    std::vector<Grant> Grants;
++    bool Eligible(const Receipt& receipt) const
++    {
++        if (!receipt.Valid()||Retired.contains(receipt.Dragon)) return false;
++        const auto kill=Kills.find(receipt.Dragon);
++        return kill!=Kills.end()&&kill->second.Other(receipt.Character)!=0;
++    }
 +    std::optional<Grant> Plan(const Receipt& receipt) const
 +    {
-+        if (!receipt.Valid()||Retired.contains(receipt.Dragon)||Grants.size()>=MaxGrants) return {};
++        if (!Eligible(receipt)||Grants.size()>=MaxGrants) return {};
 +        const auto kill=Kills.find(receipt.Dragon);
 +        if (kill==Kills.end()) return {};
 +        const auto other=kill->second.Other(receipt.Character);
@@ -2097,6 +2197,20 @@ new file mode 100644
 +    }
 +    return history;
 +}
++inline std::vector<Grant> MissingGrants(SharedHistory history,const std::vector<CampaignJournal::Operation>& operations)
++{
++    std::vector<Grant> result;
++    // Original native receipt order decides the one supplemental entitlement.
++    for (const auto& op:operations)
++        if (op.Kind=="dragon-absorbed-v1")
++            if (const auto receipt=Decode(op.Payload))
++                if (const auto grant=history.Plan(*receipt))
++                {
++                    result.push_back(*grant);
++                    history.Grants.push_back(*grant);
++                }
++    return result;
++}
 +}
 diff --git a/Code/server/Services/ActorValueService.cpp b/Code/server/Services/ActorValueService.cpp
 --- a/Code/server/Services/ActorValueService.cpp
@@ -2118,7 +2232,7 @@ diff --git a/Code/common/QuestPickupPermit.h b/Code/common/QuestPickupPermit.h
 new file mode 100644
 --- /dev/null
 +++ b/Code/common/QuestPickupPermit.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,112 @@
 +#pragma once
 +#include <CampaignJournal.h>
 +#include <TradeProperties.h>
@@ -2154,6 +2268,46 @@ new file mode 100644
 +    if (!(in>>claim.Quest>>claim.Alias>>claim.Reference>>claim.Item)||in>>extra||
 +        !claim.Valid()||claim.Encode()!=value) return {};
 +    return claim;
++}
++struct Receipt
++{
++    Claim Object;
++    int32_t Count{};
++    bool Initial{};
++    bool Valid() const
++    {return Object.Valid()&&(Count==1||Count==-1)&&(!Initial||Count==1);}
++    std::string Encode() const
++    {return Object.Encode()+" "+std::to_string(Count)+" "+std::to_string(Initial?1:0);}
++};
++inline std::optional<Receipt> DecodeReceipt(const std::string& value)
++{
++    if (value.size()>800) return {};
++    Receipt receipt;
++    auto& c=receipt.Object;
++    unsigned initial{};
++    std::string extra;
++    std::istringstream row(value);
++    if (!(row>>c.Quest>>c.Alias>>c.Reference>>c.Item>>receipt.Count>>initial)||row>>extra||initial>1) return {};
++    receipt.Initial=initial==1;
++    if (!receipt.Valid()||receipt.Encode()!=value) return {};
++    return receipt;
++}
++inline std::string Payload(const Claim& c,uint64_t character)
++{
++    return c.Quest+" 1 "+std::to_string(c.Alias)+" "+c.Reference+" "+c.Item+" 1 "+std::to_string(character);
++}
++inline bool Acknowledged(const std::vector<CampaignJournal::Operation>& ops,const Receipt& receipt,uint64_t character)
++{
++    if (!character||!receipt.Valid()) return false;
++    const auto own=Payload(receipt.Object,character);
++    const auto prefix=own.substr(0,own.rfind(' ')+1);
++    bool holder=false,spent=false;
++    for (const auto& op:ops)
++    {
++        if ((op.Kind=="quest-pickup-v1"||op.Kind=="quest-copy-v1")&&op.Payload==own) holder=true;
++        if ((op.Kind=="quest-consumed-v1"||op.Kind=="quest-consumed-v2")&&op.Payload.starts_with(prefix)) spent=true;
++    }
++    return holder&&(receipt.Count==1||spent);
 +}
 +// Even if the quest has since finished, an old physical reference cannot
 +// be acquired again by this shared first-run path.
