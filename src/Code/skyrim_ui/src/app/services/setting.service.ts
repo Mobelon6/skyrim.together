@@ -1,0 +1,179 @@
+import { Injectable } from '@angular/core';
+import { TranslocoService } from '@jsverse/transloco';
+import { BehaviorSubject } from 'rxjs';
+import { StoreService } from './store.service';
+
+export enum FontSize {
+  XS = 'xs',
+  S = 's',
+  M = 'm',
+  L = 'l',
+  XL = 'xl',
+}
+
+export enum ScreenCorner {
+  TOP_LEFT = 0,
+  TOP_RIGHT,
+  BOTTOM_RIGHT,
+  BOTTOM_LEFT,
+}
+
+export const autoHideTimerLengths = [1, 3, 5];
+
+export const fontSizeToPixels: Record<FontSize, number> = {
+  [FontSize.XS]: 10,
+  [FontSize.S]: 12,
+  [FontSize.M]: 16,
+  [FontSize.L]: 20,
+  [FontSize.XL]: 26,
+};
+
+class Setting<T> extends BehaviorSubject<T> {
+  constructor(
+    private readonly storeService: StoreService,
+    private storeKey: string,
+    defaultValue: T,
+  ) {
+    super(defaultValue);
+  }
+
+  public next(value: T) {
+    this.storeService.set(this.storeKey, value);
+    super.next(value);
+  }
+}
+
+class SliderSetting extends Setting<number> {
+  constructor(
+    storeService: StoreService,
+    storeKey: string,
+    defaultValue: number,
+  ) {
+    const initialValue = storeService.getFloat(storeKey, defaultValue);
+    super(storeService, storeKey, initialValue);
+  }
+}
+
+class ToggleSetting extends Setting<boolean> {
+  constructor(
+    storeService: StoreService,
+    storeKey: string,
+    defaultValue: boolean,
+  ) {
+    const initialValue = storeService.getBool(storeKey, defaultValue);
+    super(storeService, storeKey, initialValue);
+  }
+}
+
+class SelectSetting<T extends string | number> extends Setting<T> {
+  constructor(
+    storeService: StoreService,
+    storeKey: string,
+    private options: T[],
+    defaultValue: T,
+  ) {
+    const storedValue =
+      typeof defaultValue === 'number'
+        ? storeService.getFloat(storeKey, defaultValue)
+        : storeService.get(storeKey, defaultValue);
+    const initialValue = options.includes(storedValue)
+      ? storedValue
+      : defaultValue;
+    super(storeService, storeKey, initialValue);
+  }
+
+  public next(value: T) {
+    if (this.options.includes(value)) {
+      super.next(value);
+    }
+  }
+}
+
+@Injectable({
+  providedIn: 'root',
+})
+export class SettingService {
+  private readonly languageValues: string[] = Object.values(
+    this.translocoService.getAvailableLangs(),
+  ).map(lang => lang.id);
+  private readonly fontSizeValues = Object.values(FontSize);
+  private readonly screenCornerValues = Object.values(
+    ScreenCorner,
+  ) as ScreenCorner[];
+  private readonly autoHideTimeValues = autoHideTimerLengths;
+
+  private initialPartyOffsetY(): number {
+    const store = this.storeService;
+    const top = Number(store.get('party_anchor', ScreenCorner.TOP_LEFT)) < ScreenCorner.BOTTOM_RIGHT;
+    if (top && store.get('party_y_dialogue2', null) === null) {
+      if (store.getFloat('party_anchor_offset_y', 30) === 3) {
+        store.set('party_anchor_offset_y', 30);
+      }
+      store.set('party_y_dialogue2', 1);
+    }
+    return top ? 30 : 3;
+  }
+
+  public settings = {
+    volume: new SliderSetting(this.storeService, 'audio_volume', 0.5),
+    muted: new ToggleSetting(this.storeService, 'audio_muted', false),
+    language: new SelectSetting(
+      this.storeService,
+      'language',
+      this.languageValues,
+      this.translocoService.getDefaultLang(),
+    ),
+    fontSize: new SelectSetting(
+      this.storeService,
+      'font_size',
+      this.fontSizeValues,
+      FontSize.M,
+    ),
+    travelNpc: new ToggleSetting(this.storeService, 'share_npc_travel', true),
+    travelMap: new ToggleSetting(this.storeService, 'share_marker_travel', true),
+    isPartyShown: new ToggleSetting(this.storeService, 'party_isShown', true),
+    autoHideParty: new ToggleSetting(
+      this.storeService,
+      'party_autoHide',
+      false,
+    ),
+    autoHideTime: new SelectSetting(
+      this.storeService,
+      'party_autoHideTime',
+      this.autoHideTimeValues,
+      this.autoHideTimeValues[0],
+    ),
+    partyAnchor: new SelectSetting(
+      this.storeService,
+      'party_anchor',
+      this.screenCornerValues,
+      ScreenCorner.TOP_LEFT,
+    ),
+    partyAnchorOffsetX: new SliderSetting(
+      this.storeService,
+      'party_anchor_offset_x',
+      0,
+    ),
+    partyAnchorOffsetY: new SliderSetting(
+      this.storeService,
+      'party_anchor_offset_y',
+      this.initialPartyOffsetY(),
+    ),
+    isDebugShown: new ToggleSetting(this.storeService, 'debug_isShown', false),
+    debugAnchor: new SelectSetting(
+      this.storeService,
+      'debug_anchor',
+      this.screenCornerValues,
+      ScreenCorner.TOP_LEFT,
+    ),
+  };
+
+  constructor(
+    private readonly storeService: StoreService,
+    private readonly translocoService: TranslocoService,
+  ) {
+    this.settings.language.subscribe(lang =>
+      translocoService.setActiveLang(lang),
+    );
+  }
+}

@@ -1,0 +1,30 @@
+<div [@fadeInOutActive]="isShown | async" class="group-container-wrapper">
+  @if (group$ | async) {
+    <div class="group-container" [ngStyle]="positionStyle | async">
+      @for (player of groupMembers$ | async; track player) {
+        <div
+          [title]="player.cellName"
+          class="group-member"
+          [class.out-of-range]="!player.near"
+        >
+          <b class="group-member-level">{{ player.level }} </b>
+          @if (player.health === 0) {
+            <div class="group-member-dead"></div>
+          }
+          @if (player.isOwner) {
+            <div class="group-member-leader"></div>
+          }
+          <span class="member-name">{{ player.name }}</span>
+          @if (player.health !== undefined) {
+            <div class="group-member-health">
+              <div
+                class="group-member-health-value"
+                [app-health]="player.health"
+              ></div>
+            </div>
+          }
+        </div>
+      }
+    </div>
+  }
+</div>

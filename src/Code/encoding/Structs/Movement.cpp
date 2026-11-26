@@ -1,0 +1,56 @@
+#include <Structs/Movement.h>
+#include <TiltedCore/Serialization.hpp>
+
+using TiltedPhoques::Serialization;
+
+bool Movement::operator==(const Movement& acRhs) const noexcept
+{
+    return OwnershipEpoch == acRhs.OwnershipEpoch && CombatEpoch == acRhs.CombatEpoch && CombatMode == acRhs.CombatMode && CellId == acRhs.CellId && WorldSpaceId == acRhs.WorldSpaceId && Position == acRhs.Position && Rotation == acRhs.Rotation && Variables == acRhs.Variables && Direction == acRhs.Direction && HasLookAt == acRhs.HasLookAt && LookOffset == acRhs.LookOffset;
+}
+
+bool Movement::operator!=(const Movement& acRhs) const noexcept
+{
+    return !this->operator==(acRhs);
+}
+
+void Movement::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
+{
+    Serialization::WriteVarInt(aWriter, OwnershipEpoch);
+    CellId.Serialize(aWriter);
+    WorldSpaceId.Serialize(aWriter);
+    Position.Serialize(aWriter);
+    Rotation.Serialize(aWriter);
+    Variables.GenerateDiff(AnimationVariables{}, aWriter);
+    aWriter.WriteBits(*reinterpret_cast<const uint32_t*>(&Direction), 32);
+
+    aWriter.WriteBits(CombatMode, 2);
+    if (CombatMode) Serialization::WriteVarInt(aWriter, CombatEpoch);
+    Serialization::WriteBool(aWriter, HasLookAt);
+    if (HasLookAt)
+        LookOffset.Serialize(aWriter);
+}
+
+void Movement::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
+{
+    const auto epoch=Serialization::ReadVarInt(aReader);
+    OwnershipEpoch=epoch<=0xffffffffull?static_cast<uint32_t>(epoch):0;
+    CellId.Deserialize(aReader);
+    WorldSpaceId.Deserialize(aReader);
+    Position.Deserialize(aReader);
+    Rotation.Deserialize(aReader);
+    Variables = AnimationVariables{};
+    Variables.ApplyDiff(aReader);
+
+    uint64_t tmp = 0;
+    aReader.ReadBits(tmp, 32);
+    uint32_t tmp32 = tmp & 0xFFFFFFFF;
+    Direction = *reinterpret_cast<float*>(&tmp32);
+
+    aReader.ReadBits(tmp, 2);
+    CombatMode = static_cast<uint8_t>(tmp & 3);
+    CombatEpoch = CombatMode ? static_cast<uint32_t>(Serialization::ReadVarInt(aReader)) : 0;
+    HasLookAt = Serialization::ReadBool(aReader);
+    LookOffset = glm::vec3{};
+    if (HasLookAt)
+        LookOffset.Deserialize(aReader);
+}

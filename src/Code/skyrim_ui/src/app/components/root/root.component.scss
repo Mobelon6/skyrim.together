@@ -1,0 +1,298 @@
+@use 'sass:color';
+@use 'env';
+
+@use 'mixins/gapped-vertical';
+@use 'functions/mod';
+@use 'functions/rem';
+
+:host {
+  display: block;
+
+  &[data-app-root-game='false'] {
+    &.light-image {
+      // TODO replace with an independent image
+      background: url('https://static.giga.de/wp-content/uploads/2016/10/skyrim-special-edition-landschaft.jpg');
+    }
+
+    &.dark-image {
+      // TODO replace with an independent image
+      background: url('https://i.pinimg.com/originals/ea/b1/0f/eab10fac989a85c16dadcc1c5e27489e.jpg');
+    }
+
+    &.light {
+      $background: white;
+      $lines: color.adjust(env.$color-background, $alpha: -0.8);
+
+      background:
+        repeating-linear-gradient(
+          to right,
+          transparent,
+          transparent #{env.$size-gap},
+          $lines #{env.$size-gap},
+          $lines calc(#{env.$size-gap} + 1px)
+        ),
+        repeating-linear-gradient(
+            to bottom,
+            transparent,
+            transparent #{env.$size-gap},
+            $lines #{env.$size-gap},
+            $lines calc(#{env.$size-gap} + 1px)
+          )
+          $background;
+    }
+
+    &.dark {
+      $background: mod.mod(env.$color-background, 0.1);
+      $lines: mod.mod($background, 0.1);
+
+      background:
+        repeating-linear-gradient(
+          to right,
+          transparent,
+          transparent #{env.$size-gap},
+          $lines #{env.$size-gap},
+          $lines calc(#{env.$size-gap} + 1px)
+        ),
+        repeating-linear-gradient(
+            to bottom,
+            transparent,
+            transparent #{env.$size-gap},
+            $lines #{env.$size-gap},
+            $lines calc(#{env.$size-gap} + 1px)
+          )
+          $background;
+    }
+  }
+
+  > app-notifications {
+    width: 32vw;
+    left: env.$size-gap;
+    bottom: env.$size-gap;
+    position: absolute;
+  }
+}
+
+.background-element {
+  opacity: 30%;
+}
+
+::ng-deep {
+  .app-root-popups {
+    > app-popup > app-window {
+      max-width: 32vw;
+      min-width: 20vw;
+    }
+
+    > app-popup[data-popup='server'] > app-window {
+      max-width: 75vw;
+      min-width: 40vw;
+    }
+
+    > app-popup[data-popup='playerManager'] > app-window {
+      max-width: 30vw;
+      min-width: 25vw;
+    }
+  }
+}
+
+.app-root-controls {
+  @include gapped-vertical.gapped-vertical(env.$size-gap);
+
+  position: absolute;
+  left: env.$size-gap;
+  display: flex;
+  flex-direction: column;
+  width: 32vw;
+  bottom: env.$size-gap;
+}
+
+.app-root-menu,
+.app-root-chat {
+  flex: 0 0 auto;
+}
+
+.app-root-menu {
+  display: flex;
+  height: 4rem;
+  margin: 0 auto;
+
+  > button {
+    flex: 1 1 auto;
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+}
+
+.app-root-chat {
+  width: 100%;
+  height: 30vh;
+  display: flex;
+  flex-direction: column;
+
+  > app-chat {
+    margin: 0.1rem;
+    flex: 1 1 auto;
+  }
+}
+
+// Note: due to how `-webkit-background-clip` renders clipped text (that's needed for
+// the cooldown effect), we need to apply a few workarounds to make it look just right. I'm sorry!
+
+.cooldown-supporting-text-normal {
+  color: mod.mod(env.$color-background, 0.8);
+  transition: color 0.3s linear;
+}
+
+.cooldown-supporting-text-animating {
+  color: mod.mod(env.$color-background, 0.3);
+}
+
+.text-cooldown-effect {
+  --cooldown-duration: 10s;
+  background: linear-gradient(
+    to left,
+    mod.mod(env.$color-background, 0.3) 50%,
+    mod.mod(env.$color-background, 1) 50%
+  );
+  background-clip: text;
+  -webkit-background-clip: text;
+  transition: background-position var(--cooldown-duration) linear;
+  color: transparent;
+  background-size: 200%;
+  background-position: 0%;
+
+  &.cooldown-active {
+    background-position: 100%;
+  }
+}
+
+.conversation-marker, .conversation-reply {
+  position: fixed;
+  pointer-events: none;
+  z-index: 2;
+  color: white;
+  text-shadow: 0 1px 3px black, 0 0 5px black;
+}
+.conversation-marker {
+  width: 2.6rem;
+  height: 2.6rem;
+  transform: translate(-50%, -50%);
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  background: rgba(16, 17, 19, .75);
+  display: grid;
+  place-items: center;
+}
+.conversation-icon {
+  position: relative;
+  width: 1.37rem;
+  height: .91rem;
+  border-radius: .22rem;
+  background: currentColor;
+  &::after {
+    content: '';
+    position: absolute;
+    left: .16rem;
+    bottom: -.19rem;
+    border-top: .23rem solid currentColor;
+    border-right: .26rem solid transparent;
+  }
+}
+.conversation-bearing {
+  position: absolute;
+  inset: -.57rem;
+  &::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    border-bottom: .41rem solid currentColor;
+    border-left: .27rem solid transparent;
+    border-right: .27rem solid transparent;
+  }
+}
+.conversation-speaker {
+  position: absolute;
+  top: calc(100% + .25rem);
+  font-size: .86rem;
+  white-space: nowrap;
+}
+.conversation-reply {
+  top: 54%;
+  right: 16%;
+  max-width: 36%;
+  line-height: 1.3;
+  font-size: clamp(1.5rem, 2.65vh, 2.5rem);
+  overflow-wrap: anywhere;
+  isolation: isolate;
+
+  &::before {
+    content: '';
+    position: absolute;
+    z-index: -1;
+    inset: -.18em -.55em;
+    border-radius: .42em;
+    background: rgba(12, 12, 14, .70);
+    filter: blur(.22em);
+    pointer-events: none;
+  }
+  animation: conversation-reply-fade 5s both;
+}
+@keyframes conversation-reply-fade {
+  0%, 76% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+.carriage-shade {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, .28);
+  pointer-events: auto;
+}
+.carriage-offer {
+  max-width: 28em;
+  padding: .9em 1.6em 1.25em;
+  text-align: center;
+  background: rgba(16, 17, 19, .94);
+  border: 1px solid rgba(240, 234, 214, .5);
+  color: white;
+  button { margin: 0 .65em; min-width: 3.5em; }
+}
+
+.observer-subtitle {
+  position: absolute;
+  bottom: 5.5%;
+  left: 16%;
+  right: 16%;
+  text-align: center;
+  color: #fff;
+  font-size: clamp(16px, 2.05vh, 36px);
+  text-shadow: 0 1px 3px #000, 1px 0 3px #000, -1px 0 3px #000;
+  pointer-events: none;
+}
+
+.conversation-reply.speaker-left {
+  left: 16%;
+  right: auto;
+}
+.dialogue-exit {
+  position: fixed;
+  right: 4%;
+  bottom: 4%;
+  color: white;
+  font-size: clamp(1rem, 2vh, 1.6rem);
+  text-shadow: 0 1px 4px black;
+  pointer-events: none;
+}
+
+.trade-shade { z-index: 1001; }
+.trade-panel { width: min(86vw, 72rem); max-height: 84vh; }
+.trade-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 1.4em; text-align: left; }
+.trade-columns section { min-width: 0; }
+.trade-columns ul { padding: 0; height: 48vh; overflow-y: auto; }
+.trade-columns li { display: flex; align-items: center; gap: .4em; padding: .35em 0; border-bottom: 1px solid #666; }
+.trade-columns li span { flex: 1; }
+.trade-columns input { width: 3.3em; color: white; background: #222; }

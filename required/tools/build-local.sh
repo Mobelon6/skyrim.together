@@ -18,45 +18,13 @@ xmake --version | grep -Eq 'v3\.1\.0([ ,]|$)' || die "xmake 3.1.0 required."
 mkdir -p "$1"
 work="$(cd "$1" && pwd)"
 case "$work/" in "$root/"*) die "Workspace must be outside the STM checkout.";; esac
-# Derive the upstream pin and ordered patch list from the authoritative workflow.
-# Parse only expected literal commands, never execute YAML or arbitrary shell code.
-python - "$root/.github/workflows/build.yml" "$root" "$work" <<'PY'
-import pathlib, re, sys
-workflow, root, work = map(pathlib.Path, sys.argv[1:])
-source = workflow.read_text(encoding='utf-8')
-build = source.split('\n  build:\n', 1)[1].split('\n  packaged-ui:', 1)[0]
-pins = re.findall(r'^          repository: tiltedphoques/TiltedEvolution\s*\n          ref: ([0-9a-f]{40})$', build, re.M)
-if len(pins) != 1:
-    raise SystemExit('Cannot establish pinned upstream.')
-block = build.split('      - name: Apply co-op and overlay changes\n        run: |\n', 1)[1].split('\n      - name:', 1)[0]
-rows = []
-for line in block.splitlines():
-    if not line.strip():
-        continue
-    match = re.fullmatch(r'          git (?:-C (Libraries/TiltedConnect|Libraries/TiltedUI) )?apply (\.\./(?:\.\./\.\./)?)([a-z]+/patches/[A-Za-z0-9_]+\.patch)', line)
-    if not match:
-        raise SystemExit('Unexpected apply command: '+line)
-    sub, relative, patch = match.groups()
-    if relative != ('../../../' if sub else '../') or not (root/patch).is_file():
-        raise SystemExit('Invalid patch path: '+line)
-    rows.append((sub or '.', patch))
-check = re.findall(r'^      - run: git -C upstream apply \.\./([a-z]+/patches/[A-Za-z0-9_]+\.patch)$', source, re.M)
-if check != [p for sub,p in rows if sub == '.'] or len(rows) == 0:
-    raise SystemExit('Check/build patch order mismatch.')
-(work/'upstream-pin.txt').write_text(pins[0]+'\n', encoding='ascii', newline='\n')
-(work/'patch-order.tsv').write_text(''.join(sub+'\t'+p+'\n' for sub,p in rows), encoding='ascii', newline='\n')
-print(f'Validated {len(check)} main patches and {len(rows)-len(check)} dependency patches.')
-PY
-pin="$(cat "$work/upstream-pin.txt")"
+pin="$(sed -n '/repository: tiltedphoques\/TiltedEvolution/{n;s/.*ref: //p;}' "$root/.github/workflows/build.yml" | sort -u)"
+[[ "$pin" =~ ^[0-9a-f]{40}$ ]] || die "Cannot resolve unique upstream pin."
 git clone --no-checkout https://github.com/tiltedphoques/TiltedEvolution.git "$work/upstream"
 git -C "$work/upstream" checkout --detach "$pin"
 git -C "$work/upstream" submodule update --init --recursive
 [[ "$(git -C "$work/upstream" rev-parse HEAD)" == "$pin" ]] || die "Upstream revision mismatch."
-while IFS=$'\t' read -r sub path; do
-  printf 'Applying %s\n' "$path"
-  git -C "$work/upstream/$sub" apply --check "$root/$path"
-  git -C "$work/upstream/$sub" apply "$root/$path"
-done < "$work/patch-order.tsv"
+cp -R "$root/src/." "$work/upstream/"
 cd "$work/upstream"
 required_pnpm="$(python -c 'import json; print(json.load(open("Code/skyrim_ui/package.json"))["packageManager"].split("@",1)[1].split("+",1)[0])')"
 [[ "$(pnpm --version)" == "$required_pnpm" ]] || die "Install pnpm $required_pnpm (from pinned UI package.json)."

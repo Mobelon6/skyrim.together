@@ -1,0 +1,236 @@
+#include <Games/Skyrim/Interface/IMenu.h>
+#include <Games/Skyrim/Interface/UI.h>
+#include <Misc/BSFixedString.h>
+#include <TiltedOnlinePCH.h>
+#include "immersive_launcher/stubs/DllBlocklist.h"
+
+#include <World.h>
+#include <VersionDb.h>
+
+static bool g_RequestUnpauseAll{false};
+
+UI* UI::Get()
+{
+    POINTER_SKYRIMSE(UI*, s_instance, 400327);
+    return *s_instance.Get();
+}
+
+bool UI::GetMenuOpen(const BSFixedString& acName) const
+{
+    if (acName.data == nullptr)
+        return false;
+
+    TP_THIS_FUNCTION(TMenuSystem_IsOpen, bool, const UI, const BSFixedString&);
+    POINTER_SKYRIMSE(TMenuSystem_IsOpen, s_isMenuOpen, 82074);
+
+    return TiltedPhoques::ThisCall(s_isMenuOpen.Get(), this, acName);
+}
+
+bool UI::BlocksPartyHud() const
+{
+    if (!menuSystemVisible || numPausesGame || numItemMenus || modal)
+        return true;
+    // Some menu mods deliberately clear the pause bit.
+    static const BSFixedString menus[] = {"Journal Menu", "MapMenu", "Loading Menu", "Main Menu",
+        "Dialogue Menu", "BarterMenu", "Crafting Menu", "Lockpicking Menu", "Book Menu",
+        "GiftMenu", "RaceSex Menu", "Sleep/Wait Menu", "Training Menu"};
+    for (const auto& menu : menus)
+        if (GetMenuOpen(menu))
+            return true;
+    return IsUnpausedMenuOpen();
+}
+
+namespace
+{
+class ObserverMenu final : public IMenu
+{
+public:
+    ObserverMenu()
+    {
+        // A presentation-only native menu. HUD mods receive the ordinary open/close
+        // event and observe the menu input context. No topic or NPC is activated.
+        uiMenuFlags = kUsesMenuContext | kDontHideCursorWhenTopmost;
+        eInputContext = 1; // UserEvents::INPUT_CONTEXT_ID::kMenuMode
+    }
+    void PostCreate() override {}
+    void Unk_03() override {}
+    UI_MESSAGE_RESULTS ProcessMessage(UIMessage&) override { return UI_MESSAGE_RESULTS::kPassOn; }
+    void AdvanceMovie(float, uint32_t) override {}
+    void PostDisplay() override {}
+    void PreDisplay() override {}
+    void RefreshPlatform() override {}
+};
+IMenu* CreateObserverMenu() { return new ObserverMenu; }
+}
+
+void UI::SetObserverMenu(bool open)
+{
+    static const BSFixedString name("STR Dialogue Observer");
+    static bool registered = false;
+    if (!registered)
+    {
+        if (!open) return;
+        auto& db = VersionDb::Get();
+        unsigned long long offset{};
+        // SKSE64 v2.2.6, Steam 1.6.1170: MenuManager::Register_internal.
+        // Use this version's game module base, including under the renamed STR launcher.
+        if (db.GetLoadedVersionString() != "1.6.1170.0" || !db.FindOffsetById(82074, offset)) return;
+        auto base = reinterpret_cast<uintptr_t>(db.FindAddressById(82074)) - offset;
+        using Register = void (*)(UI*, const char*, IMenu* (*)());
+        auto registerMenu = reinterpret_cast<Register>(base + 0xFA5480);
+        registerMenu(this, name.AsAscii(), &CreateObserverMenu);
+        registered = true;
+    }
+    POINTER_SKYRIMSE(void*, queue, 400445);
+    using Message = void(void*, const BSFixedString&, UIMessage::UI_MESSAGE_TYPE, void*);
+    POINTER_SKYRIMSE(Message, enqueue, 13631);
+    if (*queue.Get())
+        enqueue.Get()(*queue.Get(), name, open ? UIMessage::kShow : UIMessage::kHide, nullptr);
+}
+
+void UI::CloseAllMenus()
+{
+    TP_THIS_FUNCTION(TUI_CloseAll, void, const UI);
+    POINTER_SKYRIMSE(TUI_CloseAll, s_CloseAll, 82088);
+
+    TiltedPhoques::ThisCall(s_CloseAll.Get(), this);
+}
+
+BSFixedString* UI::LookupMenuNameByInstance(IMenu* apMenu)
+{
+    for (auto& it : menuMap)
+    {
+        if (it.value.spMenu == apMenu)
+            return &it.key;
+    }
+    return nullptr;
+}
+
+IMenu* UI::FindMenuByName(const BSFixedString& acName)
+{
+    for (const auto& it : menuMap)
+    {
+        if (it.key == acName)
+            return it.value.spMenu;
+    }
+    return nullptr;
+}
+
+void UI::DebugLogAllMenus()
+{
+    for (auto& e : menuStack)
+    {
+        spdlog::info("Menu {}", e->uiMenuFlags);
+    }
+}
+
+static void UnfreezeMenu(IMenu* apEntry)
+{
+    if (apEntry->PausesGame())
+        apEntry->ClearFlag(IMenu::kPausesGame);
+
+    if (apEntry->FreezesBackground())
+        apEntry->ClearFlag(IMenu::kFreezeFrameBackground);
+
+    if (apEntry->FreezesFramePause())
+        apEntry->ClearFlag(IMenu::kFreezeFramePause);
+}
+
+static constexpr const char* kAllowList[] = {
+    "TweenMenu",     "MagicMenu",     "StatsMenu",     "InventoryMenu", "MessageBoxMenu",
+    "ContainerMenu", "FavoritesMenu", "Tutorial Menu", "Console"
+    //"MapMenu", // MapMenu is disabled till we find a proper fix for first person.
+    //"Journal Menu", // Journal menu, aka pause menu, is disabled until we find a fix for manual save crashing while unpaused.
+};
+
+bool UI::ShouldUnpauseMenus()
+{
+    return World::Get().GetTransport().IsConnected() && !stubs::g_IsSoulsREActive;
+}
+
+bool UI::IsUnpausedMenuOpen() const
+{
+    static const BSFixedString* s_menuNames = []()
+    {
+        auto* pNames = new BSFixedString[std::size(kAllowList)];
+        for (size_t i = 0; i < std::size(kAllowList); ++i)
+            pNames[i].Set(kAllowList[i]);
+        return pNames;
+    }();
+
+    for (size_t i = 0; i < std::size(kAllowList); ++i)
+    {
+        if (GetMenuOpen(s_menuNames[i]))
+            return true;
+    }
+
+    return false;
+}
+
+static void* (*UI_AddToActiveQueue)(UI*, IMenu*, void*);
+
+static void* UI_AddToActiveQueue_Hook(UI* apSelf, IMenu* apMenu, void* apFoundItem /*In reality a reference*/)
+{
+    // if the menu is empty we let the real function handle it.
+    if (!apMenu || !UI::ShouldUnpauseMenus())
+        return UI_AddToActiveQueue(apSelf, apMenu, apFoundItem);
+
+#if 0
+        if (auto* pName = apSelf->LookupMenuNameByInstance(apEntry))
+        {
+            spdlog::info("Menu requested {}", pName->AsAscii());
+        }
+#endif
+
+    // NOTE(Force): could also compare by RTTI later on...
+    for (const char* item : kAllowList)
+    {
+        if (auto* pMenu = apSelf->FindMenuByName(item))
+        {
+            if (pMenu == apMenu)
+                UnfreezeMenu(apMenu);
+        }
+    }
+
+    return UI_AddToActiveQueue(apSelf, apMenu, apFoundItem);
+}
+
+using TCallback = void(void*, const BSFixedString*, uint32_t, void*);
+static TCallback* UIMessageQueue__AddMessage_Real;
+
+// Useful for debugging UI related issues.
+void UIMessageQueue__AddMessage(void* a1, const BSFixedString* a2, UIMessage::UI_MESSAGE_TYPE a3, void* a4)
+{
+    spdlog::info("Adding Message {} with prio {} from {}", a2->AsAscii(), a3, fmt::ptr(_ReturnAddress()));
+    UIMessageQueue__AddMessage_Real(a1, a2, a3, a4);
+}
+
+static TiltedPhoques::Initializer s_s(
+    []()
+    {
+        // pray that this doesnt fail!
+        VersionDbPtr<uint8_t> ProcessHook(82082);
+        TiltedPhoques::SwapCall(ProcessHook.Get() + 0x682, UI_AddToActiveQueue, &UI_AddToActiveQueue_Hook);
+
+        // Ignore startup movie
+        // TODO: Move me later.
+        VersionDbPtr<uint8_t> MainInit(36548);
+        TiltedPhoques::Put<uint8_t>(MainInit.Get() + 0xFE, 0xEB);
+
+        // Credits to Skyrim Souls RE for this fix.
+        // Allows the favorites menu to be numbered during connect.
+        VersionDbPtr<uint8_t> FavoritesCanProcess(51538);
+        TiltedPhoques::Put<uint16_t>(FavoritesCanProcess.Get() + 0x15, 0x9090);
+
+        // Some experiments:
+        // POINTER_SKYRIMSE(TCallback, s_start, 13631);
+        // UIMessageQueue__AddMessage_Real = s_start.Get();
+        // TP_HOOK(&UIMessageQueue__AddMessage_Real, UIMessageQueue__AddMessage);
+
+        // This kills the loading spinner
+        // TiltedPhoques::Put<uint8_t>(0x1405D51C1, 0xEB);
+        // TiltedPhoques::Nop(0x1405D51A2, 5);
+
+        // use 8 threads by default!
+        // TiltedPhoques::Put<uint8_t>(0x141E45770, 8);
+    });

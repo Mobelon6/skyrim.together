@@ -1,0 +1,235 @@
+#include <Structs/Inventory.h>
+#include <limits>
+#include <TiltedCore/Serialization.hpp>
+
+using TiltedPhoques::Serialization;
+
+void Inventory::EffectItem::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
+{
+    Serialization::WriteFloat(aWriter, Magnitude);
+    Serialization::WriteVarInt(aWriter, Area);
+    Serialization::WriteVarInt(aWriter, Duration);
+    Serialization::WriteFloat(aWriter, RawCost);
+    EffectId.Serialize(aWriter);
+}
+
+void Inventory::EffectItem::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
+{
+    Magnitude = Serialization::ReadFloat(aReader);
+    Area = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+    Duration = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+    RawCost = Serialization::ReadFloat(aReader);
+    EffectId.Deserialize(aReader);
+}
+
+void Inventory::Entry::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
+{
+    BaseId.Serialize(aWriter);
+    Serialization::WriteVarInt(aWriter, Count);
+
+    Serialization::WriteFloat(aWriter, ExtraCharge);
+
+    ExtraEnchantId.Serialize(aWriter);
+    Serialization::WriteVarInt(aWriter, ExtraEnchantCharge);
+    Serialization::WriteVarInt(aWriter, EnchantData.Effects.size());
+    for (const EffectItem& effect : EnchantData.Effects)
+    {
+        effect.Serialize(aWriter);
+    }
+
+    Serialization::WriteFloat(aWriter, ExtraHealth);
+
+    ExtraPoisonId.Serialize(aWriter);
+    Serialization::WriteVarInt(aWriter, ExtraPoisonCount);
+
+    Serialization::WriteVarInt(aWriter, ExtraSoulLevel);
+
+    Serialization::WriteBool(aWriter, EnchantData.IsWeapon);
+    Serialization::WriteBool(aWriter, ExtraEnchantRemoveUnequip);
+    Serialization::WriteBool(aWriter, ExtraWorn);
+    Serialization::WriteBool(aWriter, ExtraWornLeft);
+    Serialization::WriteBool(aWriter, IsQuestItem);
+}
+
+void Inventory::Entry::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
+{
+    BaseId.Deserialize(aReader);
+    Count = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+
+    ExtraCharge = Serialization::ReadFloat(aReader);
+
+    ExtraEnchantId.Deserialize(aReader);
+    ExtraEnchantCharge = Serialization::ReadVarInt(aReader) & 0xFFFF;
+    uint64_t effectCount = Serialization::ReadVarInt(aReader);
+    for (uint64_t i = 0; i < effectCount; i++)
+    {
+        EffectItem effect;
+        effect.Deserialize(aReader);
+        EnchantData.Effects.push_back(effect);
+    }
+
+    ExtraHealth = Serialization::ReadFloat(aReader);
+
+    ExtraPoisonId.Deserialize(aReader);
+    ExtraPoisonCount = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+
+    ExtraSoulLevel = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+
+    EnchantData.IsWeapon = Serialization::ReadBool(aReader);
+    ExtraEnchantRemoveUnequip = Serialization::ReadBool(aReader);
+    ExtraWorn = Serialization::ReadBool(aReader);
+    ExtraWornLeft = Serialization::ReadBool(aReader);
+    IsQuestItem = Serialization::ReadBool(aReader);
+}
+
+bool Inventory::operator==(const Inventory& acRhs) const noexcept
+{
+    return Entries == acRhs.Entries;
+}
+
+bool Inventory::operator!=(const Inventory& acRhs) const noexcept
+{
+    return !this->operator==(acRhs);
+}
+
+bool Inventory::Entry::operator==(const Inventory::Entry& acRhs) const noexcept
+{
+    return BaseId == acRhs.BaseId && Count == acRhs.Count && IsExtraDataEquals(acRhs);
+}
+
+bool Inventory::Entry::operator!=(const Inventory::Entry& acRhs) const noexcept
+{
+    return !this->operator==(acRhs);
+}
+
+void Inventory::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
+{
+    Serialization::WriteVarInt(aWriter, Entries.size());
+    for (const Entry& entry : Entries)
+    {
+        entry.Serialize(aWriter);
+    }
+
+    CurrentMagicEquipment.Serialize(aWriter);
+}
+
+void Inventory::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
+{
+    uint32_t count = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        Entry entry;
+        entry.Deserialize(aReader);
+        Entries.push_back(entry);
+    }
+
+    CurrentMagicEquipment.Deserialize(aReader);
+}
+
+std::optional<Inventory::Entry> Inventory::GetEntryById(GameId& aItemId) const noexcept
+{
+    auto entry = std::find_if(Entries.begin(), Entries.end(), [aItemId](auto entry) { return entry.BaseId == aItemId; });
+    if (entry == Entries.end())
+        return std::nullopt;
+
+    return {*entry};
+}
+
+int32_t Inventory::GetEntryCountById(GameId& aItemId) const noexcept
+{
+    auto entry = GetEntryById(aItemId);
+    if (!entry)
+        return 0;
+
+    return entry->Count;
+}
+
+void Inventory::AddOrRemoveEntry(const Entry& acEntry) noexcept
+{
+    if (acEntry.Count == 0)
+        return;
+
+    if (acEntry.Count > 0)
+    {
+        auto existing = std::find_if(Entries.begin(), Entries.end(), [&](const Entry& e) { return e.CanBeMerged(acEntry); });
+        if (existing == Entries.end())
+            Entries.push_back(acEntry);
+        else
+        {
+            // Very large stacks can span several entries. Keep every unit without wrapping a signed count.
+            const int64_t sum = int64_t{existing->Count} + acEntry.Count;
+            constexpr int32_t limit = (std::numeric_limits<int32_t>::max)();
+            existing->Count = static_cast<int32_t>((std::min)(sum, int64_t{limit}));
+            if (sum > limit)
+            {
+                auto extra = acEntry;
+                extra.Count = static_cast<int32_t>(sum - limit);
+                Entries.push_back(std::move(extra));
+            }
+        }
+        return;
+    }
+
+    // Entries are a snapshot of possessions. A missed add or repeated remove cannot create a debt.
+    int64_t remaining = -int64_t{acEntry.Count};
+    for (auto it = Entries.begin(); it != Entries.end() && remaining > 0;)
+    {
+        if (!it->CanBeMerged(acEntry))
+        {
+            ++it;
+            continue;
+        }
+
+        const auto take = (std::min)(remaining, int64_t{(std::max)(int32_t{0}, it->Count)});
+        remaining -= take;
+        it->Count -= static_cast<int32_t>(take);
+        if (it->Count <= 0)
+            it = Entries.erase(it);
+        else
+            ++it;
+    }
+}
+
+void Inventory::UpdateEquipment(const Inventory& acNewInventory) noexcept
+{
+    while (true)
+    {
+        auto wornEntry = std::find_if(Entries.begin(), Entries.end(), [](auto& aEntry) { return aEntry.IsWorn(); });
+        if (wornEntry == Entries.end())
+            break;
+
+        wornEntry->ExtraWorn = wornEntry->ExtraWornLeft = false;
+    }
+
+    for (const auto& newEntry : acNewInventory.Entries)
+    {
+        if (!newEntry.IsWorn())
+            continue;
+
+        auto entry = std::find_if(Entries.begin(), Entries.end(), [&newEntry](auto& aEntry) { return aEntry.BaseId == newEntry.BaseId; });
+
+        // This shouldn't happen
+        if (entry == Entries.end())
+            continue;
+
+        entry->ExtraWorn = newEntry.ExtraWorn;
+        entry->ExtraWornLeft = newEntry.ExtraWornLeft;
+    }
+
+    CurrentMagicEquipment = acNewInventory.CurrentMagicEquipment;
+}
+
+void Inventory::RemoveByFilter(std::function<bool(const Entry&)> aFilter) noexcept
+{
+    Entries.erase(std::remove_if(Entries.begin(), Entries.end(), aFilter), Entries.end());
+}
+
+bool Inventory::ContainsQuestItems() const noexcept
+{
+    for (const auto& entry : Entries)
+    {
+        if (entry.IsQuestItem)
+            return true;
+    }
+    return false;
+}
