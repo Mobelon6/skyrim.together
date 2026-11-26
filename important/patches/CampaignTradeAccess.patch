@@ -251,7 +251,7 @@ diff --git a/Code/server/Services/CampaignAccess.h b/Code/server/Services/Campai
 new file mode 100644
 --- /dev/null
 +++ b/Code/server/Services/CampaignAccess.h
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,14 @@
 +#pragma once
 +#include <CampaignIdentity.h>
 +#include <CampaignReplication.h>
@@ -264,6 +264,7 @@ new file mode 100644
 +bool Admit(World&, Player&, const CampaignIdentity::Stamp&, std::string_view profile, std::string_view secret);
 +uint64_t Character(const Player&);
 +void RecordQuestItemChange(World&,Player&,const RequestInventoryChanges&) noexcept;
++bool ReserveQuestPickup(World&,Player&,std::string_view) noexcept;
 +}
 diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJournal.cpp
 --- a/Code/server/Services/QuestJournal.cpp
@@ -1678,16 +1679,17 @@ diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
 diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestService.cpp
 --- a/Code/server/Services/QuestService.cpp
 +++ b/Code/server/Services/QuestService.cpp
-@@ -4,4 +4,8 @@
+@@ -4,4 +4,9 @@
  #include <World.h>
  #include <Services/QuestService.h>
 +#include <Services/CampaignAccess.h>
 +#include <TradeProperties.h>
++#include <QuestPickupPermit.h>
 +#include <sstream>
 +#include <Messages/RequestInventoryChanges.h>
  
  #include <Messages/RequestQuestUpdate.h>
-@@ -15,5 +19,267 @@
+@@ -15,5 +20,301 @@
  Console::Setting bEnableMiscQuestSync{"Gameplay:bEnableMiscQuestSync", "(Experimental) Syncs miscellaneous quests when possible", false};
  
 +using QuestRun = PartyService::Party::QuestRun;
@@ -1910,6 +1912,40 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +
  }
  
++bool CampaignAccess::ReserveQuestPickup(World& world,Player& player,std::string_view value) noexcept
++{
++    try
++    {
++        auto& authority=Authority();
++        const auto character=Character(player);
++        if (!character||authority.State()!=CampaignReplication::Link::Mode::Ready||
++            !world.GetPartyService().GetPlayerParty(&player)) return false;
++        const auto claim=QuestPickupPermit::Decode(std::string(value));
++        if (!claim) return false;
++        // Validate every plugin key against the negotiated profile.
++        const auto& mods=world.ctx().at<ModsComponent>();
++        for (const auto* encoded:{&claim->Quest,&claim->Reference,&claim->Item})
++        {
++            const auto key=TradeProperties::DecodeForm(*encoded);
++            bool found=false;
++            for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
++                for (const auto& [name,entry]:*list)
++                {
++                    std::string plugin(name.begin(),name.end());
++                    for (auto& ch:plugin) if (ch>='A'&&ch<='Z') ch=static_cast<char>(ch-'A'+'a');
++                    if (plugin==key->Plugin&&(list!=&mods.GetLiteMods()||key->Local<=0xFFF)) found=true;
++                }
++            if (!found) return false;
++        }
++        QuestRun run;
++        if (!RestoreQuestRun(authority.Journal,claim->Quest,run)||!CanRecordQuestPickup(run,true,1)||
++            QuestPickupPermit::AlreadyTaken(authority.Journal.Operations(),*claim)) return false;
++        static QuestPickupPermit::Leases leases;
++        return leases.Acquire(*claim,character,QuestPickupPermit::Leases::Clock::now());
++    }
++    catch (...) {return false;}
++}
++
 +void CampaignAccess::RecordQuestItemChange(World& world,Player& player,const RequestInventoryChanges& message) noexcept
 +{
 +    try
@@ -1955,7 +1991,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +}
 +
  QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
-@@ -44,3 +310,45 @@
+@@ -44,3 +345,45 @@
      PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
      const PartyService::Party::Conversation* participants = nullptr;
 +    const std::string targets(message.Targets.data(),message.Targets.size());
@@ -2001,7 +2037,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        }
 +    }
      if (!pParty) return;
-@@ -61,6 +369,7 @@
+@@ -61,6 +404,7 @@
          // During an interaction, only the quest of the witnessed topic has provenance.
          if (inTalk || inFight) return;
 -        if (!bEnableMiscQuestSync && !(message.JournalObjective && message.Status == RequestQuestUpdate::StageUpdate &&
@@ -2011,7 +2047,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +            !(knownSharedQuest && message.Status == RequestQuestUpdate::Stopped && message.CompletedRunOnce)) return;
      }
  
-@@ -115,39 +424,47 @@
+@@ -115,39 +459,47 @@
 -    auto& run = pParty->QuestRuns[message.Id];
 -    // The sender's local quest log and the party's shared lifecycle are independent.
 -    // A late start from a second client must not clear stages the first client sent.

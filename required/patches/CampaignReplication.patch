@@ -687,7 +687,7 @@ diff --git a/Code/encoding/Messages/NotifyCampaignRecord.h b/Code/encoding/Messa
 new file mode 100644
 --- /dev/null
 +++ b/Code/encoding/Messages/NotifyCampaignRecord.h
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,16 @@
 +#pragma once
 +#include "Message.h"
 +struct NotifyCampaignRecord final : ServerMessage
@@ -699,9 +699,10 @@ new file mode 100644
 +    uint64_t Campaign{}, Nonce{}, BaseTag{}, TargetTag{};
 +    uint32_t BaseRevision{}, TargetRevision{}, Total{}, State{};
 +    String Row{};
++    bool PickupPermit{};
 +    bool operator==(const NotifyCampaignRecord& o) const noexcept
 +    { return Campaign==o.Campaign && Nonce==o.Nonce && BaseTag==o.BaseTag && TargetTag==o.TargetTag &&
-+        BaseRevision==o.BaseRevision && TargetRevision==o.TargetRevision && Total==o.Total && State==o.State && Row==o.Row; }
++        BaseRevision==o.BaseRevision && TargetRevision==o.TargetRevision && Total==o.Total && State==o.State && Row==o.Row && PickupPermit==o.PickupPermit; }
 +};
 diff --git a/Code/encoding/Messages/NotifyCampaignRecord.cpp b/Code/encoding/Messages/NotifyCampaignRecord.cpp
 new file mode 100644
@@ -715,7 +716,7 @@ new file mode 100644
 +    Serialization::WriteVarInt(w,BaseTag);Serialization::WriteVarInt(w,TargetTag);
 +    Serialization::WriteVarInt(w,BaseRevision);Serialization::WriteVarInt(w,TargetRevision);
 +    Serialization::WriteVarInt(w,Total);Serialization::WriteVarInt(w,State);
-+    Serialization::WriteString(w,Row);
++    Serialization::WriteString(w,Row);w.WriteBits(PickupPermit,1);
 +}
 +void NotifyCampaignRecord::DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept
 +{
@@ -724,7 +725,7 @@ new file mode 100644
 +    BaseTag=Serialization::ReadVarInt(r);TargetTag=Serialization::ReadVarInt(r);
 +    BaseRevision=Serialization::ReadVarInt(r)&0xffffffff;TargetRevision=Serialization::ReadVarInt(r)&0xffffffff;
 +    Total=Serialization::ReadVarInt(r)&0xffffffff;State=Serialization::ReadVarInt(r)&0xffffffff;
-+    Row=Serialization::ReadString(r);
++    Row=Serialization::ReadString(r);uint64_t permit{};r.ReadBits(permit,1);PickupPermit=permit!=0;
 +}
 diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
 --- a/Code/common/BuildInfo.h.in

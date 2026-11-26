@@ -284,16 +284,16 @@ diff --git a/Code/encoding/Messages/RequestCampaignPull.h b/Code/encoding/Messag
 -    String Credential{};
 -    bool operator==(const RequestCampaignPull& o) const noexcept
 -    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile && Character==o.Character && SaveTag==o.SaveTag && SaveRevision==o.SaveRevision && Credential==o.Credential; }
-+    String Credential{}, Checkpoint{}, LearnedWord{}, AbsorbedDragon{};
++    String Credential{}, Checkpoint{}, LearnedWord{}, AbsorbedDragon{}, PickupClaim{};
 +    uint32_t DragonEntity{};
 +    uint32_t WordPeer{}, WordCellMod{}, WordCellBase{};
 +    bool operator==(const RequestCampaignPull& o) const noexcept
-+    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile && Character==o.Character && SaveTag==o.SaveTag && SaveRevision==o.SaveRevision && Credential==o.Credential && Checkpoint==o.Checkpoint && LearnedWord==o.LearnedWord && WordPeer==o.WordPeer && WordCellMod==o.WordCellMod && WordCellBase==o.WordCellBase && AbsorbedDragon==o.AbsorbedDragon && DragonEntity==o.DragonEntity; }
++    { return Campaign==o.Campaign && Nonce==o.Nonce && Tag==o.Tag && Revision==o.Revision && Profile==o.Profile && Character==o.Character && SaveTag==o.SaveTag && SaveRevision==o.SaveRevision && Credential==o.Credential && Checkpoint==o.Checkpoint && LearnedWord==o.LearnedWord && WordPeer==o.WordPeer && WordCellMod==o.WordCellMod && WordCellBase==o.WordCellBase && AbsorbedDragon==o.AbsorbedDragon && DragonEntity==o.DragonEntity && PickupClaim==o.PickupClaim; }
  };
 diff --git a/Code/encoding/Messages/RequestCampaignPull.cpp b/Code/encoding/Messages/RequestCampaignPull.cpp
 --- a/Code/encoding/Messages/RequestCampaignPull.cpp
 +++ b/Code/encoding/Messages/RequestCampaignPull.cpp
-@@ -6,13 +6,21 @@
+@@ -6,13 +6,23 @@
      Serialization::WriteString(w,Profile);
      Serialization::WriteVarInt(w,Character);Serialization::WriteVarInt(w,SaveTag);
      Serialization::WriteVarInt(w,SaveRevision);Serialization::WriteString(w,Credential);
@@ -310,6 +310,7 @@ diff --git a/Code/encoding/Messages/RequestCampaignPull.cpp b/Code/encoding/Mess
 +    Serialization::WriteString(w,LearnedWord);Serialization::WriteVarInt(w,WordPeer);
 +    Serialization::WriteVarInt(w,WordCellMod);Serialization::WriteVarInt(w,WordCellBase);
 +    Serialization::WriteString(w,AbsorbedDragon);Serialization::WriteVarInt(w,DragonEntity);
++    Serialization::WriteString(w,PickupClaim);
 +}
 +void RequestCampaignPull::DeserializeRaw(TiltedPhoques::Buffer::Reader& r) noexcept
 +{
@@ -323,6 +324,7 @@ diff --git a/Code/encoding/Messages/RequestCampaignPull.cpp b/Code/encoding/Mess
 +    LearnedWord=Serialization::ReadString(r);WordPeer=Serialization::ReadVarInt(r)&0xffffffff;
 +    WordCellMod=Serialization::ReadVarInt(r)&0xffffffff;WordCellBase=Serialization::ReadVarInt(r)&0xffffffff;
 +    AbsorbedDragon=Serialization::ReadString(r);DragonEntity=Serialization::ReadVarInt(r)&0xffffffff;
++    PickupClaim=Serialization::ReadString(r);
  }
 diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJournal.cpp
 --- a/Code/server/Services/QuestJournal.cpp
@@ -336,7 +338,7 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 +#include <DragonAbsorption.h>
  #include <Services/CampaignAccess.h>
  #include <Messages/RequestCampaignPull.h>
-@@ -133,9 +136,112 @@
+@@ -133,9 +136,116 @@
          const auto& p=event.Packet;
 -        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64) return;
 -        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
@@ -345,9 +347,10 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 -        const CampaignIdentity::Stamp stamp{p.Campaign,p.Character,{p.SaveRevision,p.SaveTag}};
 -        if (CampaignAccess::Admit(m_world,*event.pPlayer,stamp,pull.Profile,{p.Credential.data(),p.Credential.size()}))
 -            reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
-+        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64 || p.Checkpoint.size()>1024 || p.LearnedWord.size()>224 || p.AbsorbedDragon.size()>224) return;
++        if (!p.Nonce || p.Profile.size()>128 || p.Credential.size()!=64 || p.Checkpoint.size()>1024 || p.LearnedWord.size()>224 || p.AbsorbedDragon.size()>224 || p.PickupClaim.size()>768) return;
 +        CampaignReplication::Pull pull{p.Campaign,p.Nonce,std::string(p.Profile.data(),p.Profile.size()),{p.Revision,p.Tag}};
 +        CampaignReplication::Reply reply;
++        bool pickupPermit=false;
 +        reply.Campaign=p.Campaign;reply.Nonce=p.Nonce;reply.Base=pull.Base;
 +        const CampaignIdentity::Stamp stamp{p.Campaign,p.Character,{p.SaveRevision,p.SaveTag}};
 +        if (CampaignAccess::Admit(m_world,*event.pPlayer,stamp,pull.Profile,{p.Credential.data(),p.Credential.size()}))
@@ -454,18 +457,23 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 +                }
 +            }
 +            reply=CampaignReplication::Serve(campaignLink.Journal,campaignLink.Campaign,campaignLink.Profile,pull);
++            if (!p.PickupClaim.empty()&&(reply.State==CampaignReplication::Status::Current||reply.State==CampaignReplication::Status::Record))
++                pickupPermit=CampaignAccess::ReserveQuestPickup(m_world,*event.pPlayer,{p.PickupClaim.data(),p.PickupClaim.size()});
 +        }
          NotifyCampaignRecord out;
++        out.PickupPermit=pickupPermit;
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -9,5 +9,34 @@
+@@ -9,5 +9,36 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
  #include <Services/CampaignAccess.h>
 +#include <Services/CampaignCheckpointClient.h>
 +#include <QuestWordReward.h>
++#include <QuestPickupPermit.h>
++#include <Events/ActivateEvent.h>
 +#include <DragonAbsorption.h>
 +#include <Utils.h>
 +#include <atomic>
@@ -494,7 +502,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +void RefreshCampaignDragonAwards() noexcept;
 +void RememberCampaignDragonAward(uint32_t) noexcept;
 +int ApplyCampaignDragonAward(uint32_t) noexcept;
-@@ -26,6 +55,16 @@
+@@ -26,6 +57,16 @@
  namespace
  {
  CampaignReplication::Link campaignLink;
@@ -511,7 +519,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +260,649 @@
+@@ -221,6 +262,747 @@
      return 2;
  }
  
@@ -682,6 +690,84 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        else if (result==2)
 +            spdlog::info("STM shared dragon soul granted for {:X}",form);
 +    }
++}
++
++struct DeferredQuestPickup
++{
++    QuestPickupPermit::Claim Claim;
++    uint32_t Form{},QuestForm{},Instance{},Cell{};
++    uint64_t Character{},Nonce{};
++    uint8_t Unk{};
++    char DefaultProcessing{};
++    std::chrono::steady_clock::time_point Deadline{};
++};
++std::optional<DeferredQuestPickup> deferredQuestPickup;
++
++std::string StablePickupKey(uint32_t id)
++{
++    std::vector<InventoryEvidence::PluginSlot> slots;
++    auto* mods=ModManager::Get();
++    if (!mods) return {};
++    for (const auto* mod:mods->mods)
++    {
++        if (!mod||!mod->IsLoaded()) continue;
++        const auto* end=std::find(mod->filename,mod->filename+sizeof(mod->filename),'\0');
++        if (end!=mod->filename+sizeof(mod->filename))
++            slots.push_back({mod->GetId(),mod->IsLite(),std::string(mod->filename,end)});
++    }
++    const auto stable=InventoryEvidence::Resolve(id,slots);
++    if (!stable) return {};
++    const TradeProperties::FormKey key{stable->Plugin,stable->Local};
++    return key.Valid()?key.Encode():std::string{};
++}
++std::optional<DeferredQuestPickup> DescribeQuestPickup(World& world,TESObjectREFR* ref)
++{
++    if (!ref||!ref->baseForm||ref->IsTemporary()||ref->IsDisabled()||ref->IsDeleted()||!ref->GetNiNode()) return {};
++    const auto type=ref->baseForm->formType;
++    if (type==FormType::Door||type==FormType::Container||type==FormType::Book||type==FormType::Npc) return {};
++    auto* player=PlayerCharacter::Get();
++    auto* cell=player?player->GetParentCellEx():nullptr;
++    if (!cell||ref->GetParentCellEx()!=cell||!cell->IsAttached()) return {};
++    InventoryChangeEvent evidence(player->formID,Inventory::Entry{});
++    CaptureQuestItem(ref->GetExtraDataList(),ref,ref->baseForm,evidence);
++    if (!evidence.QuestId||!evidence.QuestRef) return {};
++    const auto questId=world.GetModSystem().GetGameId(evidence.QuestId);
++    auto* quest=Cast<TESQuest>(TESForm::GetById(questId));
++    if (!quest||quest->IsStopped()||!(quest->flags&TESQuest::RunOnce)||
++        (quest->flags&(TESQuest::Failed|TESQuest::Completed|TESQuest::AllowRepeatStages))||
++        QuestService::IsNonSyncableQuest(quest)||world.GetOverlayService().IsPersonalQuest(questId)) return {};
++    bool objective=false;
++    for (const auto& entry:player->objectives)
++        if (entry.instance&&entry.instance->quest==quest) {objective=true;break;}
++    if (!objective) return {};
++    const auto identity=CampaignAccess::Current(world);
++    if (!identity) return {};
++    DeferredQuestPickup result;
++    result.Claim={StablePickupKey(questId),StablePickupKey(ref->formID),StablePickupKey(ref->baseForm->formID),evidence.QuestAlias};
++    if (!result.Claim.Valid()) return {};
++    result.Form=ref->formID;result.QuestForm=questId;result.Instance=quest->currentInstanceID;
++    result.Cell=cell->formID;result.Character=identity->Save.Character;
++    return result;
++}
++void ResolveQuestPickup(World& world,uint64_t nonce,bool permitted,uint64_t character)
++{
++    if (!deferredQuestPickup||deferredQuestPickup->Nonce!=nonce) return;
++    auto pickup=std::move(*deferredQuestPickup);deferredQuestPickup.reset();
++    if (!permitted)
++    {
++        spdlog::info("STM quest pickup refused: already acquired or reserved");
++        return;
++    }
++    if (pickup.Character!=character||pickup.Deadline<=std::chrono::steady_clock::now()||
++        !world.GetPartyService().IsInParty()||world.IsLoadingSave()||!SaveWorldReady()) return;
++    auto* ref=Cast<TESObjectREFR>(TESForm::GetById(pickup.Form));
++    auto current=DescribeQuestPickup(world,ref);
++    if (!current||current->Claim.Encode()!=pickup.Claim.Encode()||current->Character!=character||
++        current->Cell!=pickup.Cell||current->Instance!=pickup.Instance) return;
++    // Existing activation event already supports delayed native activation.
++    // Only one local attempt is executed for this reply, never an item grant.
++    world.GetRunner().Trigger(ActivateEvent(ref,PlayerCharacter::Get(),nullptr,1,
++        pickup.DefaultProcessing,pickup.Unk,TESObjectREFR::kNone,true));
 +}
 +
 +std::string NextCheckpoint(const CampaignIdentity::Stamp& stamp)
@@ -1144,12 +1230,31 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    catch (...) {spdlog::warn("STM native dragon absorption observation failed");}
 +}
 +
++bool DeferSharedQuestPickup(TESObjectREFR* ref,uint8_t unk,char processing) noexcept
++{
++    try
++    {
++        auto& world=World::Get();
++        if (!world.GetTransport().IsOnline()||!world.GetPartyService().IsInParty()||
++            world.IsLoadingSave()||!SaveWorldReady()) return false;
++        auto pickup=DescribeQuestPickup(world,ref);
++        if (!pickup) return false; // personal/non-identified native path
++        const auto now=std::chrono::steady_clock::now();
++        if (deferredQuestPickup&&deferredQuestPickup->Deadline>now) return true;
++        pickup->Unk=unk;pickup->DefaultProcessing=processing;pickup->Deadline=now+std::chrono::seconds(4);
++        deferredQuestPickup=std::move(*pickup);nextPull={};
++        return true;
++    }
++    catch (...) {return false;}
++}
++
  void QuestService::PollCampaign(const UpdateEvent&) noexcept
  {
 +    if (!m_world.IsLoadingSave()&&SaveWorldReady()) RefreshCampaignDragonAwards();
 +    if (!m_world.GetTransport().IsOnline()||!m_world.GetPartyService().IsInParty())
 +    {
 +        offeredQuestStages.clear();
++        deferredQuestPickup.reset();
 +        attemptedQuestPickups.clear();
 +        attemptedQuestConsumption.clear();
 +        wordBaseline.reset();
@@ -1158,10 +1263,11 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    if (!m_world.GetTransport().IsOnline()||m_world.IsLoadingSave()||!SaveWorldReady())
 +    {
 +        wordBaseline.reset();attemptedWords.clear();wordAttemptCharacter=0;
++        deferredQuestPickup.reset();
 +        pendingDragonAbsorptions.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +932,9 @@
+@@ -250,6 +1032,19 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -1170,13 +1276,25 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        request.Checkpoint=NextCheckpoint(*stamp).c_str();
 +        ObserveLearnedWord(m_world,stamp->Character,request);
 +        SendDragonAbsorption(stamp->Character,request);
++        if (deferredQuestPickup)
++        {
++            if (deferredQuestPickup->Deadline<=std::chrono::steady_clock::now()||deferredQuestPickup->Character!=stamp->Character)
++                deferredQuestPickup.reset();
++            else
++            {
++                request.PickupClaim=deferredQuestPickup->Claim.Encode().c_str();
++                deferredQuestPickup->Nonce=request.Nonce;
++            }
++        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +960,22 @@
+@@ -275,8 +1070,24 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
              spdlog::error("Campaign replica refused server history; restart after resolving configuration/history");
          }
++        if (result==CampaignJournal::Result::Committed||result==CampaignJournal::Result::Duplicate)
++            ResolveQuestPickup(m_world,packet.Nonce,packet.PickupPermit,stamp->Character);
 +        if ((result==CampaignJournal::Result::Committed||result==CampaignJournal::Result::Duplicate)&&
 +            campaignLink.Journal.Current().Revision==reply.Total)
 +        {
@@ -1931,3 +2049,80 @@ diff --git a/Code/server/Services/ActorValueService.cpp b/Code/server/Services/A
 +    if (lifeChanged&&characterComponent.IsDragon())
 +        RecordCampaignDragonLife(m_world,*acMessage.pPlayer,*it,message.IsDead);
      spdlog::debug("Updating death state {:x}:{}", message.Id, message.IsDead);
+diff --git a/Code/common/QuestPickupPermit.h b/Code/common/QuestPickupPermit.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/QuestPickupPermit.h
+@@ -0,0 +1,72 @@
++#pragma once
++#include <CampaignJournal.h>
++#include <TradeProperties.h>
++#include <chrono>
++#include <map>
++#include <optional>
++#include <sstream>
++#include <string>
++
++namespace QuestPickupPermit
++{
++struct Claim
++{
++    std::string Quest, Reference, Item;
++    uint32_t Alias{};
++    bool Valid() const
++    {
++        for (const auto* value:{&Quest,&Reference,&Item})
++        {
++            const auto key=TradeProperties::DecodeForm(*value);
++            if (!key||!key->Valid()||key->Encode()!=*value) return false;
++        }
++        return true;
++    }
++    std::string Encode() const {return Quest+" "+std::to_string(Alias)+" "+Reference+" "+Item;}
++};
++inline std::optional<Claim> Decode(const std::string& value)
++{
++    if (value.size()>768) return {};
++    Claim claim;
++    std::string extra;
++    std::istringstream in(value);
++    if (!(in>>claim.Quest>>claim.Alias>>claim.Reference>>claim.Item)||in>>extra||
++        !claim.Valid()||claim.Encode()!=value) return {};
++    return claim;
++}
++// Even if the quest has since finished, an old physical reference cannot
++// be acquired again by this shared first-run path.
++inline bool AlreadyTaken(const std::vector<CampaignJournal::Operation>& ops,const Claim& claim)
++{
++    for (const auto& op:ops)
++        if (op.Kind=="quest-pickup-v1")
++        {
++            std::string q,ref,item,extra;uint32_t generation{},alias{};int count{};uint64_t owner{};
++            std::istringstream in(op.Payload);
++            if (!(in>>q>>generation>>alias>>ref>>item>>count>>owner)||in>>extra||
++                !generation||count<=0||!owner) return true;
++            if (ref==claim.Reference||(q==claim.Quest&&generation==1&&alias==claim.Alias)) return true;
++        }
++    return false;
++}
++struct Leases
++{
++    using Clock=std::chrono::steady_clock;
++    struct Lease {std::string ClaimKey;uint64_t Character{};Clock::time_point Until;};
++    std::map<std::string,Lease> Active;
++    bool Acquire(const Claim& claim,uint64_t character,Clock::time_point now)
++    {
++        if (!character||!claim.Valid()) return false;
++        for (auto it=Active.begin();it!=Active.end();)
++            if (it->second.Until<=now) it=Active.erase(it);else ++it;
++        const auto key=claim.Encode();
++        const auto alias=claim.Quest+" "+std::to_string(claim.Alias)+" ";
++        for (const auto& [ref,lease]:Active)
++            if (ref==claim.Reference||lease.ClaimKey.starts_with(alias))
++                return lease.Character==character&&lease.ClaimKey==key;
++        if (Active.size()>=64) return false;
++        Active.emplace(claim.Reference,Lease{key,character,now+std::chrono::seconds(30)});
++        return true;
++    }
++};
++}

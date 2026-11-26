@@ -557,3 +557,25 @@ int main(){
     assert(ReceiptBase==0x813&&MaxGrants==768);
 }
 ''', ['-I'+str(code/'common')])
+
+run('exclusive native quest pickup permits',headers+'''
+#include <QuestPickupPermit.h>
+int main(){
+    using namespace QuestPickupPermit;
+    Claim c{"736b7972696d2e65736d.123","736b7972696d2e65736d.456","736b7972696d2e65736d.789",3};
+    assert(c.Valid()&&Decode(c.Encode()));
+    assert(!Decode(c.Encode()+" ")&&!Decode("bad 3 ref base"));
+    Leases leases;auto now=Leases::Clock::now();
+    assert(leases.Acquire(c,101,now));
+    assert(leases.Acquire(c,101,now));
+    assert(!leases.Acquire(c,202,now));
+    auto d=c;d.Reference="736b7972696d2e65736d.457";
+    assert(!leases.Acquire(d,202,now));
+    d=c;d.Alias=4;assert(!leases.Acquire(d,202,now));
+    assert(leases.Acquire(c,202,now+std::chrono::seconds(31)));
+    std::vector<CampaignJournal::Operation> ops={{"1","quest-pickup-v1",
+        c.Quest+" 1 3 "+c.Reference+" "+c.Item+" 1 101"}};
+    assert(AlreadyTaken(ops,c));assert(AlreadyTaken(ops,d));
+    d.Reference="736b7972696d2e65736d.457";assert(!AlreadyTaken(ops,d));
+}
+''', ['-I'+str(code/'common')])
