@@ -1479,7 +1479,31 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +            return;
      }
  }
-@@ -645,15 +673,30 @@
+@@ -602,12 +630,18 @@ void QuestService::OnQuestUpdate(const NotifyQuestUpdate& aUpdate) noexcept
+-    // A member stage the leader's playing scene checks can push it past its own scripts (a phase ending before its lines
+-    // and scripts ran), so hold it, and the stages after it, until the scene gets there or reaches it itself.
+-    const bool cIsLeaderStage = aUpdate.Status == NotifyQuestUpdate::StageUpdate && m_world.GetPartyService().IsLeader();
+-    HeldStages* pHeld = cIsLeaderStage || aUpdate.Status == NotifyQuestUpdate::Stopped ? GetHeldStages(formId, pQuest) : nullptr;
+-    if (cIsLeaderStage && (pHeld || IsCheckedByPlayingScene(pQuest, aUpdate.Stage)))
++    // A replay must not restart a completed one-shot quest, even when an old
++    // stage packet arrives rather than an explicit start.
++    if (pQuest->IsStopped() && (pQuest->flags & TESQuest::RunOnce) && (pQuest->flags & TESQuest::Completed) &&
++        aUpdate.Status != NotifyQuestUpdate::Stopped)
++        return;
++
++    // Both clients run native fragments and scenes. In either direction a
++    // stage must wait behind its predecessor's pending fragments or a scene.
++    const bool stageUpdate = aUpdate.Status == NotifyQuestUpdate::StageUpdate;
++    HeldStages* pHeld = stageUpdate || aUpdate.Status == NotifyQuestUpdate::Stopped ? GetHeldStages(formId, pQuest) : nullptr;
++    if (stageUpdate && (pHeld || IsCheckedByPlayingScene(pQuest, aUpdate.Stage)))
+     {
+         HoldStage(pQuest, aUpdate.Stage);
+         return;
+     }
+ 
+     // Let the scene and its running fragments finish before stopping. A restart received
+     // meanwhile belongs behind this stop, even if it uses the same form and stage numbers.
+@@ -645,15 +679,48 @@
      case NotifyQuestUpdate::Started:
      {
 -        pQuest->ScriptSetStage(aUpdate.Stage);
@@ -1499,9 +1523,16 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +            pQuest->EnsureQuestStarted(started, false);
 +            if (pQuest->IsStopped()) break;
 +        }
-+        bResult = (pQuest->IsStageReached(aUpdate.Stage) || pQuest->ScriptSetStage(aUpdate.Stage)) && !pQuest->IsStopped();
++        const bool alreadyReached = pQuest->IsStageReached(aUpdate.Stage);
++        bResult = (alreadyReached || pQuest->ScriptSetStage(aUpdate.Stage)) && !pQuest->IsStopped();
 +        if (bResult)
 +        {
++            if (!alreadyReached)
++            {
++                const auto pending = pQuest->GetStageItemCount(aUpdate.Stage);
++                if (pending)
++                    m_heldStages[formId].PendingItems.insert(m_heldStages[formId].PendingItems.end(), pending, aUpdate.Stage);
++            }
 +            pQuest->SetActive(true);
 +            spdlog::info("Remote quest started: {:X}, stage: {}", formId, aUpdate.Stage);
 +        }
@@ -1511,13 +1542,24 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 -        pQuest->ScriptSetStage(aUpdate.Stage);
 -        bResult = true;
 -        spdlog::info("Remote quest updated: {:X}, stage: {}", formId, aUpdate.Stage);
-+        bResult = pQuest->IsStageReached(aUpdate.Stage) || pQuest->ScriptSetStage(aUpdate.Stage);
++    {
++        const bool alreadyReached = pQuest->IsStageReached(aUpdate.Stage);
++        bResult = alreadyReached || pQuest->ScriptSetStage(aUpdate.Stage);
 +        if (bResult)
++        {
++            if (!alreadyReached && !pQuest->IsStopped())
++            {
++                const auto pending = pQuest->GetStageItemCount(aUpdate.Stage);
++                if (pending)
++                    m_heldStages[formId].PendingItems.insert(m_heldStages[formId].PendingItems.end(), pending, aUpdate.Stage);
++            }
 +            spdlog::info("Remote quest updated: {:X}, stage: {}", formId, aUpdate.Stage);
++        }
          break;
++    }
      case NotifyQuestUpdate::Stopped:
          bResult = StopQuest(formId);
-@@ -663,5 +706,12 @@
+@@ -663,5 +730,12 @@
      }
  
      if (!bResult)

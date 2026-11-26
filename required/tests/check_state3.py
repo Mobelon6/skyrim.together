@@ -99,7 +99,7 @@ void SetStopped(){actions.push_back(-1);stopped=true;reached.clear();}
 } quest;
 TESForm* TESForm::GetById(uint32_t id){return id==2?&quest:nullptr;}
 struct ModSystem{uint32_t GetGameId(uint32_t id){return id;}};
-struct Party{bool IsLeader(){return true;}};
+struct Party{bool leader=true;bool IsLeader(){return leader;}};
 struct World{static World& Get(){static World w;return w;}ModSystem mods;Party party;ModSystem& GetModSystem(){return mods;}Party& GetPartyService(){return party;}};
 namespace spdlog{
 template<class...T>void debug(T&&...){}
@@ -161,6 +161,25 @@ int main(){
     send(0,1);assert(quest.nativeStarts==1);
     quest.stopped=true;quest.flags=TESQuest::RunOnce|TESQuest::Completed;send(0,1);
     assert(quest.IsStopped()&&quest.nativeStarts==1&&service.m_afterHeldStages.empty());
+    send(91,0);assert(quest.IsStopped()&&!quest.IsStageReached(91));
+    // A guest must obey the same scene and fragment barriers as the host.
+    quest.flags=0;quest.stopped=false;quest.reached.clear();quest.actions.clear();
+    service.m_world.party.leader=false;
+    scene.isPlaying=true;scene.ready=false;send(100,0);send(20,0);
+    service.OnUpdate({});assert(quest.actions.empty());
+    scene.ready=true;service.OnUpdate({});assert((quest.actions==Vector<int>{100}));
+    service.OnUpdate({});assert((quest.actions==Vector<int>{100}));
+    service.m_heldStages.at(2).PendingItems.clear();
+    service.OnUpdate({});assert((quest.actions==Vector<int>{100,20}));
+    service.OnPartyLeft({});
+    // No playing scene: an applied stage can still start an async fragment.
+    scene.isPlaying=false;quest.reached.clear();quest.actions.clear();
+    send(100,0);send(20,0);send(20,2);
+    assert((quest.actions==Vector<int>{100})&&!quest.IsStopped());
+    service.OnUpdate({});assert((quest.actions==Vector<int>{100}));
+    service.m_heldStages.at(2).PendingItems.clear();
+    service.OnUpdate({});service.OnUpdate({});
+    assert((quest.actions==Vector<int>{100,20,-1}));
 }
 ''')
 

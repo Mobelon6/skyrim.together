@@ -1768,7 +1768,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +void OfferKnownStages(Player& player, const PartyService::Party& party,
 +                      const QuestRun& run, const NotifyQuestUpdate& notice)
 +{
-+    if (run.Stopped || run.Generation != 1 || run.OrderedStages.empty()) return;
++    if ((run.Stopped && !run.CompletedRunOnce) || run.Generation != 1 || run.OrderedStages.empty()) return;
 +    auto speaker = party.LeaderPlayerId;
 +    if (speaker == player.GetId())
 +        for (auto* member : party.Members)
@@ -1826,7 +1826,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +}
 +
  QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
-@@ -44,3 +237,31 @@
+@@ -44,3 +237,40 @@
      PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
      const PartyService::Party::Conversation* participants = nullptr;
 +    bool knownSharedQuest = false;
@@ -1847,7 +1847,16 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +                const auto found = pParty->QuestRuns.find(message.Id);
 +                if (found != pParty->QuestRuns.end()) { run = found.value(); known = true; }
 +            }
-+            if (known && run.CompletedRunOnce) return; // late local acceptance is not a new shared run
++            if (known && run.CompletedRunOnce)
++            {
++                // Late acceptance may happen while the rest of the party is
++                // elsewhere. Offer the recorded stages, never open a new run
++                // or force Stop on a client that has not finished the fragments.
++                if (message.Status == RequestQuestUpdate::Started ||
++                    (message.Status == RequestQuestUpdate::StageUpdate && run.Stages.contains(message.Stage)))
++                    OfferKnownStages(*pPlayer, *pParty, run, notify);
++                return;
++            }
 +            knownSharedQuest = known && !run.Stopped && run.Generation == 1 && (run.Started || !run.OrderedStages.empty());
 +            if (knownSharedQuest && (message.Status == RequestQuestUpdate::Started || run.Stages.contains(message.Stage)))
 +                OfferKnownStages(*pPlayer, *pParty, run, notify);
@@ -1858,7 +1867,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        }
 +    }
      if (!pParty) return;
-@@ -61,6 +282,7 @@
+@@ -61,6 +291,7 @@
          // During an interaction, only the quest of the witnessed topic has provenance.
          if (inTalk || inFight) return;
 -        if (!bEnableMiscQuestSync && !(message.JournalObjective && message.Status == RequestQuestUpdate::StageUpdate &&
@@ -1868,7 +1877,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +            !(knownSharedQuest && message.Status == RequestQuestUpdate::Stopped && message.CompletedRunOnce)) return;
      }
  
-@@ -115,39 +337,47 @@
+@@ -115,39 +346,47 @@
 -    auto& run = pParty->QuestRuns[message.Id];
 -    // The sender's local quest log and the party's shared lifecycle are independent.
 -    // A late start from a second client must not clear stages the first client sent.
