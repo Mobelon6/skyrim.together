@@ -1389,10 +1389,10 @@ index fdffa3f..6b397ee 100644
 +    @if (!(menuOpen$ | async)) {
 +      <div class="carriage-shade">
 +        <section class="carriage-offer" role="dialog" aria-modal="true" aria-labelledby="progress-question">
-+          <p id="progress-question">Синхронизировать прогресс с участником группы?</p>
++          <p id="progress-question">{{ offer.selfName ? 'Кто получит награду?' : 'Синхронизировать прогресс с участником группы?' }}</p>
 +          @if (offer.label) { <p>{{ offer.label }}</p> }
-+          <button (click)="answerProgress(offer.token, true)">Да</button>
-+          <button (click)="answerProgress(offer.token, false)">Нет</button>
++          <button (click)="answerProgress(offer.token, true)">{{ offer.selfName || 'Да' }}</button>
++          <button (click)="answerProgress(offer.token, false)">{{ offer.peerName || 'Нет' }}</button>
 +        </section>
 +      </div>
 +    }
@@ -1469,7 +1469,7 @@ index 85c515c..a91490e 100644
    /** Opening/close menu change. */
 +  public readonly syncRange = new BehaviorSubject<Record<number, boolean>>({});
 +  public readonly observerMode = new BehaviorSubject(false);
-+  public readonly progressOffer = new BehaviorSubject<{token: number; label: string} | null>(null);
++  public readonly progressOffer = new BehaviorSubject<{token: number; label: string; selfName?: string; peerName?: string} | null>(null);
    public carriageOffer = new BehaviorSubject<{rider: number; trip: number; name: string; marker?: boolean} | null>(null);
    public openingMenuChange = new BehaviorSubject(false);
  
@@ -1480,7 +1480,7 @@ index 85c515c..a91490e 100644
 +    skyrimtogether.on('peerRange', (id, near) => this.zone.run(() =>
 +      this.syncRange.next({ ...this.syncRange.value, [id]: near })));
 +    skyrimtogether.on('observerMode', watch => this.zone.run(() => this.observerMode.next(watch)));
-+    skyrimtogether.on('offerProgress', (token, label) => this.zone.run(() => this.progressOffer.next({token, label})));
++    skyrimtogether.on('offerProgress', (token, label, selfName, peerName) => this.zone.run(() => this.progressOffer.next({token, label, selfName, peerName})));
 +    skyrimtogether.on('hideProgress', () => this.zone.run(() => this.progressOffer.next(null)));
      skyrimtogether.on('offerCarriage', (rider, trip, name, marker) =>
        this.zone.run(() => this.carriageOffer.next({rider, trip, name, marker: !!marker})));
@@ -1526,7 +1526,7 @@ index 30cb518..9fee568 100644
    off(event: 'observerSubtitle'): void;
 +  on(event: 'peerRange', callback: (id: number, near: boolean) => void): void;
 +  on(event: 'observerMode', callback: (watch: boolean) => void): void;
-+  on(event: 'offerProgress', callback: (token: number, label: string) => void): void;
++  on(event: 'offerProgress', callback: (token: number, label: string, selfName?: string, peerName?: string) => void): void;
 +  on(event: 'hideProgress', callback: () => void): void;
 +  off(event: 'peerRange' | 'observerMode' | 'offerProgress' | 'hideProgress'): void;
 +  answerProgress(token: number, accept: number): void;

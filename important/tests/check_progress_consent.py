@@ -28,6 +28,7 @@ struct OverlayService {
     std::map<unsigned,unsigned> m_peaceSession;
     FIELDS
     void QueueProgress(bool,uint32_t,uint32_t,uint32_t,const char*,std::function<void()>,std::function<bool()> = {},uint32_t = 0,uint32_t = 0) noexcept;
+    void QueueRewardChoice(uint32_t,const char*,std::string,std::string,std::function<void(bool)>,std::function<bool()>) noexcept;
     void AnswerProgress(uint32_t,bool) noexcept;
     bool IsPersonalQuest(uint32_t) const noexcept;
     void ClearProgress() noexcept;
@@ -86,6 +87,17 @@ int main() {
     s.QueueProgress(true,70,2,2,"actor",[]{}, {},81,12);
     assert(s.m_progress.size()==2);
     s.ClearProgress();
+    bool allowed=true;
+    int recipient=0;
+    auto reward=[&] {s.QueueRewardChoice(200,"Star","One","Two",[&](bool self){recipient=self?1:2;},[&]{return allowed;});};
+    reward();reward();assert(s.m_progress.size()==1&&!s.IsPersonalQuest(200));
+    auto rewardToken=s.m_progress.front().Token;
+    assert(s.m_progress.front().SelfName=="One"&&s.m_progress.front().PeerName=="Two");
+    s.AnswerProgress(rewardToken,false);assert(recipient==0);
+    s.m_showingProgress=true;s.AnswerProgress(rewardToken,false);assert(recipient==2&&s.m_progress.empty());
+    s.AnswerProgress(rewardToken,true);assert(recipient==2);
+    reward();allowed=false;s.m_showingProgress=true;s.AnswerProgress(s.m_progress.front().Token,true);assert(recipient==2);
+    allowed=true;reward();s.m_showingProgress=true;s.AnswerProgress(s.m_progress.front().Token,true);assert(recipient==1);
     s.m_world.p.in=false;add(true,99,5,8);assert(s.m_progress.empty());
 }
 """

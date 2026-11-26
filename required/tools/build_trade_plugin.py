@@ -10,7 +10,7 @@ def group(kind,label,data):
     if isinstance(label,int):label=struct.pack('<I',label)
     return struct.pack('<4sI4sIII',b'GRUP',24+len(data),label,kind,0,0)+data
 def make():
-    header=sub(b'HEDR',struct.pack('<fII',1.7,58,0x833))+sub(b'CNAM',b'Skyrim Together\0')+sub(b'MAST',b'Skyrim.esm\0')+sub(b'DATA',bytes(8))
+    header=sub(b'HEDR',struct.pack('<fII',1.7,60,0x835))+sub(b'CNAM',b'Skyrim Together\0')+sub(b'MAST',b'Skyrim.esm\0')+sub(b'DATA',bytes(8))
     globals_=b''
     names=('STRTradeStreamLow','STRTradeStreamMiddle','STRTradeStreamHigh','STRTradeCursor',
            'STRCampaignCampaignLow','STRCampaignCampaignMiddle','STRCampaignCampaignHigh','STRCampaignCharacterLow','STRCampaignCharacterMiddle','STRCampaignCharacterHigh','STRCampaignRevisionLow','STRCampaignRevisionHigh','STRCampaignTagLow','STRCampaignTagMiddle','STRCampaignTagHigh','STRCampaignSchema')
@@ -19,6 +19,9 @@ def make():
     for i in range(32):
         name=f'STRDragonSoulReceipt{i:02d}'
         globals_+=record(b'GLOB',0,0x01000813+i,sub(b'EDID',name.encode()+b'\0')+sub(b'FNAM',b'f')+sub(b'FLTV',bytes(4)))
+    # Explicit, append-only receipt fields for DA01's two possible rewards.
+    for i,name in enumerate(('STRUniqueAzuraReward','STRUniqueBlackStarReward')):
+        globals_+=record(b'GLOB',0,0x01000833+i,sub(b'EDID',name.encode()+b'\0')+sub(b'FNAM',b'f')+sub(b'FLTV',bytes(4)))
     # Empty local-only display chest, never placed in an accessible game cell.
     base,cell,ref=0x01000810,0x01000811,0x01000812
     container=record(b'CONT',0,base,sub(b'EDID',b'STRTradeDisplayChest\0')+sub(b'OBND',bytes(12))+sub(b'FULL',b'Trade'+b'\0')+sub(b'COCT',bytes(4))+sub(b'DATA',struct.pack('<Bf',0,0.0)))

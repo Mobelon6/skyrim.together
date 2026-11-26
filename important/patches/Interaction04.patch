@@ -402,7 +402,7 @@ diff --git a/Code/client/Services/Generic/ProgressConsent.cpp b/Code/client/Serv
 index 0cd799f..f65a5cb 100644
 --- a/Code/client/Services/Generic/ProgressConsent.cpp
 +++ b/Code/client/Services/Generic/ProgressConsent.cpp
-@@ -15,24 +15,30 @@ void OverlayService::SetPeerRange(uint32_t peer, bool withinRange) noexcept
+@@ -15,24 +15,44 @@ void OverlayService::SetPeerRange(uint32_t peer, bool withinRange) noexcept
      m_pOverlay->ExecuteAsync("peerRange", args);
  }
  
@@ -436,11 +436,32 @@ index 0cd799f..f65a5cb 100644
 +    it->Changes.push_back({std::move(apply), std::move(needed)});
 +    it->Ready = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
  }
++
++void OverlayService::QueueRewardChoice(uint32_t form,const char* label,std::string self,std::string peer,
++                                      std::function<void(bool)> choice,std::function<bool()> needed) noexcept
++{
++    if (!m_world.GetPartyService().IsInParty()||!choice||self.empty()||peer.empty()||(needed&&!needed())) return;
++    for (const auto& item:m_progress)
++        if (item.RewardChoice&&std::get<1>(item.Key)==form) return;
++    if (++m_progressToken==0) ++m_progressToken;
++    PendingProgress item{};
++    item.Key={true,form,0,0};item.Token=m_progressToken;item.Label=label?label:"";
++    item.SelfName=std::move(self);item.PeerName=std::move(peer);
++    item.RewardChoice=std::move(choice);item.Changes.push_back({{},std::move(needed)});
++    m_progress.push_back(std::move(item));
++}
  
  bool OverlayService::IsPersonalQuest(uint32_t form) const noexcept
-@@ -53,7 +59,8 @@ void OverlayService::AnswerProgress(uint32_t token, bool accept) noexcept
+@@ -53,7 +73,15 @@ void OverlayService::AnswerProgress(uint32_t token, bool accept) noexcept
      m_pOverlay->ExecuteAsync("hideProgress");
      m_gameOverlayClient->SetUIVisible(false);
++    if (item.RewardChoice)
++    {
++        m_progressAnswers.erase(item.Key);
++        if (m_world.GetPartyService().IsInParty()&&(!item.Changes.front().Needed||item.Changes.front().Needed()))
++            item.RewardChoice(accept);
++        return;
++    }
      if (accept && m_world.GetPartyService().IsInParty())
 -        for (auto& apply : item.Changes) apply();
 +        for (auto& change : item.Changes)
@@ -448,7 +469,7 @@ index 0cd799f..f65a5cb 100644
  }
  
  void OverlayService::ClearProgress() noexcept
-@@ -83,7 +90,15 @@ void OverlayService::UpdateProgress() noexcept
+@@ -83,7 +111,20 @@ void OverlayService::UpdateProgress() noexcept
          auto* threat = player->GetCombatTarget();
          if (threat && (!m_peaceSession.count(threat->formID) || threat->IsInCombat())) return;
      }
@@ -465,6 +486,11 @@ index 0cd799f..f65a5cb 100644
      auto args = CefListValue::Create();
      args->SetInt(0, item.Token);
      args->SetString(1, item.Label);
++    if (item.RewardChoice)
++    {
++        args->SetString(2,item.SelfName);
++        args->SetString(3,item.PeerName);
++    }
 diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Services/Generic/QuestService.cpp
 --- a/Code/client/Services/Generic/QuestService.cpp
 +++ b/Code/client/Services/Generic/QuestService.cpp
@@ -577,7 +603,7 @@ diff --git a/Code/client/Services/OverlayService.h b/Code/client/Services/Overla
 index 0638d84..f966037 100644
 --- a/Code/client/Services/OverlayService.h
 +++ b/Code/client/Services/OverlayService.h
-@@ -81,11 +81,13 @@ struct OverlayService
+@@ -81,11 +81,14 @@ struct OverlayService
      bool BeginHire(uint32_t npc, uint32_t info, int32_t index) noexcept;
      static void InstallReplicaLifeGuard(Actor* actor) noexcept;
      static bool FollowerBusy(uint32_t npc) noexcept;
@@ -589,10 +615,11 @@ index 0638d84..f966037 100644
 -    void QueueProgress(bool quest, uint32_t form, uint32_t speaker, uint32_t session, const char* label, std::function<void()> apply) noexcept;
 +    void QueueProgress(bool quest, uint32_t form, uint32_t speaker, uint32_t session, const char* label, std::function<void()> apply,
 +                       std::function<bool()> needed = {}, uint32_t subject = 0, uint32_t encounter = 0) noexcept;
++    void QueueRewardChoice(uint32_t,const char*,std::string,std::string,std::function<void(bool)>,std::function<bool()>) noexcept;
      bool IsPersonalQuest(uint32_t form) const noexcept;
      void ResetSessionProgress() noexcept;
      void AnswerProgress(uint32_t token, bool accept) noexcept;
-@@ -118,7 +120,9 @@ private:
+@@ -118,7 +121,11 @@ private:
          ProgressKey Key;
          uint32_t Token;
          std::string Label;
@@ -600,6 +627,8 @@ index 0638d84..f966037 100644
 +        struct Change { std::function<void()> Apply; std::function<bool()> Needed; };
 +        std::vector<Change> Changes;
 +        std::chrono::steady_clock::time_point Ready{};
++        std::string SelfName,PeerName;
++        std::function<void(bool)> RewardChoice;
      };
      std::deque<PendingProgress> m_progress;
      std::map<ProgressKey,bool> m_progressAnswers;

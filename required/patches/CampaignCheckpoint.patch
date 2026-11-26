@@ -470,13 +470,15 @@ diff --git a/Code/server/Services/QuestJournal.cpp b/Code/server/Services/QuestJ
 diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Services/Generic/QuestJournal.cpp
 --- a/Code/client/Services/Generic/QuestJournal.cpp
 +++ b/Code/client/Services/Generic/QuestJournal.cpp
-@@ -9,8 +9,43 @@
+@@ -9,8 +9,46 @@
  #include <QuestJournalDisk.h>
  #include <CampaignReplication.h>
  #include <CampaignIdentity.h>
  #include <Services/CampaignAccess.h>
 +#include <Services/CampaignCheckpointClient.h>
 +#include <QuestWordReward.h>
++#include <UniqueQuestReward.h>
++#include <Components.h>
 +#include <QuestPickupPermit.h>
 +#include <Messages/RequestInventoryChanges.h>
 +#include <Games/Misc/MenuTopicManager.h>
@@ -511,10 +513,11 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +void RefreshCampaignDragonAwards() noexcept;
 +void RememberCampaignDragonAward(uint32_t) noexcept;
 +int ApplyCampaignDragonAward(uint32_t) noexcept;
++uint32_t NativeUniqueRewardQuest() noexcept;
  #include <HomeSnapshot.h>
  #include <HomePermissions.h>
  #include <TradeLedger.h>
-@@ -26,6 +61,16 @@
+@@ -26,6 +64,16 @@
  namespace
  {
  CampaignReplication::Link campaignLink;
@@ -531,7 +534,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    return confirmedLoad?loadedDigest:std::string{};
 +}
  bool enrollmentUsed{};
-@@ -221,6 +266,1090 @@
+@@ -221,6 +269,1241 @@
      return 2;
  }
  
@@ -724,6 +727,127 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            spdlog::warn("STM shared dragon receipt could not be persisted for {:X}",form);
 +        else if (result==2)
 +            spdlog::info("STM shared dragon soul granted for {:X}",form);
++    }
++}
++
++// Reuse the campaign journal, pull and existing progress window. A native
++// quest grant is deferred only for an explicitly catalogued reward.
++std::atomic<uint64_t> uniqueRewardEpoch{};
++std::map<uint32_t,uint32_t> uniqueRewardChoices;
++TESGlobal* UniqueRewardField(const UniqueQuestReward::Entry& entry)
++{
++    auto* mods=ModManager::Get();
++    auto* plugin=mods?mods->GetByName("SkyrimCoopTrade.esp"):nullptr;
++    auto* form=plugin&&plugin->IsLoaded()?TESForm::GetById(plugin->GetFormId(entry.Receipt)):nullptr;
++    return form&&static_cast<unsigned>(form->formType)==9?static_cast<TESGlobal*>(form):nullptr;
++}
++bool SetUniqueRewardField(World& world,const UniqueQuestReward::Entry& entry,float value)
++{
++    auto* field=UniqueRewardField(entry);
++    const auto* setter=world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue");
++    if (!field||!setter) return false;
++    PapyrusFunction<void,TESGlobal,float> set(setter);set(field,value);
++    return field->f==value;
++}
++void SendUniqueReward(World& world,const CampaignIdentity::Stamp& stamp,RequestCampaignPull& request)
++{
++    if (!request.QuestReceipt.empty()||!world.GetPartyService().IsInParty()) return;
++    for (const auto& entry:UniqueQuestReward::Catalog)
++    {
++        const auto state=UniqueQuestReward::Read(campaignLink.Journal.Operations(),entry.Quest);
++        if (!state||state->Recipient) continue;
++        if (state->Item==entry.Item&&state->Source==stamp.Character)
++        {
++            const auto selection=uniqueRewardChoices.find(entry.Item);
++            if (selection!=uniqueRewardChoices.end())
++            {
++                const auto& members=world.GetPartyService().GetPartyMembers();
++                if (std::find(members.begin(),members.end(),selection->second)!=members.end()||
++                    selection->second==world.GetTransport().GetLocalPlayerId())
++                    request.QuestReceipt=("reward-choice "+std::to_string(entry.Item)+" "+std::to_string(selection->second)).c_str();
++                else uniqueRewardChoices.erase(selection);
++                if (!request.QuestReceipt.empty()) return;
++            }
++        }
++        else if (!state->Item&&UniqueQuestReward::StageSource(campaignLink.Journal.Operations(),entry)==stamp.Character)
++        {
++            const auto* field=UniqueRewardField(entry);
++            if (field&&field->f==1.f)
++            {
++                request.QuestReceipt=("reward-offer "+std::to_string(entry.Item)).c_str();
++                return;
++            }
++        }
++    }
++}
++std::string RewardPeerName(World& world,uint32_t peer)
++{
++    auto view=world.view<PlayerComponent,FormIdComponent>();
++    for (auto entity:view)
++        if (view.get<PlayerComponent>(entity).Id==peer)
++            if (auto* actor=Cast<Actor>(TESForm::GetById(view.get<FormIdComponent>(entity).Id));actor&&actor->baseForm)
++                if (const auto* name=actor->baseForm->GetName();name&&*name) return name;
++    // The existing player list carries account names, not guaranteed actor names.
++    const auto& players=world.GetPartyService().GetPlayers();
++    const auto it=players.find(peer);
++    return it!=players.end()?std::string(it.value().data(),it.value().size())+" (сетевое имя)":"Участник группы";
++}
++void UpdateUniqueRewards(World& world,const CampaignIdentity::Stamp& stamp)
++{
++    if (!world.GetPartyService().IsInParty()||world.IsLoadingSave()||!SaveWorldReady()) return;
++    auto* player=PlayerCharacter::Get();
++    if (!player) return;
++    const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
++    const auto own=world.GetTransport().GetLocalPlayerId();
++    uint32_t peer{};
++    for (auto id:world.GetPartyService().GetPartyMembers())
++        if (id&&id!=own) {if (peer&&peer!=id) return;peer=id;}
++    bool ready=own&&peer&&world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue");
++    for (const auto& entry:UniqueQuestReward::Catalog)
++        ready=ready&&UniqueRewardField(entry)&&UniqueQuestReward::KnownQuest(campaignLink.Journal.Operations(),entry.Quest);
++    uniqueRewardEpoch.store(ready?epoch:0,std::memory_order_release);
++    for (const auto& entry:UniqueQuestReward::Catalog)
++    {
++        const auto state=UniqueQuestReward::Read(campaignLink.Journal.Operations(),entry.Quest);
++        if (!state||state->Item!=entry.Item) continue;
++        auto* field=UniqueRewardField(entry);
++        if (!field) continue;
++        if (state->Recipient)
++        {
++            uniqueRewardChoices.erase(entry.Item);
++            if (field->f==2.f) continue;
++            if (state->Recipient!=stamp.Character)
++            {SetUniqueRewardField(world,entry,2.f);continue;}
++            auto* item=Cast<TESBoundObject>(TESForm::GetById(entry.Item));
++            if (!item) continue;
++            // A previously obtained native item is not granted a second time.
++            if (player->GetItemCountInInventory(item)==0)
++                player->AddObjectToContainer(item,nullptr,1,nullptr);
++            if (player->GetItemCountInInventory(item)>0)
++                SetUniqueRewardField(world,entry,2.f);
++            continue;
++        }
++        if (!own||!peer||state->Source!=stamp.Character||uniqueRewardChoices.contains(entry.Item)) continue;
++        auto* item=TESForm::GetById(entry.Item);
++        if (!item) continue;
++        const auto* name=item->GetName();
++        const auto* self=player->baseForm?player->baseForm->GetName():nullptr;
++        const auto other=RewardPeerName(world,peer);
++        const auto form=entry.Item,quest=entry.Quest;
++        const auto character=stamp.Character,campaign=stamp.Campaign;
++        auto needed=[epoch,form,quest,character,campaign,peer]{
++            if (epoch!=dragonLoadEpoch.load(std::memory_order_acquire)||campaign!=campaignLink.Campaign||
++                uniqueRewardChoices.contains(form)||!World::Exists()) return false;
++            auto& w=World::Get();
++            if (!w.GetTransport().IsOnline()||!w.GetPartyService().IsInParty()||w.IsLoadingSave()) return false;
++            const auto& members=w.GetPartyService().GetPartyMembers();
++            if (std::find(members.begin(),members.end(),peer)==members.end()) return false;
++            const auto state=UniqueQuestReward::Read(campaignLink.Journal.Operations(),quest);
++            return state&&state->Item==form&&state->Source==character&&!state->Recipient;
++        };
++        world.GetOverlayService().QueueRewardChoice(form,name?name:"Уникальная награда",
++            self&&*self?self:"Ваш персонаж",other,
++            [form,own,peer](bool chooseSelf){uniqueRewardChoices[form]=chooseSelf?own:peer;nextPull={};},needed);
 +    }
 +}
 +
@@ -1319,6 +1443,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
 +    if (questObservedLoadEpoch==epoch) return;
 +    questObservedLoadEpoch=epoch;
++    uniqueRewardEpoch.store(0,std::memory_order_release);uniqueRewardChoices.clear();
 +    offeredQuestStages.clear();
 +    attemptedQuestPickups.clear();
 +    attemptedQuestConsumption.clear();
@@ -1510,6 +1635,34 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    catch (...) {spdlog::warn("STM could not queue quest item receipt");}
 +}
 +
++bool CaptureUniqueQuestAward(uint32_t item) noexcept
++{
++    try
++    {
++        const auto* entry=UniqueQuestReward::Find(item);
++        const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
++        if (!entry||NativeUniqueRewardQuest()!=entry->Quest||
++            uniqueRewardEpoch.load(std::memory_order_acquire)!=epoch||!World::Exists()) return false;
++        auto& world=World::Get();
++        if (world.IsLoadingSave()) return false;
++        // The native AddItem has reached the real inventory insertion hook.
++        // Leave the VM and its other effects intact, and defer only this unit.
++        world.GetRunner().Queue([item,epoch]{
++            if (epoch!=dragonLoadEpoch.load(std::memory_order_acquire)) return;
++            const auto* entry=UniqueQuestReward::Find(item);
++            auto* field=entry?UniqueRewardField(*entry):nullptr;
++            if (field&&field->f==0.f)
++            {
++                if (!SetUniqueRewardField(World::Get(),*entry,1.f))
++                    spdlog::error("STM unique reward observation could not be saved {:X}",item);
++            }
++            nextPull={};
++        });
++        return true;
++    }
++    catch (...) {return false;}
++}
++
 +int SharedDialogueItemState(const void* nativeQuest,uint32_t base) noexcept
 +{
 +    try
@@ -1606,6 +1759,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +    if (!m_world.IsLoadingSave()&&SaveWorldReady()) RefreshCampaignDragonAwards();
 +    if (!m_world.GetTransport().IsOnline()||!m_world.GetPartyService().IsInParty())
 +    {
++        uniqueRewardEpoch.store(0,std::memory_order_release);uniqueRewardChoices.clear();
 +        offeredQuestStages.clear();
 +        deferredQuestPickup.reset();deferredQuestTurnIn.reset();
 +        questDialogueReady=false;sharedDialogueItems.clear();
@@ -1622,7 +1776,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +        deferredQuestPickup.reset();deferredQuestTurnIn.reset();questDialogueReady=false;sharedDialogueItems.clear();
 +    }
      if (!m_world.GetTransport().IsOnline())
-@@ -250,6 +1379,31 @@
+@@ -250,6 +1533,32 @@
          request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
          request.Profile=pending.Profile.c_str();request.Revision=pending.Base.Revision;request.Tag=pending.Base.Tag;
          pendingSave=*stamp;
@@ -1630,6 +1784,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
          request.Credential=credential->Secret.c_str();
 +        request.Checkpoint=NextCheckpoint(*stamp).c_str();
 +        SendQuestReceipt(*stamp,request);
++        SendUniqueReward(m_world,*stamp,request);
 +        ObserveLearnedWord(m_world,stamp->Character,request);
 +        SendDragonAbsorption(*stamp,request);
 +        if (deferredQuestPickup)
@@ -1654,7 +1809,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            }
 +        }
          m_world.GetTransport().Send(request);
-@@ -275,8 +1429,28 @@
+@@ -275,8 +1584,29 @@
          else if (result!=CampaignJournal::Result::Duplicate)
          {
              campaignLink.Fail();
@@ -1672,6 +1827,7 @@ diff --git a/Code/client/Services/Generic/QuestJournal.cpp b/Code/client/Service
 +            try
 +            {
 +                ApplySharedDragonGrants(m_world,campaignLink.Journal,stamp->Character);
++                UpdateUniqueRewards(m_world,*stamp);
 +                RefreshSpentDialogueItems(campaignLink.Journal);
 +                RestoreLearnedWords(m_world,campaignLink.Journal,stamp->Character);
 +                RestoreOwnQuestPickups(m_world,campaignLink.Journal,stamp->Character);
@@ -1936,7 +2092,7 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
  
  TP_THIS_FUNCTION(TRegisterPapyrusFunction, void, BSScript::IVirtualMachine, NativeFunction*);
  TP_THIS_FUNCTION(TBindEverythingToScript, void, BSScript::IVirtualMachine*);
-@@ -20,8 +26,236 @@
+@@ -20,8 +26,259 @@
  TSignaturesMatch* RealSignaturesMatch = nullptr;
  TCompareVariables* RealCompareVariables = nullptr;
  
@@ -1978,7 +2134,9 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +TP_THIS_FUNCTION(TDragonNativeCall, BSScript::CallResult, BSScript::NativeFunctionBase,
 +                 void*, void*, BSScript::IVirtualMachine*, bool);
 +TDragonNativeCall* realDragonNativeCall{};
-+std::atomic<const void*> modActorValueNative{};
++std::atomic<const void*> modActorValueNative{},addItemNative{};
++thread_local uint32_t nativeUniqueRewardQuest{};
++uint32_t NativeUniqueRewardQuest() noexcept {return nativeUniqueRewardQuest;}
 +namespace
 +{
 +enum class DragonAwardState { NativePending, NativePaid, SupplementPending, SupplementPaid, Retired };
@@ -2137,6 +2295,22 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +            if (suppress&&reward) reward->data.f=0.f;
 +        }
 +    }
++    // Reuse the already installed native-call hook and the verified frame
++    // fields. Restrict the inventory interception to the generated DA01
++    // quest fragment's synchronous ObjectReference.AddItem, not other scripts.
++    const auto previous=nativeUniqueRewardQuest;
++    struct RestoreScope {uint32_t Previous;~RestoreScope(){nativeUniqueRewardQuest=Previous;}} restore{previous};
++    nativeUniqueRewardQuest=0;
++    if (apThis==addItemNative.load(std::memory_order_acquire)&&stackArgument)
++    {
++        auto* stack=*static_cast<DragonStackView**>(stackArgument);
++        auto* frame=stack?stack->Top:nullptr;
++        auto* caller=frame?frame->Previous:nullptr;
++        if (caller&&caller->Function)
++            if (const auto* scope=caller->Function->GetObjectTypeName().AsAscii();
++                scope&&!_stricmp(scope,"QF_DA01_00028AD6"))
++                nativeUniqueRewardQuest=0x28ad6;
++    }
 +    const auto result=TiltedPhoques::ThisCall(realDragonNativeCall,apThis,stackArgument,logger,vm,flag);
 +    bool paid=false;
 +    if (dragon&&!suppress&&result==BSScript::CallResult::kCompleted&&World::Exists()&&!World::Get().IsLoadingSave())
@@ -2149,6 +2323,7 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +    return result;
 +}
 +#else
++uint32_t NativeUniqueRewardQuest() noexcept {return 0;}
 +bool DragonAwardHookReady() noexcept {return false;}
 +void ResetCampaignDragonAwards() noexcept {}
 +void RefreshCampaignDragonAwards() noexcept {}
@@ -2163,6 +2338,10 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
 +        !_stricmp(apFunction->typeName.AsAscii(),"Actor")&&
 +        !_stricmp(apFunction->functionName.AsAscii(),"ModActorValue"))
 +        modActorValueNative.store(apFunction,std::memory_order_release);
++    if (apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
++        !_stricmp(apFunction->typeName.AsAscii(),"ObjectReference")&&
++        !_stricmp(apFunction->functionName.AsAscii(),"AddItem"))
++        addItemNative.store(apFunction,std::memory_order_release);
 +#endif
 +    if (apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
 +        !std::strcmp(apFunction->typeName.AsAscii(),"Game")&&
@@ -2175,7 +2354,7 @@ diff --git a/Code/client/Games/Misc/BSScript.cpp b/Code/client/Games/Misc/BSScri
      auto& runner = World::Get().GetRunner();
  
      PapyrusFunctionRegisterEvent event(apFunction->functionName.AsAscii(), apFunction->typeName.AsAscii(), apFunction->functionAddress);
-@@ -109,5 +343,10 @@
+@@ -109,5 +366,10 @@
          TP_HOOK(&RealRegisterPapyrusFunction, HookRegisterPapyrusFunction);
          TP_HOOK(&RealBindEverythingToScript, HookBindEverythingToScript);
          TP_HOOK(&RealSignaturesMatch, HookSignaturesMatch);
@@ -2961,3 +3140,86 @@ diff --git a/Code/client/Games/Misc/MenuTopicManager.h b/Code/client/Games/Misc/
  static_assert(offsetof(MenuTopicManager, pOptions) == 0x20);
  static_assert(offsetof(MenuTopicManager, speaker) == 0x68);
  static_assert(offsetof(MenuTopicManager, menuOpen) == 0xB1);
+
+diff --git a/Code/common/UniqueQuestReward.h b/Code/common/UniqueQuestReward.h
+new file mode 100644
+--- /dev/null
++++ b/Code/common/UniqueQuestReward.h
+@@ -0,0 +1,77 @@
++#pragma once
++#include <CampaignJournal.h>
++#include <TradeProperties.h>
++#include <cstdint>
++#include <optional>
++#include <sstream>
++#include <string>
++#include <string_view>
++
++namespace UniqueQuestReward
++{
++struct Entry { uint32_t Quest, Item; uint16_t Stage; uint32_t Receipt; };
++// Skyrim.esm DA01, mutually exclusive final rewards. Only known base forms.
++inline constexpr Entry Catalog[]={{0x28ad6,0x63b27,100,0x833},{0x28ad6,0x63b29,110,0x834}};
++inline const Entry* Find(uint32_t item)
++{
++    for (const auto& entry:Catalog) if (entry.Item==item) return &entry;
++    return nullptr;
++}
++inline uint64_t StageSource(const std::vector<CampaignJournal::Operation>& ops,const Entry& entry)
++{
++    const auto key=TradeProperties::FormKey{"skyrim.esm",entry.Quest}.Encode();
++    for (const auto& op:ops)
++    {
++        if (op.Kind!="quest-progress-v1") continue;
++        std::istringstream row(op.Payload);
++        std::string form;uint32_t run{},status{},stage{},type{};uint64_t source{};
++        if (row>>form>>run>>status>>stage>>type>>source)
++            if (form==key&&run==1&&(status==0||status==1)&&stage==entry.Stage&&source) return source;
++    }
++    return 0;
++}
++inline bool KnownQuest(const std::vector<CampaignJournal::Operation>& ops,uint32_t quest)
++{
++    const auto prefix=TradeProperties::FormKey{"skyrim.esm",quest}.Encode()+" 1 ";
++    for (const auto& op:ops)
++        if (op.Kind=="quest-progress-v1"&&op.Payload.starts_with(prefix)) return true;
++    return false;
++}
++struct State {uint32_t Item{};uint64_t Source{},Recipient{};};
++inline std::optional<State> Read(const std::vector<CampaignJournal::Operation>& ops,uint32_t quest)
++{
++    State state;
++    for (const auto& op:ops)
++    {
++        const bool choice=op.Kind=="quest-unique-choice-v1";
++        if (!choice&&op.Kind!="quest-unique-offer-v1") continue;
++        std::istringstream row(op.Payload);
++        std::string extra;uint32_t item{};uint64_t source{},recipient{};
++        if (!(row>>item>>source)||!source||(choice&&(!(row>>recipient)||!recipient))||row>>extra) return {};
++        const auto* entry=Find(item);
++        if (!entry) return {};
++        if (entry->Quest!=quest) continue;
++        if (!choice)
++        {
++            if (state.Item||StageSource(ops,*entry)!=source) return {};
++            state={item,source,0};
++        }
++        else
++        {
++            if (state.Item!=item||state.Source!=source||state.Recipient) return {};
++            state.Recipient=recipient;
++        }
++    }
++    return state;
++}
++struct Command {uint32_t Item{},Peer{};bool Choice{};};
++inline std::optional<Command> Decode(std::string_view value)
++{
++    const bool choice=value.starts_with("reward-choice ");
++    if (!choice&&!value.starts_with("reward-offer ")) return {};
++    std::istringstream row{std::string(value.substr(choice?14:13))};
++    Command command;command.Choice=choice;std::string extra;
++    if (!(row>>command.Item)||!Find(command.Item)||(choice&&(!(row>>command.Peer)||!command.Peer))||row>>extra) return {};
++    return command;
++}
++}

@@ -750,3 +750,27 @@ int main(){
  player.changes.entries=nullptr;assert(!probe());
 }
 ''')
+
+run('one unique quest reward and immutable recipient',headers+'''
+#include <UniqueQuestReward.h>
+int main(){
+    using namespace UniqueQuestReward;
+    const auto& azura=Catalog[0];const auto& black=Catalog[1];
+    const auto key=TradeProperties::FormKey{"skyrim.esm",azura.Quest}.Encode();
+    std::vector<CampaignJournal::Operation> ops={{"1","quest-progress-v1",key+" 1 1 0 7 101"},
+        {"2","quest-progress-v1",key+" 1 0 100 7 202"}};
+    assert(KnownQuest(ops,azura.Quest)&&StageSource(ops,azura)==202&&!StageSource(ops,black));
+    assert(!Read(ops,azura.Quest)->Item);
+    auto offer=Decode("reward-offer "+std::to_string(azura.Item));assert(offer&&!offer->Choice);
+    auto select=Decode("reward-choice "+std::to_string(azura.Item)+" 9");assert(select&&select->Choice&&select->Peer==9);
+    assert(!Decode("reward-choice 15 9")&&!Decode("reward-choice "+std::to_string(azura.Item)+" 0"));
+    ops.push_back({"3","quest-unique-offer-v1",std::to_string(azura.Item)+" 202"});
+    auto state=Read(ops,azura.Quest);assert(state&&state->Source==202&&!state->Recipient);
+    ops.push_back({"4","quest-unique-choice-v1",std::to_string(azura.Item)+" 202 101"});
+    state=Read(ops,azura.Quest);assert(state&&state->Recipient==101);
+    ops.push_back({"5","quest-unique-choice-v1",std::to_string(azura.Item)+" 202 202"});
+    assert(!Read(ops,azura.Quest));
+    ops.pop_back();ops.push_back({"5","quest-unique-offer-v1",std::to_string(black.Item)+" 101"});
+    assert(!Read(ops,azura.Quest));
+}
+''', ['-I'+str(code/'common')])

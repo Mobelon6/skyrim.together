@@ -1680,18 +1680,19 @@ diff --git a/Code/common/BuildInfo.h.in b/Code/common/BuildInfo.h.in
 diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestService.cpp
 --- a/Code/server/Services/QuestService.cpp
 +++ b/Code/server/Services/QuestService.cpp
-@@ -4,4 +4,10 @@
+@@ -4,4 +4,11 @@
  #include <World.h>
  #include <Services/QuestService.h>
 +#include <Services/CampaignAccess.h>
 +#include <TradeProperties.h>
 +#include <QuestPickupPermit.h>
++#include <UniqueQuestReward.h>
 +#include <QuestRunMember.h>
 +#include <sstream>
 +#include <Messages/RequestInventoryChanges.h>
  
  #include <Messages/RequestQuestUpdate.h>
-@@ -15,5 +21,372 @@
+@@ -15,5 +22,402 @@
  Console::Setting bEnableMiscQuestSync{"Gameplay:bEnableMiscQuestSync", "(Experimental) Syncs miscellaneous quests when possible", false};
  
 +using QuestRun = PartyService::Party::QuestRun;
@@ -1970,10 +1971,40 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +    catch (...) {return false;}
 +}
 +
++void ApplyUniqueRewardCommand(World& world,Player& player,std::string_view value)
++{
++    const auto command=UniqueQuestReward::Decode(value);
++    if (!command) return;
++    auto& authority=CampaignAccess::Authority();
++    const auto character=CampaignAccess::Character(player);
++    auto* party=world.GetPartyService().GetPlayerParty(&player);
++    if (!character||!party||authority.State()!=CampaignReplication::Link::Mode::Ready) return;
++    const auto* entry=UniqueQuestReward::Find(command->Item);
++    const auto state=UniqueQuestReward::Read(authority.Journal.Operations(),entry->Quest);
++    if (!state) return;
++    uint64_t recipient{};
++    if (command->Choice)
++    {
++        if (state->Item!=entry->Item||state->Source!=character||state->Recipient) return;
++        for (auto* member:party->Members)
++            if (member&&member->GetId()==command->Peer) recipient=CampaignAccess::Character(*member);
++        if (!recipient) return;
++    }
++    else if (state->Item||UniqueQuestReward::StageSource(authority.Journal.Operations(),*entry)!=character) return;
++    const auto head=authority.Journal.Current();
++    auto payload=std::to_string(entry->Item)+" "+std::to_string(character);
++    if (command->Choice) payload+=" "+std::to_string(recipient);
++    if (authority.Journal.Append(head,{"quest-unique-"+std::to_string(head.Revision+1),
++        command->Choice?"quest-unique-choice-v1":"quest-unique-offer-v1",payload})!=CampaignJournal::Result::Committed)
++        spdlog::error("STM unique quest reward choice could not be committed");
++}
++
 +void CampaignAccess::ReplayQuestReceipt(World& world,Player& player,std::string_view value) noexcept
 +{
 +    try
 +    {
++        if (value.starts_with("reward-offer ")||value.starts_with("reward-choice "))
++        {ApplyUniqueRewardCommand(world,player,value);return;}
 +        const auto receipt=QuestPickupPermit::DecodeReceipt(std::string(value));
 +        if (!receipt) return;
 +        if (receipt->Shared)
@@ -2064,7 +2095,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +}
 +
  QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
-@@ -44,3 +417,48 @@
+@@ -44,3 +448,48 @@
      PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
      const PartyService::Party::Conversation* participants = nullptr;
 +    const std::string targets(message.Targets.data(),message.Targets.size());
@@ -2113,7 +2144,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        }
 +    }
      if (!pParty) return;
-@@ -61,6 +479,8 @@
+@@ -61,6 +510,8 @@
          // During an interaction, only the quest of the witnessed topic has provenance.
          if (inTalk || inFight) return;
 -        if (!bEnableMiscQuestSync && !(message.JournalObjective && message.Status == RequestQuestUpdate::StageUpdate &&
@@ -2124,7 +2155,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +            !(knownSharedQuest && message.Status == RequestQuestUpdate::Stopped)) return;
      }
  
-@@ -115,39 +535,84 @@
+@@ -115,39 +566,84 @@
 -    auto& run = pParty->QuestRuns[message.Id];
 -    // The sender's local quest log and the party's shared lifecycle are independent.
 -    // A late start from a second client must not clear stages the first client sent.
