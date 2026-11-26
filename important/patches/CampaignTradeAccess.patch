@@ -1691,7 +1691,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +#include <Messages/RequestInventoryChanges.h>
  
  #include <Messages/RequestQuestUpdate.h>
-@@ -15,5 +21,359 @@
+@@ -15,5 +21,372 @@
  Console::Setting bEnableMiscQuestSync{"Gameplay:bEnableMiscQuestSync", "(Experimental) Syncs miscellaneous quests when possible", false};
  
 +using QuestRun = PartyService::Party::QuestRun;
@@ -1927,6 +1927,8 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +
  }
  
++static QuestPickupPermit::TurnInLeases sharedTurnIns;
++
 +bool CampaignAccess::ReserveQuestPickup(World& world,Player& player,std::string_view value,uint64_t nonce) noexcept
 +{
 +    try
@@ -1958,12 +1960,8 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        if (!RestoreQuestRun(authority.Journal,claim->Quest,run)||!CanRecordQuestPickup(run,true,1)) return false;
 +        if (turnIn)
 +        {
-+            const auto payload=QuestPickupPermit::Payload(*claim,character);
-+            const auto prefix=claim->Quest+" 1 "+std::to_string(claim->Alias)+" ";
-+            const auto decision=QuestItemChange(authority.Journal.Operations(),prefix,payload,true);
-+            if (decision!=QuestItemDecision::Record&&decision!=QuestItemDecision::ConsumeCopy) return false;
-+            static QuestPickupPermit::TurnInLeases turnIns;
-+            return turnIns.Acquire(*claim,character,player.GetId(),nonce,QuestPickupPermit::Leases::Clock::now());
++            if (!QuestPickupPermit::AvailableOriginal(authority.Journal.Operations(),*claim)) return false;
++            return sharedTurnIns.Acquire(*claim,character,player.GetId(),nonce,QuestPickupPermit::Leases::Clock::now());
 +        }
 +        if (QuestPickupPermit::AlreadyTaken(authority.Journal.Operations(),*claim)) return false;
 +        static QuestPickupPermit::Leases leases;
@@ -1978,6 +1976,21 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +    {
 +        const auto receipt=QuestPickupPermit::DecodeReceipt(std::string(value));
 +        if (!receipt) return;
++        if (receipt->Shared)
++        {
++            auto& authority=Authority();
++            const auto character=Character(player);
++            if (!character||authority.State()!=CampaignReplication::Link::Mode::Ready||
++                !world.GetPartyService().GetPlayerParty(&player)||
++                !sharedTurnIns.Allows(receipt->Object,character,QuestPickupPermit::Leases::Clock::now())) return;
++            const auto original=QuestPickupPermit::AvailableOriginal(authority.Journal.Operations(),receipt->Object);
++            if (!original) return; // already consumed or unknown
++            const auto head=authority.Journal.Current();
++            if (authority.Journal.Append(head,{std::string("quest-item-")+std::to_string(head.Revision+1),
++                "quest-consumed-v1",*original})!=CampaignJournal::Result::Committed)
++                spdlog::error("STM could not persist shared quest removal");
++            return;
++        }
 +        const auto& mods=world.ctx().at<ModsComponent>();
 +        const auto resolve=[&](const std::string& encoded)->GameId {
 +            const auto key=TradeProperties::DecodeForm(encoded);
@@ -2051,7 +2064,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +}
 +
  QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
-@@ -44,3 +404,48 @@
+@@ -44,3 +417,48 @@
      PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
      const PartyService::Party::Conversation* participants = nullptr;
 +    const std::string targets(message.Targets.data(),message.Targets.size());
@@ -2100,7 +2113,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +        }
 +    }
      if (!pParty) return;
-@@ -61,6 +466,8 @@
+@@ -61,6 +479,8 @@
          // During an interaction, only the quest of the witnessed topic has provenance.
          if (inTalk || inFight) return;
 -        if (!bEnableMiscQuestSync && !(message.JournalObjective && message.Status == RequestQuestUpdate::StageUpdate &&
@@ -2111,7 +2124,7 @@ diff --git a/Code/server/Services/QuestService.cpp b/Code/server/Services/QuestS
 +            !(knownSharedQuest && message.Status == RequestQuestUpdate::Stopped)) return;
      }
  
-@@ -115,39 +522,84 @@
+@@ -115,39 +535,84 @@
 -    auto& run = pParty->QuestRuns[message.Id];
 -    // The sender's local quest log and the party's shared lifecycle are independent.
 -    // A late start from a second client must not clear stages the first client sent.

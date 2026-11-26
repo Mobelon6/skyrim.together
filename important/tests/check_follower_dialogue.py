@@ -21,8 +21,10 @@ struct TESObjectREFR: TESForm {unsigned handle{};Handle GetHandle(){return {{han
 TESObjectREFR* TESObjectREFR::pick=nullptr;
 struct PlayerCharacter:TESObjectREFR{static PlayerCharacter* Get(){static PlayerCharacter p;return &p;}};
 struct TESQuest:TESForm{};
-static bool spent=false,defer=false;
-bool IsSpentSharedDialogueItem(uint32_t quest,uint32_t item) noexcept{return spent&&quest==100&&item==200;}
+static int sharedState=-1;
+static bool defer=false;
+static const void* sharedQuest=nullptr;
+int SharedDialogueItemState(const void* quest,uint32_t item) noexcept{return quest==sharedQuest&&item==200?sharedState:-1;}
 bool DeferSharedQuestTurnIn(uint32_t quest,uint32_t item,uint32_t npc,uint32_t info) noexcept{return defer&&quest==100&&item==200&&npc==10&&info==49;}
 namespace QuestPickupPermit { PREDICATE }
 struct TESTopicInfo:TESForm{TESForm* parentTopic{};TESCondition conditions;};
@@ -66,10 +68,13 @@ int main(){
  assert(played==2&&w.sent.size()==2&&w.overlay.hires==1);
  TESQuest quest;quest.formID=100;TESForm base{200};
  hire.quest=&quest;item.function=47;item.params[0]=&base;item.object=1;item.comparisonValue=1.f;
- context.quest=&quest;context.target=PlayerCharacter::Get();
+ context.quest=&quest;context.target=PlayerCharacter::Get();sharedQuest=&quest;
+ nextCondition=[](TESConditionItem*,ConditionContext&){return false;};
+ sharedState=1;assert(CheckFollowerCondition(&item,context));
+ sharedState=-1;assert(!CheckFollowerCondition(&item,context));
  nextCondition=[](TESConditionItem*,ConditionContext&){return true;};
- spent=true;assert(!CheckFollowerCondition(&item,context));
- spent=false;assert(CheckFollowerCondition(&item,context));
+ sharedState=0;assert(!CheckFollowerCondition(&item,context));
+ sharedState=-1;assert(CheckFollowerCondition(&item,context));
  defer=true;assert(!HookPlayDialogueOption(m,0)&&played==2);
  assert(!m->ResumeQuestTurnIn(10,49,100,201)&&played==2);
  assert(m->ResumeQuestTurnIn(10,49,100,200)&&played==3);

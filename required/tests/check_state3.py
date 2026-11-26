@@ -496,12 +496,10 @@ int main(){
     ops.push_back({"4","quest-consumed-v1","q 1 3 ref base 1 101"});
     history=QuestPickupHistory(ops);assert(history);
     assert(!ShouldRestorePickup(history->at(0),101,1,false));
-    assert(ShouldReconcileSpentPickup(history->at(0),101,1,true,true));
-    assert(!ShouldReconcileSpentPickup(history->at(0),202,1,true,true));
-    assert(!ShouldReconcileSpentPickup(history->at(0),101,2,true,true));
-    assert(!ShouldReconcileSpentPickup(history->at(0),101,1,false,true));
-    assert(!ShouldReconcileSpentPickup(history->at(0),101,1,true,false));
-    assert(!ShouldReconcileSpentPickup(history->at(1),202,1,true,true));
+    assert(ShouldReconcileSpentPickup(history->at(0),101,1));
+    assert(!ShouldReconcileSpentPickup(history->at(0),202,1));
+    assert(!ShouldReconcileSpentPickup(history->at(0),101,2));
+    assert(!ShouldReconcileSpentPickup(history->at(1),202,1));
     assert(ShouldRestorePickup(history->at(1),202,1,false));
     ops.push_back({"5","quest-consumed-v1","q 1 4 wrong base2 1 202"});
     assert(!QuestPickupHistory(ops));
@@ -510,13 +508,12 @@ int main(){
     history=QuestPickupHistory(ops);assert(history&&history->size()==1);
     assert(ShouldRestorePickup(history->at(0),101,1,false));
     assert(!ShouldRestorePickup(history->at(0),202,1,false));
-    assert(!ShouldReconcileSpentPickup(history->at(0),202,1,true,true));
+    assert(!ShouldReconcileSpentPickup(history->at(0),202,1));
     ops.push_back({"3","quest-consumed-v2","q 1 3 ref base 1 202"});
     history=QuestPickupHistory(ops);assert(history&&history->at(0).Consumed);
-    assert(ShouldReconcileSpentPickup(history->at(0),101,1,true,true));
-    assert(ShouldReconcileSpentPickup(history->at(0),202,1,true,true));
-    assert(!ShouldReconcileSpentPickup(history->at(0),303,1,true,true));
-    assert(!ShouldReconcileSpentPickup(history->at(0),202,1,true,false));
+    assert(ShouldReconcileSpentPickup(history->at(0),101,1));
+    assert(ShouldReconcileSpentPickup(history->at(0),202,1));
+    assert(!ShouldReconcileSpentPickup(history->at(0),303,1));
     assert(!ShouldRestorePickup(history->at(0),101,1,false));
     ops[2].Payload="q 1 3 ref base 1 303";assert(!QuestPickupHistory(ops));
 }
@@ -686,13 +683,20 @@ int main(){
     assert(!turnIns.Acquire(c,202,2,7,now));
     assert(!turnIns.Acquire(d,202,2,7,now));
     assert(turnIns.Acquire(c,202,2,9,now+std::chrono::seconds(121)));
+    assert(turnIns.Allows(c,202,now+std::chrono::seconds(122)));
+    assert(!turnIns.Allows(c,101,now+std::chrono::seconds(122)));
+    assert(!turnIns.Allows(c,202,now+std::chrono::seconds(242)));
     assert(PositiveSingleItem(0,1.f)&&PositiveSingleItem(3<<5,1.f));
     assert(PositiveSingleItem(1<<5,0.f)&&PositiveSingleItem(2<<5,0.f));
     assert(!PositiveSingleItem(1,1.f)&&!PositiveSingleItem(4,1.f)&&!PositiveSingleItem(0,2.f));
     std::vector<CampaignJournal::Operation> ops={{"1","quest-pickup-v1",
         c.Quest+" 1 3 "+c.Reference+" "+c.Item+" 1 101"}};
     assert(AlreadyTaken(ops,c));assert(AlreadyTaken(ops,d));
-    Receipt pickup{c,1,true},remove{c,-1,false};
+    Receipt pickup{c,1,true},remove{c,-1,false},shared{c,-1,false,true};
+    assert(AvailableOriginal(ops,c)==Payload(c,101));
+    assert(DecodeReceipt(shared.Encode())->Shared);
+    assert(!DecodeReceipt("turnin "+pickup.Encode()));
+    assert(!Acknowledged(ops,shared,202));
     assert(DecodeReceipt(pickup.Encode())&&DecodeReceipt(remove.Encode()));
     assert(!DecodeReceipt(remove.Encode()+" ")&&!DecodeReceipt(c.Encode()+" -1 1"));
     assert(Acknowledged(ops,pickup,101)&&!Acknowledged(ops,pickup,202));
@@ -701,6 +705,7 @@ int main(){
     ops.push_back({"3","quest-consumed-v2",Payload(c,202)});
     assert(Acknowledged(ops,pickup,202)&&Acknowledged(ops,remove,101)&&Acknowledged(ops,remove,202));
     assert(!Acknowledged(ops,remove,303));
+    assert(Acknowledged(ops,shared,303)&&!AvailableOriginal(ops,c));
     d.Reference="736b7972696d2e65736d.457";assert(!AlreadyTaken(ops,d));
 }
 ''', ['-I'+str(code/'common')])

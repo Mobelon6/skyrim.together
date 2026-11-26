@@ -432,7 +432,7 @@ diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyr
  
      return count;
  }
-@@ -1080,7 +1117,29 @@
+@@ -1080,7 +1117,41 @@
          }
  
          item.Count = -aCount;
@@ -443,6 +443,18 @@ diff --git a/Code/client/Games/Skyrim/TESObjectREFR.cpp b/Code/client/Games/Skyr
 +        if (apThis==PlayerCharacter::Get() && aCount==1 &&
 +            !apMoveToRef && aReason==ITEM_REMOVE_REASON::kRemove)
 +        {
++            if (apItem&&!apExtraList&&apThis->GetItemCountInInventory(apItem)==0)
++            {
++                // Do not publish a phantom local inventory delta. The quest
++                // journal handles only an authorized shared removal request.
++                extern void ObserveSharedQuestRemoval(uint32_t) noexcept;
++                const auto base=apItem->formID;
++                ScopedEquipOverride equip;
++                auto* result=TiltedPhoques::ThisCall(RealRemoveInventoryItem,apThis,apResult,apItem,aCount,
++                    aReason,apExtraList,apMoveToRef,apDropLoc,apRotate);
++                ObserveSharedQuestRemoval(base);
++                return result;
++            }
 +            InventoryChangeEvent change(apThis->formID,item);
 +            if (IdentifyQuestRemoval(*apThis,apItem,apExtraList,change))
 +            {
