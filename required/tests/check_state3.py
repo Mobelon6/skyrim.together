@@ -494,3 +494,25 @@ assert(svc.m_world.v.CurrentActorValues.ActorValuesList.at(24)==1.f && got.back(
 send(9,2,-10.f);assert(svc.m_world.v.CurrentActorValues.ActorValuesList.at(24)<=0.f);
 }
 ''')
+
+run('word acquisition and durable per-character learning',headers+'''
+#include <QuestWordReward.h>
+int main(){
+    using namespace QuestWordReward;
+    Sample a{11,100,2,{10,20}},b=a;
+    assert(!NewWord(a,b));b.Known.insert(30);assert(NewWord(a,b)==30);
+    b.Cell=101;assert(!NewWord(a,b));b.Cell=100;b.Peer=3;assert(!NewWord(a,b));
+    b.Peer=2;b.Character=12;assert(!NewWord(a,b));b.Character=11;
+    b.Known.erase(10);assert(!NewWord(a,b));b.Known.insert(10);
+    b.Known.insert(40);assert(!NewWord(a,b));
+    Grant g{"736b7972696d2e65736d.123",11,22};
+    assert(g.Valid()&&Decode(g.Encode())&&g.Entitles(11)&&g.Entitles(22)&&!g.Entitles(33));
+    assert(!Decode(g.Encode()+" ")&&!Decode("bad 11 22")&&!Decode(g.Word+" 11 11"));
+    std::vector<CampaignJournal::Operation> ops={{"1","quest-word-v1",g.Encode()}};
+    auto grants=Read(ops);assert(grants&&Entitled(*grants,g.Word,11)&&Entitled(*grants,g.Word,22));
+    assert(!Entitled(*grants,g.Word,33));
+    ops.push_back({"2","quest-word-v1",g.Word+" 22 33"});assert(!Read(ops));
+    ops.pop_back();ops.push_back({"2","quest-word-v1",g.Word+" 11 33"});assert(!Read(ops));
+    ops.pop_back();ops.push_back({"2","quest-word-v1",g.Word+" 33 22"});assert(Read(ops));
+}
+''', ['-I'+str(code/'common')])
