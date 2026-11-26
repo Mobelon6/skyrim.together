@@ -80,13 +80,21 @@ struct NotifyQuestUpdate{enum {StageUpdate,Started,Stopped};GameId Id;uint16_t S
 struct TESForm{static TESForm* GetById(uint32_t);};
 template<class T> T* Cast(TESForm* p){return static_cast<T*>(p);}
 struct Conditions{uint16_t wants;};
+struct TESConditionItem {
+ enum Function:uint16_t{kGetStageDone=59};enum class OpCode:uint8_t{kEqualTo,kNotEqualTo,kGreaterThan,kGreaterThanOrEqualTo,kLessThan,kLessThanOrEqualTo};
+ TESConditionItem* pNext{};float comparisonValue{};uint16_t function=kGetStageDone;void* params[2]{};uint8_t flags{},object{};
+ OpCode GetOpCode() const{return static_cast<OpCode>(flags>>5);}
+};
+struct TESCondition{TESConditionItem* pHead{};};
 struct BGSScenePhase{Conditions completionConditions;};
 struct PhaseList{int length=1;BGSScenePhase* phase;auto operator[](int)const{return phase;}};
 struct BGSScene{bool isPlaying=true;int currentPhaseIndex=0;PhaseList phases;int formID=44;bool ready=false;};
 struct TESQuest:TESForm{
 struct{struct{const char* AsAscii(){return "Quest";}}value;}fullName;enum class Type{Other,None,Miscellaneous};Type type=Type::Other;
 uint32_t formID=2,currentInstanceID=1;uint16_t currentStage=0;bool stopped=false;std::string targets;
-enum Flags{RunOnce=256,Completed=2};uint16_t flags{};
+enum Flags{RunOnce=256,Completed=2,AllowRepeatStages=8};uint16_t flags{};
+struct Stage{uint16_t stageIndex;std::vector<void*> items;};std::vector<Stage*> stages;
+bool IsStageDone(uint16_t s){return reached.contains(s);}
 enum class State{WaitingPromotion,Running,Stopped};bool pendingPromotion=false;int nativeStarts=0;
 State getState(){return pendingPromotion?State::WaitingPromotion:stopped?State::Stopped:State::Running;}
 bool EnsureQuestStarted(bool& success,bool force){assert(!force);++nativeStarts;success=true;stopped=false;return true;}
@@ -107,8 +115,9 @@ template<class...T>void info(T&&...){}
 template<class...T>void error(T&&...){}
 }
 struct QuestService{
-World& m_world=World::Get();struct HeldStages{Vector<uint16_t> Stages,PendingItems;std::chrono::steady_clock::time_point RetryAt{};std::string Targets;uint32_t LocalInstance{};};
+World& m_world=World::Get();struct HeldStages{Vector<uint16_t> Stages,PendingItems;std::chrono::steady_clock::time_point RetryAt{};std::string Targets;uint32_t LocalInstance{};bool BranchConflict{};};
 std::map<uint32_t,std::pair<uint32_t,std::string>> m_lastQuestTargets;
+std::map<uint32_t,uint32_t> m_branchConflicts;
 static std::string CaptureQuestTargets(TESQuest* q){return q->targets;}
 Map<uint32_t,HeldStages> m_heldStages; Map<uint32_t,Vector<NotifyQuestUpdate>> m_afterHeldStages;
 Map<uint32_t,std::chrono::steady_clock::time_point> m_questRetryAt;
@@ -194,6 +203,24 @@ int main(){
     assert(quest.actions.empty());
     service.OnQuestUpdate({2,20,0,0,quest.targets,8});
     assert((quest.actions==Vector<int>{20}));
+    service.OnPartyLeft({});
+    quest.stopped=false;quest.targets.clear();quest.reached={5};quest.actions.clear();
+    TESConditionItem excludes;excludes.params[0]=&quest;excludes.params[1]=reinterpret_cast<void*>(5);
+    TESCondition entry{&excludes};TESQuest::Stage branch{30,{&entry}};quest.stages={&branch};
+    assert(StageExcludedByLocalBranch(&quest,30));
+    TESConditionItem unknown;unknown.function=47;excludes.flags=1;excludes.pNext=&unknown;
+    assert(!StageExcludedByLocalBranch(&quest,30));
+    excludes.flags=0;excludes.pNext=nullptr;TESCondition unrestricted;branch.items.push_back(&unrestricted);
+    assert(!StageExcludedByLocalBranch(&quest,30));branch.items.pop_back();
+    quest.flags=TESQuest::AllowRepeatStages;assert(!StageExcludedByLocalBranch(&quest,30));quest.flags=0;
+    send(30,0);send(40,0);send(40,2);
+    assert(quest.actions.empty()&&!quest.stopped&&service.m_branchConflicts.count(2));
+    ++quest.currentInstanceID;quest.reached.clear();send(30,0);
+    assert((quest.actions==Vector<int>{30})&&!service.m_branchConflicts.count(2));
+    service.OnPartyLeft({});quest.reached.clear();quest.actions.clear();scene.isPlaying=true;scene.ready=false;
+    send(30,0);send(40,0);send(40,2);quest.reached.insert(5);scene.isPlaying=false;
+    service.OnUpdate({});assert(quest.actions.empty()&&!quest.stopped&&service.m_branchConflicts.count(2));
+    assert(service.m_heldStages.empty()&&service.m_afterHeldStages.empty());
 }
 ''')
 
