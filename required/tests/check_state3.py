@@ -86,6 +86,10 @@ struct BGSScene{bool isPlaying=true;int currentPhaseIndex=0;PhaseList phases;int
 struct TESQuest:TESForm{
 struct{struct{const char* AsAscii(){return "Quest";}}value;}fullName;enum class Type{Other,None,Miscellaneous};Type type=Type::Other;
 uint32_t formID=2;uint16_t currentStage=0;bool stopped=false;
+enum Flags{RunOnce=256,Completed=2};uint16_t flags{};
+enum class State{WaitingPromotion,Running,Stopped};bool pendingPromotion=false;int nativeStarts=0;
+State getState(){return pendingPromotion?State::WaitingPromotion:stopped?State::Stopped:State::Running;}
+bool EnsureQuestStarted(bool& success,bool force){assert(!force);++nativeStarts;success=true;stopped=false;return true;}
 std::set<uint16_t> reached,reject;std::vector<int> actions;Vector<BGSScene*> scenes;
 bool IsStageReached(uint16_t s){return reached.contains(s);}
 bool ScriptSetStage(uint16_t s){if(reject.contains(s)||!reached.insert(s).second)return false;stopped=false;actions.push_back(s);currentStage=s;return true;}
@@ -149,6 +153,14 @@ int main(){
     assert((Vector<int>(quest.actions.end()-3,quest.actions.end())==Vector<int>{70,80,-1}));
     quest.reject.insert(90);send(90,1);assert(service.m_afterHeldStages.count(2));
     service.OnDisconnected({});assert(service.m_afterHeldStages.empty()&&service.m_questRetryAt.empty());
+    // Match the native IsStageReached(0) shortcut in a stopped quest.
+    quest.stopped=true;quest.currentStage=0;quest.reached={0};quest.pendingPromotion=true;
+    send(0,1);assert(quest.nativeStarts==0&&service.m_afterHeldStages.count(2));
+    quest.pendingPromotion=false;service.m_questRetryAt.at(2)={};service.OnUpdate({});
+    assert(!quest.IsStopped()&&quest.nativeStarts==1&&service.m_afterHeldStages.empty());
+    send(0,1);assert(quest.nativeStarts==1);
+    quest.stopped=true;quest.flags=TESQuest::RunOnce|TESQuest::Completed;send(0,1);
+    assert(quest.IsStopped()&&quest.nativeStarts==1&&service.m_afterHeldStages.empty());
 }
 ''')
 

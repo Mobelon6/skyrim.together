@@ -1380,7 +1380,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +        if (!current) return false;
 +        if (update.Status == NotifyQuestUpdate::Stopped) return !current->IsStopped();
 +        if (update.Status == NotifyQuestUpdate::Started)
-+            return current->IsStopped() && (update.SharedRun > 1 || !current->IsStageReached(update.Stage));
++            return current->IsStopped() && !((current->flags & TESQuest::RunOnce) && (current->flags & TESQuest::Completed));
 +        return update.Status == NotifyQuestUpdate::StageUpdate && !current->IsStageReached(update.Stage);
 +    };
 +    const uint32_t subject = update.Encounter ? m_world.GetModSystem().GetGameId(update.Subject) : 0;
@@ -1479,13 +1479,26 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
 +            return;
      }
  }
-@@ -645,15 +673,17 @@
+@@ -645,15 +673,30 @@
      case NotifyQuestUpdate::Started:
      {
 -        pQuest->ScriptSetStage(aUpdate.Stage);
 -        pQuest->SetActive(true);
 -        bResult = true;
 -        spdlog::info("Remote quest started: {:X}, stage: {}", formId, aUpdate.Stage);
++        // Stage zero (or an already executed stage) is not proof of a running quest.
++        // Use the existing native unforced start only for an explicit start event.
++        // A pending promotion must finish before another native request.
++        if (pQuest->IsStopped() && (pQuest->flags & TESQuest::RunOnce) && (pQuest->flags & TESQuest::Completed))
++            return;
++        if (pQuest->IsStopped() && pQuest->getState() == TESQuest::State::WaitingPromotion)
++            break;
++        if (pQuest->IsStopped() && pQuest->IsStageReached(aUpdate.Stage))
++        {
++            bool started = false;
++            pQuest->EnsureQuestStarted(started, false);
++            if (pQuest->IsStopped()) break;
++        }
 +        bResult = (pQuest->IsStageReached(aUpdate.Stage) || pQuest->ScriptSetStage(aUpdate.Stage)) && !pQuest->IsStopped();
 +        if (bResult)
 +        {
@@ -1504,7 +1517,7 @@ diff --git a/Code/client/Services/Generic/QuestService.cpp b/Code/client/Service
          break;
      case NotifyQuestUpdate::Stopped:
          bResult = StopQuest(formId);
-@@ -663,5 +693,12 @@
+@@ -663,5 +706,12 @@
      }
  
      if (!bResult)
