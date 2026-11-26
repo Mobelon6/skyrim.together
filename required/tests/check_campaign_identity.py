@@ -26,7 +26,7 @@ while i<globals_end:
     names.append(fields[b"EDID"].rstrip(b"\0").decode())
     i=stop
 assert i==globals_end
-assert names==["STRTradeStreamLow","STRTradeStreamMiddle","STRTradeStreamHigh","STRTradeCursor","STRCampaignCampaignLow","STRCampaignCampaignMiddle","STRCampaignCampaignHigh","STRCampaignCharacterLow","STRCampaignCharacterMiddle","STRCampaignCharacterHigh","STRCampaignRevisionLow","STRCampaignRevisionHigh","STRCampaignTagLow","STRCampaignTagMiddle","STRCampaignTagHigh","STRCampaignSchema"]+[f"STRDragonSoulReceipt{i:02d}" for i in range(32)]
+assert names==["STRTradeStreamLow","STRTradeStreamMiddle","STRTradeStreamHigh","STRTradeCursor","STRCampaignCampaignLow","STRCampaignCampaignMiddle","STRCampaignCampaignHigh","STRCampaignCharacterLow","STRCampaignCharacterMiddle","STRCampaignCharacterHigh","STRCampaignRevisionLow","STRCampaignRevisionHigh","STRCampaignTagLow","STRCampaignTagMiddle","STRCampaignTagHigh","STRCampaignSchema"]+[f"STRDragonSoulReceipt{i:02d}" for i in range(32)]+["STRUniqueAzuraReward","STRUniqueBlackStarReward"]
 common=Path(sys.argv[1],"Code/common").resolve()
 test=r"""
 #include "CampaignIdentity.h"
