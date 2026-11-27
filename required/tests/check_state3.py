@@ -1160,3 +1160,154 @@ native = (code / 'client/Games/Misc/BSScript.cpp').read_text()
 assert 'if (CampaignRewardPolicy::SupplementDragonSouls&&\n        apThis==modActorValueNative.load' in native
 assert 'return CampaignRewardPolicy::SupplementDragonSouls&&realDragonNativeCall' in native
 print('PASS native-first personal reward entry points', flush=True)
+
+# Native-first acceptance: execute the real ordinary STR object handlers,
+# not a second implementation of locks, doors, or personal jail stashes.
+objects = 'client/Services/Generic/ObjectService.cpp'
+stash = extract(objects, 'Set<const TESObjectREFR*> GetPlayerStashContainers()', 'void ObjectService::OnDisconnected(')
+activate = extract(objects, 'void ObjectService::OnActivateNotify(', 'void ObjectService::OnLockChange(')
+lock = extract(objects, 'void ObjectService::OnLockChangeNotify(', 'void ObjectService::OnScriptAnimationEvent(')
+run('ordinary doors and locks use native replay; confiscated inventory remains personal', headers+'''
+template<class T> using Set=std::set<T>;
+enum class FormType{Door,Container,Activator};
+struct TESObjectCELL{uint32_t formID=10;};
+struct TESForm{uint32_t formID{};FormType formType{};static TESForm* GetById(uint32_t);};
+template<class T>T* Cast(TESForm* p){return static_cast<T*>(p);}
+struct Lock{bool locked=false;int lockLevel=0;bool IsLocked(){return locked;}void SetLock(bool b){locked=b;}};
+struct Actor{};
+struct TESObjectREFR:TESForm{
+ enum OpenState{kClosed,kOpen};
+ TESForm base{};TESForm* baseForm=&base;TESObjectCELL cell;Lock lock;
+ bool hasLock=false;int lockChanges=0,activations=0;OpenState state=kClosed;Actor* activator{};
+ TESObjectCELL* GetParentCellEx(){return &cell;}
+ Lock* GetLock(){return hasLock?&lock:nullptr;}
+ Lock* CreateLock(){hasLock=true;return &lock;}
+ void LockChange(){++lockChanges;}
+ OpenState GetOpenState(){return state;}
+ void Activate(Actor* a,int,void*,int,int){activator=a;++activations;if(base.formType==FormType::Door)state=state==kClosed?kOpen:kClosed;}
+} door,stashA,stashB,other,questChestA,questChestB,proxy;
+TESForm* TESForm::GetById(uint32_t id){return id==1?&door:nullptr;}
+struct TESFaction{struct{TESObjectREFR* playerInventoryContainer{};TESObjectREFR* stolenGoodsContainer{};}crimeData;};
+struct ModManager{std::vector<TESFaction*> factions;static ModManager* Get(){static ModManager m;return &m;}};
+namespace NativeTrade{bool IsProxy(const TESObjectREFR* p){return p==&proxy;}}
+namespace HomeInstance{bool ManagedCell(uint32_t id){return id==99;}}
+struct World{struct ModSystem{uint32_t GetGameId(uint32_t id){return id;}} mods;static World& Get(){static World w;return w;}ModSystem& GetModSystem(){return mods;}};
+Actor remote;namespace Utils{template<class T>T* GetByServerId(uint32_t id){return id==2?&remote:nullptr;}}
+namespace spdlog{template<class...T>void error(T&&...){}}
+struct NotifyActivate{uint32_t Id,ActivatorId;int PreActivationOpenState;};
+struct NotifyLockChange{uint32_t Id;bool IsLocked;int LockLevel;};
+struct ObjectService{void OnActivateNotify(const NotifyActivate&) noexcept;void OnLockChangeNotify(const NotifyLockChange&) noexcept;};
+'''+stash+activate+lock+'''
+int main(){
+ TESFaction faction{{&stashA,&stashB}};
+ ModManager::Get()->factions={nullptr,&faction};
+ questChestA.formID=0x39CF1;questChestB.formID=0x3EF03;
+ auto exclusions=GetPlayerStashContainers();
+ assert(exclusions.size()==2&&!ShouldSyncObject(&stashA,exclusions)&&!ShouldSyncObject(&stashB,exclusions));
+ assert(!ShouldSyncObject(&questChestA,exclusions)&&!ShouldSyncObject(&questChestB,exclusions));
+ assert(!ShouldSyncObject(&proxy,exclusions)&&!ShouldSyncObject(nullptr,exclusions));
+ assert(ShouldSyncObject(&other,exclusions)&&ShouldSyncObject(&door,exclusions));
+ ObjectService svc;door.base.formType=FormType::Door;
+ svc.OnActivateNotify({1,2,TESObjectREFR::kClosed});
+ assert(door.state==TESObjectREFR::kOpen&&door.activations==1&&door.activator==&remote);
+ svc.OnActivateNotify({1,2,TESObjectREFR::kClosed}); // repeated opening must not close it
+ assert(door.state==TESObjectREFR::kOpen&&door.activations==1);
+ svc.OnActivateNotify({1,2,TESObjectREFR::kOpen});
+ assert(door.state==TESObjectREFR::kClosed&&door.activations==2);
+ svc.OnActivateNotify({1,3,TESObjectREFR::kClosed});assert(door.activations==2);
+ svc.OnLockChangeNotify({1,true,50});
+ assert(door.hasLock&&door.lock.locked&&door.lock.lockLevel==50&&door.lockChanges==1);
+ svc.OnLockChangeNotify({1,false,50});assert(!door.lock.locked&&door.lockChanges==2);
+ svc.OnLockChangeNotify({1,false,50});assert(door.lockChanges==2);
+ door.cell.formID=99;svc.OnActivateNotify({1,2,TESObjectREFR::kClosed});svc.OnLockChangeNotify({1,true,50});
+ assert(door.activations==2&&!door.lock.locked&&door.lockChanges==2); // managed objects stay on their existing route
+}
+''')
+
+# The original server still relays weather and optional combat XP; test the
+# actual network handler branches. An in-memory transport represents recipients.
+serverObjects=extract('server/Services/ObjectService.cpp','void ObjectService::OnActivate(', 'void ObjectService::OnLockChange(')
+weather=extract('server/Services/WeatherService.cpp','void WeatherService::OnWeatherChange(', 'void WeatherService::OnRequestCurrentWeather(')
+weather_source=(code/'server/Services/WeatherService.cpp').read_text()
+weather += weather_source[weather_source.index('void WeatherService::OnRequestCurrentWeather('):]
+xp=extract('server/Services/CharacterService.cpp','void CharacterService::OnSyncExperienceRequest(', 'void CharacterService::OnDialogueRequest(')
+run('ordinary object routing, weather cache and configurable native combat XP',headers+'''
+struct GameId{uint32_t ModId{},BaseId{};bool operator==(const GameId&)const=default;};
+struct ActivateRequest{GameId CellId,Id;uint32_t ActivatorId;int PreActivationOpenState;};
+struct NotifyActivate{GameId Id;uint32_t ActivatorId{};int PreActivationOpenState{};};
+struct RequestWeatherChange{GameId Id;};struct RequestCurrentWeather{};struct NotifyWeatherChange{GameId Id;};
+struct SyncExperienceRequest{float Experience;};struct NotifySyncExperience{float Experience;};
+struct Cell{GameId Cell;bool estate=false;bool HasExteriorEstate()const{return estate;}};
+struct Player{
+ Cell location;uint32_t character=1;int party=1;std::vector<NotifyActivate> acts;std::vector<NotifyWeatherChange> weather;
+ Cell GetCellComponent()const{return location;}
+ const uint32_t* GetCharacter()const{return character?&character:nullptr;}
+ int GetParty()const{return party;}
+ void Send(const NotifyActivate& n){acts.push_back(n);}
+ void Send(const NotifyWeatherChange& n){weather.push_back(n);}
+};
+template<class T>struct PacketEvent{Player* pPlayer;T Packet;Player* GetSender()const{return pPlayer;}};
+namespace HomeScope{bool Private(uint32_t id){return id==99;}}
+struct Party{GameId CachedWeather;};
+struct World{
+ std::vector<Player*> players;Party party;
+ World& GetPartyService(){return *this;}
+ Party* GetPlayerParty(Player* p){return p->party?&party:nullptr;}
+ const auto& GetPlayerManager()const{return players;}
+};
+struct GameServer{
+ static GameServer* Get(){static GameServer s;return &s;}
+ int weatherRelays=0,xpRelays=0;float xp=0;Player* sender{};int group=0;
+ void SendToPartyInRange(const NotifyWeatherChange&,int p,uint32_t,Player* s){++weatherRelays;group=p;sender=s;}
+ void SendToParty(const NotifySyncExperience& n,int p,Player* s){++xpRelays;xp=n.Experience;group=p;sender=s;}
+};
+bool bEnableXpSync=false;
+struct ObjectService{World& m_world;void OnActivate(const PacketEvent<ActivateRequest>&)const noexcept;};
+struct WeatherService{World& m_world;void OnWeatherChange(const PacketEvent<RequestWeatherChange>&)const noexcept;void OnRequestCurrentWeather(const PacketEvent<RequestCurrentWeather>&)const noexcept;};
+struct CharacterService{void OnSyncExperienceRequest(const PacketEvent<SyncExperienceRequest>&)const noexcept;};
+'''+serverObjects+weather+xp+'''
+int main(){
+ Player a,b,c; a.location.Cell=b.location.Cell={0,10};c.location.Cell={0,11};
+ World world{{&a,&b,&c}};ObjectService objects{world};
+ objects.OnActivate({&a,{{0,10},{0,5},1,2}});
+ assert(a.acts.empty()&&c.acts.empty()&&b.acts.size()==1);
+ assert(b.acts[0].Id==(GameId{0,5})&&b.acts[0].ActivatorId==1&&b.acts[0].PreActivationOpenState==2);
+ b.location.estate=true;objects.OnActivate({&a,{{0,10},{0,5},1,2}});assert(b.acts.size()==1);
+ auto* game=GameServer::Get();WeatherService svc{world};svc.OnWeatherChange({&a,{{0,42}}});
+ assert(game->weatherRelays==1&&world.party.CachedWeather==(GameId{0,42}));
+ svc.OnRequestCurrentWeather({&b,{}});assert(b.weather.size()==1&&b.weather[0].Id==(GameId{0,42}));
+ a.party=0;svc.OnWeatherChange({&a,{{0,43}}});assert(game->weatherRelays==1&&world.party.CachedWeather==(GameId{0,42}));
+ a.party=1;CharacterService cs;cs.OnSyncExperienceRequest({&a,{10.f}});assert(game->xpRelays==0);
+ bEnableXpSync=true;cs.OnSyncExperienceRequest({&a,{10.f}});assert(game->xpRelays==1&&game->xp==10.f&&game->sender==&a&&game->group==1);
+}
+''')
+
+rest=extract('server/Services/CalendarService.cpp','void CalendarService::OnRest(', 'void CalendarService::OnUpdate(')
+days=extract('common/DateTime.cpp','const uint32_t cDayLengthArray','void DateTime::Update(')
+run('existing shared sleep and wait arrival without a second time increment',headers+'''
+#include <cmath>
+struct TimeModel{float TimeScale=20.f,Time=12.f;uint32_t Year=201,Month=0,Day=1;};
+struct DateTime{TimeModel m_timeModel;static uint32_t GetNumberOfDaysByMonthIndex(int);};
+struct RequestRestTime{TimeModel Arrival;};
+struct Player{bool party=true,character=true;bool GetCharacter()const{return character;}};
+template<class T>struct PacketEvent{Player* pPlayer;T Packet;};
+struct World{World& GetPartyService(){return *this;}bool GetPlayerParty(Player* p){return p->party;}};
+struct CalendarService{
+ World m_world;DateTime m_dateTime;int broadcasts=0;void SendTimeResync(bool rest){assert(rest);++broadcasts;}
+ void OnRest(const PacketEvent<RequestRestTime>&)noexcept;
+};
+'''+days+rest+'''
+int main(){
+ CalendarService s;Player a,b;
+ s.m_dateTime.m_timeModel={20.f,23.f,201,11,31};
+ TimeModel arrival{99.f,7.f,202,0,1};
+ s.OnRest({&a,{arrival}});
+ assert(s.m_dateTime.m_timeModel.Day==1&&s.m_dateTime.m_timeModel.Year==202&&s.m_dateTime.m_timeModel.Time==7.f);
+ assert(s.m_dateTime.m_timeModel.TimeScale==20.f&&s.broadcasts==1);
+ s.OnRest({&b,{arrival}});assert(s.m_dateTime.m_timeModel.Time==7.f&&s.broadcasts==2);
+ s.OnRest({&b,{{1.f,8.f,202,0,3}}});assert(s.m_dateTime.m_timeModel.Time==7.f&&s.m_dateTime.m_timeModel.Day==1);
+ s.OnRest({&a,{{1.f,8.f,202,1,30}}});assert(s.broadcasts==3);
+ b.party=false;s.OnRest({&b,{{1.f,8.f,202,0,1}}});assert(s.broadcasts==3);
+ b.party=true;s.OnRest({&b,{{1.f,9.f,202,0,1}}});assert(s.m_dateTime.m_timeModel.Time==9.f&&s.broadcasts==4);
+}
+''')
