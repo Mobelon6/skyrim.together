@@ -1142,7 +1142,7 @@ int main(){
 }
 ''', ['-I'+str(code/'common')])
 
-removal=extract('client/Games/Skyrim/TESObjectREFR.cpp','static bool IdentifyQuestRemoval','int64_t TESObjectREFR::GetItemCountInInventory')
+removal=extract('client/Games/Skyrim/TESObjectREFR.cpp','bool IdentifyQuestRemoval','int64_t TESObjectREFR::GetItemCountInInventory')
 run('native quest removal without an explicit extra-data stack',headers+'''
 using GameId=unsigned;
 struct TESForm{};
@@ -1517,7 +1517,7 @@ int main(){
 # Native additions/consumption: exercise the changed actual hooks. The
 # identity resolver is independently tested above; this mock controls whether
 # a native stack is exact and how much the engine actually changes.
-adds=extract('client/Games/Skyrim/TESObjectREFR.cpp','void TP_MAKE_THISCALL(HookAddInventoryItem,','BSPointerHandle<TESObjectREFR>*\nTP_MAKE_THISCALL(HookRemoveInventoryItem,')
+adds=extract('client/Games/Skyrim/TESObjectREFR.cpp','void TP_MAKE_THISCALL(HookAddInventoryItem,','// A native QF RemoveItem')
 removes=extract('client/Games/Skyrim/TESObjectREFR.cpp','BSPointerHandle<TESObjectREFR>*\nTP_MAKE_THISCALL(HookRemoveInventoryItem,','void TP_MAKE_THISCALL(HookRotateX,')
 run('confirmed native inventory deltas and nested pickup guard',headers+'''
 #include <QuestPickupInventoryScope.h>
@@ -1534,7 +1534,7 @@ struct TESObjectREFR{
 struct PlayerCharacter:TESObjectREFR{static PlayerCharacter* Get(){static PlayerCharacter p;return &p;}};
 template<class T>struct BSPointerHandle{struct{uint32_t iBits{};}handle;};
 struct NiPoint3{};
-enum class ITEM_REMOVE_REASON{kRemove,kDropping,kTransfer};
+enum class ITEM_REMOVE_REASON{kRemove,kDropping,kTransfer,kStoreInContainer};
 struct ScopedInventoryOverride{static bool IsOverriden(){return false;}};
 struct ScopedExtraDataOverride{};struct ScopedEquipOverride{};
 namespace NativeTrade{bool BlockAdd(TESObjectREFR*,TESObjectREFR*){return false;}
@@ -1545,6 +1545,7 @@ struct ModSystem{void GetServerModId(uint32_t a,uint32_t& b){b=a;}};
 struct World{ModSystem mods;static World& Get(){static World w;return w;}ModSystem& GetModSystem(){return mods;}};
 struct QuestRewardAddObservation{QuestRewardAddObservation(TESObjectREFR*,TESBoundObject*,ExtraDataList*,int32_t,TESObjectREFR*){}};
 void QuestRewardInventoryTouched(TESObjectREFR*,uint32_t) noexcept {}
+bool NativeQuestTransfer(TESObjectREFR*,ITEM_REMOVE_REASON,const InventoryChangeEvent&){return false;}
 bool IdentifyQuestRemoval(TESObjectREFR& owner,TESBoundObject*,ExtraDataList*,InventoryChangeEvent& e){
  if(!owner.exact||owner.count!=1)return false;
  e.Item.IsQuestItem=true;e.Item.Count=-1;e.QuestId=100;e.QuestRef=200;e.QuestAlias=3;return true;
@@ -1674,3 +1675,65 @@ assert 'e->IsQuestObject()' in extract('client/Services/Generic/QuestJournal.cpp
 assert 'p->RemoveItem(item,1,ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);' in extract('client/Services/Generic/QuestJournal.cpp','void UpdateKeywordRewards(', 'struct PendingQuestReceipt')
 assert 'AddObjectToContainer' not in extract('client/Services/Generic/QuestJournal.cpp','void UpdateKeywordRewards(', 'struct PendingQuestReceipt')
 print('PASS keyword reward native observation, stage barrier, protected/modified copy exclusion and no artificial grant',flush=True)
+
+
+# Actor insertion owns a nested REFR insertion and publishes the actual
+# alias-bearing unit only after Skyrim returns. Compile the production body.
+actor_add=extract('client/Games/Skyrim/Actor.cpp','void TP_MAKE_THISCALL(HookAddInventoryItem, Actor','namespace\n{\n// Native SE layouts')
+run('Q-04 actor direct insertion, nested pickup and exact inventory observation',headers+'''
+#include <QuestPickupInventoryScope.h>
+#define TP_MAKE_THISCALL(name,cls,...) name(cls* apThis,__VA_ARGS__)
+struct TESForm{uint32_t formID=40;};struct TESBoundObject:TESForm{};
+struct ExtraDataList{};
+struct Inventory{struct Entry{uint32_t BaseId{};int32_t Count{};bool IsQuestItem{};};};
+struct InventoryChangeEvent{uint32_t FormId;Inventory::Entry Item;uint32_t QuestId{},QuestRef{},QuestAlias{};};
+struct TESObjectREFR{
+ uint32_t formID=14;int64_t count{};int add{},calls{};bool exact{};
+ int64_t GetItemCountInInventory(TESForm*){return count;}
+ void GetItemFromExtraData(Inventory::Entry&,ExtraDataList*){}
+};
+struct Actor:TESObjectREFR{};struct PlayerCharacter:Actor{static PlayerCharacter* Get(){static PlayerCharacter p;return &p;}};
+struct QuestRewardAddObservation{QuestRewardAddObservation(TESObjectREFR*,TESBoundObject*,ExtraDataList*,int32_t,TESObjectREFR*){}};
+struct ScopedInventoryOverride{static bool IsOverriden(){return false;}};
+namespace NativeTrade{bool BlockAdd(TESObjectREFR*,TESObjectREFR*){return false;}}
+struct ModSystem{void GetServerModId(uint32_t a,uint32_t& b){b=a;}};
+struct World{ModSystem mods;static World& Get(){static World w;return w;}ModSystem& GetModSystem(){return mods;}};
+bool IdentifyQuestRemoval(TESObjectREFR& owner,TESForm*,ExtraDataList*,InventoryChangeEvent& e){
+ if(!owner.exact||owner.count!=1)return false;
+ e.Item.IsQuestItem=true;e.Item.Count=-1;e.QuestId=100;e.QuestRef=200;e.QuestAlias=3;return true;
+}
+std::vector<InventoryChangeEvent> sent;
+void QueueActorInventoryChange(InventoryChangeEvent e,TESObjectREFR*){sent.push_back(e);}
+void RealAddInventoryItem(Actor* o,TESBoundObject* item,ExtraDataList*,int32_t count,TESObjectREFR*){
+ if(o==PlayerCharacter::Get()&&o->count==0&&count==1) assert(QuestPickupInventory::IsNestedAdd(o->formID,item->formID));
+ o->count+=o->add;++o->calls;
+}
+namespace TiltedPhoques{template<class F,class...A>auto ThisCall(F f,A... a){return f(a...);}}
+'''+actor_add+'''
+int main(){
+ auto* p=PlayerCharacter::Get();TESBoundObject item;
+ auto add=[&]{HookAddInventoryItem(p,&item,nullptr,1,nullptr);};
+ p->add=0;add();assert(sent.empty()&&p->calls==1);
+ p->add=1;p->exact=true;add();assert(sent.size()==1&&sent.back().Item.Count==1&&sent.back().QuestRef==200);
+ p->count=0;p->exact=false;add();assert(sent.size()==2&&!sent.back().QuestRef);
+ p->count=0;
+ {QuestPickupInventory::Scope scope(p->formID,item.formID);add();assert(sent.size()==2);}
+ assert(!QuestPickupInventory::IsNestedAdd(p->formID,item.formID));
+ Actor npc;npc.add=1;HookAddInventoryItem(&npc,&item,nullptr,1,nullptr);
+ assert(sent.size()==3&&!sent.back().QuestRef);
+}
+''',['-I'+str(code/'common')])
+reference=(code/'client/Games/Skyrim/TESObjectREFR.cpp').read_text()
+assert 'CampaignAccess::Mode()!=CampaignReplication::Link::Mode::Ready' in reference
+assert 'nativeQuestRemovalQuest=quest->formID' in (code/'client/Games/Misc/BSScript.cpp').read_text()
+assert 'NativeQuestTransfer(apMoveToRef,aReason,change)' in reference
+assert 'destinationBefore+1' in reference
+assert 'QuestPickupPermit::AlreadyTaken(authority.Journal.Operations(),' in physical_server
+receipt=extract('client/Services/Generic/QuestJournal.cpp','void QueueQuestItemReceipt(', 'void QuestRewardInventoryTouched(')
+assert 'CampaignAccess::LocalIdentity(world)' in receipt
+assert 'GetTransport().IsOnline()' not in receipt
+send_receipt=extract('client/Services/Generic/QuestJournal.cpp','void SendQuestReceipt(', 'std::optional<DeferredQuestPickup> DescribeQuestPickup')
+assert 'Acknowledged(' in send_receipt and 'Deadline' not in send_receipt
+event=extract('client/Services/Generic/InventoryService.cpp','void InventoryService::OnInventoryChangeEvent(', 'void InventoryService::OnEquipmentChangeEvent(')
+assert event.index('QueueQuestItemReceipt(m_world,request);')<event.index('if (!m_transport.IsConnected())')
+print('PASS Q-04/09/10 receipt before transport lookup, native transfer evidence, no remote base-only quest copy',flush=True)

@@ -859,20 +859,16 @@ struct PendingQuestReceipt
 {
     QuestPickupPermit::Receipt Receipt;
     uint64_t Campaign{},Character{};
-    std::chrono::steady_clock::time_point Deadline{};
 };
 std::vector<PendingQuestReceipt> pendingQuestReceipts;
 void SendQuestReceipt(const CampaignIdentity::Stamp& stamp,RequestCampaignPull& request)
 {
-    const auto now=std::chrono::steady_clock::now();
     std::erase_if(pendingQuestReceipts,[&](const auto& entry){
         if (entry.Campaign!=stamp.Campaign||entry.Character!=stamp.Character) return true;
         if (QuestPickupPermit::Acknowledged(campaignLink.Journal.Operations(),entry.Receipt,stamp.Character)) return true;
-        if (entry.Deadline<=now)
-        {
-            spdlog::warn("STM quest item receipt not confirmed before retry deadline");
-            return true;
-        }
+        // A confirmed native mutation is not invalidated by elapsed wall
+        // time or a short network outage. Retry in this loaded ESS until ACK;
+        // load/identity change clears the observation, not the server history.
         return false;
     });
     if (pendingQuestReceipts.empty()) return;
@@ -1681,11 +1677,11 @@ void QueueQuestItemReceipt(World& world,const RequestInventoryChanges& message) 
 {
     try
     {
-        if (!world.GetTransport().IsOnline()||!world.GetPartyService().IsInParty()||
+        if (!world.GetPartyService().IsInParty()||
             world.IsLoadingSave()||!SaveWorldReady()||message.Drop||!message.Item.IsQuestItem||
             !message.QuestId||!message.QuestRef||
             (message.Item.Count!=1&&message.Item.Count!=-1)) return;
-        const auto identity=CampaignAccess::Current(world);
+        const auto identity=CampaignAccess::LocalIdentity(world);
         if (!identity) return;
         auto& mods=world.GetModSystem();
         QuestPickupPermit::Receipt receipt{
@@ -1699,8 +1695,7 @@ void QueueQuestItemReceipt(World& world,const RequestInventoryChanges& message) 
                 entry.Receipt.Encode()==encoded) return;
         if (pendingQuestReceipts.size()>=64)
         {spdlog::warn("STM pending quest item receipt capacity reached");return;}
-        pendingQuestReceipts.push_back({std::move(receipt),identity->Save.Campaign,identity->Save.Character,
-            std::chrono::steady_clock::now()+std::chrono::minutes(2)});
+        pendingQuestReceipts.push_back({std::move(receipt),identity->Save.Campaign,identity->Save.Character});
         nextPull={};
     }
     catch (...) {spdlog::warn("STM could not queue quest item receipt");}

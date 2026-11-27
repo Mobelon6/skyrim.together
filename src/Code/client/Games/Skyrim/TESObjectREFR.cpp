@@ -3,6 +3,7 @@
 #include <Games/References.h>
 #include <QuestPickupInventoryScope.h>
 #include <Services/QuestRewardClient.h>
+#include <Services/CampaignAccess.h>
 #include <Games/Overrides.h>
 
 #include <World.h>
@@ -484,7 +485,7 @@ TESContainer* TESObjectREFR::GetContainer() const noexcept
 // it only when the ENTIRE local base-form count is one and its single
 // inventory stack carries the native, exact quest alias. Do not select a
 // stack when the engine could remove an ordinary item of the same type.
-static bool IdentifyQuestRemoval(TESObjectREFR& owner,TESForm* base,ExtraDataList* supplied,
+bool IdentifyQuestRemoval(TESObjectREFR& owner,TESForm* base,ExtraDataList* supplied,
     InventoryChangeEvent& change)
 {
     if (!base) return false;
@@ -952,9 +953,12 @@ void TESObjectREFR::AddOrRemoveItem(const Inventory::Entry& arEntry, bool aIsSet
         RemoveItem(pObject, -arEntry.Count, ITEM_REMOVE_REASON::kRemove, pExtraDataList, nullptr);
     }
 
-    // TODO(cosideci): this is still flawed. Adding the refr to the quest leader is hard.
-    // It is still recommended that the quest leader loots all quest items.
-    if (arEntry.IsQuestItem && arEntry.Count > 0 && !aIsSettingInventory)
+    // A cooperative campaign uses the actual holder's native inventory.
+    // Never manufacture a base-only quest copy from a remote player delta,
+    // even if its exact alias receipt could not be recorded. Keep the legacy
+    // behavior outside campaign mode for unmodified STR sessions.
+    if (arEntry.IsQuestItem && arEntry.Count > 0 && !aIsSettingInventory &&
+        CampaignAccess::Mode()!=CampaignReplication::Link::Mode::Ready)
     {
         PlayerCharacter* pPlayer = PlayerCharacter::Get();
 
@@ -1133,6 +1137,7 @@ void TP_MAKE_THISCALL(HookAddInventoryItem, TESObjectREFR, TESBoundObject* apIte
         if (apThis==PlayerCharacter::Get()&&aCount==1&&apThis->GetItemCountInInventory(apItem)==0)
         {
             InventoryChangeEvent change(apThis->formID,item);
+            QuestPickupInventory::Scope scope(apThis->formID,apItem->formID);
             TiltedPhoques::ThisCall(RealAddInventoryItem,apThis,apItem,apExtraData,aCount,apOldOwner);
             const auto actual=apThis->GetItemCountInInventory(apItem);
             if (actual==1)
@@ -1154,6 +1159,20 @@ void TP_MAKE_THISCALL(HookAddInventoryItem, TESObjectREFR, TESBoundObject* apIte
     spdlog::debug("Adding inventory item {:X} to {:X}", apItem->formID, apThis->formID);
 
     TiltedPhoques::ThisCall(RealAddInventoryItem, apThis, apItem, apExtraData, aCount, apOldOwner);
+}
+
+// A native QF RemoveItem with an explicit NPC destination is a turn-in
+// only when the exact protected alias belongs to that very quest. Never
+// interpret ordinary sales, drops, teammate storage or player trade as spend.
+bool NativeQuestTransfer(TESObjectREFR* target,ITEM_REMOVE_REASON reason,const InventoryChangeEvent& change) noexcept
+{
+    if (!target||target==PlayerCharacter::Get()||
+        (reason!=ITEM_REMOVE_REASON::kRemove&&reason!=ITEM_REMOVE_REASON::kStoreInContainer)) return false;
+    auto* actor=Cast<Actor>(target);
+    if (!actor||actor->GetExtension()->IsRemotePlayer()||!change.QuestId) return false;
+    extern uint32_t NativeQuestRemovalQuest() noexcept;
+    const auto quest=NativeQuestRemovalQuest();
+    return quest&&World::Get().GetModSystem().GetGameId(change.QuestId)==quest;
 }
 
 BSPointerHandle<TESObjectREFR>*
@@ -1184,11 +1203,12 @@ TP_MAKE_THISCALL(HookRemoveInventoryItem, TESObjectREFR, BSPointerHandle<TESObje
 
         // A unique quest object removed by the player's native script is
         // observed only after the real inventory count has decreased.
-        // Transfers, drops and sales are not evidence of consumption.
+        // Only a proven native quest-to-NPC transfer also qualifies.
         if (apThis==PlayerCharacter::Get() && aCount==1 &&
-            !apMoveToRef && aReason==ITEM_REMOVE_REASON::kRemove)
+            ((!apMoveToRef&&aReason==ITEM_REMOVE_REASON::kRemove)||
+             (apMoveToRef&&(aReason==ITEM_REMOVE_REASON::kRemove||aReason==ITEM_REMOVE_REASON::kStoreInContainer))))
         {
-            if (apItem&&!apExtraList&&apThis->GetItemCountInInventory(apItem)==0)
+            if (!apMoveToRef&&apItem&&!apExtraList&&apThis->GetItemCountInInventory(apItem)==0)
             {
                 // No phantom local delta for an empty inventory. The exact
                 // Papyrus RemoveItem call observes a permitted shared turn-in.
@@ -1197,15 +1217,25 @@ TP_MAKE_THISCALL(HookRemoveInventoryItem, TESObjectREFR, BSPointerHandle<TESObje
                     aReason,apExtraList,apMoveToRef,apDropLoc,apRotate);
             }
             InventoryChangeEvent change(apThis->formID,item);
-            if (IdentifyQuestRemoval(*apThis,apItem,apExtraList,change))
+            if (IdentifyQuestRemoval(*apThis,apItem,apExtraList,change)&&
+                (!apMoveToRef||NativeQuestTransfer(apMoveToRef,aReason,change)))
             {
                 const auto before=apThis->GetItemCountInInventory(apItem);
+                const auto destinationBefore=apMoveToRef?apMoveToRef->GetItemCountInInventory(apItem):0;
                 ScopedEquipOverride equip;
                 auto* result=TiltedPhoques::ThisCall(RealRemoveInventoryItem,apThis,apResult,apItem,aCount,
                     aReason,apExtraList,apMoveToRef,apDropLoc,apRotate);
                 const auto after=apThis->GetItemCountInInventory(apItem);
                 if (before>0 && after==before-1)
-                    QueueReferenceInventoryChange(std::move(change),nullptr);
+                {
+                    if (apMoveToRef&&apMoveToRef->GetItemCountInInventory(apItem)!=destinationBefore+1)
+                    {
+                        // Native debit happened, but destination receipt is
+                        // ambiguous. Keep the ordinary inventory delta only.
+                        change.QuestId={};change.QuestRef={};change.QuestAlias=0;
+                    }
+                    QueueReferenceInventoryChange(std::move(change),apMoveToRef);
+                }
                 else
                     spdlog::debug("Quest removal not confirmed in local inventory");
                 return result;

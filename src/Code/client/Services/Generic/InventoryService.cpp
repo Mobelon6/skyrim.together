@@ -245,6 +245,55 @@ void InventoryService::ObserveInventory() noexcept
 
 void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEvent) noexcept
 {
+    RequestInventoryChanges request;
+    request.Item = acEvent.Item;
+    request.Drop = acEvent.Drop;
+    request.UpdateClients = acEvent.UpdateClients;
+    request.QuestId = acEvent.QuestId;
+    request.QuestRef = acEvent.QuestRef;
+    request.QuestAlias = acEvent.QuestAlias;
+    RequestQuestUpdate observedStage{};
+    bool reportStage=false;
+    const auto* localPlayer=PlayerCharacter::Get();
+    const bool own=localPlayer&&acEvent.FormId==localPlayer->formID;
+    if (request.QuestId&&own)
+    {
+        const auto form=m_world.GetModSystem().GetGameId(request.QuestId);
+        auto* quest=Cast<TESQuest>(TESForm::GetById(form));
+        if (!quest||QuestService::IsNonSyncableQuest(quest)||
+            !(quest->flags&TESQuest::RunOnce)||(quest->flags&TESQuest::AllowRepeatStages)||
+            m_world.GetOverlayService().IsPersonalQuest(form))
+        {
+            request.QuestId={};request.QuestRef={};request.QuestAlias=0;
+        }
+        else if (request.Item.Count==1&&!request.Drop&&!quest->IsStopped()&&
+            (quest->flags&TESQuest::RunOnce)&&!(quest->flags&(TESQuest::Failed|TESQuest::Completed|TESQuest::AllowRepeatStages)))
+        {
+            // This check runs on the main thread. An alias alone does not
+            // establish that a background or personal quest is shared.
+            for (const auto& objective:localPlayer->objectives)
+                if (objective.instance&&objective.instance->quest==quest)
+                {
+                    request.QuestInitialEvidence=true;
+                    break;
+                }
+            if (request.QuestInitialEvidence&&quest->IsStageReached(quest->currentStage))
+            {
+                observedStage.Id=request.QuestId;
+                observedStage.Stage=quest->currentStage;
+                observedStage.Status=RequestQuestUpdate::StageUpdate;
+                observedStage.ClientQuestType=static_cast<uint8_t>(quest->type);
+                observedStage.JournalObjective=true;
+                reportStage=true;
+            }
+        }
+    }
+
+    if (request.QuestId&&request.QuestRef&&own)
+    {
+        extern void QueueQuestItemReceipt(World&,const RequestInventoryChanges&) noexcept;
+        QueueQuestItemReceipt(m_world,request);
+    }
     if (!m_transport.IsConnected())
         return;
 
@@ -282,55 +331,8 @@ void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEven
         serverId = *serverIdRes;
     }
 
-    RequestInventoryChanges request;
     request.ServerId = serverId;
     request.OwnershipEpoch = ownershipEpoch;
-    request.Item = acEvent.Item;
-    request.Drop = acEvent.Drop;
-    request.UpdateClients = acEvent.UpdateClients;
-    request.QuestId = acEvent.QuestId;
-    request.QuestRef = acEvent.QuestRef;
-    request.QuestAlias = acEvent.QuestAlias;
-    RequestQuestUpdate observedStage{};
-    bool reportStage=false;
-    if (request.QuestId)
-    {
-        const auto form=m_world.GetModSystem().GetGameId(request.QuestId);
-        auto* quest=Cast<TESQuest>(TESForm::GetById(form));
-        if (!quest||QuestService::IsNonSyncableQuest(quest)||
-            !(quest->flags&TESQuest::RunOnce)||(quest->flags&TESQuest::AllowRepeatStages)||
-            m_world.GetOverlayService().IsPersonalQuest(form))
-        {
-            request.QuestId={};request.QuestRef={};request.QuestAlias=0;
-        }
-        else if (request.Item.Count==1&&!request.Drop&&!quest->IsStopped()&&
-            (quest->flags&TESQuest::RunOnce)&&!(quest->flags&(TESQuest::Failed|TESQuest::Completed|TESQuest::AllowRepeatStages)))
-        {
-            // This check runs on the main thread. An alias alone does not
-            // establish that a background or personal quest is shared.
-            for (const auto& objective:PlayerCharacter::Get()->objectives)
-                if (objective.instance&&objective.instance->quest==quest)
-                {
-                    request.QuestInitialEvidence=true;
-                    break;
-                }
-            if (request.QuestInitialEvidence&&quest->IsStageReached(quest->currentStage))
-            {
-                observedStage.Id=request.QuestId;
-                observedStage.Stage=quest->currentStage;
-                observedStage.Status=RequestQuestUpdate::StageUpdate;
-                observedStage.ClientQuestType=static_cast<uint8_t>(quest->type);
-                observedStage.JournalObjective=true;
-                reportStage=true;
-            }
-        }
-    }
-
-    if (request.QuestId&&request.QuestRef&&PlayerCharacter::Get()&&acEvent.FormId==PlayerCharacter::Get()->formID)
-    {
-        extern void QueueQuestItemReceipt(World&,const RequestInventoryChanges&) noexcept;
-        QueueQuestItemReceipt(m_world,request);
-    }
     m_transport.Send(request);
     // Inventory evidence is sent first. If the native stage event already
     // arrived, the existing server deduplicator ignores this observation.

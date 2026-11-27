@@ -1124,6 +1124,11 @@ void* TP_MAKE_THISCALL(HookRegenAttributes, Actor, int aId, float aRegenValue)
 void TP_MAKE_THISCALL(HookAddInventoryItem, Actor, TESBoundObject* apItem, ExtraDataList* apExtraData, int32_t aCount, TESObjectREFR* apOldOwner)
 {
     if (NativeTrade::BlockAdd(apThis,apOldOwner)) return;
+    if (apItem&&QuestPickupInventory::IsNestedAdd(apThis->formID,apItem->formID))
+    {
+        TiltedPhoques::ThisCall(RealAddInventoryItem,apThis,apItem,apExtraData,aCount,apOldOwner);
+        return;
+    }
     QuestRewardAddObservation reward(apThis,apItem,apExtraData,aCount,apOldOwner);
     if (!ScopedInventoryOverride::IsOverriden())
     {
@@ -1136,6 +1141,28 @@ void TP_MAKE_THISCALL(HookAddInventoryItem, Actor, TESBoundObject* apItem, Extra
         if (apExtraData)
             apThis->GetItemFromExtraData(item, apExtraData);
 
+        // The Actor virtual insertion can bypass or nest the REFR insertion.
+        // Observe the actual acquisition once, preserving exact alias evidence.
+        if (apThis==PlayerCharacter::Get()&&aCount==1&&apThis->GetItemCountInInventory(apItem)==0)
+        {
+            extern bool IdentifyQuestRemoval(TESObjectREFR&,TESForm*,ExtraDataList*,InventoryChangeEvent&);
+            InventoryChangeEvent change(apThis->formID,item);
+            QuestPickupInventory::Scope scope(apThis->formID,apItem->formID);
+            TiltedPhoques::ThisCall(RealAddInventoryItem,apThis,apItem,apExtraData,aCount,apOldOwner);
+            const auto actual=apThis->GetItemCountInInventory(apItem);
+            if (actual==1)
+            {
+                if (IdentifyQuestRemoval(*apThis,apItem,nullptr,change)) change.Item.Count=1;
+                else {change.Item=item;change.QuestId={};change.QuestRef={};change.QuestAlias=0;}
+                QueueActorInventoryChange(std::move(change),apOldOwner);
+            }
+            else if (actual>0&&actual<=INT32_MAX)
+            {
+                item.Count=static_cast<int32_t>(actual);
+                QueueActorInventoryChange(InventoryChangeEvent(apThis->formID,std::move(item)),apOldOwner);
+            }
+            return;
+        }
         QueueActorInventoryChange(InventoryChangeEvent(apThis->formID, std::move(item)), apOldOwner);
     }
 

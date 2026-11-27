@@ -427,7 +427,9 @@ bool CampaignAccess::RecordQuestItemChange(World& world,Player& player,const Req
         const auto decision=QuestItemChange(authority.Journal.Operations(),prefix,payload,consumed);
         if (decision==QuestItemDecision::Duplicate) return true;
         if (decision==QuestItemDecision::Record && !consumed &&
-            !CanRecordQuestPickup(run,message.QuestInitialEvidence,message.Item.Count)) return false;
+            (!CanRecordQuestPickup(run,message.QuestInitialEvidence,message.Item.Count)||
+             QuestPickupPermit::AlreadyTaken(authority.Journal.Operations(),
+                 {key,reference,item,message.QuestAlias}))) return false;
         // A later pickup is never a new shared item. Record only an actual
         // displayed RunOnce quest pickup, not an ambiguous background alias.
         if (decision==QuestItemDecision::Copy && !message.QuestInitialEvidence) return false;

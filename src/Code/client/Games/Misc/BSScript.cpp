@@ -67,7 +67,9 @@ bool TeachCampaignWord(TESForm* word) noexcept
 TP_THIS_FUNCTION(TDragonNativeCall, BSScript::CallResult, BSScript::NativeFunctionBase,
                  void*, void*, BSScript::IVirtualMachine*, bool);
 TDragonNativeCall* realDragonNativeCall{};
-std::atomic<const void*> modActorValueNative{},addItemNative{};
+std::atomic<const void*> modActorValueNative{},addItemNative{},removeItemNative{};
+thread_local uint32_t nativeQuestRemovalQuest{};
+uint32_t NativeQuestRemovalQuest() noexcept {return nativeQuestRemovalQuest;}
 thread_local uint32_t nativeUniqueRewardQuest{};
 thread_local uint16_t nativeUniqueRewardStage{};
 thread_local uint32_t nativeUniqueRewardInstance{};
@@ -237,11 +239,12 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
     // not merely a QF script name or the quest's maximum stage.
     struct RestoreScope
     {
-        uint32_t Quest;uint16_t Stage;uint32_t Instance;
-        ~RestoreScope(){nativeUniqueRewardQuest=Quest;nativeUniqueRewardStage=Stage;nativeUniqueRewardInstance=Instance;}
-    } restore{nativeUniqueRewardQuest,nativeUniqueRewardStage,nativeUniqueRewardInstance};
-    nativeUniqueRewardQuest=0;nativeUniqueRewardStage=0;nativeUniqueRewardInstance=0;
-    if (apThis==addItemNative.load(std::memory_order_acquire)&&stackArgument)
+        uint32_t Quest;uint16_t Stage;uint32_t Instance,RemovalQuest;
+        ~RestoreScope(){nativeUniqueRewardQuest=Quest;nativeUniqueRewardStage=Stage;nativeUniqueRewardInstance=Instance;nativeQuestRemovalQuest=RemovalQuest;}
+    } restore{nativeUniqueRewardQuest,nativeUniqueRewardStage,nativeUniqueRewardInstance,nativeQuestRemovalQuest};
+    nativeUniqueRewardQuest=0;nativeUniqueRewardStage=0;nativeUniqueRewardInstance=0;nativeQuestRemovalQuest=0;
+    const bool removing=apThis==removeItemNative.load(std::memory_order_acquire);
+    if ((removing||apThis==addItemNative.load(std::memory_order_acquire))&&stackArgument)
     {
         auto* stack=*static_cast<DragonStackView**>(stackArgument);
         auto* frame=stack?stack->Top:nullptr;
@@ -264,9 +267,13 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
                     !_strnicmp(script,"qf_",3)&&!_strnicmp(fragment,"fragment_",9)&&
                     (quest->flags&TESQuest::RunOnce)&&!(quest->flags&TESQuest::AllowRepeatStages)&&quest->currentStage)
                 {
-                    nativeUniqueRewardQuest=quest->formID;
-                    nativeUniqueRewardStage=quest->currentStage;
-                    nativeUniqueRewardInstance=quest->currentInstanceID;
+                    if (removing) nativeQuestRemovalQuest=quest->formID;
+                    else
+                    {
+                        nativeUniqueRewardQuest=quest->formID;
+                        nativeUniqueRewardStage=quest->currentStage;
+                        nativeUniqueRewardInstance=quest->currentInstanceID;
+                    }
                 }
             }
         }
@@ -286,6 +293,7 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
 uint32_t NativeUniqueRewardQuest() noexcept {return 0;}
 uint16_t NativeUniqueRewardStage() noexcept {return 0;}
 uint32_t NativeUniqueRewardInstance() noexcept {return 0;}
+uint32_t NativeQuestRemovalQuest() noexcept {return 0;}
 bool DragonAwardHookReady() noexcept {return false;}
 void ResetCampaignDragonAwards() noexcept {}
 void RefreshCampaignDragonAwards() noexcept {}
@@ -304,6 +312,10 @@ void TP_MAKE_THISCALL(HookRegisterPapyrusFunction, BSScript::IVirtualMachine, Na
         !_stricmp(apFunction->typeName.AsAscii(),"ObjectReference")&&
         !_stricmp(apFunction->functionName.AsAscii(),"AddItem"))
         addItemNative.store(apFunction,std::memory_order_release);
+    if (apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
+        !_stricmp(apFunction->typeName.AsAscii(),"ObjectReference")&&
+        !_stricmp(apFunction->functionName.AsAscii(),"RemoveItem"))
+        removeItemNative.store(apFunction,std::memory_order_release);
 #endif
     if (CampaignRewardPolicy::SupplementWords&&apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
         !std::strcmp(apFunction->typeName.AsAscii(),"Game")&&
