@@ -23,6 +23,7 @@ headers = '''
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -105,6 +106,12 @@ int main(){
 bodies = (extract(qs,'void QuestService::OnUpdate(', 'BSTEventResult QuestService::OnEvent(')
         +extract(qs,'void QuestService::HoldStage','void QuestService::NotifyOverlayOfQuestUpdate')
         +extract(qs,'bool QuestService::StopQuest','static constexpr std::array kNonSyncableQuestIds'))
+# Exercise the real adapter to Papyrus, not a replacement ScriptSetStage.
+bodies += extract('client/Games/Skyrim/Forms/TESQuest.cpp',
+    'bool TESQuest::ScriptSetStage(', 'void TESQuest::SetStopped(')
+bodies += extract(qs,
+    'BSTEventResult QuestService::OnEvent(const TESQuestStageItemDoneEvent*',
+    'BSTEventResult QuestService::OnEvent(const TESEnterBleedoutEvent*')
 # The simulator supplies the standard map in place of TiltedCore's map adapter.
 bodies=bodies.replace('it.value()', 'it->second').replace('deferred.value()', 'deferred->second').replace('retry.value()', 'retry->second')
 run('actual client quest handlers with simulated Skyrim scenes',headers+'''
@@ -138,15 +145,28 @@ State getState(){return pendingPromotion?State::WaitingPromotion:stopped?State::
 bool EnsureQuestStarted(bool& success,bool force){assert(!force);++nativeStarts;success=true;stopped=false;return true;}
 std::set<uint16_t> reached,reject;std::vector<int> actions;Vector<BGSScene*> scenes;
 bool IsStageReached(uint16_t s){return reached.contains(s);}
-bool ScriptSetStage(uint16_t s){if(reject.contains(s)||!reached.insert(s).second)return false;stopped=false;actions.push_back(s);currentStage=s;return true;}
-unsigned GetStageItemCount(uint16_t stage){return stage==100?1:0;}
+std::function<void(uint16_t)> nativeFragment;
+bool ScriptSetStage(uint16_t);
+void NativeSetCurrentStageID(int s){
+    if(reject.contains(s)||!reached.insert(s).second)return;
+    stopped=false;actions.push_back(s);currentStage=s;
+    if(nativeFragment)nativeFragment(s);
+}
+unsigned GetStageItemCount(uint16_t stage){return stage==100||(nativeFragment&&stage==20)?1:0;}
 bool IsStopped(){return stopped;}void SetActive(bool){}
 void SetStopped(){actions.push_back(-1);stopped=true;reached.clear();}
 } quest;
+#define PAPYRUS_FUNCTION(result, type, name, arg) auto s_p##name = [](type* self, arg s) -> result {self->NativeSetCurrentStageID(s);}
+enum class BSTEventResult{kOk};
+template<class T> struct EventDispatcher{};
+struct TESQuestStageItemDoneEvent{uint32_t formId;uint16_t stageId;};
 TESForm* TESForm::GetById(uint32_t id){return id==2?&quest:nullptr;}
 struct ModSystem{uint32_t GetGameId(uint32_t id){return id;}};
 struct Party{bool leader=true;bool IsLeader(){return leader;}};
-struct World{static World& Get(){static World w;return w;}ModSystem mods;Party party;ModSystem& GetModSystem(){return mods;}Party& GetPartyService(){return party;}};
+struct World{static World& Get(){static World w;return w;}ModSystem mods;Party party;ModSystem& GetModSystem(){return mods;}Party& GetPartyService(){return party;}
+ struct Runner{template<class F> void Queue(F f){f();}} runner;
+ Runner& GetRunner(){return runner;}
+};
 namespace spdlog{
 template<class...T>void debug(T&&...){}
 template<class...T>void info(T&&...){}
@@ -162,6 +182,7 @@ Map<uint32_t,std::chrono::steady_clock::time_point> m_questRetryAt;
 void OnUpdate(const UpdateEvent&) noexcept;void OnDisconnected(const DisconnectedEvent&) noexcept;void OnPartyLeft(const PartyLeftEvent&) noexcept;
 void HoldStage(TESQuest*,uint16_t) noexcept;HeldStages* GetHeldStages(uint32_t,TESQuest*) noexcept;
 void OnQuestUpdate(const NotifyQuestUpdate&) noexcept;static bool StopQuest(uint32_t);
+BSTEventResult OnEvent(const TESQuestStageItemDoneEvent*,const EventDispatcher<TESQuestStageItemDoneEvent>*);
 };
 using HeldStages=QuestService::HeldStages;
 static bool MatchesQuestTargets(TESQuest* q,const NotifyQuestUpdate& u){return q&&(!u.CheckInstance||(!q->stopped&&q->currentInstanceID==u.ExpectedInstance))&&(u.Targets.empty()||(!q->stopped&&q->currentInstanceID==u.LocalInstance&&q->targets==u.Targets));}
@@ -270,6 +291,58 @@ int main(){
     assert(service.m_afterHeldStages.count(2));
     ++quest.currentInstanceID;scene.isPlaying=false;service.m_questRetryAt.at(2)={};
     service.OnUpdate({});assert(!quest.stopped&&quest.actions.empty()&&service.m_afterHeldStages.empty());
+
+    // Restore two missed reward-bearing stages in the accepted journal order.
+    // The test VM is deliberately asynchronous. The real ScriptSetStage calls
+    // its SetCurrentStageID adapter; rewards occur only in native fragments,
+    // never from the STM journal. These are representative effects, not actual
+    // Skyrim scripts or an assertion about a particular quest's conditions.
+    service.OnPartyLeft({});
+    quest.flags=0;quest.stopped=false;quest.reached.clear();quest.actions.clear();
+    quest.stages.clear();quest.targets.clear();scene.isPlaying=false;
+    struct Personal{std::set<int> words,spells;int skill=15,souls=0;};
+    Personal personal;
+    std::vector<uint16_t> fragments;
+    quest.nativeFragment=[&](uint16_t stage){fragments.push_back(stage);};
+    auto finish=[&](uint16_t stage){
+        assert(!fragments.empty()&&fragments.front()==stage);
+        fragments.erase(fragments.begin());
+        if(stage==100){personal.words.insert(1);personal.spells.insert(2);++personal.souls;}
+        if(stage==20)personal.skill+=5;
+        TESQuestStageItemDoneEvent event{2,stage};
+        assert(service.OnEvent(&event,nullptr)==BSTEventResult::kOk);
+    };
+    auto restore=[&]{send(100,0);send(20,0);};
+    restore();restore();
+    assert((quest.actions==Vector<int>{100})&&(fragments==Vector<uint16_t>{100}));
+    assert(personal.words.empty()&&personal.spells.empty()&&personal.skill==15&&personal.souls==0);
+    service.OnUpdate({});assert((quest.actions==Vector<int>{100}));
+    finish(100);service.OnUpdate({});
+    assert((quest.actions==Vector<int>{100,20})&&(fragments==Vector<uint16_t>{20}));
+    assert(personal.words.contains(1)&&personal.spells.contains(2)&&personal.souls==1&&personal.skill==15);
+    finish(20);service.OnUpdate({});restore();service.OnUpdate({});
+    assert(fragments.empty()&&personal.skill==20&&personal.souls==1);
+    // Reconnect after spending the soul: an already executed stage must not
+    // be executed again just because its personal resource was consumed.
+    --personal.souls;service.OnDisconnected({});restore();service.OnUpdate({});
+    assert(fragments.empty()&&personal.souls==0&&personal.skill==20);
+    assert((quest.actions==Vector<int>{100,20}));
+    // Load an older ESS in which stage 100 and its rewards are present but
+    // stage 20 and its skill award are absent. Only the missing effect runs.
+    service.OnDisconnected({});quest.reached={100};quest.currentStage=100;
+    quest.actions.clear();personal.skill=15;
+    restore();assert((fragments==Vector<uint16_t>{20}));
+    finish(20);service.OnUpdate({});restore();service.OnUpdate({});
+    assert((quest.actions==Vector<int>{20})&&fragments.empty());
+    assert(personal.skill==20&&personal.souls==0&&personal.words.contains(1)&&personal.spells.contains(2));
+    // Load an ESS from before both stages, including its original rewards.
+    service.OnDisconnected({});quest.reached.clear();quest.currentStage=0;
+    quest.actions.clear();personal=Personal{};
+    restore();finish(100);service.OnUpdate({});finish(20);service.OnUpdate({});
+    assert((quest.actions==Vector<int>{100,20})&&fragments.empty());
+    assert(personal.words.contains(1)&&personal.spells.contains(2)&&personal.skill==20&&personal.souls==1);
+    quest.nativeFragment={};
+    std::puts("PASS native stage reward fragments: replay, ordering, duplicate, spent soul, older ESS");
 }
 ''')
 
@@ -467,6 +540,11 @@ int main(){
     quest.reached.insert(40);stages=plan();assert(stages.size()==1&&stages[0].Stage==20);
     busy=true;assert(plan().empty());busy=false;
     quest.reached.insert(20);assert(plan().empty());
+    // An older ESS can contain a later stage but not an earlier reward
+    // fragment. Select the absent recorded stage rather than the max stage.
+    quest.reached.erase(40);stages=plan();
+    assert(stages.size()==1&&stages[0].Stage==40&&stages[0].Status==NotifyQuestUpdate::StageUpdate);
+    quest.reached.insert(40);assert(plan().empty());
     quest.stopped=true;quest.flags=TESQuest::RunOnce|TESQuest::Completed;assert(plan().empty());
     quest.flags=TESQuest::RunOnce|TESQuest::Failed;assert(plan().empty());
     quest.flags=TESQuest::RunOnce|TESQuest::AllowRepeatStages;assert(plan().empty());
