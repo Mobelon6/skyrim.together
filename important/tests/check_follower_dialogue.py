@@ -6,10 +6,10 @@ root = Path(sys.argv[1], "Code/client/Games")
 src = (root / "Misc/MenuTopicManager.cpp").read_text()
 cond = (root / "Skyrim/Components/TESCondition.h").read_text().split("#pragma once")[1]
 selection = src[src.index("namespace\n{"):src.index("static TiltedPhoques::Initializer")]
-permit = (root.parent.parent / "common/QuestPickupPermit.h").read_text()
-predicate = permit[permit.index("inline std::optional<bool> CompareSingleItem"):permit.index("\n}", permit.index("inline bool PositiveSingleItem"))+2]
+common = (root.parent.parent / "common").resolve()
 mocks = r"""
 #include <cassert>
+#include <QuestPickupPermit.h>
 #include <cmath>
 #include <optional>
 #include <cstdint>
@@ -28,7 +28,6 @@ static bool defer=false;
 static const void* sharedQuest=nullptr;
 int SharedDialogueItemState(const void* quest,uint32_t item) noexcept{return quest==sharedQuest&&item==200?sharedState:-1;}
 bool DeferSharedQuestTurnIn(uint32_t quest,uint32_t item,uint32_t npc,uint32_t info) noexcept{return defer&&quest==100&&item==200&&npc==10&&info==49;}
-namespace QuestPickupPermit { PREDICATE }
 struct TESTopicInfo:TESForm{TESForm* parentTopic{};TESCondition conditions;};
 struct MenuTopicManager{struct Opt{const char* text;TESTopicInfo* info;TESForm* quest{};};std::vector<Opt*>* pOptions;Handle speaker;bool menuOpen{};
  static MenuTopicManager* Get(){static MenuTopicManager m{};return &m;}bool IsDialogueOpen() const noexcept{return menuOpen;}bool IsCurrentSpeaker(const Handle& h)const noexcept{return menuOpen&&h.handle.iBits==speaker.handle.iBits;}
@@ -92,7 +91,7 @@ int main(){
 """
 with tempfile.TemporaryDirectory() as folder:
     binary = Path(folder, "follower")
-    cpp = mocks.replace("PREDICATE",predicate).replace("struct TESTopicInfo:", cond+"\nstruct TESTopicInfo:")
-    subprocess.run(["g++","-std=c++20","-x","c++","-","-o",binary],input=cpp+selection+checks,text=True,check=True)
+    cpp = mocks.replace("struct TESTopicInfo:", cond+"\nstruct TESTopicInfo:")
+    subprocess.run(["g++","-std=c++20","-I",str(common),"-x","c++","-","-o",binary],input=cpp+selection+checks,text=True,check=True)
     subprocess.run([binary],check=True)
 print("PASS actual response predicates and native dispatch: empty/full slot, foreign follower, unrelated conditions, stale grants, single playback")
