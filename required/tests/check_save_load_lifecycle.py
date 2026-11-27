@@ -59,7 +59,7 @@ thread_local uint32_t threadId=1;
 uint32_t GetCurrentThreadId(){return threadId;}
 struct DisconnectedEvent{};
 struct CalendarService {
-    static inline bool s_gameClockLocked=true;
+    static inline bool s_gameClockLocked=true, s_restMenuOpen=false;
     float m_fadeTimer=4.f;
     uint64_t m_lastTick=9000,m_lastLogTick=8000;
     void OnDisconnected(const DisconnectedEvent&) noexcept;

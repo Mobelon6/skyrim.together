@@ -62,6 +62,7 @@ enum ClientOpcode : unsigned char
     kRequestPartyTrade,
     kRequestPartyHome,
     kRequestCampaignPull,
+    kRequestRestTime,
     kClientOpcodeMax
 };
 
