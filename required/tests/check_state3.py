@@ -1737,3 +1737,71 @@ assert 'Acknowledged(' in send_receipt and 'Deadline' not in send_receipt
 event=extract('client/Services/Generic/InventoryService.cpp','void InventoryService::OnInventoryChangeEvent(', 'void InventoryService::OnEquipmentChangeEvent(')
 assert event.index('QueueQuestItemReceipt(m_world,request);')<event.index('if (!m_transport.IsConnected())')
 print('PASS Q-04/09/10 receipt before transport lookup, native transfer evidence, no remote base-only quest copy',flush=True)
+
+
+# TRAVEL-01: actual native sleep event record, first run and active stage,
+# per-recipient acknowledgement, no stale/duplicate dispatch.
+run('scripted travel native sleep trigger policy and durable arrival',headers+'''
+#include <ScriptedTravel.h>
+#include <filesystem>
+int main(){
+ namespace T=ScriptedTravel;using namespace CampaignJournal;
+ T::Move m{TradeProperties::FormKey{"example.esm",0x123}.Encode(),
+   TradeProperties::FormKey{"example.esm",0x456}.Encode(),"ExampleQuestScript",30,
+   std::bit_cast<uint32_t>(12.f),std::bit_cast<uint32_t>(12.25f)};
+ assert(m.Valid()&&T::Decode(m.Encode()));
+ auto bad=m;bad.Script="Other Method";assert(!bad.Valid());
+ bad=m;bad.EndBits=std::bit_cast<uint32_t>(-1.f);assert(!bad.Valid());
+ assert(!T::Decode(m.Encode()+" extra"));
+ auto root=std::filesystem::temp_directory_path()/("stm-sleep-travel-"+std::to_string(
+   std::chrono::steady_clock::now().time_since_epoch().count()));
+ assert(!std::filesystem::exists(root));
+ Journal journal;assert(journal.Open(root,42,"test",true));
+ assert(!T::CurrentStage(journal.Operations(),m));
+ assert(journal.Append(journal.Current(),{"stage","quest-progress-v1",m.Quest+" 1 0 30 4 101"})==Result::Committed);
+ assert(T::CurrentStage(journal.Operations(),m));
+ assert(T::MayPublish(true,101,202,nullptr,true));
+ assert(!T::MayPublish(false,202,101,nullptr,true));
+ assert(!T::MayPublish(true,101,101,nullptr,true));
+ assert(journal.Append(journal.Current(),{"move","quest-sleep-move-v1",T::Payload(m,101,202)})==Result::Committed);
+ auto records=T::Read(journal.Operations());assert(records&&records->size()==1);
+ auto r=records->at(0);assert(r.Revision==2&&!r.Arrived);
+ assert(!T::MayPublish(true,101,202,&r,true));
+ assert(T::MayDispatch(r,202,true,false,false,false));
+ assert(!T::MayDispatch(r,101,true,false,false,false));
+ assert(!T::MayDispatch(r,202,true,true,false,false));
+ assert(!T::MayDispatch(r,202,true,false,true,false));
+ assert(!T::MayDispatch(r,202,true,false,false,true));
+ assert(!T::MayDispatch(r,202,false,false,false,false));
+ assert(!T::MayAck(&r,101,m)&&T::MayAck(&r,202,m));
+ assert(journal.Append(journal.Current(),{"ack","quest-sleep-arrived-v1",T::Payload(m,101,202)})==Result::Committed);
+ records=T::Read(journal.Operations());assert(records&&records->at(0).Arrived);
+ assert(!T::MayDispatch(records->at(0),202,true,false,false,false));
+ assert(!T::MayAck(&records->at(0),202,m));
+ auto old=journal.Current();Journal reopened;
+ assert(reopened.Open(root,42,"test",false)&&reopened.Current()==old);
+ assert(T::Read(reopened.Operations())->at(0).Arrived);
+ auto ops=journal.Operations();ops.push_back({"later","quest-progress-v1",m.Quest+" 1 0 40 4 101"});
+ assert(!T::CurrentStage(ops,m));
+ ops=journal.Operations();ops.push_back({"repeat","quest-progress-v1",m.Quest+" 2 0 30 4 101"});
+ assert(!T::CurrentStage(ops,m));
+ ops=journal.Operations();ops.push_back({"duplicate","quest-sleep-move-v1",T::Payload(m,101,202)});
+ assert(!T::Read(ops));
+ std::filesystem::remove_all(root);
+}
+''',['-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp'),str(code/'common/QuestJournalDisk.cpp')])
+travel_native=(code/'client/Games/Misc/BSScript.cpp').read_text()
+assert 'DragonFrameActor(&frame->Self)!=PlayerCharacter::Get()' in travel_native
+assert 'BSInputEnableManager::IsMovementControlsEnabled()' in travel_native
+assert 'DispatchMethodCall2(handle,scope,method,args,callback)' in travel_native
+assert 'method("OnSleepStart")' in travel_native
+assert 'ObserveScriptedTravel(std::move(*move))' in travel_native
+travel_client=extract('client/Services/Generic/QuestJournal.cpp','struct SleepTravelObservation','struct DeferredQuestTurnIn')
+assert 'AtScriptedTravelTarget(target)' in travel_client
+assert 'DispatchScriptedSleep(questId,r.Event.Script,start,end)' in travel_client
+assert '->MoveTo(' not in travel_client
+assert 'sleepAttempts.insert(r.Event.Key())' in travel_client
+assert 'quest->currentStage!=r.Event.Stage' in travel_client
+assert 'ApplyScriptedTravel(m_world,*stamp,canDispatch)' in (code/'client/Services/Generic/QuestJournal.cpp').read_text()
+assert 'ScriptedTravel::MayPublish(party->LeaderPlayerId==player.GetId()' in (code/'server/Services/QuestService.cpp').read_text()
+print('PASS TRAVEL-01 native trigger integration, no coordinate fallback',flush=True)

@@ -15,6 +15,9 @@
 #include <CampaignRewardPolicy.h>
 #include <UniqueQuestReward.h>
 #include <KeywordQuestReward.h>
+#include <ScriptedTravel.h>
+#include <Services/ScriptedTravelClient.h>
+#include <AI/Movement/PlayerControls.h>
 #include <Services/QuestRewardClient.h>
 #include <Components/BGSKeywordForm.h>
 #include <Forms/BGSKeyword.h>
@@ -1251,6 +1254,117 @@ uint32_t LocalQuestForm(const std::string& key)
     return mod&&mod->IsLoaded()&&(!mod->IsLite()||form->Local<=0xfff)?mod->GetFormId(form->Local):0;
 }
 
+// Script-driven movement is observed, not replaced. A missing native
+// sleep trigger uses the existing campaign receipt stream. Ordinary stage
+// methods are already replayed by ReceiveQuestProgress.
+struct SleepTravelObservation
+{
+    ScriptedTravel::Move Event;
+    uint64_t Character{},Campaign{},Epoch{};
+    uint32_t QuestForm{},TargetForm{},Instance{};
+    bool Arrived{};
+    std::chrono::steady_clock::time_point Deadline{};
+};
+std::map<std::string,SleepTravelObservation> sleepMoves;
+std::set<std::string> sleepAttempts;
+void ResetScriptedTravel()
+{
+    sleepMoves.clear();sleepAttempts.clear();
+}
+void RememberScriptedTravel(ScriptedMoveObservation o)
+{
+    auto& w=World::Get();
+    if (o.Epoch!=dragonLoadEpoch.load(std::memory_order_acquire)||w.IsLoadingSave()||
+        !w.GetPartyService().IsInParty()||!w.GetTransport().IsOnline()) return;
+    auto* quest=Cast<TESQuest>(TESForm::GetById(o.Quest));
+    if (!quest||quest->currentInstanceID!=o.Instance||QuestService::IsNonSyncableQuest(quest)||
+        w.GetOverlayService().IsPersonalQuest(o.Quest)) return;
+    spdlog::debug("STM native scripted player MoveTo: quest {:X}, stage {}, target {:X}, sleep {}",
+        o.Quest,o.Stage,o.Target,o.Sleep);
+    if (!o.Sleep||o.WasAtTarget) return;
+    auto identity=CampaignAccess::Current(w);
+    if (!identity) return;
+    ScriptedTravel::Move m{StablePickupKey(o.Quest),StablePickupKey(o.Target),o.Script,o.Stage,
+        std::bit_cast<uint32_t>(o.Start),std::bit_cast<uint32_t>(o.End)};
+    if (!m.Valid()||sleepMoves.size()>=16) return;
+    const auto key=m.Key();
+    // Keep the first observation; a subsequent native replay must not
+    // replace its arguments or cause a second dispatch.
+    sleepMoves.try_emplace(key,SleepTravelObservation{m,identity->Save.Character,identity->Save.Campaign,o.Epoch,
+        o.Quest,o.Target,o.Instance,false,std::chrono::steady_clock::now()+std::chrono::seconds(30)});
+    nextPull={};
+}
+void ObserveSleepArrivals(World& w)
+{
+    if (w.IsLoadingSave()||!SaveWorldReady()) return;
+    const auto now=std::chrono::steady_clock::now();
+    for (auto& [key,o]:sleepMoves)
+    {
+        if (o.Arrived||now>=o.Deadline||o.Epoch!=dragonLoadEpoch.load(std::memory_order_acquire)) continue;
+        auto* quest=Cast<TESQuest>(TESForm::GetById(o.QuestForm));
+        auto* target=Cast<TESObjectREFR>(TESForm::GetById(o.TargetForm));
+        if (quest&&quest->currentInstanceID==o.Instance&&AtScriptedTravelTarget(target))
+        {o.Arrived=true;nextPull={};}
+    }
+}
+void SendScriptedTravel(World& w,const CampaignIdentity::Stamp& stamp,RequestCampaignPull& request)
+{
+    if (!request.QuestReceipt.empty()||!w.GetPartyService().IsInParty()) return;
+    const auto records=ScriptedTravel::Read(campaignLink.Journal.Operations());
+    if (!records) return;
+    for (const auto& [key,o]:sleepMoves)
+    {
+        if (!o.Arrived||o.Campaign!=stamp.Campaign||o.Character!=stamp.Character||
+            o.Epoch!=dragonLoadEpoch.load(std::memory_order_acquire)) continue;
+        const auto* existing=ScriptedTravel::Find(*records,o.Event);
+        if (existing&&existing->Recipient==stamp.Character&&!existing->Arrived&&
+            existing->Event.Target==o.Event.Target&&existing->Event.Script==o.Event.Script)
+        {
+            // The recipient may have slept independently with a different
+            // duration; acknowledge the authoritative event only after the
+            // same native quest, stage and marker were actually observed.
+            request.QuestReceipt=("script-sleep-arrived "+existing->Event.Encode()).c_str();return;
+        }
+        if (!existing&&w.GetPartyService().IsLeader()&&
+            ScriptedTravel::CurrentStage(campaignLink.Journal.Operations(),o.Event))
+        {request.QuestReceipt=("script-sleep-move "+o.Event.Encode()).c_str();return;}
+    }
+}
+template<class CanDispatch>
+void ApplyScriptedTravel(World& w,const CampaignIdentity::Stamp& stamp,CanDispatch canDispatch)
+{
+    if (!w.GetTransport().IsOnline()||!w.GetPartyService().IsInParty()||w.IsLoadingSave()||!SaveWorldReady()) return;
+    auto* ui=UI::Get();auto* player=PlayerCharacter::Get();
+    if (!ui||!player||ui->BlocksPartyHud()||ui->GetMenuOpen("Sleep/Wait Menu")||
+        player->IsInCombat()||!BSInputEnableManager::IsMovementControlsEnabled()) return;
+    const auto records=ScriptedTravel::Read(campaignLink.Journal.Operations());
+    if (!records) return;
+    for (const auto& r:*records)
+    {
+        if (!ScriptedTravel::MayDispatch(r,stamp.Character,
+            ScriptedTravel::CurrentStage(campaignLink.Journal.Operations(),r.Event),
+            sleepMoves.contains(r.Event.Key()),sleepAttempts.contains(r.Event.Key()),false)) continue;
+        // A saved checkpoint that already applied this revision is not a
+        // new instruction to replay a latent native script.
+        if (stamp.Applied.Revision>=r.Revision) continue;
+        const auto questId=LocalQuestForm(r.Event.Quest),targetId=LocalQuestForm(r.Event.Target);
+        auto* quest=questId?Cast<TESQuest>(TESForm::GetById(questId)):nullptr;
+        auto* target=targetId?Cast<TESObjectREFR>(TESForm::GetById(targetId)):nullptr;
+        if (!quest||!target||quest->IsStopped()||!(quest->flags&TESQuest::RunOnce)||
+            (quest->flags&(TESQuest::Failed|TESQuest::Completed|TESQuest::AllowRepeatStages))||
+            quest->currentStage!=r.Event.Stage||!quest->IsStageReached(r.Event.Stage)||
+            QuestService::IsNonSyncableQuest(quest)||w.GetOverlayService().IsPersonalQuest(questId)||
+            !canDispatch(questId,quest->currentInstanceID)||AtScriptedTravelTarget(target)) continue;
+        if (!sleepAttempts.insert(r.Event.Key()).second) continue;
+        const auto start=std::bit_cast<float>(r.Event.StartBits),end=std::bit_cast<float>(r.Event.EndBits);
+        if (!DispatchScriptedSleep(questId,r.Event.Script,start,end))
+            spdlog::warn("STM could not dispatch native sleep travel for quest {:X}",questId);
+        // No forced MoveTo or synthetic player-controls changes on failure.
+        // Only a subsequent real native MoveTo observation confirms arrival.
+        break;
+    }
+}
+
 struct DeferredQuestTurnIn
 {
     QuestPickupPermit::Claim Claim;
@@ -1422,6 +1536,7 @@ void ResetQuestReplayForLoad()
     questObservedLoadEpoch=epoch;
     repeatJoins.clear();
     ResetKeywordRewards();
+    ResetScriptedTravel();
     uniqueRewardEpoch.store(0,std::memory_order_release);uniqueRewardChoices.clear();
     attemptedQuestPickups.clear();
     attemptedQuestConsumption.clear();
@@ -1673,6 +1788,29 @@ void RecordNativeDragonAbsorption(uint32_t form) noexcept
     catch (...) {spdlog::warn("STM native dragon absorption observation failed");}
 }
 
+uint64_t ScriptedTravelEpoch() noexcept
+{return dragonLoadEpoch.load(std::memory_order_acquire);}
+
+bool AtScriptedTravelTarget(TESObjectREFR* target) noexcept
+{
+    auto* player=PlayerCharacter::Get();
+    if (!player||!target||target->IsDeleted()||!target->GetParentCellEx()||!player->GetParentCellEx()) return false;
+    auto* world=target->GetWorldSpace();
+    if (world?player->GetWorldSpace()!=world:player->GetParentCellEx()!=target->GetParentCellEx()) return false;
+    return glm::distance(static_cast<const glm::vec3&>(player->position),
+                         static_cast<const glm::vec3&>(target->position))<=128.f;
+}
+
+void ObserveScriptedTravel(ScriptedMoveObservation observation) noexcept
+{
+    try
+    {
+        if (!World::Exists()||World::Get().IsLoadingSave()) return;
+        World::Get().GetRunner().Queue([o=std::move(observation)]() mutable {RememberScriptedTravel(std::move(o));});
+    }
+    catch (...) {}
+}
+
 void QueueQuestItemReceipt(World& world,const RequestInventoryChanges& message) noexcept
 {
     try
@@ -1814,6 +1952,7 @@ void QuestService::PollCampaign(const UpdateEvent&) noexcept
 {
     ResetQuestReplayForLoad();
     questDialogueThread=true;
+    ObserveSleepArrivals(m_world);
     if (CampaignRewardPolicy::SupplementDragonSouls&&!m_world.IsLoadingSave()&&SaveWorldReady()) RefreshCampaignDragonAwards();
     if (!m_world.GetTransport().IsOnline()||!m_world.GetPartyService().IsInParty())
     {
@@ -1866,6 +2005,7 @@ void QuestService::PollCampaign(const UpdateEvent&) noexcept
         request.Credential=credential->Secret.c_str();
         request.Checkpoint=NextCheckpoint(*stamp).c_str();
         SendQuestReceipt(*stamp,request);
+        SendScriptedTravel(m_world,*stamp,request);
         SendKeywordRewards(m_world,*stamp,request);
         SendUniqueReward(m_world,*stamp,request);
         ObserveLearnedWord(m_world,stamp->Character,request);
@@ -1960,6 +2100,7 @@ void QuestService::OnCampaignRecord(const NotifyCampaignRecord& packet) noexcept
                 ReconcileRepeatStarts(m_world,campaignLink.Journal,stamp->Campaign,stamp->Character,canDispatch);
                 for (const auto& update:MissingActiveQuestStages(m_world,campaignLink.Journal,stamp->Character,canDispatch))
                     ReceiveQuestProgress(update);
+                ApplyScriptedTravel(m_world,*stamp,canDispatch);
             }
             catch (...) {spdlog::warn("STM active quest catch-up failed");}
         }

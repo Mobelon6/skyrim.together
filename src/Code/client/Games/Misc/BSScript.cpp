@@ -19,6 +19,9 @@
 #include <UniqueQuestReward.h>
 #include <CampaignRewardPolicy.h>
 #include <array>
+#include <Services/ScriptedTravelClient.h>
+#include <AI/Movement/PlayerControls.h>
+#include <Games/Memory.h>
 
 TP_THIS_FUNCTION(TRegisterPapyrusFunction, void, BSScript::IVirtualMachine, NativeFunction*);
 TP_THIS_FUNCTION(TBindEverythingToScript, void, BSScript::IVirtualMachine*);
@@ -67,7 +70,7 @@ bool TeachCampaignWord(TESForm* word) noexcept
 TP_THIS_FUNCTION(TDragonNativeCall, BSScript::CallResult, BSScript::NativeFunctionBase,
                  void*, void*, BSScript::IVirtualMachine*, bool);
 TDragonNativeCall* realDragonNativeCall{};
-std::atomic<const void*> modActorValueNative{},addItemNative{},removeItemNative{};
+std::atomic<const void*> modActorValueNative{},addItemNative{},removeItemNative{},moveToNative{};
 thread_local uint32_t nativeQuestRemovalQuest{};
 uint32_t NativeQuestRemovalQuest() noexcept {return nativeQuestRemovalQuest;}
 thread_local uint32_t nativeUniqueRewardQuest{};
@@ -214,6 +217,107 @@ static uint32_t NativeDragonSource(void* stackArgument,BSScript::Variable*& rewa
     if (!dragon||!dragon->IsDragon()||!dragon->IsDead()||dragon->IsTemporary()) return 0;
     reward=amount;return dragon->formID;
 }
+static std::optional<ScriptedMoveObservation> NativeScriptedMove(void* stackArgument)
+{
+    if (!stackArgument||!World::Exists()||World::Get().IsLoadingSave()||
+        BSInputEnableManager::IsMovementControlsEnabled()) return {};
+    auto* stack=*static_cast<DragonStackView**>(stackArgument);
+    auto* frame=stack?stack->Top:nullptr;
+    auto* caller=frame?frame->Previous:nullptr;
+    if (!frame||!frame->Parent||frame->Size<5||!caller||!caller->Parent||!caller->Function||
+        DragonFrameActor(&frame->Self)!=PlayerCharacter::Get()||!PlayerCharacter::Get()) return {};
+    auto* gameVM=GameVM::Get();
+    auto* policy=gameVM&&gameVM->virtualMachine&&!gameVM->inactive?gameVM->virtualMachine->GetObjectHandlePolicy():nullptr;
+    auto* self=caller->Self.GetObject();
+    const auto handle=self?self->GetHandle():0;
+    constexpr auto qt=static_cast<uint32_t>(FormType::QuestItem);
+    if (!policy||!handle||!policy->HandleIsType(qt,handle)||!policy->IsHandleObjectAvailable(handle)) return {};
+    auto* quest=static_cast<TESQuest*>(policy->GetObjectForHandle(qt,handle));
+    if (!quest||quest->IsTemporary()||quest->IsStopped()||!(quest->flags&TESQuest::RunOnce)||
+        (quest->flags&(TESQuest::Failed|TESQuest::AllowRepeatStages))||!quest->currentStage) return {};
+    auto* f=reinterpret_cast<BSScript::StackFrame*>(frame);
+    const auto page=f->GetPageForFrame();
+    auto* arg=f->GetStackFrameVariable(0,page);
+    auto* object=arg?arg->GetObject():nullptr;
+    const auto targetHandle=object?object->GetHandle():0;
+    // Papyrus ObjectReference type REFR (61), not a dynamic actor target.
+    constexpr uint32_t refType=61;
+    if (!targetHandle||!policy->HandleIsType(refType,targetHandle)||!policy->IsHandleObjectAvailable(targetHandle)) return {};
+    auto* target=static_cast<TESObjectREFR*>(policy->GetObjectForHandle(refType,targetHandle));
+    if (!target||target->IsTemporary()||static_cast<uint32_t>(target->formType)!=refType||
+        target->IsDeleted()||!target->GetParentCellEx()) return {};
+    // Only the standard marker MoveTo without offsets is observed here.
+    for (uint32_t i=1;i<=3;++i)
+    {
+        auto* offset=f->GetStackFrameVariable(i,page);
+        if (!offset||offset->type!=BSScript::Variable::kFloat||offset->data.f!=0.f) return {};
+    }
+    const auto* name=caller->Function->GetName().AsAscii();
+    const auto* script=caller->Function->GetObjectTypeName().AsAscii();
+    if (!name||!script||!*script) return {};
+    ScriptedMoveObservation result;
+    result.Quest=quest->formID;result.Target=target->formID;result.Instance=quest->currentInstanceID;
+    result.Stage=quest->currentStage;result.Epoch=ScriptedTravelEpoch();
+    result.Script=script;result.WasAtTarget=AtScriptedTravelTarget(target);
+    // Stage fragments and their quest methods already execute on both
+    // clients through native stage replay. Only a missing external sleep
+    // trigger is reproduced, never arbitrary methods from a network string.
+    if (!_stricmp(name,"OnSleepStart")&&caller->Function->GetParamCount()==2&&caller->Size>=2)
+    {
+        auto* cf=reinterpret_cast<BSScript::StackFrame*>(caller);
+        const auto cp=cf->GetPageForFrame();
+        auto* start=cf->GetStackFrameVariable(0,cp);
+        auto* end=cf->GetStackFrameVariable(1,cp);
+        if (start&&end&&start->type==BSScript::Variable::kFloat&&end->type==BSScript::Variable::kFloat&&
+            std::isfinite(start->data.f)&&std::isfinite(end->data.f)&&start->data.f>=0.f&&
+            end->data.f>start->data.f&&end->data.f-start->data.f<=24.5f)
+        {result.Sleep=true;result.Start=start->data.f;result.End=end->data.f;}
+    }
+    return result;
+}
+
+namespace
+{
+// Engine owns the IFunctionArguments after DispatchMethodCall2. Allocate
+// on the Skyrim heap and use the exact bool-returning callback ABI.
+struct SleepTravelArguments final:BSScript::IFunctionArguments
+{
+    float Start,End;
+    SleepTravelArguments(float start,float end):Start(start),End(end){}
+    static void operator delete(void* p) noexcept {Memory::Free(p);}
+    bool Prepare(Statement& out) const noexcept override
+    {
+        static_assert(offsetof(Statement,vars)==8&&offsetof(Statement,size)==0x18);
+        out.SetSize(2);
+        if (!out.vars||out.size!=2||out.capacity<2) return false;
+        out.vars[0].Set(Start);out.vars[1].Set(End);
+        return true;
+    }
+};
+}
+bool DispatchScriptedSleep(uint32_t questId,const std::string& script,float start,float end) noexcept
+{
+    try
+    {
+        auto* vm=GameVM::Get();
+        auto* quest=Cast<TESQuest>(TESForm::GetById(questId));
+        if (!vm||!vm->virtualMachine||vm->inactive||!quest||quest->IsStopped()||
+            !std::isfinite(start)||!std::isfinite(end)||end<=start||end-start>24.5f) return false;
+        auto* policy=vm->virtualMachine->GetObjectHandlePolicy();
+        constexpr auto qt=static_cast<uint32_t>(FormType::QuestItem);
+        const auto handle=policy?policy->GetHandleForObject(qt,quest):0;
+        if (!handle||!policy->HandleIsType(qt,handle)||!policy->IsHandleObjectAvailable(handle)||
+            policy->GetObjectForHandle(qt,handle)!=quest) return false;
+        BSFixedString scope(script.c_str()),method("OnSleepStart");
+        void* callback=nullptr;
+        auto* storage=Memory::Allocate(sizeof(SleepTravelArguments));
+        if (!storage) return false;
+        auto* args=::new(storage) SleepTravelArguments(start,end);
+        return vm->virtualMachine->DispatchMethodCall2(handle,scope,method,args,callback);
+    }
+    catch (...) {return false;}
+}
+
 void RecordNativeDragonAbsorption(uint32_t form) noexcept;
 BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunctionBase,
     void* stackArgument, void* logger, BSScript::IVirtualMachine* vm, bool flag)
@@ -278,7 +382,12 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
             }
         }
     }
+    std::optional<ScriptedMoveObservation> move;
+    if (apThis==moveToNative.load(std::memory_order_acquire))
+        try {move=NativeScriptedMove(stackArgument);} catch (...) {}
     const auto result=TiltedPhoques::ThisCall(realDragonNativeCall,apThis,stackArgument,logger,vm,flag);
+    if (move&&(result==BSScript::CallResult::kCompleted||result==BSScript::CallResult::kInProgress))
+        ObserveScriptedTravel(std::move(*move));
     bool paid=false;
     if (dragon&&!suppress&&result==BSScript::CallResult::kCompleted&&World::Exists()&&!World::Get().IsLoadingSave())
     {
@@ -294,6 +403,7 @@ uint32_t NativeUniqueRewardQuest() noexcept {return 0;}
 uint16_t NativeUniqueRewardStage() noexcept {return 0;}
 uint32_t NativeUniqueRewardInstance() noexcept {return 0;}
 uint32_t NativeQuestRemovalQuest() noexcept {return 0;}
+bool DispatchScriptedSleep(uint32_t,const std::string&,float,float) noexcept {return false;}
 bool DragonAwardHookReady() noexcept {return false;}
 void ResetCampaignDragonAwards() noexcept {}
 void RefreshCampaignDragonAwards() noexcept {}
@@ -316,6 +426,10 @@ void TP_MAKE_THISCALL(HookRegisterPapyrusFunction, BSScript::IVirtualMachine, Na
         !_stricmp(apFunction->typeName.AsAscii(),"ObjectReference")&&
         !_stricmp(apFunction->functionName.AsAscii(),"RemoveItem"))
         removeItemNative.store(apFunction,std::memory_order_release);
+    if (apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
+        !_stricmp(apFunction->typeName.AsAscii(),"ObjectReference")&&
+        !_stricmp(apFunction->functionName.AsAscii(),"MoveTo"))
+        moveToNative.store(apFunction,std::memory_order_release);
 #endif
     if (CampaignRewardPolicy::SupplementWords&&apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
         !std::strcmp(apFunction->typeName.AsAscii(),"Game")&&

@@ -8,6 +8,7 @@
 #include <QuestPickupPermit.h>
 #include <UniqueQuestReward.h>
 #include <KeywordQuestReward.h>
+#include <ScriptedTravel.h>
 #include <QuestRunMember.h>
 #include <sstream>
 #include <Messages/RequestInventoryChanges.h>
@@ -328,6 +329,59 @@ void ApplyUniqueRewardCommand(World& world,Player& player,std::string_view value
         spdlog::error("STM unique quest reward choice could not be committed");
 }
 
+void ApplyScriptedTravelCommand(World& world,Player& player,std::string_view value)
+{
+    const bool arrival=value.starts_with("script-sleep-arrived ");
+    if (!arrival&&!value.starts_with("script-sleep-move ")) return;
+    auto move=ScriptedTravel::Decode(value.substr(arrival?21:18));
+    if (!move) return;
+    auto& authority=CampaignAccess::Authority();
+    const auto who=CampaignAccess::Character(player);
+    auto* party=world.GetPartyService().GetPlayerParty(&player);
+    if (!who||!party||authority.State()!=CampaignReplication::Link::Mode::Ready) return;
+    // Validate the stable keys against the negotiated mod profile.
+    const auto& mods=world.ctx().at<ModsComponent>();
+    for (const auto* encoded:{&move->Quest,&move->Target})
+    {
+        const auto key=TradeProperties::DecodeForm(*encoded);
+        bool found=false;
+        for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
+            for (const auto& [name,entry]:*list)
+            {
+                std::string plugin(name.begin(),name.end());
+                for (auto& c:plugin) if (c>='A'&&c<='Z') c=static_cast<char>(c-'A'+'a');
+                if (plugin==key->Plugin&&(list!=&mods.GetLiteMods()||key->Local<=0xFFF)) found=true;
+            }
+        if (!found) return;
+    }
+    const auto records=ScriptedTravel::Read(authority.Journal.Operations());
+    if (!records) return;
+    const auto* existing=ScriptedTravel::Find(*records,*move);
+    uint64_t source=who,recipient{};
+    if (arrival)
+    {
+        if (!ScriptedTravel::MayAck(existing,who,*move)) return;
+        source=existing->Source;recipient=who;
+    }
+    else
+    {
+        for (auto* member:party->Members)
+            if (member&&member!=&player)
+            {
+                const auto other=CampaignAccess::Character(*member);
+                if (!other||recipient) return;
+                recipient=other;
+            }
+        if (!ScriptedTravel::MayPublish(party->LeaderPlayerId==player.GetId(),who,recipient,existing,
+            ScriptedTravel::CurrentStage(authority.Journal.Operations(),*move))) return;
+    }
+    const auto head=authority.Journal.Current();
+    if (authority.Journal.Append(head,{"script-sleep-"+std::to_string(head.Revision+1),
+        arrival?"quest-sleep-arrived-v1":"quest-sleep-move-v1",
+        ScriptedTravel::Payload(*move,source,recipient)})!=CampaignJournal::Result::Committed)
+        spdlog::error("STM scripted travel record could not be committed");
+}
+
 void ApplyKeywordRewardCommand(World& world,Player& player,std::string_view value)
 {
     namespace KR=KeywordQuestReward;
@@ -366,6 +420,8 @@ void CampaignAccess::ReplayQuestReceipt(World& world,Player& player,std::string_
 {
     try
     {
+        if (value.starts_with("script-sleep-"))
+        {ApplyScriptedTravelCommand(world,player,value);return;}
         if (value.starts_with("reward-keyword-"))
         {ApplyKeywordRewardCommand(world,player,value);return;}
         if (value.starts_with("reward-offer ")||value.starts_with("reward-choice "))
