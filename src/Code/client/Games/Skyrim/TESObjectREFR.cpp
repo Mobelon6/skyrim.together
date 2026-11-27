@@ -8,6 +8,7 @@
 #include <Services/NativeTrade.h>
 #include <Services/HomeActorProtection.h>
 #include <Services/HomePlacementClient.h>
+#include <Services/Workbench.h>
 #include <Events/ActivateEvent.h>
 #include <Events/InventoryChangeEvent.h>
 #include <Events/ScriptAnimationEvent.h>
@@ -1074,6 +1075,8 @@ bool TP_MAKE_THISCALL(HookActivate, TESObjectREFR, TESObjectREFR* apActivator, u
         auto& service = World::Get().GetOverlayService();
         if (service.TryJoinConversation(apThis->formID))
             return true;
+        if (aCount==1&&!apObjectToGet&&!ScopedActivateOverride::IsOverriden()&&
+            !ScopedInventoryOverride::IsOverriden()&&Workbench::Defer(apThis,aUnk1,aDefaultProcessing)) return true;
         if (service.TryHouseDoor(apThis->formID)) return true;
         if (service.TryTrade(apThis->formID)) return true;
         service.NoteActivation(apThis->formID);

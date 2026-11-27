@@ -1196,6 +1196,7 @@ struct TESFaction{struct{TESObjectREFR* playerInventoryContainer{};TESObjectREFR
 struct ModManager{std::vector<TESFaction*> factions;static ModManager* Get(){static ModManager m;return &m;}};
 namespace NativeTrade{bool IsProxy(const TESObjectREFR* p){return p==&proxy;}}
 namespace HomeInstance{bool ManagedCell(uint32_t id){return id==99;}}
+namespace Workbench{bool owned=false,ordinary=false;bool Owns(const TESObjectREFR*){return owned;}bool OrdinaryRoute(const TESObjectREFR*){return ordinary;}}
 struct World{struct ModSystem{uint32_t GetGameId(uint32_t id){return id;}} mods;static World& Get(){static World w;return w;}ModSystem& GetModSystem(){return mods;}};
 Actor remote;namespace Utils{template<class T>T* GetByServerId(uint32_t id){return id==2?&remote:nullptr;}}
 namespace spdlog{template<class...T>void error(T&&...){}}
@@ -1226,6 +1227,10 @@ int main(){
  svc.OnLockChangeNotify({1,false,50});assert(door.lockChanges==2);
  door.cell.formID=99;svc.OnActivateNotify({1,2,TESObjectREFR::kClosed});svc.OnLockChangeNotify({1,true,50});
  assert(door.activations==2&&!door.lock.locked&&door.lockChanges==2); // managed objects stay on their existing route
+ door.base.formType=FormType::Activator;Workbench::ordinary=true;
+ svc.OnActivateNotify({1,2,TESObjectREFR::kClosed});assert(door.activations==3);
+ Workbench::owned=true;svc.OnActivateNotify({1,2,TESObjectREFR::kClosed});assert(door.activations==3);
+ Workbench::owned=false;Workbench::ordinary=false;
 }
 ''')
 

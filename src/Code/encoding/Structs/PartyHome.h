@@ -9,6 +9,9 @@ struct PartyHome
     uint32_t SaveRevision{};
     uint64_t SnapshotDigest{};
     uint32_t SnapshotPart{}, SnapshotParts{};
+    // AccessOp 11: ephemeral ordinary workbench lease. Root/Visible are
+    // canonical CELL/REFR keys; AccessGuest nonce, AccessRight action/result,
+    // AccessRevision echoes the action. No campaign or snapshot fields.
     uint32_t AccessOp{}, AccessRevision{}, AccessRight{};
     uint64_t AccessGuest{};
     TiltedPhoques::String Profile{}, Credential{}, Root{};

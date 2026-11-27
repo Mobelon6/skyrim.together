@@ -11,6 +11,7 @@
 #include <PlayerCharacter.h>
 #include <Forms/TESObjectCELL.h>
 #include <Services/HomeInstance.h>
+#include <Services/Workbench.h>
 #include <HomeRegistry.h>
 
 namespace
@@ -112,12 +113,13 @@ void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterp
         const auto* player=PlayerCharacter::Get();
         const auto* cell=apActor->GetParentCellEx();
         uint32_t mod{},base{};
-        if (player && cell && player->GetParentCellEx()==cell && !HomeInstance::ProjectionForm(cell->formID) &&
-            HomeInstance::Encode(cell->formID,mod,base) && HomeRegistry::Scoped(mod))
+        if (player && cell && player->GetParentCellEx()==cell && !HomeInstance::ProjectionForm(cell->formID))
         {
             const auto* furniture=TESObjectREFR::GetByHandle(apActor->currentProcess->middleProcess->occupiedFurniture.handle.iBits);
+            const bool scoped=HomeInstance::Encode(cell->formID,mod,base) && HomeRegistry::Scoped(mod);
             nativeRemoteSeat=furniture && furniture->baseForm && static_cast<uint32_t>(furniture->baseForm->formType)==40 &&
-                !furniture->IsTemporary() && !furniture->IsDisabled() && !furniture->IsDeleted() && furniture->GetParentCellEx()==cell;
+                !furniture->IsTemporary() && !furniture->IsDisabled() && !furniture->IsDeleted() && furniture->GetParentCellEx()==cell&&
+                (scoped||Workbench::OrdinaryRoute(furniture));
         }
     }
     const bool sittingInPlace = ((apActor->actorState.flags1 >> 14) & 15u) == 3u &&

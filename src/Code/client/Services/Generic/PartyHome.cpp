@@ -1,6 +1,11 @@
 #include <TiltedOnlinePCH.h>
 #include <World.h>
 #include <Services/HomeInstance.h>
+#include <Services/Workbench.h>
+#include <HomeSeatLeases.h>
+#include <Events/ActivateEvent.h>
+#include <AI/AIProcess.h>
+#include <Misc/MiddleProcess.h>
 #include <Services/HomeOriginalOverlay.h>
 #include <Services/HomeGuestSave.h>
 #include <Services/CampaignCheckpointClient.h>
@@ -359,6 +364,141 @@ void UpdateSeat(World& world) noexcept
     }
     catch (...) {seat={};}
 }
+
+struct WorkbenchRequest
+{
+    uint64_t Nonce{};
+    uint32_t Form{},Cell{},Await{};
+    std::string Root,Ref;
+    uint8_t Unk{};
+    bool DefaultProcessing{},Started{},Warned{};
+    Clock::time_point Deadline{},Next{},Expires{};
+    HomeSeatLeases::Usage Use;
+};
+WorkbenchRequest workbench;
+uint64_t workbenchNonce{};
+
+bool WorkbenchContext(World& world,PlayerCharacter& player,TESObjectREFR& object) noexcept
+{
+    auto* cell=player.GetParentCellEx();
+    auto* target=object.GetParentCellEx();
+    if (!world.GetTransport().IsOnline()||!world.GetPartyService().IsInParty()||
+        world.IsLoadingSave()||!CampaignAccess::GameReady()||!cell||!cell->IsAttached()||
+        !target||!target->IsAttached()||!Workbench::OrdinaryRoute(&object)||
+        HomeInstance::PrivateCell(cell->formID)||HomeInstance::NativeGuestCell(cell->formID)||
+        HomeInstance::ProjectionForm(cell->formID)||
+        (cell!=target&&(!cell->worldspace||cell->worldspace!=target->worldspace))) return false;
+    return glm::distance(static_cast<const glm::vec3&>(player.position),
+        static_cast<const glm::vec3&>(object.position))<=350.f;
+}
+bool SendWorkbench(World& world,uint32_t action)
+{
+    if (!workbench.Nonce||!world.GetTransport().IsOnline()) return false;
+    RequestPartyHome request;auto& e=request.Event;
+    e.AccessOp=HomeSeatLeases::WorkbenchOperation;e.AccessGuest=workbench.Nonce;
+    e.AccessRight=action;e.Root=workbench.Root.c_str();e.Visible=workbench.Ref.c_str();
+    if (!world.GetTransport().Send(request)) return false;
+    if (action) {workbench.Await=action;workbench.Deadline=Clock::now()+4s;}
+    return true;
+}
+void ReleaseWorkbench(World& world)
+{
+    if (workbench.Nonce) SendWorkbench(world,0);
+    workbench={};
+}
+bool RequestWorkbench(World& world,TESObjectREFR& object,PlayerCharacter& player,uint8_t unk,bool processing)
+{
+    if (!world.GetTransport().IsOnline()||!world.GetPartyService().IsInParty()||
+        !Workbench::OrdinaryRoute(&object)) return false;
+    if (workbench.Nonce) return true; // one pending or active native use per player
+    if (!WorkbenchContext(world,player,object)||!NativeStanding(world,player)) return true;
+    const auto root=NativeFormKey(player.GetParentCellEx()->formID),ref=NativeFormKey(object.formID);
+    if (!root||!ref) return false; // no stable shared reference: keep native behavior
+    if (!++workbenchNonce) ++workbenchNonce;
+    workbench.Nonce=workbenchNonce;workbench.Form=object.formID;
+    workbench.Cell=player.GetParentCellEx()->formID;workbench.Root=root->Encode();workbench.Ref=ref->Encode();
+    workbench.Unk=unk;workbench.DefaultProcessing=processing;
+    if (!SendWorkbench(world,1))
+    {
+        workbench={};Utils::ShowHudMessage("Не удалось проверить занятость станка.");
+    }
+    return true;
+}
+bool WorkbenchCurrent(World& world,PlayerCharacter* player,TESObjectREFR* object) noexcept
+{
+    return player&&object&&player->GetParentCellEx()&&
+        player->GetParentCellEx()->formID==workbench.Cell&&WorkbenchContext(world,*player,*object);
+}
+bool ObservedWorkbenchUse(PlayerCharacter& player,TESObjectREFR& object)
+{
+    // Keep the reservation through the native crafting menu and furniture
+    // entry/exit. NPC occupancy is intentionally not an admission criterion.
+    static const BSFixedString crafting("Crafting Menu");
+    if (auto* ui=UI::Get();ui&&ui->GetMenuOpen(crafting)) return true;
+    if (!player.currentProcess||!player.currentProcess->middleProcess||
+        !player.currentProcess->middleProcess->occupiedFurniture) return false;
+    const auto handle=player.currentProcess->middleProcess->occupiedFurniture.handle.iBits;
+    return ((player.actorState.flags1>>14)&15u)!=0&&TESObjectREFR::GetByHandle(handle)==&object;
+}
+void WorkbenchReply(World& world,const PartyHome& e)
+{
+    if (!workbench.Nonce||!workbench.Await||e.AccessGuest!=workbench.Nonce||
+        e.AccessRevision!=workbench.Await||e.Owner!=world.GetTransport().GetLocalPlayerId()||
+        std::string_view(e.Root.data(),e.Root.size())!=workbench.Root||
+        std::string_view(e.Visible.data(),e.Visible.size())!=workbench.Ref||e.AccessRight>1||
+        Clock::now()>=workbench.Deadline) return;
+    const auto action=workbench.Await;workbench.Await=0;
+    if (!e.AccessRight)
+    {
+        if (!workbench.Started)
+        {
+            workbench={};Utils::ShowHudMessage("Станок пока занят");
+        }
+        else
+        {
+            workbench.Next=Clock::now()+5s;
+            if (!workbench.Warned)
+            {workbench.Warned=true;Utils::ShowHudMessage("Связь с бронью станка потеряна. Завершите работу.");}
+        }
+        return;
+    }
+    auto* player=PlayerCharacter::Get();
+    auto* object=Cast<TESObjectREFR>(TESForm::GetById(workbench.Form));
+    if (!WorkbenchCurrent(world,player,object)) {ReleaseWorkbench(world);return;}
+    const auto now=Clock::now();
+    workbench.Expires=now+25s;workbench.Next=now+5s;
+    if (action==2) return;
+    if (!NativeStanding(world,*player)) {ReleaseWorkbench(world);return;}
+    // Use the original activation arguments. Activate bypasses HookActivate,
+    // so publish the same ordinary STR event after successful native activation.
+    workbench.Started=true;workbench.Use.Grace=now+10s;
+    if (!object->Activate(player,workbench.Unk,nullptr,1,workbench.DefaultProcessing))
+    {ReleaseWorkbench(world);return;}
+    world.GetRunner().Trigger(ActivateEvent(object,player,nullptr,1,workbench.DefaultProcessing,
+        workbench.Unk,TESObjectREFR::kNone));
+}
+void UpdateWorkbench(World& world)
+{
+    if (!workbench.Nonce) return;
+    auto* player=PlayerCharacter::Get();
+    auto* object=Cast<TESObjectREFR>(TESForm::GetById(workbench.Form));
+    if (!WorkbenchCurrent(world,player,object)) {ReleaseWorkbench(world);return;}
+    const auto now=Clock::now();
+    if (!workbench.Started)
+    {
+        if (now>=workbench.Deadline)
+        {ReleaseWorkbench(world);Utils::ShowHudMessage("Не удалось проверить занятость станка.");}
+        return;
+    }
+    if (!workbench.Use.Keep(ObservedWorkbenchUse(*player,*object),now))
+    {ReleaseWorkbench(world);return;}
+    if (workbench.Await&&now>=workbench.Deadline) workbench.Await=0;
+    if (now>=workbench.Expires&&!workbench.Warned)
+    {workbench.Warned=true;Utils::ShowHudMessage("Связь с бронью станка потеряна. Завершите работу.");}
+    if (!workbench.Await&&now>=workbench.Next)
+    {workbench.Next=now+5s;SendWorkbench(world,2);}
+}
+
 std::string lastResumeDigest;
 Clock::time_point resumePoll{};
 struct PendingLock {uint32_t Revision{};Clock::time_point Until;};
@@ -1451,8 +1591,40 @@ void ObserveEstateConstruction(World& world)
     if (world.GetTransport().Send(request)) {track.Pending=bits;track.Next=now+3s;}
 }
 }
+
+bool Workbench::IsStandard(const TESObjectREFR* object) noexcept
+{
+    if (!object||!object->baseForm||static_cast<uint32_t>(object->baseForm->formType)!=40) return false;
+    // CommonLibSSE-NG TESFurniture.h: WorkBenchData at E0, benchType at 0.
+    // https://ng.commonlib.dev/TESFurniture_8h_source.html
+    uint8_t type{};
+    std::memcpy(&type,reinterpret_cast<const unsigned char*>(object->baseForm)+0xE0,sizeof(type));
+    return HomeSeatLeases::IsWorkbenchType(type);
+}
+bool Workbench::OrdinaryRoute(const TESObjectREFR* object) noexcept
+{
+    if (!IsStandard(object)||object->IsTemporary()||object->IsDeleted()||object->IsDisabled()) return false;
+    auto* cell=const_cast<TESObjectREFR*>(object)->GetParentCellEx();
+    return cell&&!HomeInstance::ProjectionForm(cell->formID)&&!HomeInstance::PrivateCell(cell->formID)&&
+        !HomeInstance::NativeGuestCell(cell->formID)&&
+        (HomeEstateConstruction::SharedMode()||!HomeInstance::ManagedCell(cell->formID));
+}
+bool Workbench::Owns(const TESObjectREFR* object) noexcept
+{return object&&workbench.Started&&workbench.Form==object->formID;}
+bool Workbench::Defer(TESObjectREFR* object,uint8_t unk,bool processing) noexcept
+{
+    try
+    {
+        if (!World::Exists()||!object) return false;
+        auto* player=PlayerCharacter::Get();
+        return player&&RequestWorkbench(World::Get(),*object,*player,unk,processing);
+    }
+    catch (...) {return true;}
+}
+
 void OverlayService::ClearHomes() noexcept
 {
+    ReleaseWorkbench(m_world);
     constructionTrack={};
     seat={};linkedNext.reset();
     HomeResidentProjection::Clear();residentDisplayNext={};
@@ -1470,6 +1642,11 @@ void OverlayService::ClearHomes() noexcept
 void OverlayService::OnHome(const NotifyPartyHome& msg) noexcept
 {
     const auto& e=msg.Event;
+    if (e.AccessOp==HomeSeatLeases::WorkbenchOperation)
+    {
+        try {WorkbenchReply(m_world,e);} catch (...) {ReleaseWorkbench(m_world);}
+        return;
+    }
     if (CampaignAccess::Mode()!=CampaignReplication::Link::Mode::Disabled)
     {
         if (e.AccessOp)
@@ -1792,6 +1969,7 @@ void OverlayService::UpdateHomes() noexcept
     if (auto* p=PlayerCharacter::Get();!p || !p->GetParentCellEx() || p->GetParentCellEx()->formID!=lockContext.Cell ||
         !CampaignAccess::GameReady() || !m_transport.IsOnline()) lockContext={};
     UpdateSeat(m_world);
+    try {UpdateWorkbench(m_world);} catch (...) {ReleaseWorkbench(m_world);}
     try {ObserveEstateConstruction(m_world);} catch (...) {constructionTrack={};}
     if (HomeEstateConstruction::SharedMode()&&!originalGuestCell.load())
     {
@@ -2230,6 +2408,7 @@ bool HomeInstance::NativeGuestResident(uint32_t source,uint32_t base) noexcept
 }
 void HomeInstance::ForgetOriginalVisit() noexcept
 {
+    if (World::Exists()) ReleaseWorkbench(World::Get()); else workbench={};
     constructionTrack={};
     if (visit.Native) {visit={};activeHomeRoute.store(0);projectedRoot.store(0);}
     originalGuestCell.store(0);previousGuestCell.store(0);linkedNext.reset();lastResumeDigest.clear();resumePoll={};seat={};

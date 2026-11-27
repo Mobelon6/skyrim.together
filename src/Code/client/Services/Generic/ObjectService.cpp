@@ -6,6 +6,7 @@
 #include <Events/UpdateEvent.h>
 #include <Events/CellChangeEvent.h>
 #include <Services/HomeInstance.h>
+#include <Services/Workbench.h>
 #include <Events/ActivateEvent.h>
 #include <Events/LockChangeEvent.h>
 #include <Events/ScriptAnimationEvent.h>
@@ -266,7 +267,8 @@ void ObjectService::OnActivate(const ActivateEvent& acEvent) noexcept
     }
 
     // Managed interiors use the journal; never publish an unscoped activation.
-    if (auto* cell=acEvent.pObject->GetParentCellEx();cell && HomeInstance::ManagedCell(cell->formID)) return;
+    if (auto* cell=acEvent.pObject->GetParentCellEx();cell && HomeInstance::ManagedCell(cell->formID)&&
+        !Workbench::OrdinaryRoute(acEvent.pObject)) return;
     if (!m_transport.IsConnected())
         return;
 
@@ -333,7 +335,9 @@ void ObjectService::OnActivateNotify(const NotifyActivate& acMessage) noexcept
         return;
     }
 
-    if (auto* cell=pObject->GetParentCellEx();cell && HomeInstance::ManagedCell(cell->formID)) return;
+    if (!pObject->baseForm||Workbench::Owns(pObject)) return;
+    if (auto* cell=pObject->GetParentCellEx();cell && HomeInstance::ManagedCell(cell->formID)&&
+        !Workbench::OrdinaryRoute(pObject)) return;
     if (pObject->baseForm->formType == FormType::Door)
     {
         auto remotePreActivationState = static_cast<TESObjectREFR::OpenState>(acMessage.PreActivationOpenState);

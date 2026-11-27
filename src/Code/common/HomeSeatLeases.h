@@ -8,11 +8,26 @@
 namespace HomeSeatLeases
 {
 using Clock=std::chrono::steady_clock;
+// Public furniture is session-scoped, not part of the durable home journal.
+inline constexpr uint32_t WorkbenchOperation=11, WorkbenchScope=UINT32_MAX;
+inline constexpr bool IsWorkbenchType(uint8_t type) noexcept {return type>=1&&type<=7;}
+struct Usage
+{
+    Clock::time_point Grace{};
+    bool Seen{};
+    bool Keep(bool observed,Clock::time_point now) noexcept
+    {
+        if (observed) Seen=true;
+        return observed||(!Seen&&now<Grace);
+    }
+};
 struct Claim
 {
     uint64_t Campaign{},Character{},Connection{},Nonce{};
     uint32_t Player{},Slot{},Cell{};
     std::string Ref;
+    uint32_t CellMod{};
+    uint64_t Location{};
     bool operator==(const Claim&) const=default;
 };
 struct Lease {Claim Who;Clock::time_point Until;};

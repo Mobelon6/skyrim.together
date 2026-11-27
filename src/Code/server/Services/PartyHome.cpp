@@ -29,6 +29,54 @@ struct PendingSnapshot {uint64_t Campaign{},Owner{};uint32_t Connection{};Clock:
 std::map<uint32_t,PendingSnapshot> pendingSnapshots;
 struct Lease {uint64_t Campaign{},Character{},Connection{};uint32_t Slot{};Clock::time_point Until;};
 std::map<uint32_t,Lease> visits;
+
+std::optional<GameId> WorkbenchForm(World& world,std::string_view raw)
+{
+    const auto key=TradeProperties::DecodeForm(raw);
+    if (!key||!key->Valid()||key->Encode()!=raw) return {};
+    const auto& mods=world.ctx().at<ModsComponent>();
+    for (const auto* list:{&mods.GetStandardMods(),&mods.GetLiteMods()})
+        for (const auto& [name,entry]:*list)
+            if (InventoryEvidence::CanonicalPlugin({name.data(),name.size()})==key->Plugin&&
+                (list!=&mods.GetLiteMods()||key->Local<=0xFFFu))
+                return GameId(entry.id,key->Local);
+    return {};
+}
+void PublicWorkbench(World& world,Player& owner,const PartyHome& e)
+{
+    if (e.Owner||e.House||e.Campaign||e.Character||e.SaveRevision||e.SaveTag||
+        !e.Profile.empty()||!e.Credential.empty()||e.SnapshotDigest||e.SnapshotPart||e.SnapshotParts||
+        e.AccessRevision||!e.AccessGuest||e.AccessRight>2||e.Root.size()>220||
+        e.Visible.empty()||e.Visible.size()>220) return;
+    static HomeSeatLeases::Table seats;
+    const auto now=Clock::now();
+    seats.Prune(now,[&](const HomeSeatLeases::Claim& c)
+    {
+        auto* p=world.GetPlayerManager().GetById(c.Player);
+        if (!p||uint64_t(p->GetConnectionId())!=c.Connection||!p->GetCharacter()||
+            !world.GetPartyService().GetPlayerParty(p)||p->LocationEpoch()!=c.Location) return false;
+        const auto& loc=p->GetCellComponent();
+        return !loc.HasExteriorEstate()&&!HomeScope::Private(loc.Cell.ModId)&&
+            loc.Cell.ModId==c.CellMod&&loc.Cell.BaseId==c.Cell;
+    });
+    const auto cell=WorkbenchForm(world,{e.Root.data(),e.Root.size()});
+    const auto ref=WorkbenchForm(world,{e.Visible.data(),e.Visible.size()});
+    const auto& loc=owner.GetCellComponent();
+    if (!cell||!ref||!owner.GetCharacter()||!world.GetPartyService().GetPlayerParty(&owner)||
+        loc.HasExteriorEstate()||HomeScope::Private(loc.Cell.ModId)||loc.Cell!=*cell) return;
+    // Separate in-memory table for ordinary shared references. The authenticated
+    // live connection/player and its location epoch are the temporary identity;
+    // no campaign admission, property registration or durable record is needed.
+    HomeSeatLeases::Claim claim{1,uint64_t(owner.GetId())+1,uint64_t(owner.GetConnectionId()),
+        e.AccessGuest,owner.GetId(),HomeSeatLeases::WorkbenchScope,cell->BaseId,
+        std::string(e.Visible.data(),e.Visible.size()),cell->ModId,owner.LocationEpoch()};
+    const bool granted=seats.Change(e.AccessRight,claim,now);
+    NotifyPartyHome reply;auto& r=reply.Event;
+    r.Owner=owner.GetId();r.Root=e.Root;r.Visible=e.Visible;
+    r.AccessOp=HomeSeatLeases::WorkbenchOperation;r.AccessGuest=e.AccessGuest;
+    r.AccessRevision=e.AccessRight;r.AccessRight=granted?1u:0u;
+    owner.Send(reply);
+}
 }
 bool HomeVisit::CanEnter(Player& player,uint32_t mod,uint32_t base)
 {
@@ -66,6 +114,8 @@ void OverlayService::OnHome(const PacketEvent<RequestPartyHome>& packet) noexcep
         auto* owner=packet.pPlayer;
         if (!owner) return;
         const auto& e=packet.Packet.Event;
+        if (e.AccessOp==HomeSeatLeases::WorkbenchOperation)
+        {PublicWorkbench(m_world,*owner,e);return;}
         auto& link=CampaignAccess::Authority();
         if (link.State()!=CampaignReplication::Link::Mode::Disabled)
         {
