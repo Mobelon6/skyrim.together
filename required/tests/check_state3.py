@@ -119,9 +119,19 @@ bodies += extract(qs,
     'BSTEventResult QuestService::OnEvent(const TESEnterBleedoutEvent*')
 # The simulator supplies the standard map in place of TiltedCore's map adapter.
 bodies=bodies.replace('it.value()', 'it->second').replace('deferred.value()', 'deferred->second').replace('retry.value()', 'retry->second')
+# Q-11: join the actual server transitions, disk journal, client history
+# parser and native stage adapter in the existing scene simulator.
+branch_server=(extract('server/Services/QuestService.cpp','bool ValidQuestTargets(', 'std::string QuestKey(')
+    +extract('server/Services/QuestService.cpp','bool RestoreQuestRun(', 'bool CanRecordQuestPickup('))
+branch_history=extract('client/Services/Generic/QuestJournal.cpp','struct QuestReplayState','struct QuestPickup')
 run('actual client quest handlers with simulated Skyrim scenes',headers+'''
+#include <CampaignJournal.h>
+#include <QuestRunMember.h>
+#include <TradeProperties.h>
+#include <filesystem>
+#include <sstream>
 #define __FUNCTION__ "test"
-struct GameId{uint32_t BaseId;uint32_t ModId=0;GameId(uint32_t x):BaseId(x){}operator uint32_t()const{return BaseId;} uint32_t LogFormat()const{return BaseId;}};
+struct GameId{uint32_t BaseId;uint32_t ModId=0;GameId(uint32_t x=0):BaseId(x){}operator uint32_t()const{return BaseId;} uint32_t LogFormat()const{return BaseId;}};
 template<class T> using Vector=std::vector<T>;
 template<class K,class V> using Map=std::map<K,V>;
 struct UpdateEvent{};struct DisconnectedEvent{};struct PartyLeftEvent{};
@@ -196,8 +206,16 @@ static void ReleaseUncheckedStages(TESQuest*,HeldStages&) noexcept;
 static bool IsCheckedByPlayingScene(TESQuest* q,uint16_t){return !q->scenes.empty()&&q->scenes[0]->isPlaying;}
 static bool IsCheckedByStage(const Conditions& c,TESQuest*,uint16_t s,bool){return s==c.wants;}
 static bool IsPhaseWaitingOnConditions(BGSScene* s,int){return s->ready;}
-'''+bodies+'''
-int main(){
+struct QuestRun{
+    unsigned Generation{1};
+    std::set<uint16_t> Stages;
+    std::vector<uint16_t> OrderedStages;
+    bool Stopped=false,Started=false,CompletedRunOnce=false;
+    std::string Targets;
+    QuestRunMember::Members Members;
+};
+'''+bodies+branch_server+branch_history+'''
+int main(int argc,char** argv){
     QuestService service;
     BGSScenePhase phase{{20}}; BGSScene scene;scene.phases.phase=&phase;quest.scenes={&scene};
     auto send=[&](uint16_t stage,uint8_t status){service.OnQuestUpdate({2,stage,status,0});};
@@ -348,8 +366,116 @@ int main(){
     assert(personal.words.contains(1)&&personal.spells.contains(2)&&personal.skill==20&&personal.souls==1);
     quest.nativeFragment={};
     std::puts("PASS native stage reward fragments: replay, ordering, duplicate, spent soul, older ESS");
+
+    // Same cooperative campaign: either player can select either branch.
+    // The branch definitions are synthetic, but use the real GetStageDone
+    // exclusion guard and native adapter. No Skyrim quest PEX is executed.
+    const auto key=TradeProperties::FormKey{"skyrim.esm",2}.Encode();
+    const auto dir=std::filesystem::path(argv[0]).parent_path();
+    TESConditionItem excludes30,excludes40;
+    excludes30.params[0]=&quest;excludes30.params[1]=reinterpret_cast<void*>(40);
+    excludes40.params[0]=&quest;excludes40.params[1]=reinterpret_cast<void*>(30);
+    TESCondition entry30{&excludes30},entry40{&excludes40};
+    TESQuest::Stage branch30{30,{&entry30}},branch40{40,{&entry40}};
+    quest.stages={&branch30,&branch40};quest.flags=TESQuest::RunOnce;
+    quest.scenes.clear();quest.targets.clear();
+    auto reset=[&](std::set<uint16_t> reached){
+        service.OnDisconnected({});
+        quest.stopped=false;quest.reached=std::move(reached);quest.actions.clear();
+        ++quest.currentInstanceID;quest.currentStage=0;
+    };
+    auto publish=[&](CampaignJournal::Journal& j,uint64_t author,uint16_t stage,uint8_t status,bool completed=false){
+        QuestRun accepted;assert(RestoreQuestRun(j,key,accepted));
+        NotifyQuestUpdate update{2,stage,status,6};
+        if(!AdvanceQuestRun(accepted,update,completed)) return false;
+        return StoreQuestRun(j,key,author,accepted,update,std::nullopt);
+    };
+    auto sync=[&](CampaignJournal::Journal& h,CampaignJournal::Journal& g){
+        while(g.Current().Revision<h.Current().Revision){
+            const auto prior=g.Current();const auto next=prior.Revision+1;
+            assert(g.ImportExpected(prior,*h.At(next),*h.Export(next))==CampaignJournal::Result::Committed);
+        }
+        assert(g.Current()==h.Current()&&g.Operations()==h.Operations());
+    };
+    auto replay=[&](const CampaignJournal::Journal& replica){
+        const auto history=ActiveQuestHistory(replica.Operations());
+        assert(history&&history->contains(key));
+        const auto& run=history->at(key);
+        for(const auto& [stage,type]:run.Stages){
+            NotifyQuestUpdate notice{2,stage,NotifyQuestUpdate::StageUpdate,type};
+            notice.LocalInstance=quest.currentInstanceID;
+            service.OnQuestUpdate(notice);
+            service.OnUpdate({});
+        }
+    };
+    // Two author roles x two valid branches, same ordered journal format.
+    unsigned scenario=0;
+    for(uint64_t author:{101u,202u}) for(uint16_t chosen:{30u,40u}){
+        const uint16_t opposite=chosen==30?40:30;
+        const uint64_t other=author==101?202:101;
+        const auto hostPath=dir/("q11-host-"+std::to_string(++scenario));
+        const auto peerPath=dir/("q11-peer-"+std::to_string(scenario));
+        CampaignJournal::Journal h,g;
+        assert(h.Open(hostPath,71,"profile",true)&&g.Open(peerPath,71,"profile",true));
+        assert(publish(h,other,10,NotifyQuestUpdate::Started));
+        sync(h,g); // peer goes offline before the choice
+        const auto old=g.Current();
+        reset({10});
+        World::Get().party.leader=author==101;
+        quest.NativeSetCurrentStageID(chosen); // local, already happened in Skyrim
+        assert(publish(h,author,chosen,NotifyQuestUpdate::StageUpdate));
+        assert(!publish(h,other,chosen,NotifyQuestUpdate::StageUpdate));
+        assert(publish(h,other,70,NotifyQuestUpdate::StageUpdate)); // either can continue
+        assert(publish(h,author,70,NotifyQuestUpdate::Stopped,true));
+        assert(!publish(h,other,opposite,NotifyQuestUpdate::StageUpdate)); // completed run cannot accept a new stage
+        CampaignJournal::Journal reopened,peer;
+        assert(reopened.Open(hostPath,71,"profile",false));
+        assert(peer.Open(peerPath,71,"profile",false)&&peer.Current()==old);
+        QuestRun restored;assert(RestoreQuestRun(reopened,key,restored));
+        assert(restored.CompletedRunOnce&&(restored.OrderedStages==Vector<uint16_t>{chosen,70}));
+        sync(reopened,peer);
+        const auto outcome=ActiveQuestHistory(peer.Operations());
+        assert(outcome&&outcome->at(key).CanRestoreStart(other));
+        reset({10});World::Get().party.leader=other==101;
+        unsigned choiceEffects=0,continuationEffects=0;
+        quest.nativeFragment=[&](uint16_t stage){
+            if(stage==chosen)++choiceEffects;
+            else if(stage==70)++continuationEffects;
+            else assert(false);
+        };
+        replay(peer);replay(peer);
+        assert((quest.actions==Vector<int>{chosen,70})&&choiceEffects==1&&continuationEffects==1);
+        assert(StageExcludedByLocalBranch(&quest,opposite));
+        // Old cooperative save with choice already applied but next stage missing.
+        reset({10,chosen});choiceEffects=1;continuationEffects=0;
+        replay(peer);replay(peer);
+        assert((quest.actions==Vector<int>{70})&&choiceEffects==1&&continuationEffects==1);
+        // Old cooperative save before choice; recover both, once.
+        reset({10});choiceEffects=continuationEffects=0;
+        replay(peer);assert((quest.actions==Vector<int>{chosen,70})&&choiceEffects==1&&continuationEffects==1);
+        // A contradictory received stage cannot run its fragments.
+        send(opposite,NotifyQuestUpdate::StageUpdate);
+        assert((quest.actions==Vector<int>{chosen,70})&&service.m_branchConflicts.count(2));
+        quest.nativeFragment={};
+    }
+    std::puts("PASS Q-11 either author/branch, authoritative disk replay, old cooperative saves, duplicate and incoming exclusion");
+    // Characterize the remaining race, do not claim first-choice-wins:
+    // two different native stages can arrive before either client replays
+    // the other. The server has no quest condition data and accepts both.
+    CampaignJournal::Journal race;
+    assert(race.Open(dir/"q11-race",71,"profile",true));
+    assert(publish(race,101,10,NotifyQuestUpdate::Started));
+    assert(publish(race,101,30,NotifyQuestUpdate::StageUpdate));
+    assert(publish(race,202,40,NotifyQuestUpdate::StageUpdate));
+    QuestRun racing;assert(RestoreQuestRun(race,key,racing));
+    assert((racing.OrderedStages==Vector<uint16_t>{30,40}));
+    reset({10,30});send(40,NotifyQuestUpdate::StageUpdate);
+    assert(quest.actions.empty()&&service.m_branchConflicts.count(2));
+    reset({10,40});send(30,NotifyQuestUpdate::StageUpdate);
+    assert(quest.actions.empty()&&service.m_branchConflicts.count(2));
+    std::puts("PASS Q-11 known race characterization: no second native branch replay, server does not arbitrate different stages");
 }
-''')
+''', ['-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp'),str(code/'common/QuestJournalDisk.cpp')])
 
 server=extract('server/Services/QuestService.cpp','bool AdvanceQuestRun(', 'std::string QuestKey(')
 run('party quest lifecycle and ordered catch-up history',headers+'''
