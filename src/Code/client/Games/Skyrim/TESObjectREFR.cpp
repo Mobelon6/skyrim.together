@@ -1,6 +1,7 @@
 #include <TiltedOnlinePCH.h>
 
 #include <Games/References.h>
+#include <QuestPickupInventoryScope.h>
 #include <Games/Overrides.h>
 
 #include <World.h>
@@ -1108,6 +1109,11 @@ bool TP_MAKE_THISCALL(HookActivate, TESObjectREFR, TESObjectREFR* apActivator, u
 void TP_MAKE_THISCALL(HookAddInventoryItem, TESObjectREFR, TESBoundObject* apItem, ExtraDataList* apExtraData, int32_t aCount, TESObjectREFR* apOldOwner)
 {
     if (NativeTrade::BlockAdd(apThis,apOldOwner)) return;
+    if (apItem&&QuestPickupInventory::IsNestedAdd(apThis->formID,apItem->formID))
+    {
+        TiltedPhoques::ThisCall(RealAddInventoryItem,apThis,apItem,apExtraData,aCount,apOldOwner);
+        return;
+    }
     extern bool CaptureUniqueQuestAward(uint32_t) noexcept;
     if (!ScopedInventoryOverride::IsOverriden()&&apThis==PlayerCharacter::Get()&&apItem&&
         !apOldOwner&&!apExtraData&&aCount==1&&CaptureUniqueQuestAward(apItem->formID)) return;
@@ -1122,6 +1128,27 @@ void TP_MAKE_THISCALL(HookAddInventoryItem, TESObjectREFR, TESBoundObject* apIte
         if (apExtraData)
             apThis->GetItemFromExtraData(item, apExtraData);
 
+        // A direct native AddItem/transfer may carry an exact quest alias.
+        // Confirm the resulting stack and count, never infer an original
+        // merely from the base form or requested count.
+        if (apThis==PlayerCharacter::Get()&&aCount==1&&apThis->GetItemCountInInventory(apItem)==0)
+        {
+            InventoryChangeEvent change(apThis->formID,item);
+            TiltedPhoques::ThisCall(RealAddInventoryItem,apThis,apItem,apExtraData,aCount,apOldOwner);
+            const auto actual=apThis->GetItemCountInInventory(apItem);
+            if (actual==1)
+            {
+                if (IdentifyQuestRemoval(*apThis,apItem,nullptr,change)) change.Item.Count=1;
+                else {change.Item=item;change.QuestId={};change.QuestRef={};change.QuestAlias=0;}
+                QueueReferenceInventoryChange(std::move(change),apOldOwner);
+            }
+            else if (actual>0&&actual<=INT32_MAX)
+            {
+                item.Count=static_cast<int32_t>(actual);
+                QueueReferenceInventoryChange(InventoryChangeEvent(apThis->formID,std::move(item)),apOldOwner);
+            }
+            return;
+        }
         QueueReferenceInventoryChange(InventoryChangeEvent(apThis->formID, std::move(item)), apOldOwner);
     }
 
@@ -1185,6 +1212,23 @@ TP_MAKE_THISCALL(HookRemoveInventoryItem, TESObjectREFR, BSPointerHandle<TESObje
             }
         }
 
+        // For ordinary local consumption publish the actual debit, not the
+        // requested amount, which may exceed the backpack. Transfers, drops
+        // and remote actor interactions keep their original STR path.
+        if (apThis==PlayerCharacter::Get()&&aCount>0&&!apMoveToRef&&aReason==ITEM_REMOVE_REASON::kRemove)
+        {
+            const auto before=apThis->GetItemCountInInventory(apItem);
+            ScopedEquipOverride equip;
+            auto* result=TiltedPhoques::ThisCall(RealRemoveInventoryItem,apThis,apResult,apItem,aCount,
+                aReason,apExtraList,apMoveToRef,apDropLoc,apRotate);
+            const auto actual=before-apThis->GetItemCountInInventory(apItem);
+            if (actual>0&&actual<=aCount)
+            {
+                item.Count=-static_cast<int32_t>(actual);
+                QueueReferenceInventoryChange(InventoryChangeEvent(apThis->formID,std::move(item)),nullptr);
+            }
+            return result;
+        }
         QueueReferenceInventoryChange(InventoryChangeEvent(apThis->formID, std::move(item)), apMoveToRef);
     }
 

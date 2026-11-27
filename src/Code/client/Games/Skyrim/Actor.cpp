@@ -1,4 +1,5 @@
 #include <Games/References.h>
+#include <QuestPickupInventoryScope.h>
 #include <Games/Skyrim/EquipManager.h>
 #include <AI/AIProcess.h>
 #include <Misc/MiddleProcess.h>
@@ -1254,6 +1255,7 @@ void* TP_MAKE_THISCALL(HookPickUpObject, Actor, TESObjectREFR* apObject, int32_t
             CaptureQuestPickup(apObject, change);
             auto* base = apObject->baseForm;
             const auto before = apThis->GetItemCountInInventory(base);
+            QuestPickupInventory::Scope pickupScope(apThis->formID,base->formID);
             auto* result = TiltedPhoques::ThisCall(RealPickUpObject, apThis, apObject, aCount, aUnk1, aUnk2);
             const auto delta = apThis->GetItemCountInInventory(base) - before;
             if (delta > 0 && delta <= INT32_MAX)

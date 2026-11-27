@@ -13,7 +13,7 @@ uint64_t Character(const Player&);
 bool RestoreFollowers(World&);
 bool RecordFollower(GameId,uint64_t character,bool hire,bool reserved=false);
 void Disconnect(uint32_t connection);
-void RecordQuestItemChange(World&,Player&,const RequestInventoryChanges&) noexcept;
+bool RecordQuestItemChange(World&,Player&,const RequestInventoryChanges&) noexcept;
 void ReplayQuestReceipt(World&,Player&,std::string_view) noexcept;
 bool ReserveQuestPickup(World&,Player&,std::string_view,uint64_t nonce) noexcept;
 }

@@ -90,13 +90,28 @@ void InventoryService::OnInventoryChanges(const PacketEvent<RequestInventoryChan
 
     auto& inventoryComponent = view.get<InventoryComponent>(*it);
     inventoryComponent.Content.AddOrRemoveEntry(message.Item);
+    bool sharedOriginal=false;
     if (message.QuestId && message.QuestRef && message.Item.IsQuestItem &&
         message.Item.Count != 0 && !message.Drop && acMessage.pPlayer->GetCharacter() &&
         *acMessage.pPlayer->GetCharacter() == *it)
-        CampaignAccess::RecordQuestItemChange(m_world,*acMessage.pPlayer,message);
+        sharedOriginal=CampaignAccess::RecordQuestItemChange(m_world,*acMessage.pPlayer,message);
 
     if (!message.UpdateClients && !isRemoteNpcInteraction)
         return;
+
+    // The old positive quest-item delta auto-copies a remote player's item
+    // into the local backpack. A confirmed original already has a holder.
+    // Use STR's existing remote actor snapshot instead; no packet ABI change.
+    if (sharedOriginal&&message.Item.Count>0)
+    {
+        NotifyInventorySnapshot snapshot;
+        snapshot.ServerId=message.ServerId;
+        snapshot.OwnershipEpoch=message.OwnershipEpoch;
+        snapshot.CurrentInventory=inventoryComponent.Content;
+        if (!GameServer::Get()->SendToPlayersInRange(snapshot,*it,acMessage.GetSender()))
+            spdlog::debug("Could not relay shared quest inventory snapshot");
+        return;
+    }
 
     NotifyInventoryChanges notify;
     notify.ServerId = message.ServerId;

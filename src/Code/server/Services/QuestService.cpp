@@ -378,38 +378,38 @@ void CampaignAccess::ReplayQuestReceipt(World& world,Player& player,std::string_
     catch (...) {spdlog::warn("STM quest receipt replay failed");}
 }
 
-void CampaignAccess::RecordQuestItemChange(World& world,Player& player,const RequestInventoryChanges& message) noexcept
+bool CampaignAccess::RecordQuestItemChange(World& world,Player& player,const RequestInventoryChanges& message) noexcept
 {
     try
     {
         auto& authority=Authority();
         if (authority.State()!=CampaignReplication::Link::Mode::Ready||
-            !world.GetPartyService().GetPlayerParty(&player)) return;
+            !world.GetPartyService().GetPlayerParty(&player)) return false;
         const auto character=Character(player);
         if (!character||!message.QuestId||!message.QuestRef||!message.Item.IsQuestItem||
-            (message.Item.Count<=0&&message.Item.Count!=-1)||message.Drop) return;
+            (message.Item.Count<=0&&message.Item.Count!=-1)||message.Drop) return false;
         const auto key=QuestKey(world,message.QuestId);
         const auto reference=QuestKey(world,message.QuestRef);
         const auto item=QuestKey(world,message.Item.BaseId);
-        if (key.empty()||reference.empty()||item.empty()) return;
+        if (key.empty()||reference.empty()||item.empty()) return false;
         QuestRun run;
-        if (!RestoreQuestRun(authority.Journal,key,run)||run.Generation!=1) return;
+        if (!RestoreQuestRun(authority.Journal,key,run)||run.Generation!=1) return false;
         const bool consumed=message.Item.Count<0;
-        if (!consumed&&message.Item.Count!=1) return;
+        if (!consumed&&message.Item.Count!=1) return false;
         const auto prefix=key+" "+std::to_string(run.Generation)+" "+std::to_string(message.QuestAlias)+" ";
         const auto payload=prefix+reference+" "+item+" "+
             std::to_string(consumed?1:message.Item.Count)+" "+std::to_string(character);
         const auto decision=QuestItemChange(authority.Journal.Operations(),prefix,payload,consumed);
-        if (decision==QuestItemDecision::Duplicate) return;
+        if (decision==QuestItemDecision::Duplicate) return true;
         if (decision==QuestItemDecision::Record && !consumed &&
-            !CanRecordQuestPickup(run,message.QuestInitialEvidence,message.Item.Count)) return;
+            !CanRecordQuestPickup(run,message.QuestInitialEvidence,message.Item.Count)) return false;
         // A later pickup is never a new shared item. Record only an actual
         // displayed RunOnce quest pickup, not an ambiguous background alias.
-        if (decision==QuestItemDecision::Copy && !message.QuestInitialEvidence) return;
+        if (decision==QuestItemDecision::Copy && !message.QuestInitialEvidence) return false;
         if (decision==QuestItemDecision::Reject)
         {
             spdlog::warn("Unmatched quest item change for {:X}, alias {}",message.QuestId.LogFormat(),message.QuestAlias);
-            return;
+            return false;
         }
         const auto head=authority.Journal.Current();
         const char* kind=decision==QuestItemDecision::Copy?"quest-copy-v1":
@@ -417,9 +417,13 @@ void CampaignAccess::RecordQuestItemChange(World& world,Player& player,const Req
             consumed?"quest-consumed-v1":"quest-pickup-v1";
         if (authority.Journal.Append(head,{std::string("quest-item-")+std::to_string(head.Revision+1),
             kind,payload})!=CampaignJournal::Result::Committed)
+        {
             spdlog::error("STM could not persist quest item change");
+            return false;
+        }
+        return true;
     }
-    catch (...) {spdlog::error("STM quest item change failed");}
+    catch (...) {spdlog::error("STM quest item change failed");return false;}
 }
 
 QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)

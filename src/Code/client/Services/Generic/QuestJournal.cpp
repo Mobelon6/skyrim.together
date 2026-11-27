@@ -18,6 +18,7 @@
 #include <Components.h>
 #include <QuestPickupPermit.h>
 #include <Messages/RequestInventoryChanges.h>
+#include <Messages/RequestInventorySnapshot.h>
 #include <Messages/RequestQuestUpdate.h>
 #include <Games/Misc/MenuTopicManager.h>
 #include <QuestRunMember.h>
@@ -1177,6 +1178,21 @@ void ResolveQuestTurnIn(World& world,uint64_t nonce,bool permitted,uint64_t char
         ClearAuthorizedQuestTurnIn();
 }
 
+void PublishReconciledQuestInventory(World& world,PlayerCharacter& player)
+{
+    auto view=world.view<FormIdComponent,LocalComponent>();
+    for (auto entity:view)
+    {
+        if (view.get<FormIdComponent>(entity).Id!=player.formID) continue;
+        const auto& local=view.get<LocalComponent>(entity);
+        RequestInventorySnapshot request{};
+        request.ServerId=local.Id;request.OwnershipEpoch=local.OwnershipEpoch;
+        request.CurrentInventory=player.GetActorInventory();
+        world.GetTransport().Send(request);
+        return;
+    }
+}
+
 void RestoreOwnQuestPickups(World& world,const CampaignJournal::Journal& journal,uint64_t character)
 {
     if (!SaveWorldReady()||!world.GetPartyService().IsInParty()) return;
@@ -1212,7 +1228,10 @@ void RestoreOwnQuestPickups(World& world,const CampaignJournal::Journal& journal
             if (!FindSpentQuestStack(*player,base,questNet,refNet,item.Alias)||
                 !attemptedQuestConsumption.emplace(questId,referenceId).second) continue;
             if (ReconcileSpentQuestStack(*player,base,questNet,refNet,item.Alias))
+            {
+                PublishReconciledQuestInventory(world,*player);
                 spdlog::info("STM reconciled spent quest item {:X} for character {}",referenceId,character);
+            }
             else
                 spdlog::warn("STM could not reconcile spent quest item {:X}",referenceId);
             continue;
@@ -1238,7 +1257,10 @@ void RestoreOwnQuestPickups(World& world,const CampaignJournal::Journal& journal
         ScopedInventoryOverride scope;
         player->PickUpObject(ref,1,false,0.f);
         if (player->GetItemCountInInventory(base)==1)
+        {
+            PublishReconciledQuestInventory(world,*player);
             spdlog::info("STM restored original quest pickup {:X} for character {}",referenceId,character);
+        }
         else
             spdlog::warn("STM could not restore original quest pickup {:X}",referenceId);
     }

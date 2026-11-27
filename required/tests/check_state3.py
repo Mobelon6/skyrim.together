@@ -763,6 +763,7 @@ int main(){
 
 pickup=extract('client/Games/Skyrim/Actor.cpp','void* TP_MAKE_THISCALL(HookPickUpObject','void Actor::PickUpObject(')
 run('native quest pickup requires actual inventory increase',headers+'''
+#include <QuestPickupInventoryScope.h>
 #define TP_MAKE_THISCALL(name,cls,...) name(cls* apThis, __VA_ARGS__)
 struct Base {uint32_t formID=10;};
 struct Extra {bool quest=true;};
@@ -782,14 +783,18 @@ struct InventoryChangeEvent{uint32_t id;Inventory::Entry Item;bool Drop,UpdateCl
 void CaptureQuestPickup(TESObjectREFR* object,InventoryChangeEvent& change){if(!object->temporary){change.QuestId=30;change.QuestRef=40;change.QuestAlias=3;}}
 std::vector<InventoryChangeEvent> sent;
 void QueueActorInventoryChange(InventoryChangeEvent e){sent.push_back(e);}
-void* RealPickUpObject(Actor* actor,TESObjectREFR*,int32_t,bool,float){++actor->calls;actor->count+=actor->actual;return actor;}
+void* RealPickUpObject(Actor* actor,TESObjectREFR* object,int32_t,bool,float){
+ if(actor==PlayerCharacter::Get()&&object->extra.quest)
+    assert(QuestPickupInventory::IsNestedAdd(actor->formID,object->baseForm->formID));
+ ++actor->calls;actor->count+=actor->actual;return actor;
+}
 namespace TiltedPhoques{template<class F,class... A>auto ThisCall(F f,A... a){return f(a...);}}
 namespace spdlog{template<class... A>void debug(A...){}}
 '''+pickup+'''
 int main(){
  Base base;TESObjectREFR object{&base};auto* player=PlayerCharacter::Get();
  player->actual=0;assert(HookPickUpObject(player,&object,1,false,0)==player);
- assert(sent.empty()&&player->calls==1);
+ assert(sent.empty()&&player->calls==1&&!QuestPickupInventory::IsNestedAdd(player->formID,base.formID));
  player->actual=1;HookPickUpObject(player,&object,2,false,0);
  assert(sent.size()==1&&sent[0].Item.Count==1&&sent[0].Item.IsQuestItem&&!sent[0].UpdateClients&&player->calls==2);
  assert(sent[0].QuestId==30&&sent[0].QuestRef==40&&sent[0].QuestAlias==3);
@@ -800,7 +805,7 @@ int main(){
  object.extra.quest=false;player->actual=0;HookPickUpObject(player,&object,1,false,0);
  assert(sent.size()==4&&!sent.back().Item.IsQuestItem);
 }
-''')
+''', ['-I'+str(code/'common')])
 
 item_change=extract('server/Services/QuestService.cpp','bool CanRecordQuestPickup','// A player who has independently accepted')
 run('unique quest item consumption matches original holder and reference',headers+'''
@@ -1563,3 +1568,69 @@ int main(){
  service.OnPlayerLeaveCellEvent({11});assert(world.objects.size()==1);
 }
 ''')
+
+
+# Native additions/consumption: exercise the changed actual hooks. The
+# identity resolver is independently tested above; this mock controls whether
+# a native stack is exact and how much the engine actually changes.
+adds=extract('client/Games/Skyrim/TESObjectREFR.cpp','void TP_MAKE_THISCALL(HookAddInventoryItem,','BSPointerHandle<TESObjectREFR>*\nTP_MAKE_THISCALL(HookRemoveInventoryItem,')
+removes=extract('client/Games/Skyrim/TESObjectREFR.cpp','BSPointerHandle<TESObjectREFR>*\nTP_MAKE_THISCALL(HookRemoveInventoryItem,','void TP_MAKE_THISCALL(HookRotateX,')
+run('confirmed native inventory deltas and nested pickup guard',headers+'''
+#include <QuestPickupInventoryScope.h>
+#define TP_MAKE_THISCALL(name,cls,...) name(cls* apThis,__VA_ARGS__)
+struct TESBoundObject{uint32_t formID=40;};
+struct ExtraDataList{bool quest{};};
+struct Inventory{struct Entry{uint32_t BaseId{};int32_t Count{};bool IsQuestItem{};};};
+struct InventoryChangeEvent{uint32_t FormId;Inventory::Entry Item;uint32_t QuestId{},QuestRef{},QuestAlias{};};
+struct TESObjectREFR{
+ uint32_t formID=14;int64_t count{};int add{},remove{},calls{};bool exact{};
+ int64_t GetItemCountInInventory(TESBoundObject*){return count;}
+ void GetItemFromExtraData(Inventory::Entry& e,ExtraDataList* data){e.IsQuestItem=data->quest;}
+};
+struct PlayerCharacter:TESObjectREFR{static PlayerCharacter* Get(){static PlayerCharacter p;return &p;}};
+template<class T>struct BSPointerHandle{struct{uint32_t iBits{};}handle;};
+struct NiPoint3{};
+enum class ITEM_REMOVE_REASON{kRemove,kDropping,kTransfer};
+struct ScopedInventoryOverride{static bool IsOverriden(){return false;}};
+struct ScopedExtraDataOverride{};struct ScopedEquipOverride{};
+namespace NativeTrade{bool BlockAdd(TESObjectREFR*,TESObjectREFR*){return false;}
+bool BlockRemove(TESObjectREFR*,TESObjectREFR*,TESBoundObject*,int32_t,ExtraDataList*){return false;}}
+namespace HomePlacementClient{bool InterceptDrop(TESObjectREFR*,TESBoundObject*,ExtraDataList*,int32_t,const NiPoint3*,const NiPoint3*){return false;}}
+namespace spdlog{template<class...T>void debug(T&&...){}}
+struct ModSystem{void GetServerModId(uint32_t a,uint32_t& b){b=a;}};
+struct World{ModSystem mods;static World& Get(){static World w;return w;}ModSystem& GetModSystem(){return mods;}};
+bool CaptureUniqueQuestAward(uint32_t)noexcept{return false;}
+bool IdentifyQuestRemoval(TESObjectREFR& owner,TESBoundObject*,ExtraDataList*,InventoryChangeEvent& e){
+ if(!owner.exact||owner.count!=1)return false;
+ e.Item.IsQuestItem=true;e.Item.Count=-1;e.QuestId=100;e.QuestRef=200;e.QuestAlias=3;return true;
+}
+std::vector<InventoryChangeEvent> sent;
+void QueueReferenceInventoryChange(InventoryChangeEvent e,TESObjectREFR*){sent.push_back(e);}
+void RealAddInventoryItem(TESObjectREFR* o,TESBoundObject*,ExtraDataList*,int32_t,TESObjectREFR*){o->count+=o->add;++o->calls;}
+BSPointerHandle<TESObjectREFR>* RealRemoveInventoryItem(TESObjectREFR* o,BSPointerHandle<TESObjectREFR>* out,TESBoundObject*,int32_t,ITEM_REMOVE_REASON,ExtraDataList*,TESObjectREFR*,const NiPoint3*,const NiPoint3*){o->count-=std::min<int64_t>(o->count,o->remove);++o->calls;return out;}
+namespace TiltedPhoques{template<class F,class...A>auto ThisCall(F f,A... a){return f(a...);}}
+'''+adds+removes+'''
+int main(){
+ auto* player=PlayerCharacter::Get();TESBoundObject item;BSPointerHandle<TESObjectREFR> out;
+ auto add=[&]{HookAddInventoryItem(player,&item,nullptr,1,nullptr);};
+ auto remove=[&](int count){return HookRemoveInventoryItem(player,&out,&item,count,ITEM_REMOVE_REASON::kRemove,nullptr,nullptr,nullptr,nullptr);};
+ player->add=0;add();assert(sent.empty());
+ player->add=1;player->exact=true;add();assert(sent.size()==1&&sent.back().Item.Count==1&&sent.back().QuestRef==200);
+ player->remove=1;assert(remove(1)==&out);assert(sent.size()==2&&sent.back().Item.Count==-1&&sent.back().QuestRef==200);
+ player->exact=false;add();assert(sent.size()==3&&!sent.back().QuestRef);
+ player->remove=1;remove(3);assert(sent.size()==4&&sent.back().Item.Count==-1);
+ remove(3);assert(sent.size()==4);
+ {QuestPickupInventory::Scope scope(player->formID,item.formID);add();assert(sent.size()==4);
+   {QuestPickupInventory::Scope inner(17,99);assert(!QuestPickupInventory::IsNestedAdd(player->formID,item.formID));}
+   assert(QuestPickupInventory::IsNestedAdd(player->formID,item.formID));}
+ assert(!QuestPickupInventory::IsNestedAdd(player->formID,item.formID));
+ player->remove=0;remove(2);assert(sent.size()==4&&player->count==1);
+}
+''',['-I'+str(code/'common')])
+server_inventory=(code/'server/Services/InventoryService.cpp').read_text()
+assert 'sharedOriginal=CampaignAccess::RecordQuestItemChange' in server_inventory
+assert 'if (sharedOriginal&&message.Item.Count>0)' in server_inventory
+assert 'snapshot.CurrentInventory=inventoryComponent.Content;' in server_inventory
+quest_recovery=(code/'client/Services/Generic/QuestJournal.cpp').read_text()
+assert quest_recovery.count('PublishReconciledQuestInventory(world,*player);')==2
+print('PASS confirmed originals use existing snapshot route after acquisition and reconciliation',flush=True)
