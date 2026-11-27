@@ -14,6 +14,7 @@ struct PlayerLeaveEvent;
 struct PartyInviteRequest;
 struct PartyAcceptInviteRequest;
 struct PartyLeaveRequest;
+struct RequestCoopInteraction;
 struct NotifyPartyInfo;
 struct PartyCreateRequest;
 struct PartyChangeLeaderRequest;
@@ -29,6 +30,7 @@ struct PartyService
         uint32_t LeaderPlayerId;
         Vector<Player*> Members;
         GameId CachedWeather{};
+        std::map<uint32_t,uint32_t> Downed;
         struct QuestRun
         {
             TiltedPhoques::Set<uint16_t> Stages;
@@ -118,6 +120,8 @@ private:
     uint64_t m_rangeTick{};
     uint64_t m_nextInvitationExpire{0};
 
+    void OnRescueState(const PacketEvent<RequestCoopInteraction>&) noexcept;
+    entt::scoped_connection m_rescueConnection;
     entt::scoped_connection m_updateEvent;
     entt::scoped_connection m_playerJoinConnection;
     entt::scoped_connection m_playerLeaveConnection;

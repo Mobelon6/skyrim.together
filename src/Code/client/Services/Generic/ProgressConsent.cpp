@@ -140,3 +140,12 @@ void OverlayService::ResetSessionProgress() noexcept
     m_conversations.clear();
     ClearDialogueHud();
 }
+
+void OverlayService::ShowRescueReturn(bool visible) noexcept
+{
+    if (!m_pOverlay || !m_gameOverlayClient) return;
+    auto args = CefListValue::Create();
+    args->SetBool(0,visible);
+    m_pOverlay->ExecuteAsync("rescueReturn",args);
+    if (visible || GetActive()) m_gameOverlayClient->SetUIVisible(visible);
+}

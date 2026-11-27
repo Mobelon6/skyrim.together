@@ -12,6 +12,8 @@
 #include <cmath>
 #include <TradeLedger.h>
 #include <Services/PartyService.h>
+#include <Services/PlayerService.h>
+#include <Messages/RequestCoopInteraction.h>
 #include <OverlayApp.hpp>
 #include <include/cef_parser.h>
 #include <Messages/RequestPartyTrade.h>
@@ -38,6 +40,7 @@
 #include <Components/TESContainer.h>
 #include <Forms/EnchantmentItem.h>
 #include <Forms/AlchemyItem.h>
+#include <Forms/ActorValueInfo.h>
 #include <InventoryEvidence.h>
 #include <Games/Memory.h>
 #include <Games/BGSCreatedObjectManager.h>
@@ -1686,6 +1689,102 @@ bool HomeGuestSave::InventoryReady(World& world) noexcept
     }
     catch (...) {return false;}
 }
+namespace
+{
+struct RescueSelection
+{
+    uint32_t peer = UINT32_MAX, fall{}, targetForm{};
+    std::map<uint32_t,int> selected;
+    bool awaiting{};
+    Clock::time_point deadline{};
+};
+RescueSelection rescue;
+constexpr uint32_t RescueMenuToken = 0x7fffffff;
+
+float RestoreAmount(TESForm* form)
+{
+    if (!form || !Cast<AlchemyItem>(form)) return 0;
+    auto* potion = Cast<MagicItem>(form);
+    if (!potion) return 0;
+    float hp = 0;
+    for (const auto* effect : potion->listOfEffects)
+    {
+        const auto* setting = effect ? effect->pEffectSetting : nullptr;
+        if (!setting || (setting->flags & 4u) || setting->primaryActorValue != ActorValueInfo::kHealth ||
+            setting->eArchetype != EffectArchetypes::ArchetypeID::kValueModifier) continue;
+        if (effect->data.fMagnitude > 0)
+            hp += effect->data.fMagnitude * std::max(1,effect->data.iDuration);
+    }
+    return std::isfinite(hp) ? hp : 0;
+}
+std::map<uint32_t,int> RescuePotions(PlayerCharacter& player)
+{
+    std::map<uint32_t,int> result;
+    const auto collect = [&](TESForm* form) {
+        if (!RestoreAmount(form)) return;
+        const auto n = player.GetItemCountInInventory(form);
+        if (n > 0 && n <= INT32_MAX) result[form->formID] = static_cast<int>(n);
+    };
+    if (auto* base = player.GetContainer())
+        for (uint32_t i=0; i<base->count; ++i)
+            if (base->entries && base->entries[i]) collect(base->entries[i]->form);
+    if (auto* changes = player.GetContainerChanges(); changes && changes->entries)
+        for (const auto* entry : *changes->entries)
+            if (entry) collect(entry->form);
+    return result;
+}
+}
+void OverlayService::DisplayRescue() noexcept
+{
+    if (!m_pOverlay || !m_gameOverlayClient || !PlayerCharacter::Get()) return;
+    auto pocket = RescuePotions(*PlayerCharacter::Get());
+    for (auto [id,count] : rescue.selected) pocket[id] -= count;
+    auto args = CefListValue::Create();
+    args->SetInt(0,RescueMenuToken);args->SetString(1,"Лечение");args->SetBool(2,true);
+    args->SetString(3,Rows(pocket));args->SetString(4,Rows(rescue.selected));
+    m_pOverlay->ExecuteAsync("partyTrade",args);
+    m_gameOverlayClient->SetUIVisible(true);
+}
+
+void OverlayService::CloseRescue() noexcept
+{
+    if (!rescue.fall) return;
+    rescue = {};
+    if (m_pOverlay) m_pOverlay->ExecuteAsync("hideTrade");
+    if (m_gameOverlayClient && GetActive()) m_gameOverlayClient->SetUIVisible(false);
+}
+
+void OverlayService::SpendRescue(uint32_t target,uint32_t fall) noexcept
+{
+    if (!rescue.awaiting || rescue.peer != target || rescue.fall != fall) return;
+    auto* player = PlayerCharacter::Get();
+    auto* other = Cast<Actor>(TESForm::GetById(rescue.targetForm));
+    if (!player || !other || player->actorState.IsBleedingOut() || m_world.IsLoadingSave() ||
+        !m_world.ctx().at<PlayerService>().IsFallenPeer(target) || TradePeer(other->formID) != target ||
+        player->GetParentCellEx() != other->GetParentCellEx() ||
+        glm::distance(player->position,other->position) > 250.f) { CloseRescue(); return; }
+    auto pocket = RescuePotions(*player);
+    for (const auto& [id,count] : rescue.selected)
+        if (count <= 0 || pocket[id] < count) { CloseRescue(); return; }
+    double health = 0;
+    for (const auto& [id,count] : rescue.selected)
+    {
+        auto* item = Cast<TESBoundObject>(TESForm::GetById(id));
+        const auto before = player->GetItemCountInInventory(item);
+        player->RemoveItem(item,count,ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
+        const auto spent = std::clamp<int64_t>(before-player->GetItemCountInInventory(item),0,count);
+        health += spent * static_cast<double>(RestoreAmount(item));
+    }
+    if (health > 0)
+    {
+        RequestCoopInteraction packet;
+        packet.Event = {Interaction::ApplyRescue,target,fall,
+            static_cast<uint32_t>(std::clamp(health*100.,1.,double(UINT32_MAX)))};
+        m_transport.Send(packet);
+    }
+    CloseRescue();
+}
+
 bool OverlayService::TryTrade(uint32_t form) noexcept
 {
     if (HomeGuestSave::Busy()) return true;
@@ -1773,6 +1872,16 @@ bool OverlayService::TryTrade(uint32_t form) noexcept
     if (HomeInstance::ProjectionForm(form)) return true;
     const auto id=TradePeer(form);
     if (id==UINT32_MAX) return false;
+    auto& life = m_world.ctx().at<PlayerService>();
+    if (life.IsFallenPeer(id))
+    {
+        if (!session && !rescue.fall && !m_active)
+        {
+            rescue.peer=id;rescue.fall=life.FallenToken();rescue.targetForm=form;
+            DisplayRescue();
+        }
+        return true;
+    }
     Wallet w;
     if (receiptFailure) {Utils::ShowHudMessage("Обмен остановлен: загрузите сохранение до ошибки квитанции.");return true;}
     if (!CampaignAccess::TradeEnabled()) {Utils::ShowHudMessage("Обмен кампании отключён.");return true;}
@@ -1783,6 +1892,7 @@ bool OverlayService::TryTrade(uint32_t form) noexcept
 }
 void OverlayService::ClearTrade() noexcept
 {
+    CloseRescue();
     nativeToken.store(0);
     ResetNativeIntents();takeAllRegistered=false;
     shadowCleanupPending=true;cleanupRetry={};
@@ -1810,6 +1920,31 @@ void OverlayService::RecheckTradeAfterLoad() noexcept
 }
 void OverlayService::TradeAction(uint32_t token,int action,uint32_t id,uint32_t count) noexcept
 {
+    if (token == RescueMenuToken && rescue.fall)
+    {
+        auto* player = PlayerCharacter::Get();
+        auto& life = m_world.ctx().at<PlayerService>();
+        if (!player || !life.IsFallenPeer(rescue.peer) || life.FallenToken() != rescue.fall || action == 0)
+        { CloseRescue(); return; }
+        if (rescue.awaiting) return;
+        if (action == 4 && !rescue.selected.empty())
+        {
+            RequestCoopInteraction request;
+            request.Event = {Interaction::PrepareRescue,rescue.peer,rescue.fall};
+            rescue.awaiting = m_transport.Send(request);
+            rescue.deadline = Clock::now() + std::chrono::seconds(5);
+            return;
+        }
+        if (action != 2 && action != 3) return;
+        auto available = RescuePotions(*player);
+        if (!count || count > 9999 || !available.contains(id)) return;
+        auto& selected = rescue.selected[id];
+        if (action == 2) selected += std::min<int>(count,std::max(0,available[id]-selected));
+        else selected -= std::min<int>(count,selected);
+        if (!selected) rescue.selected.erase(id);
+        DisplayRescue();
+        return;
+    }
     if (!session || session!=token) return;
     Wallet w;
     if (action==0) {Send({TradeOp::Close,peer,session}); ClearTrade();return;}
@@ -1985,6 +2120,14 @@ void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
 }
 void OverlayService::UpdateTrade() noexcept
 {
+    if (rescue.fall)
+    {
+        auto& life = m_world.ctx().at<PlayerService>();
+        if (!life.IsFallenPeer(rescue.peer) || life.FallenToken() != rescue.fall ||
+            !m_transport.IsOnline() || m_world.IsLoadingSave() ||
+            (rescue.awaiting && Clock::now() >= rescue.deadline))
+            CloseRescue();
+    }
     MaintainShadow();
     HomePlacementClient::Update(m_world);
     if (receiptFailure || !m_transport.IsOnline() || !m_inGame || !CampaignAccess::GameReady())

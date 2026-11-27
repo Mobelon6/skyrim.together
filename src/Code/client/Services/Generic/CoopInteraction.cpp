@@ -335,6 +335,16 @@ void OverlayService::ClearInteraction() noexcept
 void OverlayService::OnInteraction(const NotifyCoopInteraction& packet) noexcept
 {
     const auto& e = packet.Event;
+    if (e.Kind == Interaction::SpendRescue)
+    {
+        SpendRescue(e.Speaker,e.Session);
+        return;
+    }
+    if (e.Kind == Interaction::ApplyRescue || e.Kind == Interaction::PartyWipe || e.Kind == Interaction::PlayerDown || e.Kind == Interaction::PlayerUp)
+    {
+        m_world.ctx().at<PlayerService>().OnRescueState(e);
+        return;
+    }
     const bool hireNotice = e.Kind == Interaction::FollowerReserved || e.Kind == Interaction::FollowerReleased ||
         e.Kind == Interaction::HireReady || e.Kind == Interaction::Granted || e.Kind == Interaction::Denied;
     if (!hireNotice && !m_world.GetPartyService().IsInParty())

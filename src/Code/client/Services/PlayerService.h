@@ -15,6 +15,7 @@ struct PartyJoinedEvent;
 struct PartyLeftEvent;
 
 struct NotifyPlayerRespawn;
+struct CoopInteraction;
 
 /**
  * @brief Handles logic related to the local player.
@@ -27,6 +28,10 @@ struct PlayerService
     TP_NOCOPYMOVE(PlayerService);
     void ResetWorldTracking() noexcept
     {
+        m_waitingRescue = m_returnOffered = m_returnRequested = false;
+        m_healPending = false;
+        m_peerToken = 0;
+        m_entryCell = 0;
         m_respawnTimerStarted=m_knockdownStart=m_godmodeStart=false;
         m_respawnDeadline=m_knockdownDeadline=m_godmodeDeadline={};
         m_cachedMainSpellId=m_cachedSecondarySpellId=m_cachedPowerId=0;
@@ -38,6 +43,11 @@ struct PlayerService
         m_closedUntil=m_nextDialogueUpdate=m_dialogueTextUntil={};
     }
 
+    void OnRescueState(const CoopInteraction&) noexcept;
+    bool IsFallenPeer(uint32_t peer) const noexcept;
+    uint32_t FallenToken() const noexcept { return m_peerToken; }
+    void RequestReturn() noexcept;
+    void ObserveRescueSpell() noexcept;
     uint32_t ActiveDialogueSession(uint32_t form) noexcept;
 
 protected:
@@ -47,7 +57,7 @@ protected:
     void OnServerSettingsReceived(const ServerSettings& acSettings) noexcept;
     void OnNotifyPlayerRespawn(const NotifyPlayerRespawn& acMessage) const noexcept;
     void OnGridCellChangeEvent(const GridCellChangeEvent& acEvent) const noexcept;
-    void OnCellChangeEvent(const CellChangeEvent& acEvent) const noexcept;
+    void OnCellChangeEvent(const CellChangeEvent& acEvent) noexcept;
     void OnPlayerDialogueEvent(const PlayerDialogueEvent& acEvent) noexcept;
     void UpdateDialogue(const PlayerDialogueEvent* apChoice = nullptr) noexcept;
     void OnPlayerLevelEvent(const PlayerLevelEvent& acEvent) const noexcept;
@@ -85,6 +95,11 @@ private:
 
     std::chrono::steady_clock::time_point m_respawnDeadline;
     bool m_respawnTimerStarted=false;
+    bool m_waitingRescue{}, m_returnOffered{}, m_returnRequested{}, m_healPending{};
+    uint32_t m_rescueToken{}, m_entryCell{}, m_peerId{UINT32_MAX}, m_peerToken{};
+    float m_entryX{}, m_entryY{}, m_entryZ{};
+    std::chrono::steady_clock::time_point m_healUntil{};
+    void ReportRescueState(bool down) noexcept;
     int32_t m_serverDifficulty = 6;
     int32_t m_previousDifficulty = 6;
 

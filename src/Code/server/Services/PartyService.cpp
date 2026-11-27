@@ -2,6 +2,7 @@
 #include <Services/CampaignAccess.h>
 #include <Components.h>
 #include <Messages/NotifyCoopInteraction.h>
+#include <Messages/RequestCoopInteraction.h>
 #include <GameServer.h>
 
 #include <Events/PlayerJoinEvent.h>
@@ -23,6 +24,7 @@
 
 PartyService::PartyService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
     : m_world(aWorld)
+    , m_rescueConnection(aDispatcher.sink<PacketEvent<RequestCoopInteraction>>().connect<&PartyService::OnRescueState>(this))
     , m_updateEvent(aDispatcher.sink<UpdateEvent>().connect<&PartyService::OnUpdate>(this))
     , m_playerJoinConnection(aDispatcher.sink<PlayerJoinEvent>().connect<&PartyService::OnPlayerJoin>(this))
     , m_playerLeaveConnection(aDispatcher.sink<PlayerLeaveEvent>().connect<&PartyService::OnPlayerLeave>(this))
@@ -419,6 +421,7 @@ void PartyService::RemovePlayerFromParty(Player* apPlayer) noexcept
         auto id = *pPartyComponent->JoinedPartyId;
 
         Party& party = m_parties[id];
+        party.Downed.erase(apPlayer->GetId());
         auto& members = party.Members;
 
         const auto departing = apPlayer->GetId();
@@ -515,4 +518,54 @@ void PartyService::SendPartyJoinedEvent(Party& aParty, Player* aPlayer) noexcept
     }
     spdlog::debug("[PartyService]: Sending party join event to player");
     aPlayer->Send(joinedMessage);
+}
+
+void PartyService::OnRescueState(const PacketEvent<RequestCoopInteraction>& packet) noexcept
+{
+    const auto& e = packet.Packet.Event;
+    if (e.Session && (e.Kind == Interaction::PrepareRescue || e.Kind == Interaction::ApplyRescue))
+    {
+        auto* party = GetPlayerParty(packet.pPlayer);
+        auto* target = m_world.GetPlayerManager().GetById(e.Speaker);
+        if (!party || !target || target == packet.pPlayer || GetPlayerParty(target) != party ||
+            party->Members.size() != 2 || party->Downed.contains(packet.pPlayer->GetId())) return;
+        const auto fallen = party->Downed.find(target->GetId());
+        if (fallen == party->Downed.end() || fallen->second != e.Session ||
+            !WithinSyncRange(m_world,*packet.pPlayer,*target)) return;
+        NotifyCoopInteraction message;
+        if (e.Kind == Interaction::PrepareRescue)
+        {
+            message.Event = {Interaction::SpendRescue,target->GetId(),e.Session};
+            packet.pPlayer->Send(message);
+        }
+        else if (e.Value)
+        {
+            message.Event = {Interaction::ApplyRescue,packet.pPlayer->GetId(),e.Session,e.Value};
+            target->Send(message);
+        }
+        return;
+    }
+    if (!e.Session || (e.Kind != Interaction::PlayerDown && e.Kind != Interaction::PlayerUp)) return;
+    auto* party = GetPlayerParty(packet.pPlayer);
+    if (!party || party->Members.size() != 2) return;
+    const auto id = packet.pPlayer->GetId();
+    if (e.Kind == Interaction::PlayerDown)
+        party->Downed[id] = e.Session;
+    else
+    {
+        const auto it = party->Downed.find(id);
+        if (it == party->Downed.end() || it->second != e.Session) return;
+        party->Downed.erase(it);
+    }
+    for (auto* member : party->Members)
+    {
+        NotifyCoopInteraction notice;
+        notice.Event = {e.Kind, id, e.Session};
+        if (member != packet.pPlayer) member->Send(notice);
+        if (party->Downed.size() == 2)
+        {
+            notice.Event = {Interaction::PartyWipe, member->GetId(), party->Downed.at(member->GetId())};
+            member->Send(notice);
+        }
+    }
 }

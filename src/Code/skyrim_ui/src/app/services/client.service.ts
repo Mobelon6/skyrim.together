@@ -24,6 +24,7 @@ interface PartyConversation {
   providedIn: 'root',
 })
 export class ClientService implements OnDestroy {
+  readonly rescueReturn = new BehaviorSubject(false);
   public readonly partyConversation = new BehaviorSubject<PartyConversation | null>(null);
 
   /** Initialization done. */
@@ -158,6 +159,7 @@ export class ClientService implements OnDestroy {
     skyrimtogether.on('hideProgress', () => this.zone.run(() => this.progressOffer.next(null)));
     skyrimtogether.on('offerHome', (token,names) => this.zone.run(() => this.home.next({token,names:names.split('\n')})));
     skyrimtogether.on('hideHome', () => this.zone.run(() => this.home.next(null)));
+    skyrimtogether.on('rescueReturn', visible => this.zone.run(() => this.rescueReturn.next(visible)));
     skyrimtogether.on('partyTrade', (session,name,open,pocket,buffer) => this.zone.run(() => {
       this.trade.next({session,name,open,pocket:JSON.parse(pocket),buffer:JSON.parse(buffer)});
     }));
@@ -220,6 +222,8 @@ export class ClientService implements OnDestroy {
     skyrimtogether.off('hideProgress');
     skyrimtogether.off('offerHome');
     skyrimtogether.off('hideHome');
+    this.rescueReturn.next(false);
+    skyrimtogether.off('rescueReturn');
     skyrimtogether.off('partyTrade');
     skyrimtogether.off('hideTrade');
     skyrimtogether.off('offerCarriage');

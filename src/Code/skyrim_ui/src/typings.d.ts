@@ -115,6 +115,9 @@ interface SkyrimTogether {
   on(event: 'hideHome', callback: () => void): void;
   off(event: 'offerHome' | 'hideHome'): void;
   chooseHome(token: number, choice: number): void;
+  returnEntrance(): void;
+  on(event: 'rescueReturn', callback: (visible: boolean) => void): void;
+  off(event: 'rescueReturn'): void;
   on(event: 'partyTrade', callback: (session: number, name: string, open: boolean, pocket: string, buffer: string) => void): void;
   on(event: 'hideTrade', callback: () => void): void;
   off(event: 'partyTrade' | 'hideTrade'): void;

@@ -77,6 +77,10 @@ struct OverlayService
 
     void NoteActivation(uint32_t form) noexcept;
     uint32_t TradePeer(uint32_t form) const noexcept;
+    void SpendRescue(uint32_t peerId,uint32_t fall) noexcept;
+    void CloseRescue() noexcept;
+    void DisplayRescue() noexcept;
+    void ShowRescueReturn(bool visible) noexcept;
     bool TryTrade(uint32_t form) noexcept;
     void TradeAction(uint32_t session, int action, uint32_t row, uint32_t count) noexcept;
     bool TryHouseDoor(uint32_t form) noexcept;

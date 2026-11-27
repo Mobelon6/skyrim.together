@@ -17,6 +17,7 @@
 #include <Events/BeastFormChangeEvent.h>
 
 #include <Messages/PlayerRespawnRequest.h>
+#include <Messages/RequestCoopInteraction.h>
 #include <Messages/NotifyPlayerRespawn.h>
 #include <Messages/ShiftGridCellRequest.h>
 #include <Messages/EnterExteriorCellRequest.h>
@@ -136,8 +137,18 @@ void PlayerService::OnGridCellChangeEvent(const GridCellChangeEvent& acEvent) co
     }
 }
 
-void PlayerService::OnCellChangeEvent(const CellChangeEvent& acEvent) const noexcept
+void PlayerService::OnCellChangeEvent(const CellChangeEvent& acEvent) noexcept
 {
+    m_entryCell = 0;
+    auto* player = PlayerCharacter::Get();
+    auto* cell = player ? player->GetParentCellEx() : nullptr;
+    if (cell && !acEvent.WorldSpaceId && !player->actorState.IsBleedingOut())
+    {
+        m_entryCell = cell->formID;
+        m_entryX = player->position.x;
+        m_entryY = player->position.y;
+        m_entryZ = player->position.z;
+    }
     if (acEvent.WorldSpaceId)
     {
         EnterExteriorCellRequest message;
@@ -292,6 +303,7 @@ void PlayerService::OnPartyJoinedEvent(const PartyJoinedEvent& acEvent) noexcept
 
 void PlayerService::OnPartyLeftEvent(const PartyLeftEvent& acEvent) noexcept
 {
+    m_peerToken = 0;
     // TODO: this can be done a bit prettier
     if (World::Get().GetTransport().IsConnected())
     {
@@ -306,8 +318,16 @@ void PlayerService::RunRespawnUpdates() noexcept
         return;
 
     PlayerCharacter* pPlayer = PlayerCharacter::Get();
+    if (!pPlayer || m_world.IsLoadingSave()) return;
     if (!pPlayer->actorState.IsBleedingOut())
     {
+        if (m_waitingRescue)
+        {
+            ReportRescueState(false);
+            pPlayer->SetNoBleedoutRecovery(true);
+            m_world.GetOverlayService().ShowRescueReturn(false);
+            m_waitingRescue = m_returnRequested = m_returnOffered = m_healPending = false;
+        }
         m_cachedMainSpellId = pPlayer->magicItems[0] ? pPlayer->magicItems[0]->formID : 0;
         m_cachedSecondarySpellId = pPlayer->magicItems[1] ? pPlayer->magicItems[1]->formID : 0;
         m_cachedPowerId = pPlayer->equippedShout ? pPlayer->equippedShout->formID : 0;
@@ -320,7 +340,14 @@ void PlayerService::RunRespawnUpdates() noexcept
     {
         m_respawnTimerStarted = true;
         m_respawnDeadline = std::chrono::steady_clock::now() + 5s;
-        FadeOutGame(true, true, 3.0f, true, 2.0f);
+        m_waitingRescue = m_world.GetPartyService().GetPartyMembers().size() == 2;
+        if (m_waitingRescue)
+        {
+            if (!++m_rescueToken) ++m_rescueToken;
+            ReportRescueState(true);
+            Utils::ShowHudMessage("Вы упали. Напарник может вас вылечить.");
+        }
+        else FadeOutGame(true, true, 3.0f, true, 2.0f);
 
         // If a player dies not by its health reaching 0, getting it up from its bleedout state isn't possible
         // just by setting its health back to max. Therefore, put it to 0.
@@ -330,9 +357,46 @@ void PlayerService::RunRespawnUpdates() noexcept
     }
 
     const auto cNow = std::chrono::steady_clock::now();
-    if (cNow >= m_respawnDeadline)
+    if (m_waitingRescue && !m_returnRequested)
     {
-        pPlayer->RespawnPlayer();
+        const bool alone = m_world.GetPartyService().GetPartyMembers().size() != 2;
+        if (alone != m_returnOffered)
+        {
+            m_returnOffered = alone;
+            m_world.GetOverlayService().ShowRescueReturn(alone);
+        }
+        if (m_healPending)
+        {
+            if (cNow > m_healUntil) m_healPending = false;
+            else if (pPlayer->GetActorValue(ActorValueInfo::kHealth) > 0.f)
+                pPlayer->SetNoBleedoutRecovery(false);
+        }
+        if (!alone && cNow >= m_respawnDeadline)
+        {
+            ReportRescueState(true);
+            m_respawnDeadline = cNow + 2s;
+        }
+        return;
+    }
+    if (m_returnRequested || cNow >= m_respawnDeadline)
+    {
+        if (m_waitingRescue)
+        {
+            ReportRescueState(false);
+            m_world.GetOverlayService().ShowRescueReturn(false);
+        }
+        auto* cell = pPlayer->GetParentCellEx();
+        if (m_waitingRescue && !pPlayer->GetWorldSpace() && cell)
+        {
+            // Stay inside the current scripted interior if its entry was not observed.
+            const auto entry = cell->formID == m_entryCell ? NiPoint3(glm::vec3(m_entryX,m_entryY,m_entryZ)) : pPlayer->position;
+            pPlayer->SetNoBleedoutRecovery(false);
+            pPlayer->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, 1000000);
+            pPlayer->MoveTo(cell,entry);
+            pPlayer->SetNoBleedoutRecovery(true);
+        }
+        else pPlayer->RespawnPlayer();
+        m_waitingRescue = m_returnRequested = m_returnOffered = m_healPending = false;
 
         m_transport.Send(PlayerRespawnRequest());
 
@@ -371,7 +435,7 @@ void PlayerService::RunPostDeathUpdates() noexcept
         PlayerCharacter::SetGodMode(true);
         m_godmodeStart = true;
 
-        pPlayer->currentProcess->KnockExplosion(pPlayer, &pPlayer->position, 0.f);
+        if (pPlayer->currentProcess) pPlayer->currentProcess->KnockExplosion(pPlayer, &pPlayer->position, 0.f);
 
         FadeOutGame(false, true, 0.5f, true, 2.f);
 
@@ -452,4 +516,54 @@ void PlayerService::ToggleDeathSystem(bool aSet) noexcept
     m_isDeathSystemEnabled = aSet;
 
     PlayerCharacter::Get()->SetPlayerRespawnMode(aSet);
+}
+
+void PlayerService::ReportRescueState(bool down) noexcept
+{
+    RequestCoopInteraction packet;
+    packet.Event = {down ? Interaction::PlayerDown : Interaction::PlayerUp, 0, m_rescueToken};
+    m_transport.Send(packet);
+}
+
+void PlayerService::OnRescueState(const CoopInteraction& e) noexcept
+{
+    if (e.Kind == Interaction::PlayerDown)
+    {
+        m_peerId = e.Speaker;
+        m_peerToken = e.Session;
+    }
+    if (e.Kind == Interaction::PlayerUp && m_peerId == e.Speaker && m_peerToken == e.Session)
+        m_peerToken = 0;
+    if (e.Kind == Interaction::ApplyRescue && m_waitingRescue && e.Session == m_rescueToken && e.Value)
+    {
+        auto* player = PlayerCharacter::Get();
+        if (!player || !player->actorState.IsBleedingOut() || m_world.IsLoadingSave()) return;
+        const auto hp = std::min(player->GetActorPermanentValue(ActorValueInfo::kHealth), e.Value / 100.f);
+        if (hp <= 0) return;
+        player->SetNoBleedoutRecovery(false);
+        player->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, hp);
+        ObserveRescueSpell();
+    }
+    if (e.Kind == Interaction::PartyWipe && m_waitingRescue && e.Session == m_rescueToken)
+        m_returnRequested = true;
+}
+
+void PlayerService::RequestReturn() noexcept
+{
+    if (m_waitingRescue && m_returnOffered && m_world.GetPartyService().GetPartyMembers().size() != 2)
+        m_returnRequested = true;
+}
+
+void PlayerService::ObserveRescueSpell() noexcept
+{
+    if (!m_waitingRescue) return;
+    m_healPending = true;
+    m_healUntil = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+}
+
+bool PlayerService::IsFallenPeer(uint32_t peer) const noexcept
+{
+    const auto& members = m_world.GetPartyService().GetPartyMembers();
+    return peer != UINT32_MAX && m_peerToken && m_peerId == peer && members.size() == 2 &&
+        std::find(members.begin(),members.end(),peer) != members.end();
 }

@@ -5,6 +5,7 @@
 #include <AI/Movement/PlayerControls.h>
 
 #include <Services/OverlayClient.h>
+#include <Services/PlayerService.h>
 #include <Services/TransportService.h>
 
 #include <Messages/SendChatMessageRequest.h>
@@ -94,6 +95,8 @@ bool OverlayClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefR
             const int choice=eventArgs->GetInt(1);
             World::Get().GetRunner().Queue([=] {World::Get().GetOverlayService().ChooseHome(token,choice);});
         }
+        else if (eventName == "returnEntrance")
+            World::Get().GetRunner().Queue([] { World::Get().ctx().at<PlayerService>().RequestReturn(); });
         else if (eventName == "tradeAction")
         {
             const uint32_t session = eventArgs->GetInt(0), row = eventArgs->GetInt(2), count = eventArgs->GetInt(3);

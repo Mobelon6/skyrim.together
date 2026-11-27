@@ -1,4 +1,5 @@
 #include <Services/MagicService.h>
+#include <Services/PlayerService.h>
 
 #include <World.h>
 
@@ -453,7 +454,11 @@ void MagicService::OnNotifyAddTarget(const NotifyAddTarget& acMessage) noexcept
     if (pEffect->IsSlowEffect())
         pActor = PlayerCharacter::Get();
 
-    pActor->magicTarget.AddTarget(data, acMessage.ApplyHealPerkBonus, acMessage.ApplyStaminaPerkBonus);
+    const auto& members = m_world.GetPartyService().GetPartyMembers();
+    if (pActor->magicTarget.AddTarget(data, acMessage.ApplyHealPerkBonus, acMessage.ApplyStaminaPerkBonus) &&
+        pActor == PlayerCharacter::Get() && pCaster && pSpell->IsHealingSpell() &&
+        std::find(members.begin(),members.end(),m_world.GetOverlayService().TradePeer(pCaster->formID)) != members.end())
+        m_world.ctx().at<PlayerService>().ObserveRescueSpell();
     spdlog::debug("Applied remote magic effect");
 }
 

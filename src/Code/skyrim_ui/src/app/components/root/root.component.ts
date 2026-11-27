@@ -52,6 +52,8 @@ export class RootComponent implements OnInit {
   }
   readonly home$ = this.client.home.asObservable();
   chooseHome(token: number, choice: number): void { skyrimtogether.chooseHome(token,choice); }
+  readonly rescueReturn$ = this.client.rescueReturn.asObservable();
+  returnEntrance(): void { skyrimtogether.returnEntrance(); }
   readonly trade$ = this.client.trade.asObservable();
   tradeAction(session: number, action: number, row = 0, count = 1): void {
     skyrimtogether.tradeAction(session, action, row | 0, Math.min(9999, Math.max(1, Math.trunc(count || 1))));

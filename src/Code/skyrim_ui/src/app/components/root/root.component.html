@@ -50,6 +50,12 @@
       <button (click)="chooseHome(h.token,-1)">Отмена</button>
     </section></div>
   }
+  @if (rescueReturn$ | async) {
+    <div class="carriage-shade"><section class="carriage-offer" role="dialog" aria-label="Помощь недоступна">
+      <p>Напарник отключился. Можно дождаться его возвращения.</p>
+      <button (click)="returnEntrance()">Вернуться ко входу</button>
+    </section></div>
+  }
   @if (trade$ | async; as t) {
     <div class="carriage-shade trade-shade">
       <section class="carriage-offer" [class.trade-panel]="t.open" role="dialog" aria-modal="true" aria-labelledby="trade-title">
@@ -58,7 +64,7 @@
           <button (click)="tradeAction(t.session,1)">Да</button>
           <button (click)="tradeAction(t.session,0)">Нет</button>
         } @else {
-          <h2 id="trade-title">Обмен с {{ t.name }}</h2>
+          <h2 id="trade-title">{{ t.session === 2147483647 ? 'Вылечить напарника' : 'Обмен с ' + t.name }}</h2>
           <div class="trade-columns">
             @for (side of [0,1]; track side) {
               <section><h3>{{ side ? 'Общий контейнер' : 'Мой инвентарь' }}</h3>
@@ -73,6 +79,9 @@
               </section>
             }
           </div>
+          @if (t.session === 2147483647) {
+            <button (click)="tradeAction(t.session,4)" [disabled]="!t.buffer.length">Вылечить</button>
+          }
           <button (click)="tradeAction(t.session,0)">Закрыть</button>
         }
       </section>

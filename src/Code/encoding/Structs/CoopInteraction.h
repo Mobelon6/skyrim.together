@@ -4,7 +4,7 @@
 enum class Interaction : uint32_t
 {
     Join, Leave, Joined, WatchOutcomes, FollowerReport, FollowerReserved, FollowerReleased,
-    Hire, Granted, Denied, Brawl, OpponentState, Outcome, Rejoin, CancelHire, PrepareHire, HireReady, CommitHire, SyncRange, FavorResult, BrawlFactionEnded
+    Hire, Granted, Denied, Brawl, OpponentState, Outcome, Rejoin, CancelHire, PrepareHire, HireReady, CommitHire, SyncRange, FavorResult, BrawlFactionEnded, PlayerDown, PlayerUp, PartyWipe, PrepareRescue, SpendRescue, ApplyRescue
 };
 struct CoopInteraction
 {

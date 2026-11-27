@@ -1,6 +1,7 @@
 #include <TiltedOnlinePCH.h>
 #include <World.h>
 #include <PlayerCharacter.h>
+#include <Services/PlayerService.h>
 #include <Misc/BSString.h>
 #include <Games/Memory.h>
 #include <Games/Misc/MenuTopicManager.h>
@@ -34,7 +35,9 @@ bool JoinText(TESNPC* base, TESObjectREFR* ref, BSString& destination)
     // Vanilla HUD accepts "verb\\nname". Preserve the name supplied by Skyrim or other UI mods.
     const char* text = destination.AsAscii();
     const char* name = text ? std::strchr(text, '\n') : nullptr;
-    std::string replacement = join ? "Присоединиться" : "Обменяться";
+    auto& world = World::Get();
+    const bool fallen = world.ctx().at<PlayerService>().IsFallenPeer(world.GetOverlayService().TradePeer(pick->formID));
+    std::string replacement = fallen ? "Вылечить" : join ? "Присоединиться" : "Обменяться";
     if (name)
         replacement += name;
     return destination.Assign(replacement.c_str()) || result;
