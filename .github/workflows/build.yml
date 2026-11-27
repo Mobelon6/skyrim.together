@@ -200,8 +200,7 @@ jobs:
           python important/tests/check_dialogue_ui.py "$ui"
           python important/tests/verify_travel_settings.py "$ui"
           python important/tests/check_party_windows.py "$ui"
-      - if: ${{ false }} # Public binary distribution pending license audit.
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: Skyrim-Coop-SE-1170-Interaction07-dev-MO2
           path: Skyrim-Coop-SE-1170-Interaction07-dev-MO2.zip

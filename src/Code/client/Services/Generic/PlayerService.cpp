@@ -327,7 +327,6 @@ void PlayerService::RunRespawnUpdates() noexcept
         if (pPlayer->GetActorValue(ActorValueInfo::kHealth) > 0.f)
             pPlayer->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, 0);
 
-        pPlayer->PayCrimeGoldToAllFactions();
     }
 
     const auto cNow = std::chrono::steady_clock::now();
