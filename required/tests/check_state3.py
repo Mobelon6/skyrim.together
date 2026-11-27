@@ -60,6 +60,11 @@ int main(){
     change(sword,std::numeric_limits<int32_t>::min());assert(inv.Entries.size()==2&&inv.Entries[1].Count==7);
     change(sword,-7);change(fire,-3);change(fire,-3);assert(inv.Entries.empty());
     change(sword,1);change(sword,-1);assert(inv.Entries.empty());
+    // Repeated removals of the last available item cannot underflow the
+    // snapshot or consume another item. No claim about native grants/CTDs.
+    change(sword,1);change(fire,2);change(sword,-1);change(sword,-1);
+    assert(inv.Entries.size()==1&&inv.Entries.front().CanBeMerged(fire)&&inv.Entries.front().Count==2);
+    change(fire,-2);assert(inv.Entries.empty());
     auto other=frost;other.EnchantData.Effects.front().Duration=25;assert(!other.CanBeMerged(frost));
     other=frost;other.EnchantData.IsWeapon=true;assert(!other.CanBeMerged(frost));
 }
@@ -1390,3 +1395,40 @@ assert 'if (leaderChanged)' in party_info
 assert 'm_leaderPlayerId = acPartyInfo.LeaderPlayerId;' in party_info
 assert 'Console::Setting bEnableXpSync{"Gameplay:bEnableXpSync", "Syncs combat XP within the party", false};' in (code/'server/Services/CharacterService.cpp').read_text()
 print('PASS individual combat XP default and party weather handoff integration',flush=True)
+
+
+# Verify actual transient cell lifecycle, not native ESS persistence or reset.
+leave_cell=extract('server/Services/ObjectService.cpp','void ObjectService::OnPlayerLeaveCellEvent(', '// NOTE: this whole system')
+run('ordinary object lifecycle: one player remains versus empty cell',headers+'''
+namespace entt{using entity=uint32_t;}
+template<class T>using Vector=std::vector<T>;
+struct CellIdComponent{uint32_t Cell;};
+struct ObjectComponent{};
+struct Player{CellIdComponent location;const CellIdComponent& GetCellComponent()const{return location;}};
+struct PlayerLeaveCellEvent{uint32_t OldCell;};
+struct World{
+ std::vector<Player*> players;
+ std::map<entt::entity,CellIdComponent> objects;
+ const auto& GetPlayerManager()const{return players;}
+ struct View{
+  World& w;std::vector<entt::entity> ids;
+  auto begin(){return ids.begin();}auto end(){return ids.end();}
+  template<class T>const T& get(entt::entity id){return w.objects.at(id);}
+ };
+ template<class... T>View view(){View v{*this,{}};for(auto& [id,cell]:objects)v.ids.push_back(id);return v;}
+ void destroy(entt::entity id){assert(objects.erase(id)==1);}
+};
+struct ObjectService{World& m_world;void OnPlayerLeaveCellEvent(const PlayerLeaveCellEvent&) noexcept;};
+'''+leave_cell+'''
+int main(){
+ Player a{{10}},b{{10}};World world{{&a,&b},{{1,{10}},{2,{10}},{3,{11}}}};
+ ObjectService service{world};
+ a.location.Cell=11;
+ service.OnPlayerLeaveCellEvent({10});assert(world.objects.size()==3);
+ b.location.Cell=11;
+ service.OnPlayerLeaveCellEvent({10});
+ assert(world.objects.size()==1&&world.objects.contains(3));
+ service.OnPlayerLeaveCellEvent({10});assert(world.objects.size()==1);
+ service.OnPlayerLeaveCellEvent({11});assert(world.objects.size()==1);
+}
+''')
