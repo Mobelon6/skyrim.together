@@ -645,11 +645,17 @@ void OverlayService::UpdateInteraction() noexcept
     if (!local || !local->parentCell || !local->GetNiNode())
         return; // a load screen cannot confirm dismissal
     auto* followerQuest = Cast<TESQuest>(TESForm::GetById(0x750BA)); // DialogueFollower, human follower alias
-    if (followerQuest && now >= m_followerPoll)
+    if (!m_world.IsLoadingSave() && followerQuest && now >= m_followerPoll)
     {
         m_followerPoll = now + 500ms;
-        auto* follower = followerQuest->GetAliasedRef(0);
-        Transmit(Interaction::FollowerReport, 0, 0, follower ? NetworkForm(follower->formID) : GameId{});
+        const auto handle = followerQuest->GetAliasedHandle(0);
+        if (!handle || handle == *TESObjectREFR::GetNullHandle())
+            Transmit(Interaction::FollowerReport, 0, 0, GameId{});
+        else if (auto* follower = TESObjectREFR::GetByHandle(handle))
+        {
+            const auto id = NetworkForm(follower->formID);
+            if (id) Transmit(Interaction::FollowerReport, 0, 0, id);
+        }
     }
     UpdateHireOffer();
     if (!m_world.GetPartyService().IsInParty())

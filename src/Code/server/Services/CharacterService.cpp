@@ -901,6 +901,7 @@ bool CharacterService::CanClaimOwnership(Player* apPlayer, const entt::entity aE
 
     auto& partyService = m_world.GetPartyService();
     const auto key = view.get<FormIdComponent>(*it).Id.LogFormat();
+    if (!CampaignAccess::RestoreFollowers(m_world)) return false;
     const auto& followers = partyService.Followers();
     const auto follower = followers.find(key);
     if (follower != followers.end() &&

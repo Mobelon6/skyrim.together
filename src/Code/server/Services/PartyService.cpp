@@ -436,6 +436,7 @@ void PartyService::RemovePlayerFromParty(Player* apPlayer) noexcept
             fight.Listeners.erase(departing);
         members.erase(std::find(std::begin(members), std::end(members), apPlayer));
 
+        if (members.size()<2) party.Downed.clear();
         if (members.empty())
         {
             m_parties.erase(id);

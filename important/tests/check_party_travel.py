@@ -86,6 +86,11 @@ int main(){
  act(rider,OpenTravelMap,11);act(yes,AcceptCarriage,11);act(rider,ArriveByCarriage,11,12000);service.UpdateRides({});assert(yes.events.size()==before);
  act(rider,ArriveByMarker,11,300);service.UpdateRides({});assert(yes.events.size()==before+1 && yes.events.back().Kind==InviteMarkerPassenger);
  act(yes,AcceptCarriage,11);act(no,DeclineCarriage,11);service.UpdateRides({});assert(yes.events.back().Kind==TransportPassenger);
+ act(rider,BoardCarriage,12);act(yes,AcceptCarriage,12);
+ w.movements[yes.id].Position.x=1300;no.cell.WorldSpaceId=2;
+ act(rider,ArriveByCarriage,12,9530);service.UpdateRides({});
+ assert(yes.events.back().Kind==CancelPassenger && no.events.back().Kind==CancelPassenger);
+ assert(service.m_rides.empty());w.movements[yes.id].Position.x=1200;no.cell.WorldSpaceId=1;
  act(rider,BoardCarriage,5);service.m_rides.at(1).expires={};
  act(yes,AcceptCarriage,5);service.UpdateRides({});assert(yes.events.back().Kind==CancelPassenger&&service.m_rides.empty());
 }

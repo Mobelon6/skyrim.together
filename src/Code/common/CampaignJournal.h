@@ -32,6 +32,7 @@ public:
     // Explicit creation only. Opening a missing or corrupted existing history fails.
     bool Open(const std::filesystem::path& root, uint64_t campaign, std::string_view profile, bool create);
     Head Current() const;
+    const Operation* Find(const std::string& id) const;
     std::optional<Head> At(uint32_t revision) const;
     Result Append(Head expected, const Operation& op);
     // Caller authenticates source and verifies the campaign/profile handshake first.

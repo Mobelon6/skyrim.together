@@ -74,6 +74,7 @@ void OverlayService::OnInteraction(const PacketEvent<RequestCoopInteraction>& pa
     if (e.Kind == Interaction::FollowerReport || e.Kind == Interaction::Hire || prepare)
     {
         const auto character = CampaignAccess::Character(player);
+        if (!CampaignAccess::RestoreFollowers(m_world)) return;
         for (auto i = followers.begin(); i != followers.end(); )
         {
             auto& f = i->second;
@@ -92,6 +93,13 @@ void OverlayService::OnInteraction(const PacketEvent<RequestCoopInteraction>& pa
             if (!m_world.GetPlayerManager().GetById(f.Owner) || (!f.Confirmed && now >= f.Expires) ||
                 (e.Kind == Interaction::FollowerReport && f.Owner == id && f.Confirmed && e.Npc != f.Npc))
             {
+                if (f.Confirmed && f.Character && !m_world.GetPlayerManager().GetById(f.Owner))
+                {
+                    f.Detached=true;
+                    ++i;
+                    continue;
+                }
+                if (f.Confirmed && !CampaignAccess::RecordFollower(f.Npc,character,false)) return;
                 if (!f.Prepared) announce(Interaction::FollowerReleased, f.Owner, f.Npc);
                 i = followers.erase(i);
             }
@@ -135,6 +143,7 @@ void OverlayService::OnInteraction(const PacketEvent<RequestCoopInteraction>& pa
             }
             if (free || (!i->second.Detached && i->second.Owner == id))
             {
+                if ((free || !i->second.Confirmed) && !CampaignAccess::RecordFollower(e.Npc,character,true,!free && !i->second.Prepared)) return;
                 if (free || i->second.Prepared)
                     announce(Interaction::FollowerReserved, id, e.Npc);
                 auto& entry = followers[e.Npc.LogFormat()];

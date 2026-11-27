@@ -30,6 +30,7 @@ assert names==["STRTradeStreamLow","STRTradeStreamMiddle","STRTradeStreamHigh","
 common=Path(sys.argv[1],"Code/common").resolve()
 test=r"""
 #include "CampaignIdentity.h"
+#include "CampaignFollower.h"
 #include <cassert>
 #include <fstream>
 #include <limits>
@@ -61,6 +62,22 @@ int main(int argc,char** argv)
     assert(Known(journal,71,a));
     a.Applied.Tag++;assert(!Known(journal,71,a));
     a.Applied={7,zero.Tag};assert(!Known(journal,71,a));
+    TradeProperties::FormKey npc{"skyrim.esm",81},second{"example.esp",81};
+    auto owners=CampaignFollower::Read(journal);assert(owners&&owners->empty());
+    assert(CampaignFollower::Write(journal,*owners,npc,42,true));
+    auto hired=journal.Current();
+    assert(CampaignFollower::Write(journal,*owners,npc,42,true)&&journal.Current()==hired);
+    assert(!CampaignFollower::Write(journal,*owners,second,42,true));
+    assert(!CampaignFollower::Write(journal,*owners,npc,7,true));
+    assert(!CampaignFollower::Write(journal,*owners,npc,7,false));
+    Journal restarted;assert(restarted.Open(root/"authority",71,"profile",false));
+    auto restored=CampaignFollower::Read(restarted);
+    assert(restored&&*restored==*owners);
+    assert(CampaignFollower::Write(restarted,*restored,npc,42,false));
+    assert(!CampaignFollower::Write(restarted,*restored,npc,42,true)); // stale native alias from an older ESS
+    assert(CampaignFollower::Write(restarted,*restored,npc,7,true,true));
+    assert(CampaignFollower::Write(restarted,*restored,second,42,true));
+    assert(CampaignFollower::Read(restarted)==restored);
     const std::string key1(64,'a'),key2(64,'b');
     {std::ofstream f(root/"Participants.txt");f<<"1 "<<key1<<"\n2 "<<key2<<"\n";}
     {std::ofstream f(root/"CharacterLink.txt");f<<"1 "<<key1<<"\n";}

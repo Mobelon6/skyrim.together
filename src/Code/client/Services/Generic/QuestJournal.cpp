@@ -71,6 +71,8 @@ namespace
 CampaignReplication::Link campaignLink;
 CampaignReplication::Pull pending;
 CampaignIdentity::Stamp pendingSave;
+uint64_t pendingLoadEpoch{};
+std::chrono::steady_clock::time_point pendingDeadline{};
 std::mutex checkpointLoadMutex;
 std::string loadedDigest;
 bool confirmedLoad{};
@@ -728,15 +730,11 @@ void ResolveQuestPickup(World& world,uint64_t nonce,bool permitted,uint64_t char
 
 std::string NextCheckpoint(const CampaignIdentity::Stamp& stamp)
 {
-    const auto digest=LoadedDigest();
-    if (CampaignCheckpoint::DigestValid(digest))
-    {
-        const auto known=CampaignCheckpoint::Find(campaignLink.Journal,stamp.Campaign,stamp.Character,digest);
-        if (!known)
-            if (auto r=CampaignCheckpoint::ReadLocal(campaignLink.Root,stamp.Campaign,stamp.Character,digest);
-                r&&r->Save==stamp)
-                checkpointOutbox.insert_or_assign(CampaignCheckpoint::Id(stamp.Character,digest),std::move(*r));
-    }
+    static std::pair<uint64_t,uint64_t> restored{};
+    const auto owner=std::pair{stamp.Campaign,stamp.Character};
+    if (restored!=owner && CampaignCheckpoint::RestoreOutbox(campaignLink.Root,campaignLink.Journal,
+        stamp.Campaign,stamp.Character,checkpointOutbox))
+        restored=owner;
     for (auto it=checkpointOutbox.begin();it!=checkpointOutbox.end();)
     {
         auto& r=it->second;
@@ -1741,7 +1739,7 @@ void QuestService::PollCampaign(const UpdateEvent&) noexcept
         wordBaseline.reset();pendingWord.reset();attemptedWords.clear();wordAttemptCharacter=0;
         deferredQuestPickup.reset();deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();questDialogueReady=false;sharedDialogueItems.clear();
     }
-    if (!m_world.GetTransport().IsOnline())
+    if (!m_world.GetTransport().IsOnline()||m_world.IsLoadingSave()||!SaveWorldReady())
     {
         pending={};
         nextPull={};
@@ -1750,7 +1748,11 @@ void QuestService::PollCampaign(const UpdateEvent&) noexcept
     try
     {
         if (campaignLink.Start(false)!=CampaignReplication::Link::Mode::Ready) return;
-        if (!SaveWorldReady()) {pending={};return;}
+        const auto now=std::chrono::steady_clock::now();
+        const bool newClaim=(deferredQuestPickup && !deferredQuestPickup->Nonce) ||
+            (deferredQuestTurnIn && !deferredQuestTurnIn->Nonce);
+        if (now<nextPull || (!newClaim && pending.Nonce && now<pendingDeadline)) return;
+        nextPull=now+std::chrono::seconds(2);
         const auto credential=CampaignIdentity::ReadCredential(campaignLink.Root);
         const auto stamp=credential ? ReadSave(m_world,*credential,true) : std::nullopt;
         if (!stamp)
@@ -1760,9 +1762,8 @@ void QuestService::PollCampaign(const UpdateEvent&) noexcept
             return;
         }
         saveWarning=false;
-        auto now=std::chrono::steady_clock::now();
-        if (now<nextPull) return;
-        nextPull=now+std::chrono::seconds(2);
+        pendingLoadEpoch=dragonLoadEpoch.load(std::memory_order_acquire);
+        pendingDeadline=now+std::chrono::seconds(8);
         pending={campaignLink.Campaign,++nonce,campaignLink.Profile,campaignLink.Journal.Current()};
         RequestCampaignPull request;
         request.Campaign=pending.Campaign;request.Nonce=pending.Nonce;
@@ -1796,7 +1797,7 @@ void QuestService::PollCampaign(const UpdateEvent&) noexcept
                 deferredQuestTurnIn->Nonce=request.Nonce;
             }
         }
-        m_world.GetTransport().Send(request);
+        if (!m_world.GetTransport().Send(request)) pending={};
     }
     catch (...) { campaignLink.Fail();spdlog::error("Campaign replica initialization/poll failed"); }
 }
@@ -1804,6 +1805,11 @@ void QuestService::OnCampaignRecord(const NotifyCampaignRecord& packet) noexcept
 {
     if (!m_world.GetTransport().IsOnline() || campaignLink.State()!=CampaignReplication::Link::Mode::Ready ||
         !pending.Nonce || packet.Nonce!=pending.Nonce || packet.Campaign!=pending.Campaign) return;
+    if (m_world.IsLoadingSave()||pendingLoadEpoch!=dragonLoadEpoch.load(std::memory_order_acquire))
+    {
+        pending={};
+        return;
+    }
     try
     {
         const auto credential=CampaignIdentity::ReadCredential(campaignLink.Root);
@@ -1816,6 +1822,14 @@ void QuestService::OnCampaignRecord(const NotifyCampaignRecord& packet) noexcept
         if (packet.State>3 || packet.Row.size()>4096) {campaignLink.Fail();return;}
         reply.State=static_cast<CampaignReplication::Status>(packet.State);
         reply.Row.assign(packet.Row.data(),packet.Row.size());
+        // The old connection can still hold the character while the guest
+        // reconnects. No reply data is accepted until admission succeeds.
+        if (reply.State==CampaignReplication::Status::Unavailable)
+        {
+            pending={};
+            nextPull=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+            return;
+        }
         auto result=CampaignReplication::Receive(campaignLink.Journal,pending,reply);
         pending={};
         if (result==CampaignJournal::Result::Committed) nextPull={};

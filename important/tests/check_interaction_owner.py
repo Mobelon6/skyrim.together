@@ -32,6 +32,7 @@ struct Registry{OwnerComponent o;CharacterComponent c;CellIdComponent loc;FormId
  template<class...Ts> auto& view(){return *this;}const unsigned*find(unsigned)const{return &token;}const unsigned*end()const{return nullptr;}unsigned token{};
  template<class T>const T& get(unsigned)const{if constexpr(std::is_same_v<T,OwnerComponent>)return o;else if constexpr(std::is_same_v<T,CellIdComponent>)return loc;else if constexpr(std::is_same_v<T,FormIdComponent>)return f;else return c;}
  PartyService& GetPartyService(){return ps;}};
+namespace CampaignAccess{bool RestoreFollowers(Registry&){return true;}}
 struct World{static unsigned ToInteger(unsigned n){return n;}};
 struct CharacterService{Registry&m_world;enum class OwnershipTransferReason{LeaderAssignment,LeaderClaim,PartyInteraction};
  static const char*GetOwnershipTransferReasonName(OwnershipTransferReason){return "";}

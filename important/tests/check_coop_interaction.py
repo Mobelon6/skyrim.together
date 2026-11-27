@@ -38,7 +38,8 @@ struct Player {unsigned id; struct Membership{std::optional<unsigned> JoinedPart
  std::string GetUsername(){return "actor";}auto& GetParty(){return membership;}unsigned GetId(){return id;}auto& GetCellComponent(){return cell;}
  void Send(const NotifyCoopInteraction& e){messages.push_back(e.Event);}
 };
-namespace CampaignAccess { uint64_t Character(const Player& p){return p.id+100;} }
+struct World;
+namespace CampaignAccess { bool RestoreFollowers(World&){return true;} bool RecordFollower(GameId,uint64_t,bool,bool=false){return true;} uint64_t Character(const Player& p){return p.id+100;} }
 template<class T>struct PacketEvent{T Packet;Player* pPlayer;};
 struct World; struct PartyService {static bool WithinSyncRange(World&,Player&,Player&) noexcept;struct Party{unsigned LeaderPlayerId{};RECORDS std::vector<Player*> Members; } one;
  std::map<uint64_t,Party::Follower> followers;std::map<uint32_t,Party::Conversation> hireTalks;

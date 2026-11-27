@@ -127,7 +127,11 @@ void OverlayService::UpdateRides(const UpdateEvent&) noexcept
         for (auto member = ride.passengers.begin(); member != ride.passengers.end(); )
         {
             auto* guest = m_world.GetPlayerManager().GetById(member->first);
-            if (!guest || guest->GetParty().JoinedPartyId != ride.party || ended)
+            const auto* movement = guest && guest->GetCharacter()
+                ? m_world.try_get<MovementComponent>(*guest->GetCharacter()) : nullptr;
+            if (!guest || guest->GetParty().JoinedPartyId != ride.party || ended ||
+                guest->GetCellComponent().WorldSpaceId != ride.originWorld ||
+                !movement || !Within(ride.origin, movement->Position, 1200.f))
             {
                 if (guest && (!ride.marker || ride.destination.Cell))
                 {

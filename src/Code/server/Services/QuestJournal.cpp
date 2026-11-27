@@ -198,7 +198,11 @@ void QuestService::OnCampaignPull(const PacketEvent<RequestCampaignPull>& event)
         bool pickupPermit=false;
         reply.Campaign=p.Campaign;reply.Nonce=p.Nonce;reply.Base=pull.Base;
         const CampaignIdentity::Stamp stamp{p.Campaign,p.Character,{p.SaveRevision,p.SaveTag}};
-        if (CampaignAccess::Admit(m_world,*event.pPlayer,stamp,pull.Profile,{p.Credential.data(),p.Credential.size()}))
+        const bool admitted=CampaignAccess::Admit(m_world,*event.pPlayer,stamp,pull.Profile,
+            {p.Credential.data(),p.Credential.size()});
+        if (admitted && campaignLink.Journal.At(pull.Base.Revision)!=pull.Base)
+            reply.State=CampaignReplication::Status::Conflict;
+        else if (admitted)
         {
             if (!p.QuestReceipt.empty()&&CampaignIdentity::Known(campaignLink.Journal,campaignLink.Campaign,
                 {p.Campaign,p.Character,{p.Revision,p.Tag}}))

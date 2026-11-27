@@ -118,13 +118,11 @@ inline std::optional<Record> Find(const CampaignJournal::Journal& journal,uint64
 {
     if (!character||!DigestValid(digest)) return {};
     const auto id=Id(character,digest);
-    for (const auto& op:journal.Operations())
-        if (op.Id==id)
-        {
-            auto r=Decode(op.Payload);
-            if (op.Kind==Kind&&r&&r->Save.Character==character&&r->Digest==digest&&Known(journal,campaign,*r)) return r;
-            return {};
-        }
+    if (const auto* op=journal.Find(id); op&&op->Kind==Kind)
+    {
+        auto r=Decode(op->Payload);
+        if (r&&r->Save.Character==character&&r->Digest==digest&&Known(journal,campaign,*r)) return r;
+    }
     return {};
 }
 // Call again immediately before requesting the ordinary server visit lease.
@@ -168,5 +166,27 @@ inline std::optional<Record> ReadLocal(const std::filesystem::path& root,uint64_
     }
     catch (...) {}
     return {};
+}
+
+// After a process restart the loaded ESS may be newer than several unsent
+// checkpoints. Recover each immutable retry record belonging to this character.
+inline bool RestoreOutbox(const std::filesystem::path& root,const CampaignJournal::Journal& journal,
+    uint64_t campaign,uint64_t character,std::map<std::string,Record>& pending)
+{
+    if (!journal.Ready()||!campaign||!character) return false;
+    const auto directory=Outbox(root,campaign,"");
+    std::error_code ec;
+    if (!std::filesystem::exists(directory,ec)) return !ec;
+    std::filesystem::directory_iterator it(directory,ec), end;
+    for (; !ec&&it!=end; it.increment(ec))
+    {
+        const auto digest=it->path().filename().string();
+        if (!DigestValid(digest)) continue;
+        const auto id=Id(character,digest);
+        if (journal.Find(id)||pending.contains(id)) continue;
+        if (auto record=ReadLocal(root,campaign,character,digest))
+            pending.emplace(id,std::move(*record));
+    }
+    return !ec;
 }
 }

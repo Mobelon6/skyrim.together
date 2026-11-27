@@ -105,6 +105,11 @@ bool Journal::Open(const std::filesystem::path& root, uint64_t campaign, std::st
     }
     catch (...) { *this=Journal{};return false; }
 }
+const Operation* Journal::Find(const std::string& id) const
+{
+    const auto it=m_ids.find(id);
+    return m_ready && it!=m_ids.end() ? &m_operations[it->second-1] : nullptr;
+}
 Head Journal::Current() const { return m_ready ? m_heads.back() : Head{}; }
 std::optional<Head> Journal::At(uint32_t revision) const
 {
