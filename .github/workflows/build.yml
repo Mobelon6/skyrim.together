@@ -189,6 +189,8 @@ jobs:
           cd ..
           7z a -tzip ../Skyrim-Coop-SE-1170-Interaction07-dev-MO2.zip .
           7z t ../Skyrim-Coop-SE-1170-Interaction07-dev-MO2.zip
+          echo "STM commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          sha256sum ../Skyrim-Coop-SE-1170-Interaction07-dev-MO2.zip >> "$GITHUB_STEP_SUMMARY"
       - name: Test interface from the assembled installer
         working-directory: .
         run: |

@@ -20,6 +20,7 @@ def run(name, source, extra=()):
 
 headers = '''
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -1019,7 +1020,7 @@ int main(){
  frame.args[2].type=Variable::kBoolean;frame.args[2].data.b=false;
  DragonStackView stack{&frame},*p=&stack;
  auto read=[&]{return ReadNativeSharedRemoval(&p);};
- assert(read().Item==10&&read().Caller==20);
+ assert(read().Item==10&&read().Callers[0]==20);
  frame.args[3].type=Variable::kObject;frame.args[3].data.pObj=&destination;assert(!read().Item);
  frame.args[3].data.pObj=nullptr;assert(read().Item==10);
  frame.args[3].type=static_cast<Variable::Type>(32);assert(read().Item==10);
@@ -1029,12 +1030,25 @@ int main(){
  frame.args[1].data.i=2;assert(!read().Item);frame.args[1].data.i=1;
  frame.Size=3;assert(!read().Item);frame.Size=4;
  frame.Self.data.pObj=nullptr;assert(!read().Item);frame.Self.data.pObj=&player;
- source.Self.data.pObj=nullptr;assert(!read().Caller);source.Self.data.pObj=&caller;
+ source.Self.data.pObj=nullptr;assert(!read().Callers[0]);source.Self.data.pObj=&caller;
+ Object ancestor{40};StackFrame origin{};
+ origin.Parent=&parent;origin.Function=&function;origin.Self.type=Variable::kObject;origin.Self.data.pObj=&ancestor;
+ source.Previous=&origin;assert(read().Callers[0]==20&&read().Callers[1]==40);
+ source.Self.data.pObj=nullptr;assert(read().Callers[0]==40&&!read().Callers[1]);
+ int foreign=2;origin.Parent=&foreign;assert(!read().Callers[0]);
+ source.Self.data.pObj=&caller;origin.Parent=&parent;source.Previous=nullptr;
  function.params=3;assert(!read().Item);function.params=4;
  frame.Previous=nullptr;assert(!read().Item);frame.Previous=&source;
  TESForm exact,other;IObjectHandlePolicy policy;policy.expected=&exact;
  assert(MatchesNativeRemovalHandle(&policy,10,&exact));
  assert(!MatchesNativeRemovalHandle(&policy,10,&other)&&!MatchesNativeRemovalHandle(&policy,11,&exact));
+ assert(MatchesNativeRemovalItem(&policy,10,&exact,nullptr));
+ assert(MatchesNativeRemovalItem(&policy,10,&other,&exact));
+ assert(!MatchesNativeRemovalItem(&policy,10,&other,nullptr));
+ assert(!MatchesNativeRemovalItem(&policy,11,&exact,&other));
+ assert(MatchesNativeRemovalSource(&policy,{20,10},&exact,&other));
+ assert(MatchesNativeRemovalSource(&policy,{20,10},&other,&exact));
+ assert(!MatchesNativeRemovalSource(&policy,{20,30},&exact,&other));
  policy.available=false;assert(!MatchesNativeRemovalHandle(&policy,10,&exact));
  policy.available=true;policy.typed=false;assert(!MatchesNativeRemovalHandle(&policy,10,&exact));
 }

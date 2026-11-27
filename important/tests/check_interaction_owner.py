@@ -24,7 +24,7 @@ struct Player{unsigned id{};CellIdComponent cell;auto& GetCellComponent(){return
 struct OwnerComponent{Player* old{};unsigned OwnershipEpoch{6};auto* GetOwner()const{return old;}};
 struct CharacterComponent{bool mount{},player{};bool IsMount()const{return mount;}bool IsPlayer()const{return player;}bool IsDragon()const{return false;}};
 struct PartyService{struct Party {struct Lease{unsigned Owner;bool Confirmed;std::chrono::steady_clock::time_point Expires;bool Detached{};};
- struct Fight{struct {GameId TargetForm;}Anchor;std::chrono::steady_clock::time_point Expires;bool Detached{};};
+ struct Fight{struct {GameId TargetForm;}Anchor;std::chrono::steady_clock::time_point Expires;};
  std::map<uint64_t,Lease> Followers;std::map<unsigned,Fight>Brawls;std::vector<Player*>Members;};
  Party party;auto& Followers(){return party.Followers;}bool IsPlayerInParty(Player*p){return std::find(party.Members.begin(),party.Members.end(),p)!=party.Members.end();}
  bool IsPlayerLeader(Player*p){return p->id==0;}Party* GetPlayerParty(Player*){return &party;}};

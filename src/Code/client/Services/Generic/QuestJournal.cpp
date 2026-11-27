@@ -13,6 +13,7 @@
 #include <Services/CampaignCheckpointClient.h>
 #include <QuestWordReward.h>
 #include <UniqueQuestReward.h>
+#include <array>
 #include <Components.h>
 #include <QuestPickupPermit.h>
 #include <Messages/RequestInventoryChanges.h>
@@ -1613,13 +1614,26 @@ static bool MatchesNativeRemovalHandle(BSScript::IObjectHandlePolicy* policy,uin
         policy->GetObjectForHandle(type,handle)==form;
 }
 
-void ObserveSharedQuestRemoval(uint64_t itemHandle,uint64_t callerHandle,uint64_t permit) noexcept
+static bool MatchesNativeRemovalItem(BSScript::IObjectHandlePolicy* policy,uint64_t handle,TESForm* base,TESForm* exactReference)
+{
+    return MatchesNativeRemovalHandle(policy,handle,base)||
+        MatchesNativeRemovalHandle(policy,handle,exactReference);
+}
+static bool MatchesNativeRemovalSource(BSScript::IObjectHandlePolicy* policy,const std::array<uint64_t,8>& callers,
+                                       TESForm* quest,TESForm* info)
+{
+    for (const auto handle:callers)
+        if (MatchesNativeRemovalHandle(policy,handle,quest)||MatchesNativeRemovalHandle(policy,handle,info)) return true;
+    return false;
+}
+
+void ObserveSharedQuestRemoval(uint64_t itemHandle,std::array<uint64_t,8> callers,uint64_t permit) noexcept
 {
     try
     {
         const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
         if (!permit||!World::Exists()) return;
-        World::Get().GetRunner().Queue([itemHandle,callerHandle,permit,epoch]{
+        World::Get().GetRunner().Queue([itemHandle,callers,permit,epoch]{
             if (epoch!=dragonLoadEpoch.load(std::memory_order_acquire)||!authorizedQuestTurnIn||
                 authorizedQuestTurnIn->Nonce!=permit||SharedTurnInObservationNonce()!=permit) return;
             const auto pending=*authorizedQuestTurnIn;
@@ -1634,8 +1648,13 @@ void ObserveSharedQuestRemoval(uint64_t itemHandle,uint64_t callerHandle,uint64_
             auto* quest=TESForm::GetById(pending.QuestForm);
             auto* info=TESForm::GetById(pending.Info);
             auto* player=PlayerCharacter::Get();
-            if (!player||!MatchesNativeRemovalHandle(policy,itemHandle,base)||
-                (!MatchesNativeRemovalHandle(policy,callerHandle,quest)&&!MatchesNativeRemovalHandle(policy,callerHandle,info))||
+            const auto referenceId=LocalQuestForm(pending.Claim.Reference);
+            auto* reference=referenceId?Cast<TESObjectREFR>(TESForm::GetById(referenceId)):nullptr;
+            // RemoveItem(Form) also accepts an object reference. Only the exact
+            // original from the authorized claim can match, not a second copy.
+            if (reference&&reference->baseForm!=base) reference=nullptr;
+            if (!player||!base||!MatchesNativeRemovalItem(policy,itemHandle,base,reference)||
+                !MatchesNativeRemovalSource(policy,callers,quest,info)||
                 player->GetItemCountInInventory(base)!=0) return;
             const auto item=FindSharedTurnIn(pending.QuestForm,pending.BaseForm);
             if (!item||item->Consumed||item->Character==pending.Character||item->Copies.contains(pending.Character)||

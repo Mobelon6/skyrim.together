@@ -17,6 +17,7 @@
 #include <Forms/ActorValueInfo.h>
 #include <Forms/TESQuest.h>
 #include <UniqueQuestReward.h>
+#include <array>
 
 TP_THIS_FUNCTION(TRegisterPapyrusFunction, void, BSScript::IVirtualMachine, NativeFunction*);
 TP_THIS_FUNCTION(TBindEverythingToScript, void, BSScript::IVirtualMachine*);
@@ -209,9 +210,9 @@ static uint32_t NativeDragonSource(void* stackArgument,BSScript::Variable*& rewa
 }
 void RecordNativeDragonAbsorption(uint32_t form) noexcept;
 uint64_t SharedTurnInObservationNonce() noexcept;
-void ObserveSharedQuestRemoval(uint64_t itemHandle,uint64_t callerHandle,uint64_t permit) noexcept;
+void ObserveSharedQuestRemoval(uint64_t itemHandle,std::array<uint64_t,8> callers,uint64_t permit) noexcept;
 
-struct NativeSharedRemoval {uint64_t Item{},Caller{};};
+struct NativeSharedRemoval {uint64_t Item{};std::array<uint64_t,8> Callers{};};
 static NativeSharedRemoval ReadNativeSharedRemoval(void* stackArgument)
 {
     if (!stackArgument) return {};
@@ -234,8 +235,19 @@ static NativeSharedRemoval ReadNativeSharedRemoval(void* stackArgument)
         !((destination->type==BSScript::Variable::kObject||
            (destination->type>BSScript::Variable::kMax&&!(destination->type&1)))&&!destination->GetObject())) return {};
     auto* object=item->GetObject();
-    auto* source=caller->Self.GetObject();
-    return {object?object->GetHandle():0,source?source->GetHandle():0};
+    NativeSharedRemoval removal;
+    removal.Item=object?object->GetHandle():0;
+    // Synchronous helpers can be invoked by the authorized INFO/QUST.
+    // Never inspect a different stack or retain native frame pointers.
+    size_t countHandles=0;
+    for (size_t depth=0;caller&&depth<removal.Callers.size();++depth,caller=caller->Previous)
+    {
+        if (caller->Parent!=frame->Parent||!caller->Function) break;
+        auto* source=caller->Self.GetObject();
+        const auto handle=source?source->GetHandle():0;
+        if (handle) removal.Callers[countHandles++]=handle;
+    }
+    return removal;
 }
 BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunctionBase,
     void* stackArgument, void* logger, BSScript::IVirtualMachine* vm, bool flag)
@@ -293,8 +305,8 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
     const auto permit=apThis==removeItemNative.load(std::memory_order_acquire)?SharedTurnInObservationNonce():0;
     const auto removal=permit?ReadNativeSharedRemoval(stackArgument):NativeSharedRemoval{};
     const auto result=TiltedPhoques::ThisCall(realDragonNativeCall,apThis,stackArgument,logger,vm,flag);
-    if (permit&&removal.Item&&removal.Caller&&result==BSScript::CallResult::kCompleted)
-        ObserveSharedQuestRemoval(removal.Item,removal.Caller,permit);
+    if (permit&&removal.Item&&removal.Callers[0]&&result==BSScript::CallResult::kCompleted)
+        ObserveSharedQuestRemoval(removal.Item,removal.Callers,permit);
     bool paid=false;
     if (dragon&&!suppress&&result==BSScript::CallResult::kCompleted&&World::Exists()&&!World::Get().IsLoadingSave())
     {
