@@ -38,6 +38,7 @@ struct Player {unsigned id; struct Membership{std::optional<unsigned> JoinedPart
  std::string GetUsername(){return "actor";}auto& GetParty(){return membership;}unsigned GetId(){return id;}auto& GetCellComponent(){return cell;}
  void Send(const NotifyCoopInteraction& e){messages.push_back(e.Event);}
 };
+namespace CampaignAccess { uint64_t Character(const Player& p){return p.id+100;} }
 template<class T>struct PacketEvent{T Packet;Player* pPlayer;};
 struct World; struct PartyService {static bool WithinSyncRange(World&,Player&,Player&) noexcept;struct Party{unsigned LeaderPlayerId{};RECORDS std::vector<Player*> Members; } one;
  std::map<uint64_t,Party::Follower> followers;std::map<uint32_t,Party::Conversation> hireTalks;
@@ -146,6 +147,11 @@ int main(){
  w.pos[2].Position.x=500;act(guest,Interaction::Hire,0,2,81,99);assert(guest.messages.back().Kind==Interaction::Denied);
  w.pos[2].Position.x=0;act(guest,Interaction::Hire,0,3,81,99);assert(guest.messages.back().Kind==Interaction::Granted);
  act(guest,Interaction::FollowerReport,0,0,81);assert(w.parties.Followers().at(81).Owner==2);
+ auto& saved=w.parties.Followers().at(81);saved.Detached=true;saved.Owner=host.id;
+ act(host,Interaction::FollowerReport,0,0,81);assert(saved.Detached);
+ act(guest,Interaction::FollowerReport,0,0,0);assert(saved.Detached);
+ act(guest,Interaction::FollowerReport,0,0,81);assert(!saved.Detached && saved.Owner==guest.id);
+ act(guest,Interaction::FollowerReport,0,0,0);assert(!w.parties.Followers().contains(81));
 }
 """
 range_file = (root / "server/Services/PartyService.cpp").read_text()

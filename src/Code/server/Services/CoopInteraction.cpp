@@ -1,4 +1,5 @@
 #include <GameServer.h>
+#include <Services/CampaignAccess.h>
 #include <World.h>
 #include <Game/Player.h>
 #include <Services/OverlayService.h>
@@ -72,9 +73,22 @@ void OverlayService::OnInteraction(const PacketEvent<RequestCoopInteraction>& pa
     }
     if (e.Kind == Interaction::FollowerReport || e.Kind == Interaction::Hire || prepare)
     {
+        const auto character = CampaignAccess::Character(player);
         for (auto i = followers.begin(); i != followers.end(); )
         {
-            const auto& f = i->second;
+            auto& f = i->second;
+            if (f.Detached)
+            {
+                if (e.Kind == Interaction::FollowerReport && character == f.Character && e.Npc == f.Npc)
+                {
+                    f.Owner = id;
+                    f.Detached = false;
+                    f.Expires = now;
+                    Send(player, Interaction::FollowerReleased, id, 0, f.Npc);
+                }
+                ++i;
+                continue;
+            }
             if (!m_world.GetPlayerManager().GetById(f.Owner) || (!f.Confirmed && now >= f.Expires) ||
                 (e.Kind == Interaction::FollowerReport && f.Owner == id && f.Confirmed && e.Npc != f.Npc))
             {
@@ -103,7 +117,7 @@ void OverlayService::OnInteraction(const PacketEvent<RequestCoopInteraction>& pa
                 if (valid && !competing && (free || own))
                 {
                     for (const auto& [key, f] : followers)
-                        if (f.Owner == id && f.Npc != e.Npc)
+                        if ((f.Detached ? character && f.Character == character : f.Owner == id) && f.Npc != e.Npc)
                             free = own = false;
                     if (free || (own && (i->second.Prepared || (!prepare && i->second.Nonce == e.Session))))
                     {
@@ -119,7 +133,7 @@ void OverlayService::OnInteraction(const PacketEvent<RequestCoopInteraction>& pa
                     Send(player, Interaction::Denied, id, e.Session, e.Npc);
                 return;
             }
-            if (free || i->second.Owner == id)
+            if (free || (!i->second.Detached && i->second.Owner == id))
             {
                 if (free || i->second.Prepared)
                     announce(Interaction::FollowerReserved, id, e.Npc);
@@ -127,6 +141,7 @@ void OverlayService::OnInteraction(const PacketEvent<RequestCoopInteraction>& pa
                 const bool checkSimulation = !entry.Confirmed || now >= entry.Expires;
                 entry.Npc = e.Npc;
                 entry.Owner = id;
+                if (character) entry.Character = character;
                 entry.Confirmed = true;
                 entry.Prepared = false;
                 if (checkSimulation)
@@ -137,7 +152,7 @@ void OverlayService::OnInteraction(const PacketEvent<RequestCoopInteraction>& pa
             }
         }
         for (const auto& [key, f] : followers)
-            if (f.Owner != id && !f.Prepared)
+            if ((f.Detached ? character && f.Character != character : f.Owner != id) && !f.Prepared)
                 Send(player, Interaction::FollowerReserved, f.Owner, 0, f.Npc);
         return;
     }

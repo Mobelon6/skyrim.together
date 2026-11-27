@@ -1,4 +1,5 @@
 #include <Services/PartyService.h>
+#include <Services/CampaignAccess.h>
 #include <Components.h>
 #include <Messages/NotifyCoopInteraction.h>
 #include <GameServer.h>
@@ -382,10 +383,18 @@ void PartyService::OnPartyLeave(const PacketEvent<PartyLeaveRequest>& acPacket) 
 void PartyService::OnPlayerLeave(const PlayerLeaveEvent& acEvent) noexcept
 {
     const auto leaving = acEvent.pPlayer->GetId();
+    CampaignAccess::Disconnect(leaving);
     m_hireTalks.erase(leaving);
     for (auto i = m_followers.begin(); i != m_followers.end(); )
     {
-        if (i->second.Owner != leaving) { ++i; continue; }
+        auto& follower = i->second;
+        if (follower.Detached || follower.Owner != leaving) { ++i; continue; }
+        if (follower.Confirmed && follower.Character)
+        {
+            follower.Detached = true;
+            ++i;
+            continue;
+        }
         if (!i->second.Prepared)
         {
             NotifyCoopInteraction notice;

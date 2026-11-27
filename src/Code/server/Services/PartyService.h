@@ -66,6 +66,8 @@ struct PartyService
             uint32_t Nonce{};
             bool Prepared{};
             uint32_t Session{};
+            uint64_t Character{};
+            bool Detached{};
         };
         std::map<uint32_t, Conversation> Talks;
         std::map<uint32_t, Conversation> Brawls;

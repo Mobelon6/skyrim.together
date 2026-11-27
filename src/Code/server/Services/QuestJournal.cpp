@@ -70,6 +70,8 @@ bool CampaignAccess::Admit(World& world, Player& player, const CampaignIdentity:
     return CampaignIdentity::Known(campaignLink.Journal,campaignLink.Campaign,stamp) &&
         admission.Claim(player.GetId(),{stamp.Character,std::string(secret)});
 }
+void CampaignAccess::Disconnect(uint32_t connection) { admission.Release(connection); }
+
 uint64_t CampaignAccess::Character(const Player& player)
 {
     const auto it=admission.Active().find(player.GetId());

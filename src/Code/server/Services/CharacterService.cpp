@@ -905,7 +905,7 @@ bool CharacterService::CanClaimOwnership(Player* apPlayer, const entt::entity aE
     const auto follower = followers.find(key);
     if (follower != followers.end() &&
         (follower->second.Confirmed || follower->second.Expires > std::chrono::steady_clock::now()))
-        return follower->second.Owner == apPlayer->GetId();
+        return !follower->second.Detached && follower->second.Owner == apPlayer->GetId();
 
     if (!partyService.IsPlayerInParty(apPlayer))
         return reject("the player is not in a party");
