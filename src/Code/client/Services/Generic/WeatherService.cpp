@@ -35,8 +35,20 @@ void WeatherService::OnDisconnected(const DisconnectedEvent& acEvent) noexcept
     ToggleGameWeatherSystem(true);
 }
 
+void WeatherService::RefreshPartyWeather() noexcept
+{
+    if (!m_transport.IsOnline() || !m_world.GetPartyService().IsInParty())
+    {
+        ToggleGameWeatherSystem(true);
+        return;
+    }
+    OnPartyJoinedEvent(PartyJoinedEvent(m_world.GetPartyService().IsLeader()));
+}
+
 void WeatherService::OnPartyJoinedEvent(const PartyJoinedEvent& acEvent) noexcept
 {
+    // Do not retain an override from the previous leader or party.
+    ToggleGameWeatherSystem(true);
     if (!acEvent.IsLeader)
     {
         // TODO: why is this loop here? Party should always have a leader.
@@ -123,6 +135,11 @@ void WeatherService::OnPlayerComponentRemoved(entt::registry& aRegistry, entt::e
 
 void WeatherService::OnWeatherChange(const NotifyWeatherChange& acMessage) noexcept
 {
+    // A reply already in flight must not override regional weather after the
+    // leader has left our loaded area, or after we become the leader.
+    if (!m_followingWeather || !m_transport.IsOnline() ||
+        !m_world.GetPartyService().IsInParty() || m_world.GetPartyService().IsLeader())
+        return;
     auto& modSystem = m_world.GetModSystem();
     const uint32_t weatherId = modSystem.GetGameId(acMessage.Id);
     TESWeather* pWeather = Cast<TESWeather>(TESForm::GetById(weatherId));
@@ -189,19 +206,19 @@ void WeatherService::RunWeatherUpdates(const double acDelta) noexcept
 
 void WeatherService::ToggleGameWeatherSystem(bool aToggle) noexcept
 {
+    m_followingWeather = !aToggle;
+    m_cachedWeatherId = 0;
     if (aToggle)
     {
         if (auto* sky=Sky::Get()) sky->ReleaseWeatherOverride();
     }
     else
         m_transport.Send(RequestCurrentWeather());
-
-    m_cachedWeatherId = 0;
 }
 
 void WeatherService::SetCachedWeather() noexcept
 {
-    if (m_cachedWeatherId == 0)
+    if (!m_followingWeather || m_cachedWeatherId == 0)
         return;
 
     TESWeather* pWeather = Cast<TESWeather>(TESForm::GetById(m_cachedWeatherId));

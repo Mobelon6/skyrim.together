@@ -1,6 +1,7 @@
 #include <Services/PartyService.h>
 
 #include <Services/TransportService.h>
+#include <Services/WeatherService.h>
 
 #include <Events/UpdateEvent.h>
 #include <Events/DisconnectedEvent.h>
@@ -117,9 +118,13 @@ void PartyService::OnPartyInfo(const NotifyPartyInfo& acPartyInfo) noexcept
     if (m_inParty)
     {
         spdlog::debug("[PartyService]: Got party info update");
+        const bool leaderChanged = m_isLeader != acPartyInfo.IsLeader ||
+            m_leaderPlayerId != acPartyInfo.LeaderPlayerId;
         m_isLeader = acPartyInfo.IsLeader;
         m_leaderPlayerId = acPartyInfo.LeaderPlayerId;
         m_partyMembers = acPartyInfo.PlayerIds;
+        if (leaderChanged)
+            m_world.ctx().at<WeatherService>().RefreshPartyWeather();
 
         // Both peers receive this packet on handoff, including the outgoing leader.
         if (auto* pEncounters = Cast<TESGlobal>(TESForm::GetById(0xB8EC1)))

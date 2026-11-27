@@ -1311,3 +1311,82 @@ int main(){
  b.party=true;s.OnRest({&b,{{1.f,9.f,202,0,1}}});assert(s.m_dateTime.m_timeModel.Time==9.f&&s.broadcasts==4);
 }
 ''')
+
+
+# Verify the approved weather policy against real client handlers, including
+# party leadership changes and a delayed response after leaving the loaded area.
+weather_client = (code/'client/Services/Generic/WeatherService.cpp').read_text()
+weather_client = weather_client[weather_client.index('void WeatherService::OnDisconnected('):]
+run('regional weather when apart; existing party weather on approach and handoff',headers+'''
+namespace entt{struct registry{};using entity=int;}
+struct GameId{uint32_t ModId{},BaseId{};};
+struct TESForm{uint32_t formID{};static TESForm* GetById(uint32_t);};
+struct TESWeather:TESForm{} regional{{10}},remoteWeather{{20}},mapWeather{{0xA6858}};
+TESForm* TESForm::GetById(uint32_t id){return id==10?&regional:id==20?&remoteWeather:id==0xA6858?&mapWeather:nullptr;}
+template<class T>T* Cast(TESForm* p){return static_cast<T*>(p);}
+struct Sky{
+ TESWeather* current=&regional;bool forced=false;int releases=0;
+ static Sky* Get(){static Sky s;return &s;}
+ TESWeather* GetWeather(){return current;}
+ void ForceWeather(TESWeather* weather){current=weather;forced=true;}
+ void ReleaseWeatherOverride(){current=&regional;forced=false;++releases;}
+};
+struct PlayerComponent{uint32_t Id{};};
+struct PartyService{bool in=true,leader=false;uint32_t leaderId=2;bool IsInParty()const{return in;}bool IsLeader()const{return leader;}uint32_t GetLeaderPlayerId()const{return leaderId;}};
+struct World:entt::registry{
+ PartyService party;std::map<int,PlayerComponent> players;
+ PartyService& GetPartyService(){return party;}
+ struct ModSystem{uint32_t GetGameId(GameId id){return id.BaseId;}bool GetServerModId(uint32_t id,GameId& out){out={0,id};return true;}} mods;
+ ModSystem& GetModSystem(){return mods;}
+ template<class T>T* try_get(int id){auto it=players.find(id);return it==players.end()?nullptr:&it->second;}
+ template<class T>T& get(int id){return players.at(id);}
+ struct View{World& world;std::vector<int> ids;auto begin(){return ids.begin();}auto end(){return ids.end();}
+  template<class T>T& get(int id){return world.get<T>(id);}
+ };
+ template<class T>View view(){View v{*this,{}};for(auto& [id,p]:players)v.ids.push_back(id);return v;}
+};
+struct RequestCurrentWeather{};struct RequestWeatherChange{GameId Id;};struct NotifyWeatherChange{GameId Id;};
+struct TransportService{bool online=true;int requests=0;std::vector<uint32_t> published;
+ bool IsOnline(){return online;}void Send(RequestCurrentWeather){++requests;}void Send(RequestWeatherChange p){published.push_back(p.Id.BaseId);}
+};
+struct DisconnectedEvent{};struct PartyJoinedEvent{bool IsLeader;};struct PartyLeftEvent{};
+namespace spdlog{template<class...T>void error(T&&...){}}
+struct WeatherService{
+ World& m_world;TransportService& m_transport;uint32_t m_cachedWeatherId{};bool m_followingWeather{};
+ void RefreshPartyWeather()noexcept;void OnDisconnected(const DisconnectedEvent&)noexcept;
+ void OnPartyJoinedEvent(const PartyJoinedEvent&)noexcept;void OnPartyLeftEvent(const PartyLeftEvent&)noexcept;
+ void OnWaitingFor3DRemoved(entt::registry&,entt::entity)noexcept;void OnPlayerComponentRemoved(entt::registry&,entt::entity)noexcept;
+ void OnWeatherChange(const NotifyWeatherChange&)noexcept;void RunWeatherUpdates(double)noexcept;
+ void ToggleGameWeatherSystem(bool)noexcept;void SetCachedWeather()noexcept;
+};
+'''+weather_client+'''
+int main(){
+ World world;TransportService transport;WeatherService service{world,transport};auto* sky=Sky::Get();
+ service.OnPartyJoinedEvent({false});
+ assert(!sky->forced&&!service.m_followingWeather&&transport.requests==0);
+ service.OnWeatherChange({{0,20}});assert(!sky->forced);
+ world.players[2]={2};
+ service.OnWaitingFor3DRemoved(world,2);assert(service.m_followingWeather&&transport.requests==1);
+ service.OnWeatherChange({{0,20}});assert(sky->forced&&sky->current==&remoteWeather);
+ sky->current=&regional;service.RunWeatherUpdates(0);assert(sky->current==&remoteWeather);
+ service.OnPlayerComponentRemoved(world,2);world.players.erase(2);
+ assert(!sky->forced&&!service.m_followingWeather&&sky->current==&regional);
+ service.OnWeatherChange({{0,20}});service.RunWeatherUpdates(0);assert(!sky->forced);
+ world.players[2]={2};service.OnWaitingFor3DRemoved(world,2);
+ service.OnWeatherChange({{0,20}});assert(sky->forced);
+ world.party.leader=true;world.party.leaderId=1;service.RefreshPartyWeather();
+ assert(!sky->forced&&!service.m_followingWeather&&transport.published==std::vector<uint32_t>{10});
+ service.OnWeatherChange({{0,20}});assert(!sky->forced);
+ world.party.leader=false;world.party.leaderId=2;service.RefreshPartyWeather();
+ assert(service.m_followingWeather&&transport.requests==3);
+ service.OnWeatherChange({{0,20}});assert(sky->forced);
+ world.party.in=false;service.OnPartyLeftEvent({});service.OnWeatherChange({{0,20}});assert(!sky->forced);
+ transport.online=false;service.OnDisconnected({});assert(!service.m_followingWeather);
+}
+''')
+party_info=extract('client/Services/Generic/PartyService.cpp','void PartyService::OnPartyInfo(', 'void PartyService::OnPartyInvite(')
+assert 'm_world.ctx().at<WeatherService>().RefreshPartyWeather();' in party_info
+assert 'if (leaderChanged)' in party_info
+assert 'm_leaderPlayerId = acPartyInfo.LeaderPlayerId;' in party_info
+assert 'Console::Setting bEnableXpSync{"Gameplay:bEnableXpSync", "Syncs combat XP within the party", false};' in (code/'server/Services/CharacterService.cpp').read_text()
+print('PASS individual combat XP default and party weather handoff integration',flush=True)

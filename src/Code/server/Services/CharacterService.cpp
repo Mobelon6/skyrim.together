@@ -45,7 +45,7 @@
 #include <Setting.h>
 namespace
 {
-Console::Setting bEnableXpSync{"Gameplay:bEnableXpSync", "Syncs combat XP within the party", true};
+Console::Setting bEnableXpSync{"Gameplay:bEnableXpSync", "Syncs combat XP within the party", false};
 }
 
 CharacterService::CharacterService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
