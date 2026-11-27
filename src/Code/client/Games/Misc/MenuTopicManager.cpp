@@ -9,7 +9,6 @@
 #include <PlayerCharacter.h>
 #include <QuestPickupPermit.h>
 
-int SharedDialogueItemState(const void*,uint32_t) noexcept;
 bool DeferSharedQuestTurnIn(uint32_t,uint32_t,uint32_t,uint32_t) noexcept;
 
 TP_THIS_FUNCTION(TPlayDialogueOption, bool, MenuTopicManager, int32_t aIndex);
@@ -193,12 +192,7 @@ TCheckCondition* nextCondition{};
 bool TP_MAKE_THISCALL(CheckFollowerCondition, TESConditionItem, ConditionContext& context)
 {
     const auto fn = apThis->function;
-    if (fn==47&&context.quest&&context.action&&context.target==PlayerCharacter::Get())
-        if (const auto item=PlayerItemCondition(*apThis))
-            if (const auto* menu=MenuTopicManager::Get();menu&&menu->IsCurrentSpeaker(context.action->GetHandle()))
-                if (const auto state=SharedDialogueItemState(context.quest,item);state>=0)
-                    if (const auto result=QuestPickupPermit::CompareSingleItem(apThis->flags,apThis->comparisonValue,state))
-                        return *result;
+    // Item availability and every comparison are evaluated by Skyrim on the local player.
     const auto* param = static_cast<const TESForm*>(apThis->params[0]);
     // Alias and package-data operands can be numeric slots instead of TESForm pointers.
     if ((fn == 74 || fn == 71) && param && !(apThis->flags & 0x1E) && apThis->object == 0 &&

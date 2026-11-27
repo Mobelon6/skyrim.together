@@ -1066,26 +1066,8 @@ struct DeferredQuestTurnIn
     uint64_t Campaign{},Character{},Nonce{};
     std::chrono::steady_clock::time_point Deadline{};
 };
-std::optional<DeferredQuestTurnIn> deferredQuestTurnIn,authorizedQuestTurnIn;
-// Published only after a server permit, before resuming the exact dialogue.
-std::atomic<uint64_t> sharedTurnInNonce{};
-void ClearAuthorizedQuestTurnIn() noexcept
-{
-    sharedTurnInNonce.store(0,std::memory_order_release);
-    authorizedQuestTurnIn.reset();
-}
-// The campaign update and dialogue run on the game thread. Other engine
-// condition evaluation threads must not read its mutable journal.
+std::optional<DeferredQuestTurnIn> deferredQuestTurnIn;
 thread_local bool questDialogueThread{};
-thread_local bool questDialogueReady{};
-// Use the native quest pointer only as an opaque lookup key, not a
-// dereference of an undocumented condition-context member.
-struct SharedDialogueItem
-{
-    uint32_t Quest{},Instance{},Reference{},Alias{};
-    bool Consumed{},LocalHolder{};
-};
-thread_local std::map<std::pair<const void*,uint32_t>,SharedDialogueItem> sharedDialogueItems;
 
 std::optional<QuestPickup> FindSharedTurnIn(uint32_t questId,uint32_t baseId)
 {
@@ -1102,33 +1084,6 @@ std::optional<QuestPickup> FindSharedTurnIn(uint32_t questId,uint32_t baseId)
         }
     return match;
 }
-void RefreshSpentDialogueItems(const CampaignJournal::Journal& journal,uint64_t character)
-{
-    sharedDialogueItems.clear();questDialogueReady=false;
-    const auto items=QuestPickupHistory(journal.Operations());
-    if (!items||!character) return;
-    std::map<std::pair<uint32_t,uint32_t>,std::pair<unsigned,const QuestPickup*>> counts;
-    for (const auto& item:*items)
-        if (item.Generation==1&&item.Count==1)
-        {
-            const auto quest=LocalQuestForm(item.Quest),base=LocalQuestForm(item.Item);
-            if (!quest||!base) continue;
-            auto& state=counts[{quest,base}];++state.first;state.second=&item;
-        }
-    for (const auto& [key,state]:counts)
-    {
-        if (state.first!=1) continue; // GetItemCount cannot distinguish aliases
-        const auto& item=*state.second;
-        const auto reference=LocalQuestForm(item.Reference);
-        auto* quest=Cast<TESQuest>(TESForm::GetById(key.first));
-        if (!reference||!quest||quest->IsStopped()||!(quest->flags&TESQuest::RunOnce)||
-            (quest->flags&(TESQuest::Failed|TESQuest::Completed|TESQuest::AllowRepeatStages))||
-            QuestService::IsNonSyncableQuest(quest)) continue;
-        sharedDialogueItems[{quest,key.second}]={key.first,quest->currentInstanceID,reference,item.Alias,
-            item.Consumed,item.Character==character||item.Copies.contains(character)};
-    }
-    questDialogueReady=true;
-}
 bool CanUseSharedTurnIn(World& world,const QuestPickup& item,uint32_t questId,uint32_t baseId,uint64_t character)
 {
     auto* player=PlayerCharacter::Get();
@@ -1141,9 +1096,8 @@ bool CanUseSharedTurnIn(World& world,const QuestPickup& item,uint32_t questId,ui
     auto* ref=quest->GetAliasedRef(item.Alias);
     if (!ref||ref->formID!=refId||!ref->baseForm||ref->baseForm!=base) return false;
     const auto count=player->GetItemCountInInventory(base);
-    if (item.Character!=character&&!item.Copies.contains(character))
-        return count==0; // another participant owns the exact original
-    if (count!=1) return false;
+    // A native dialogue must be backed by the submitter's physical exact stack.
+    if (!QuestPickupPermit::PhysicalHolder(character,item.Character,item.Copies.contains(character),count)) return false;
     GameId questNet{},refNet{};
     return world.GetModSystem().GetServerModId(questId,questNet)&&
         world.GetModSystem().GetServerModId(refId,refNet)&&
@@ -1166,16 +1120,8 @@ void ResolveQuestTurnIn(World& world,uint64_t nonce,bool permitted,uint64_t char
         !CanUseSharedTurnIn(world,*item,pending.QuestForm,pending.BaseForm,character)) return;
     auto* menu=MenuTopicManager::Get();
     if (!menu) return;
-    // The native dialogue still runs on the submitter. Only its subsequent
-    // removal of an absent shared object may consume the other inventory.
-    if (item->Character!=character&&!item->Copies.contains(character))
-    {
-        authorizedQuestTurnIn=pending;
-        authorizedQuestTurnIn->Deadline=std::chrono::steady_clock::now()+std::chrono::minutes(2);
-        sharedTurnInNonce.store(pending.Nonce,std::memory_order_release);
-    }
-    if (!menu->ResumeQuestTurnIn(pending.Npc,pending.Info,pending.QuestForm,pending.BaseForm))
-        ClearAuthorizedQuestTurnIn();
+    // The holder alone runs the original dialogue and actual native removal.
+    menu->ResumeQuestTurnIn(pending.Npc,pending.Info,pending.QuestForm,pending.BaseForm);
 }
 
 void PublishReconciledQuestInventory(World& world,PlayerCharacter& player)
@@ -1288,7 +1234,7 @@ void ResetQuestReplayForLoad()
     attemptedQuestConsumption.clear();
     deferredQuestPickup.reset();
     pendingQuestReceipts.clear();
-    deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();questDialogueReady=false;sharedDialogueItems.clear();
+    deferredQuestTurnIn.reset();
     pendingWord.reset();
     wordBaseline.reset();
     attemptedWords.clear();
@@ -1591,111 +1537,6 @@ bool CaptureUniqueQuestAward(uint32_t item) noexcept
     catch (...) {return false;}
 }
 
-int SharedDialogueItemState(const void* nativeQuest,uint32_t base) noexcept
-{
-    try
-    {
-        if (!questDialogueThread||!questDialogueReady||questObservedLoadEpoch!=dragonLoadEpoch.load(std::memory_order_acquire)||
-            !World::Exists()) return -1;
-        auto& world=World::Get();
-        if (world.IsLoadingSave()||!world.GetTransport().IsOnline()||!world.GetPartyService().IsInParty()) return -1;
-        const auto it=sharedDialogueItems.find({nativeQuest,base});
-        if (it==sharedDialogueItems.end()) return -1;
-        const auto& item=it->second;
-        auto* quest=Cast<TESQuest>(TESForm::GetById(item.Quest));
-        auto* object=Cast<TESBoundObject>(TESForm::GetById(base));
-        auto* player=PlayerCharacter::Get();
-        if (!quest||quest!=nativeQuest||quest->currentInstanceID!=item.Instance||quest->IsStopped()||
-            !(quest->flags&TESQuest::RunOnce)||(quest->flags&(TESQuest::Failed|TESQuest::Completed|TESQuest::AllowRepeatStages))||
-            !object||!player||world.GetOverlayService().IsPersonalQuest(item.Quest)) return -1;
-        const auto count=player->GetItemCountInInventory(object);
-        // A spent item with no physical local copy needs no override. An
-        // available original must still match the active native alias.
-        if (item.Consumed&&count==0) return 0;
-        auto* assigned=quest->GetAliasedRef(item.Alias);
-        if (!assigned||assigned->formID!=item.Reference||assigned->baseForm!=object) return -1;
-        bool exact=false;
-        if (count==1&&item.LocalHolder)
-        {
-            GameId questNet{},refNet{};
-            exact=world.GetModSystem().GetServerModId(item.Quest,questNet)&&
-                world.GetModSystem().GetServerModId(item.Reference,refNet)&&
-                FindSpentQuestStack(*player,object,questNet,refNet,item.Alias)!=nullptr;
-        }
-        return QuestPickupPermit::SharedSingleItemCount(count,item.Consumed,item.LocalHolder,exact);
-    }
-    catch (...) {return -1;}
-}
-
-uint64_t SharedTurnInObservationNonce() noexcept
-{
-    return sharedTurnInNonce.load(std::memory_order_acquire);
-}
-
-static bool MatchesNativeRemovalHandle(BSScript::IObjectHandlePolicy* policy,uint64_t handle,TESForm* form)
-{
-    if (!policy||!handle||!form) return false;
-    const auto type=static_cast<uint32_t>(form->formType);
-    return policy->HandleIsType(type,handle)&&policy->IsHandleObjectAvailable(handle)&&
-        policy->GetObjectForHandle(type,handle)==form;
-}
-
-static bool MatchesNativeRemovalItem(BSScript::IObjectHandlePolicy* policy,uint64_t handle,TESForm* base,TESForm* exactReference)
-{
-    return MatchesNativeRemovalHandle(policy,handle,base)||
-        MatchesNativeRemovalHandle(policy,handle,exactReference);
-}
-static bool MatchesNativeRemovalSource(BSScript::IObjectHandlePolicy* policy,const std::array<uint64_t,8>& callers,
-                                       TESForm* quest,TESForm* info)
-{
-    for (const auto handle:callers)
-        if (MatchesNativeRemovalHandle(policy,handle,quest)||MatchesNativeRemovalHandle(policy,handle,info)) return true;
-    return false;
-}
-
-void ObserveSharedQuestRemoval(uint64_t itemHandle,std::array<uint64_t,8> callers,uint64_t permit) noexcept
-{
-    try
-    {
-        const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
-        if (!permit||!World::Exists()) return;
-        World::Get().GetRunner().Queue([itemHandle,callers,permit,epoch]{
-            if (epoch!=dragonLoadEpoch.load(std::memory_order_acquire)||!authorizedQuestTurnIn||
-                authorizedQuestTurnIn->Nonce!=permit||SharedTurnInObservationNonce()!=permit) return;
-            const auto pending=*authorizedQuestTurnIn;
-            if (pending.Deadline<=std::chrono::steady_clock::now()) {ClearAuthorizedQuestTurnIn();return;}
-            auto& world=World::Get();
-            if (world.IsLoadingSave()||!SaveWorldReady()) return;
-            const auto identity=CampaignAccess::Current(world);
-            if (!identity||identity->Save.Character!=pending.Character||identity->Save.Campaign!=pending.Campaign) return;
-            auto* gameVM=GameVM::Get();
-            auto* policy=gameVM&&gameVM->virtualMachine?gameVM->virtualMachine->GetObjectHandlePolicy():nullptr;
-            auto* base=TESForm::GetById(pending.BaseForm);
-            auto* quest=TESForm::GetById(pending.QuestForm);
-            auto* info=TESForm::GetById(pending.Info);
-            auto* player=PlayerCharacter::Get();
-            const auto referenceId=LocalQuestForm(pending.Claim.Reference);
-            auto* reference=referenceId?Cast<TESObjectREFR>(TESForm::GetById(referenceId)):nullptr;
-            // RemoveItem(Form) also accepts an object reference. Only the exact
-            // original from the authorized claim can match, not a second copy.
-            if (reference&&reference->baseForm!=base) reference=nullptr;
-            if (!player||!base||!MatchesNativeRemovalItem(policy,itemHandle,base,reference)||
-                !MatchesNativeRemovalSource(policy,callers,quest,info)||
-                player->GetItemCountInInventory(base)!=0) return;
-            const auto item=FindSharedTurnIn(pending.QuestForm,pending.BaseForm);
-            if (!item||item->Consumed||item->Character==pending.Character||item->Copies.contains(pending.Character)||
-                QuestPickupPermit::Claim{item->Quest,item->Reference,item->Item,item->Alias}.Encode()!=pending.Claim.Encode()) return;
-            // The Papyrus removal completed even if the empty inventory never
-            // entered TESObjectREFR::RemoveItem. No local delta or copy.
-            if (pendingQuestReceipts.size()>=64)
-            {spdlog::warn("STM pending quest item receipt capacity reached");return;}
-            pendingQuestReceipts.push_back({{pending.Claim,-1,false,true},pending.Campaign,pending.Character,pending.Deadline});
-            ClearAuthorizedQuestTurnIn();nextPull={};
-        });
-    }
-    catch (...) {spdlog::warn("STM shared quest removal observation failed");}
-}
-
 bool DeferSharedQuestTurnIn(uint32_t questId,uint32_t baseId,uint32_t npc,uint32_t info) noexcept
 {
     try
@@ -1716,8 +1557,6 @@ bool DeferSharedQuestTurnIn(uint32_t questId,uint32_t baseId,uint32_t npc,uint32
         {Utils::ShowHudMessage("Не подтверждён исходный квестовый предмет.");return true;}
         const auto now=std::chrono::steady_clock::now();
         if (deferredQuestTurnIn&&deferredQuestTurnIn->Deadline>now) return true;
-        if (authorizedQuestTurnIn&&authorizedQuestTurnIn->Deadline>now) return true;
-        ClearAuthorizedQuestTurnIn();
         deferredQuestTurnIn=DeferredQuestTurnIn{{item->Quest,item->Reference,item->Item,item->Alias},
             questId,baseId,npc,info,quest->currentInstanceID,identity->Save.Campaign,character,0,now+std::chrono::seconds(8)};
         nextPull={};
@@ -1752,8 +1591,7 @@ void QuestService::PollCampaign(const UpdateEvent&) noexcept
     if (!m_world.GetTransport().IsOnline()||!m_world.GetPartyService().IsInParty())
     {
         uniqueRewardEpoch.store(0,std::memory_order_release);uniqueRewardChoices.clear();
-        deferredQuestPickup.reset();deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();
-        questDialogueReady=false;sharedDialogueItems.clear();
+        deferredQuestPickup.reset();deferredQuestTurnIn.reset();
         attemptedQuestPickups.clear();
         attemptedQuestConsumption.clear();
         wordBaseline.reset();
@@ -1765,7 +1603,7 @@ void QuestService::PollCampaign(const UpdateEvent&) noexcept
     {
         uniqueRewardEpoch.store(0,std::memory_order_release);
         wordBaseline.reset();pendingWord.reset();attemptedWords.clear();wordAttemptCharacter=0;
-        deferredQuestPickup.reset();deferredQuestTurnIn.reset();ClearAuthorizedQuestTurnIn();questDialogueReady=false;sharedDialogueItems.clear();
+        deferredQuestPickup.reset();deferredQuestTurnIn.reset();
     }
     if (!m_world.GetTransport().IsOnline()||m_world.IsLoadingSave()||!SaveWorldReady())
     {
@@ -1879,7 +1717,6 @@ void QuestService::OnCampaignRecord(const NotifyCampaignRecord& packet) noexcept
             {
                 ApplySharedDragonGrants(m_world,campaignLink.Journal,stamp->Character);
                 UpdateUniqueRewards(m_world,*stamp);
-                RefreshSpentDialogueItems(campaignLink.Journal,stamp->Character);
                 RestoreLearnedWords(m_world,campaignLink.Journal,stamp->Character);
                 RestoreOwnQuestPickups(m_world,campaignLink.Journal,stamp->Character);
                 // Reconcile against observed native state, not a permanent

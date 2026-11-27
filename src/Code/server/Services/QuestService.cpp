@@ -289,7 +289,7 @@ bool CampaignAccess::ReserveQuestPickup(World& world,Player& player,std::string_
         if (!RestoreQuestRun(authority.Journal,claim->Quest,run)||!CanRecordQuestPickup(run,true,1)) return false;
         if (turnIn)
         {
-            if (!QuestPickupPermit::AvailableOriginal(authority.Journal.Operations(),*claim)) return false;
+            if (!QuestPickupPermit::HasAvailableHolder(authority.Journal.Operations(),*claim,character)) return false;
             return sharedTurnIns.Acquire(*claim,character,player.GetId(),nonce,QuestPickupPermit::Leases::Clock::now());
         }
         if (QuestPickupPermit::AlreadyTaken(authority.Journal.Operations(),*claim)) return false;
@@ -335,21 +335,9 @@ void CampaignAccess::ReplayQuestReceipt(World& world,Player& player,std::string_
         {ApplyUniqueRewardCommand(world,player,value);return;}
         const auto receipt=QuestPickupPermit::DecodeReceipt(std::string(value));
         if (!receipt) return;
-        if (receipt->Shared)
-        {
-            auto& authority=Authority();
-            const auto character=Character(player);
-            if (!character||authority.State()!=CampaignReplication::Link::Mode::Ready||
-                !world.GetPartyService().GetPlayerParty(&player)||
-                !sharedTurnIns.Allows(receipt->Object,character,QuestPickupPermit::Leases::Clock::now())) return;
-            const auto original=QuestPickupPermit::AvailableOriginal(authority.Journal.Operations(),receipt->Object);
-            if (!original) return; // already consumed or unknown
-            const auto head=authority.Journal.Current();
-            if (authority.Journal.Append(head,{std::string("quest-item-")+std::to_string(head.Revision+1),
-                "quest-consumed-v1",*original})!=CampaignJournal::Result::Committed)
-                spdlog::error("STM could not persist shared quest removal");
-            return;
-        }
+        // Old virtual turn-in commands remain decodable for compatibility,
+        // but cannot change the campaign under the physical-holder rule.
+        if (receipt->Shared) return;
         const auto& mods=world.ctx().at<ModsComponent>();
         const auto resolve=[&](const std::string& encoded)->GameId {
             const auto key=TradeProperties::DecodeForm(encoded);

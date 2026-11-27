@@ -9,60 +9,6 @@ with tempfile.TemporaryDirectory() as work:
 #include <cassert>
 int main(){
  {
- // A single atomic expense, using the existing campaign and receipt wallet.
- // Neither receipt credits escrow; applying/acknowledging one cannot create
- // stock, and an older valid ESS can apply its own missing debit once.
- CampaignJournal::Journal host;assert(host.Open("quest-expense",191,"profile",true));
- TradeLedger ledger(host,191);assert(ledger.Stream()==191);
- using E=TradeLedger::QuestExpense;
- E e{{"skyrim.esm",100},{"skyrim.esm",200},{"skyrim.esm",300},101,202,3,0,0,2,1};
- assert(e.Valid()&&e.SpeakerDebit()==2&&e.PeerDebit()==1);
- assert(E::Decode(e.Encode())&&E::Decode(e.Encode())->Encode()==e.Encode());
- assert(!E::Decode(e.Encode()+" extra"));
- auto bad=e;bad.PeerBefore=0;assert(!bad.Valid()&&!ledger.CommitQuestExpense(bad));
- bad=e;bad.Peer=101;assert(!ledger.CommitQuestExpense(bad));
- bad=e;bad.Item.Local=15;assert(!ledger.CommitQuestExpense(bad));
- bad=e;bad.SpeakerCursor=1;assert(!ledger.CommitQuestExpense(bad));
- assert(host.Current().Revision==0);
- assert(ledger.CommitQuestExpense(e)&&host.Current().Revision==1);
- assert(ledger.CommitQuestExpense(e)&&host.Current().Revision==1);
- bad=e;bad.Required=2;assert(!ledger.CommitQuestExpense(bad));
- assert(!ledger.Commit({"101","quest/x","skyrim.esm",300,-1,2},1));
- assert(!ledger.Commit({"quest/x","202","skyrim.esm",300,-1,2},0));
- assert(ledger.History("101").size()==1&&ledger.History("202").size()==1);
- assert(ledger.MatchesReceipt("101",0,0,1,"skyrim.esm",300,-2,2));
- assert(ledger.MatchesReceipt("202",0,0,1,"skyrim.esm",300,-1,1));
- assert(!ledger.MatchesReceipt("101",0,0,1,"skyrim.esm",300,-3,2));
- assert(ledger.Stock("101","202").empty()&&!ledger.NextRefund("101")&&!ledger.NextRefund("202"));
- assert(ledger.Ack("101",1)&&ledger.Ack("101",1));
- // The other character's unfinished receipt prevents another expense.
- auto next=e;next.Info.Local=201;next.SpeakerCursor=1;next.PeerCursor=1;
- next.SpeakerBefore=0;next.PeerBefore=4;
- const auto prior=host.Current();assert(!ledger.CommitQuestExpense(next)&&host.Current()==prior);
- assert(ledger.Ack("202",1));
- assert(ledger.Stock("101","202").empty()&&!ledger.NextRefund("101")&&!ledger.NextRefund("202"));
- assert(ledger.CommitQuestExpense(next)); // all items come from the peer
- assert(ledger.History("101").size()==1&&ledger.History("202").size()==2);
- assert(ledger.Ack("202",2));
- auto reverse=e;reverse.Info.Local=202;reverse.Speaker=202;reverse.Peer=101;
- reverse.SpeakerCursor=2;reverse.PeerCursor=1;reverse.SpeakerBefore=5;reverse.PeerBefore=0;
- assert(ledger.CommitQuestExpense(reverse)); // either participant, local inventory first
- assert(ledger.History("101").size()==1&&ledger.History("202").size()==3);
- assert(ledger.Ack("202",3));
- CampaignJournal::Journal restored;assert(restored.Open("quest-expense",191,"profile",false));
- TradeLedger after(restored,191);assert(after.Stream()==191);
- assert(after.CommitQuestExpense(e)&&restored.Current()==host.Current());
- assert(after.MatchesReceipt("101",0,0,1,"skyrim.esm",300,-2,2));
- assert(after.MatchesReceipt("202",191,1,2,"skyrim.esm",300,-3,4));
- assert(after.MatchesReceipt("202",191,2,3,"skyrim.esm",300,-3,5));
- assert(after.Ack("101",1)&&after.Ack("202",3));
- assert(after.Stock("101","202").empty()&&!after.NextRefund("101")&&!after.NextRefund("202"));
- assert(!after.HasOutstanding("101")&&!after.HasOutstanding("202"));
- const auto& row=after.History("101")[0];assert(TradeLedger::CanApply(row,2));
- assert(!TradeLedger::CanApply(row,0)&&!TradeLedger::CanApply(row,3));
- TradeLedger legacy("no-quest-expense");assert(legacy.Stream()&&!legacy.CommitQuestExpense(e));
- }
- {
  using namespace TradeProperties;
  Values v{Values::HasHealth,std::bit_cast<uint32_t>(1.25f),0,0};
  auto key=v.Encode();assert(Decode(key)&&Decode(key)->Health==v.Health);

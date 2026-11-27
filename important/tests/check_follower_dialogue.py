@@ -23,10 +23,7 @@ struct TESObjectREFR: TESForm {unsigned handle{};Handle GetHandle(){return {{han
 TESObjectREFR* TESObjectREFR::pick=nullptr;
 struct PlayerCharacter:TESObjectREFR{static PlayerCharacter* Get(){static PlayerCharacter p;return &p;}};
 struct TESQuest:TESForm{};
-static int sharedState=-1;
 static bool defer=false;
-static const void* sharedQuest=nullptr;
-int SharedDialogueItemState(const void* quest,uint32_t item) noexcept{return quest==sharedQuest&&item==200?sharedState:-1;}
 bool DeferSharedQuestTurnIn(uint32_t quest,uint32_t item,uint32_t npc,uint32_t info) noexcept{return defer&&quest==100&&item==200&&npc==10&&info==49;}
 struct TESTopicInfo:TESForm{TESForm* parentTopic{};TESCondition conditions;};
 struct MenuTopicManager{struct Opt{const char* text;TESTopicInfo* info;TESForm* quest{};};std::vector<Opt*>* pOptions;Handle speaker;bool menuOpen{};
@@ -69,21 +66,18 @@ int main(){
  assert(played==2&&w.sent.size()==2&&w.overlay.hires==1);
  TESQuest quest;quest.formID=100;TESForm base{200};
  hire.quest=&quest;item.function=47;item.params[0]=&base;item.object=1;item.comparisonValue=1.f;
- context.quest=&quest;context.target=PlayerCharacter::Get();sharedQuest=&quest;
+ context.quest=&quest;context.target=PlayerCharacter::Get();
+ // Every item condition uses the original engine result, including
+ // insufficient local stock and a native negative/absence condition.
  nextCondition=[](TESConditionItem*,ConditionContext&){return false;};
- sharedState=1;assert(CheckFollowerCondition(&item,context));
- sharedState=-1;assert(!CheckFollowerCondition(&item,context));
+ for(unsigned flag:{0u,32u,64u,96u,128u,160u}){
+     item.flags=flag;item.comparisonValue=3.f;assert(!CheckFollowerCondition(&item,context));
+ }
  nextCondition=[](TESConditionItem*,ConditionContext&){return true;};
- sharedState=0;assert(!CheckFollowerCondition(&item,context));
- // The mutually exclusive absence response follows the same group state.
- item.comparisonValue=0;
- sharedState=1;assert(!CheckFollowerCondition(&item,context));
- sharedState=0;assert(CheckFollowerCondition(&item,context));
- item.flags=5<<5;assert(CheckFollowerCondition(&item,context));
- sharedState=1;assert(!CheckFollowerCondition(&item,context));
- item.flags=2<<5;assert(CheckFollowerCondition(&item,context));
- item.flags=0;item.comparisonValue=1;
- sharedState=-1;assert(CheckFollowerCondition(&item,context));
+ for(unsigned flag:{0u,32u,64u,96u,128u,160u}){
+     item.flags=flag;item.comparisonValue=3.f;assert(CheckFollowerCondition(&item,context));
+ }
+ item.flags=0;item.comparisonValue=1.f;
  defer=true;assert(!HookPlayDialogueOption(m,0)&&played==2);
  assert(!m->ResumeQuestTurnIn(10,49,100,201)&&played==2);
  assert(m->ResumeQuestTurnIn(10,49,100,200)&&played==3);

@@ -67,7 +67,7 @@ bool TeachCampaignWord(TESForm* word) noexcept
 TP_THIS_FUNCTION(TDragonNativeCall, BSScript::CallResult, BSScript::NativeFunctionBase,
                  void*, void*, BSScript::IVirtualMachine*, bool);
 TDragonNativeCall* realDragonNativeCall{};
-std::atomic<const void*> modActorValueNative{},addItemNative{},removeItemNative{};
+std::atomic<const void*> modActorValueNative{},addItemNative{};
 thread_local uint32_t nativeUniqueRewardQuest{};
 thread_local uint16_t nativeUniqueRewardStage{};
 uint32_t NativeUniqueRewardQuest() noexcept {return nativeUniqueRewardQuest;}
@@ -211,46 +211,6 @@ static uint32_t NativeDragonSource(void* stackArgument,BSScript::Variable*& rewa
     reward=amount;return dragon->formID;
 }
 void RecordNativeDragonAbsorption(uint32_t form) noexcept;
-uint64_t SharedTurnInObservationNonce() noexcept;
-void ObserveSharedQuestRemoval(uint64_t itemHandle,std::array<uint64_t,8> callers,uint64_t permit) noexcept;
-
-struct NativeSharedRemoval {uint64_t Item{};std::array<uint64_t,8> Callers{};};
-static NativeSharedRemoval ReadNativeSharedRemoval(void* stackArgument)
-{
-    if (!stackArgument) return {};
-    auto* stack=*static_cast<DragonStackView**>(stackArgument);
-    auto* frame=stack?stack->Top:nullptr;
-    auto* caller=frame?frame->Previous:nullptr;
-    auto* player=PlayerCharacter::Get();
-    if (!frame||!frame->Parent||!frame->Function||frame->Function->GetParamCount()!=4||frame->Size<4||
-        !caller||!caller->Parent||!caller->Function||!player||DragonFrameActor(&frame->Self)!=player) return {};
-    auto* nativeFrame=reinterpret_cast<BSScript::StackFrame*>(frame);
-    const auto page=nativeFrame->GetPageForFrame();
-    auto* item=nativeFrame->GetStackFrameVariable(0,page);
-    auto* count=nativeFrame->GetStackFrameVariable(1,page);
-    auto* silent=nativeFrame->GetStackFrameVariable(2,page);
-    auto* destination=nativeFrame->GetStackFrameVariable(3,page);
-    if (!item||!count||!silent||!destination||count->type!=BSScript::Variable::kInteger||count->data.i!=1||
-        silent->type!=BSScript::Variable::kBoolean) return {};
-    // None may have the declared reference type with a null object pointer.
-    if (destination->type!=BSScript::Variable::kEmpty&&
-        !((destination->type==BSScript::Variable::kObject||
-           (destination->type>BSScript::Variable::kMax&&!(destination->type&1)))&&!destination->GetObject())) return {};
-    auto* object=item->GetObject();
-    NativeSharedRemoval removal;
-    removal.Item=object?object->GetHandle():0;
-    // Synchronous helpers can be invoked by the authorized INFO/QUST.
-    // Never inspect a different stack or retain native frame pointers.
-    size_t countHandles=0;
-    for (size_t depth=0;caller&&depth<removal.Callers.size();++depth,caller=caller->Previous)
-    {
-        if (caller->Parent!=frame->Parent||!caller->Function) break;
-        auto* source=caller->Self.GetObject();
-        const auto handle=source?source->GetHandle():0;
-        if (handle) removal.Callers[countHandles++]=handle;
-    }
-    return removal;
-}
 BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunctionBase,
     void* stackArgument, void* logger, BSScript::IVirtualMachine* vm, bool flag)
 {
@@ -305,11 +265,7 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
             }
         }
     }
-    const auto permit=apThis==removeItemNative.load(std::memory_order_acquire)?SharedTurnInObservationNonce():0;
-    const auto removal=permit?ReadNativeSharedRemoval(stackArgument):NativeSharedRemoval{};
     const auto result=TiltedPhoques::ThisCall(realDragonNativeCall,apThis,stackArgument,logger,vm,flag);
-    if (permit&&removal.Item&&removal.Callers[0]&&result==BSScript::CallResult::kCompleted)
-        ObserveSharedQuestRemoval(removal.Item,removal.Callers,permit);
     bool paid=false;
     if (dragon&&!suppress&&result==BSScript::CallResult::kCompleted&&World::Exists()&&!World::Get().IsLoadingSave())
     {
@@ -341,10 +297,6 @@ void TP_MAKE_THISCALL(HookRegisterPapyrusFunction, BSScript::IVirtualMachine, Na
         !_stricmp(apFunction->typeName.AsAscii(),"ObjectReference")&&
         !_stricmp(apFunction->functionName.AsAscii(),"AddItem"))
         addItemNative.store(apFunction,std::memory_order_release);
-    if (apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
-        !_stricmp(apFunction->typeName.AsAscii(),"ObjectReference")&&
-        !_stricmp(apFunction->functionName.AsAscii(),"RemoveItem"))
-        removeItemNative.store(apFunction,std::memory_order_release);
 #endif
     if (CampaignRewardPolicy::SupplementWords&&apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
         !std::strcmp(apFunction->typeName.AsAscii(),"Game")&&

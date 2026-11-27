@@ -15,7 +15,6 @@
 #include <optional>
 #include <sstream>
 #include <vector>
-#include <limits>
 
 class TradeLedger
 {
@@ -28,49 +27,6 @@ public:
         int64_t before{-1}; // -1 = legacy receipt without an inventory checkpoint.
         bool refund{}; // R record: consume only the depositor's own escrow.
         std::string variant{};
-    };
-    // One confirmed consumption in a shared first-run quest. This is
-    // deliberately not an escrow deposit: the items leave the campaign.
-    // The caller must bind the native INFO/QUST consumption and obtain
-    // fresh, unambiguous backpack counts before committing this expense.
-    struct QuestExpense
-    {
-        TradeProperties::FormKey Quest, Info, Item;
-        uint64_t Speaker{}, Peer{};
-        uint32_t Required{}, SpeakerCursor{}, PeerCursor{};
-        int64_t SpeakerBefore{}, PeerBefore{};
-        uint32_t SpeakerDebit() const noexcept
-        {return SpeakerBefore<=0?0:static_cast<uint32_t>(std::min<int64_t>(Required,SpeakerBefore));}
-        uint32_t PeerDebit() const noexcept {return Required-SpeakerDebit();}
-        bool Valid() const
-        {
-            return Quest.Valid()&&Info.Valid()&&Item.Valid()&&
-                !(Item.Plugin=="skyrim.esm"&&Item.Local==15)&&Speaker&&Peer&&Speaker!=Peer&&
-                Required>0&&Required<=9999&&SpeakerBefore>=0&&SpeakerBefore<=INT32_MAX&&
-                PeerBefore>=0&&PeerBefore<=INT32_MAX&&PeerBefore>=PeerDebit()&&
-                SpeakerCursor<0xFFFFFE&&PeerCursor<0xFFFFFE;
-        }
-        std::string Key() const {return "quest/"+Quest.Encode()+"/"+Info.Encode()+"/"+Item.Encode();}
-        std::string Encode() const
-        {
-            std::ostringstream out;
-            out<<"Q "<<Quest.Encode()<<' '<<Info.Encode()<<' '<<Item.Encode()<<' '<<Speaker<<' '<<Peer
-                <<' '<<Required<<' '<<SpeakerCursor<<' '<<PeerCursor<<' '<<SpeakerBefore<<' '<<PeerBefore;
-            return out.str();
-        }
-        static std::optional<QuestExpense> Decode(const std::string& data)
-        {
-            std::istringstream in(data);char kind{};std::string q,i,b,extra;
-            QuestExpense e;
-            if (!(in>>kind>>q>>i>>b>>e.Speaker>>e.Peer>>e.Required>>e.SpeakerCursor>>e.PeerCursor>>
-                  e.SpeakerBefore>>e.PeerBefore)||kind!='Q'||in>>extra) return {};
-            const auto quest=TradeProperties::DecodeForm(q),info=TradeProperties::DecodeForm(i),
-                item=TradeProperties::DecodeForm(b);
-            if (!quest||!info||!item) return {};
-            e.Quest=*quest;e.Info=*info;e.Item=*item;
-            if (!e.Valid()||e.Encode()!=data) return {};
-            return e;
-        }
     };
     explicit TradeLedger(std::filesystem::path path) : root(std::move(path)) {}
     TradeLedger(CampaignJournal::Journal& journal,uint64_t campaign) : authority(&journal), campaignId(campaign) {}
@@ -98,7 +54,7 @@ public:
         if (authority)
         {
             if (!campaignId) throw std::runtime_error("invalid campaign trade stream");
-            accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); looseAccounts.clear(); placements.clear(); confirmed.clear(); questExpenses.clear(); last=0;
+            accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); looseAccounts.clear(); placements.clear(); confirmed.clear(); last=0;
             size_t position=0;
             for (const auto& op:authority->Operations())
             {
@@ -322,51 +278,12 @@ public:
             state->Encode().size()>HomeSnapshot::MaxBytes) return {};
         return state;
     }
-    // Both debits are represented by one durable record. A failure to
-    // validate either wallet leaves both accounts and the journal unchanged.
-    // Existing receipt cursors apply each participant's actual debit in ESS.
-    bool CommitQuestExpense(const QuestExpense& expense)
-    {
-        if (!authority||!Stream()||!expense.Valid()) return false;
-        const auto key=expense.Key(),data=expense.Encode();
-        if (const auto it=questExpenses.find(key);it!=questExpenses.end())
-            return it->second==data;
-        if (!CanCommitQuestExpense(expense)||!Store(data)) return false;
-        AppendQuestExpense(expense);
-        return true;
-    }
     bool Commit(const Row& r,uint32_t cursor)
     {
-        if (r.peer.starts_with("home/") || r.user.starts_with("home/") ||
-            r.peer.starts_with("quest/") || r.user.starts_with("quest/")) return false;
+        if (r.peer.starts_with("home/") || r.user.starts_with("home/")) return false;
         return CommitRow(r,cursor,false);
     }
 private:
-    bool CanCommitQuestExpense(const QuestExpense& e) const
-    {
-        if (!e.Valid()||questExpenses.contains(e.Key())) return false;
-        const auto ready=[&](uint64_t id,uint32_t cursor){
-            const auto user=std::to_string(id);
-            const auto a=accounts.find(user);
-            const auto c=confirmed.find(user);
-            return cursor==(a==accounts.end()?0:a->second.size())&&
-                cursor==(c==confirmed.end()?0:c->second);
-        };
-        return ready(e.Speaker,e.SpeakerCursor)&&ready(e.Peer,e.PeerCursor);
-    }
-    void AppendQuestExpense(const QuestExpense& e)
-    {
-        const auto key=e.Key();
-        questExpenses.emplace(key,e.Encode());
-        const auto add=[&](uint64_t id,uint32_t debit,int64_t before){
-            if (debit) Append({std::to_string(id),key,e.Item.Plugin,e.Item.Local,
-                -static_cast<int>(debit),before,false,{}});
-        };
-        add(e.Speaker,e.SpeakerDebit(),e.SpeakerBefore);
-        add(e.Peer,e.PeerDebit(),e.PeerBefore);
-    }
-    static bool QuestPeer(const Row& r) {return r.peer.starts_with("quest/");}
-
     bool CommitRow(const Row& r,uint32_t cursor,bool home)
     {
         if (r.user.empty() || r.peer.empty() || r.user==r.peer || r.plugin.empty() || !r.base ||
@@ -531,14 +448,6 @@ private:
     }
     void Replay(const std::string& data,size_t beforePosition=0)
     {
-        if (data.starts_with("Q "))
-        {
-            const auto expense=QuestExpense::Decode(data);
-            if (!authority||!beforePosition||!expense||!CanCommitQuestExpense(*expense))
-                throw std::runtime_error("invalid quest expense");
-            AppendQuestExpense(*expense);
-            return;
-        }
         std::istringstream in(data);
         char kind{}; Row r;
         if (!(in>>kind>>std::quoted(r.user)) || r.user.empty()) throw std::runtime_error("invalid trade receipt");
@@ -567,8 +476,6 @@ private:
                 std::abs(static_cast<long long>(r.count))>9999 ||
                 accounts[r.user].size()!=confirmed[r.user] || accounts[r.user].size()>=0xFFFFFE)
                 throw std::runtime_error("invalid trade operation");
-            if (QuestPeer(r)||r.user.starts_with("quest/"))
-                throw std::runtime_error("reserved quest account");
             if (kind=='H')
             {
                 if (!beforePosition || !HomePeer(r) || !ValidHome(r,beforePosition)) throw std::runtime_error("invalid home receipt");
@@ -598,7 +505,6 @@ private:
     void Append(const Row& r)
     {
         accounts[r.user].push_back(r);
-        if (QuestPeer(r)) return; // consumed, never enters any transferable stock
         if (HomePeer(r))
         {
             if (r.count<0)
@@ -626,7 +532,6 @@ private:
     {
         confirmed[user]=pos;
         const auto& r=accounts[user][pos-1];
-        if (QuestPeer(r)) return; // ACK only advances the existing receipt cursor
         if (HomePeer(r))
         {
             if (r.count<0) homeStock.at(r.peer)[{r.plugin,r.base,r.variant}]-=r.count;
@@ -644,7 +549,6 @@ private:
     std::filesystem::path root;
     uint64_t stream{};
     uint32_t last{};
-    std::map<std::string,std::string> questExpenses;
     std::map<std::string,std::vector<Row>> accounts;
     std::map<std::string,uint32_t> confirmed;
     std::map<std::pair<std::string,std::string>,Items> stock;

@@ -95,6 +95,20 @@ inline std::optional<std::string> AvailableOriginal(const std::vector<CampaignJo
     }
     return original;
 }
+// The journal can attest an acquisition, not the current contents of a
+// backpack. The client must additionally check the live exact stack.
+inline bool HasAvailableHolder(const std::vector<CampaignJournal::Operation>& ops,const Claim& claim,uint64_t character)
+{
+    if (!character||!AvailableOriginal(ops,claim)) return false;
+    const auto own=Payload(claim,character);
+    for (const auto& op:ops)
+        if ((op.Kind=="quest-pickup-v1"||op.Kind=="quest-copy-v1")&&op.Payload==own) return true;
+    return false;
+}
+inline bool PhysicalHolder(uint64_t character,uint64_t owner,bool recordedCopy,int64_t count)
+{
+    return character&&owner&&(character==owner||recordedCopy)&&count==1;
+}
 // Even if the quest has since finished, an old physical reference cannot
 // be acquired again by this shared first-run path.
 inline bool AlreadyTaken(const std::vector<CampaignJournal::Operation>& ops,const Claim& claim)
