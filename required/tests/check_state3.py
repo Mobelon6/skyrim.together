@@ -1053,3 +1053,32 @@ int main(){
  policy.available=true;policy.typed=false;assert(!MatchesNativeRemovalHandle(&policy,10,&exact));
 }
 ''')
+
+# Native-first acceptance: the previous supplements remain readable but must
+# not observe, issue, replay or suppress personal rewards in this build.
+run('native-first personal reward policy', '''
+#include <CampaignRewardPolicy.h>
+static_assert(!CampaignRewardPolicy::SupplementWords);
+static_assert(!CampaignRewardPolicy::SupplementDragonSouls);
+int main() {}
+''', ['-I'+str(code/'common')])
+for file, marker, guard in [
+    ('client/Services/Generic/QuestJournal.cpp', 'void ObserveLearnedWord(', 'if (!CampaignRewardPolicy::SupplementWords) return;'),
+    ('client/Services/Generic/QuestJournal.cpp', 'void RestoreLearnedWords(', 'if (!CampaignRewardPolicy::SupplementWords) return;'),
+    ('client/Services/Generic/QuestJournal.cpp', 'void SendDragonAbsorption(', 'if (!CampaignRewardPolicy::SupplementDragonSouls) return;'),
+    ('client/Services/Generic/QuestJournal.cpp', 'void ApplySharedDragonGrants(', 'if (!CampaignRewardPolicy::SupplementDragonSouls) return;'),
+    ('client/Services/Generic/QuestJournal.cpp', 'void RecordNativeDragonAbsorption(', 'if (!CampaignRewardPolicy::SupplementDragonSouls) return;'),
+    ('server/Services/QuestJournal.cpp', 'void RecordCampaignDragonLife(', 'if (!CampaignRewardPolicy::SupplementDragonSouls) return;'),
+    ('client/Games/Misc/BSScript.cpp', 'bool TeachCampaignWord(', 'if (!CampaignRewardPolicy::SupplementWords) return false;'),
+]:
+    source = (code / file).read_text()
+    start = source.index('{', source.index(marker))
+    assert source[start+1:].lstrip().startswith(guard), (file, marker)
+server = (code / 'server/Services/QuestJournal.cpp').read_text()
+assert 'if (CampaignRewardPolicy::SupplementWords&&!p.LearnedWord.empty()' in server
+assert 'if (CampaignRewardPolicy::SupplementDragonSouls&&!p.AbsorbedDragon.empty()' in server
+assert 'if (CampaignRewardPolicy::SupplementDragonSouls)\n            if (const auto history=DragonAbsorption::ReadShared' in server
+native = (code / 'client/Games/Misc/BSScript.cpp').read_text()
+assert 'if (CampaignRewardPolicy::SupplementDragonSouls&&\n        apThis==modActorValueNative.load' in native
+assert 'return CampaignRewardPolicy::SupplementDragonSouls&&realDragonNativeCall' in native
+print('PASS native-first personal reward entry points', flush=True)

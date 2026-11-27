@@ -17,6 +17,7 @@
 #include <Forms/ActorValueInfo.h>
 #include <Forms/TESQuest.h>
 #include <UniqueQuestReward.h>
+#include <CampaignRewardPolicy.h>
 #include <array>
 
 TP_THIS_FUNCTION(TRegisterPapyrusFunction, void, BSScript::IVirtualMachine, NativeFunction*);
@@ -37,6 +38,7 @@ bool teachWordLong{};
 }
 bool TeachCampaignWord(TESForm* word) noexcept
 {
+    if (!CampaignRewardPolicy::SupplementWords) return false;
     if (!word||static_cast<uint8_t>(word->formType)!=0x76) return false;
     if (word->flags&0x40u) return true;
     void* address{};
@@ -76,7 +78,7 @@ enum class DragonAwardState { NativePending, NativePaid, SupplementPending, Supp
 std::mutex dragonAwardMutex;
 std::map<uint32_t,DragonAwardState> dragonAwards;
 }
-bool DragonAwardHookReady() noexcept {return realDragonNativeCall&&modActorValueNative.load(std::memory_order_acquire);}
+bool DragonAwardHookReady() noexcept {return CampaignRewardPolicy::SupplementDragonSouls&&realDragonNativeCall&&modActorValueNative.load(std::memory_order_acquire);}
 void ResetCampaignDragonAwards() noexcept
 {
     std::lock_guard lock(dragonAwardMutex);dragonAwards.clear();
@@ -256,7 +258,8 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
     float before{};
     BSScript::Variable* reward{};
     bool tracked=false,suppress=false;
-    if (apThis==modActorValueNative.load(std::memory_order_acquire)&&World::Exists()&&
+    if (CampaignRewardPolicy::SupplementDragonSouls&&
+        apThis==modActorValueNative.load(std::memory_order_acquire)&&World::Exists()&&
         !World::Get().IsLoadingSave())
     {
         dragon=NativeDragonSource(stackArgument,reward);
@@ -330,7 +333,7 @@ int ApplyCampaignDragonAward(uint32_t) noexcept {return 0;}
 void TP_MAKE_THISCALL(HookRegisterPapyrusFunction, BSScript::IVirtualMachine, NativeFunction* apFunction)
 {
 #ifdef TP_SKYRIM_1_6_1170
-    if (apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
+    if (CampaignRewardPolicy::SupplementDragonSouls&&apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
         !_stricmp(apFunction->typeName.AsAscii(),"Actor")&&
         !_stricmp(apFunction->functionName.AsAscii(),"ModActorValue"))
         modActorValueNative.store(apFunction,std::memory_order_release);
@@ -343,7 +346,7 @@ void TP_MAKE_THISCALL(HookRegisterPapyrusFunction, BSScript::IVirtualMachine, Na
         !_stricmp(apFunction->functionName.AsAscii(),"RemoveItem"))
         removeItemNative.store(apFunction,std::memory_order_release);
 #endif
-    if (apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
+    if (CampaignRewardPolicy::SupplementWords&&apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
         !std::strcmp(apFunction->typeName.AsAscii(),"Game")&&
         !std::strcmp(apFunction->functionName.AsAscii(),"TeachWord"))
     {

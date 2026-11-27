@@ -12,6 +12,7 @@
 #include <Services/CampaignAccess.h>
 #include <Services/CampaignCheckpointClient.h>
 #include <QuestWordReward.h>
+#include <CampaignRewardPolicy.h>
 #include <UniqueQuestReward.h>
 #include <array>
 #include <Components.h>
@@ -339,6 +340,7 @@ std::optional<QuestWordReward::Sample> CaptureWordSample(World& world,uint64_t c
 
 void ObserveLearnedWord(World& world,uint64_t character,RequestCampaignPull& request)
 {
+    if (!CampaignRewardPolicy::SupplementWords) return;
     auto sample=CaptureWordSample(world,character);
     if (!sample) {wordBaseline.reset();pendingWord.reset();return;}
     const auto grants=QuestWordReward::Read(campaignLink.Journal.Operations());
@@ -390,6 +392,7 @@ void ObserveLearnedWord(World& world,uint64_t character,RequestCampaignPull& req
 
 void RestoreLearnedWords(World& world,const CampaignJournal::Journal& journal,uint64_t character)
 {
+    if (!CampaignRewardPolicy::SupplementWords) return;
     if (!character||world.IsLoadingSave()||!SaveWorldReady()) return;
     if (wordAttemptCharacter!=character) {attemptedWords.clear();wordAttemptCharacter=character;}
     const auto grants=QuestWordReward::Read(journal.Operations());
@@ -438,6 +441,7 @@ std::vector<PendingDragonAbsorption> pendingDragonAbsorptions;
 
 void SendDragonAbsorption(const CampaignIdentity::Stamp& stamp,RequestCampaignPull& request)
 {
+    if (!CampaignRewardPolicy::SupplementDragonSouls) return;
     const auto receipts=DragonAbsorption::Read(campaignLink.Journal.Operations());
     if (!receipts) {pendingDragonAbsorptions.clear();return;}
     const auto now=std::chrono::steady_clock::now();
@@ -455,6 +459,7 @@ uint64_t dragonObservedEpoch{},dragonObservedCharacter{};
 std::optional<uint32_t> dragonSessionStart;
 void ApplySharedDragonGrants(World& world,const CampaignJournal::Journal& journal,uint64_t character)
 {
+    if (!CampaignRewardPolicy::SupplementDragonSouls) return;
     if (!character||!DragonAwardHookReady()||!SaveWorldReady()||world.IsLoadingSave()||
         !world.GetPartyService().IsInParty()) return;
     const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
@@ -1453,6 +1458,7 @@ uint32_t ExpectedRepeatRun(uint32_t form) noexcept
 // Resolve the actor anew: the VM thread never retains a world/actor pointer.
 void RecordNativeDragonAbsorption(uint32_t form) noexcept
 {
+    if (!CampaignRewardPolicy::SupplementDragonSouls) return;
     try
     {
         auto& world=World::Get();
@@ -1720,7 +1726,7 @@ void QuestService::PollCampaign(const UpdateEvent&) noexcept
 {
     ResetQuestReplayForLoad();
     questDialogueThread=true;
-    if (!m_world.IsLoadingSave()&&SaveWorldReady()) RefreshCampaignDragonAwards();
+    if (CampaignRewardPolicy::SupplementDragonSouls&&!m_world.IsLoadingSave()&&SaveWorldReady()) RefreshCampaignDragonAwards();
     if (!m_world.GetTransport().IsOnline()||!m_world.GetPartyService().IsInParty())
     {
         uniqueRewardEpoch.store(0,std::memory_order_release);uniqueRewardChoices.clear();

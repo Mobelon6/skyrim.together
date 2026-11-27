@@ -10,6 +10,7 @@
 #include <CampaignIdentity.h>
 #include <CampaignCheckpoint.h>
 #include <QuestWordReward.h>
+#include <CampaignRewardPolicy.h>
 #include <DragonAbsorption.h>
 #include <Services/CampaignAccess.h>
 #include <Messages/RequestCampaignPull.h>
@@ -80,6 +81,7 @@ uint64_t CampaignAccess::Character(const Player& player)
 
 void RecordCampaignDragonLife(World& world,Player& owner,entt::entity entity,bool dead) noexcept
 {
+    if (!CampaignRewardPolicy::SupplementDragonSouls) return;
     try
     {
         auto& link=CampaignAccess::Authority();
@@ -220,7 +222,7 @@ void QuestService::OnCampaignPull(const PacketEvent<RequestCampaignPull>& event)
             }
             // A single observed native word, in a stable party/cell sample.
             // Only the nominated peer may acquire a durable entitlement.
-            if (!p.LearnedWord.empty()&&p.WordPeer&&p.WordPeer!=event.pPlayer->GetId()&&
+            if (CampaignRewardPolicy::SupplementWords&&!p.LearnedWord.empty()&&p.WordPeer&&p.WordPeer!=event.pPlayer->GetId()&&
                 CampaignIdentity::Known(campaignLink.Journal,campaignLink.Campaign,
                     {p.Campaign,p.Character,{p.Revision,p.Tag}}))
             {
@@ -265,7 +267,7 @@ void QuestService::OnCampaignPull(const PacketEvent<RequestCampaignPull>& event)
             }
             // A witnessed native award can be retried against the durable
             // death cohort even after its transient network actor disappears.
-            if (!p.AbsorbedDragon.empty()&&
+            if (CampaignRewardPolicy::SupplementDragonSouls&&!p.AbsorbedDragon.empty()&&
                 CampaignIdentity::Known(campaignLink.Journal,campaignLink.Campaign,
                     {p.Campaign,p.Character,{p.Revision,p.Tag}}))
             {
@@ -306,6 +308,7 @@ void QuestService::OnCampaignPull(const PacketEvent<RequestCampaignPull>& event)
             }
             // A crash between the receipt and grant append must not strand
             // the other eligible player. Reconcile the existing journal on pull.
+            if (CampaignRewardPolicy::SupplementDragonSouls)
             if (const auto history=DragonAbsorption::ReadShared(campaignLink.Journal.Operations()))
                 for (const auto& grant:DragonAbsorption::MissingGrants(*history,campaignLink.Journal.Operations()))
                 {
