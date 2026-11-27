@@ -159,9 +159,9 @@ struct TurnInLeases
 // by exactly one item. Never change global/alias/package operands or OR terms.
 // Only literal, non-OR GetItemCount conditions with the six native
 // comparison operators. Do not interpret global/alias/package parameters.
-inline std::optional<bool> CompareSingleItem(uint8_t flags,float value,int count)
+inline std::optional<bool> CompareItemCount(uint8_t flags,float value,int count)
 {
-    if ((flags&0x1f)||!std::isfinite(value)||(count!=0&&count!=1)) return {};
+    if ((flags&0x1f)||!std::isfinite(value)||count<0||count>9999) return {};
     const auto n=static_cast<float>(count);
     switch (flags>>5)
     {
@@ -173,6 +173,26 @@ inline std::optional<bool> CompareSingleItem(uint8_t flags,float value,int count
     case 5:return n<=value;
     default:return {};
     }
+}
+inline std::optional<bool> CompareSingleItem(uint8_t flags,float value,int count)
+{
+    if (count!=0&&count!=1) return {};
+    return CompareItemCount(flags,value,count);
+}
+// For a direct literal requirement, determine its least positive satisfying
+// quantity. This is an eligibility test, NOT proof that the dialogue consumes
+// that quantity. Do not treat price/ownership/access conditions as expenses.
+inline std::optional<uint32_t> MinimumRequiredCount(uint8_t flags,float value)
+{
+    if ((flags&0x1f)||!std::isfinite(value)||CompareItemCount(flags,value,0)!=false) return {};
+    const auto op=flags>>5;
+    if (op!=0&&op!=2&&op!=3) return {};
+    if (value<0.f||value>9999.f) return {};
+    const auto candidate=op==2?std::floor(value)+1.f:std::ceil(value);
+    if (candidate<1.f||candidate>9999.f) return {};
+    const auto count=static_cast<int>(candidate);
+    if (CompareItemCount(flags,value,count)!=true) return {};
+    return static_cast<uint32_t>(count);
 }
 inline bool PositiveSingleItem(uint8_t flags,float value)
 {

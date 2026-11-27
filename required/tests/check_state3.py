@@ -1094,6 +1094,20 @@ int main(){
     assert(SharedSingleItemCount(1,true,true,false)==-1);
     assert(SharedSingleItemCount(0,true,false,false)==0);
     assert(SharedSingleItemCount(2,true,true,true)==-1);
+    assert(MinimumRequiredCount(0,3.f)==3);
+    assert(MinimumRequiredCount(2u<<5,2.f)==3);
+    assert(MinimumRequiredCount(3u<<5,2.1f)==3);
+    assert(MinimumRequiredCount(3u<<5,9999.f)==9999);
+    assert(!MinimumRequiredCount(0,2.5f));
+    assert(!MinimumRequiredCount(1u<<5,0.f));
+    assert(!MinimumRequiredCount(4u<<5,4.f));
+    assert(!MinimumRequiredCount(1,3.f)); // OR
+    assert(!MinimumRequiredCount(4,3.f)); // non-literal flags
+    assert(!MinimumRequiredCount(2u<<5,9999.f));
+    assert(CompareItemCount(3u<<5,3.f,2)==false);
+    assert(CompareItemCount(3u<<5,3.f,3)==true);
+    assert(!CompareSingleItem(3u<<5,3.f,3)); // previous exact path unchanged
+
     std::vector<CampaignJournal::Operation> ops={{"1","quest-pickup-v1",
         c.Quest+" 1 3 "+c.Reference+" "+c.Item+" 1 101"}};
     assert(AlreadyTaken(ops,c));assert(AlreadyTaken(ops,d));
