@@ -54,8 +54,8 @@ void ResetCampaignDragonAwards() noexcept;
 void RefreshCampaignDragonAwards() noexcept;
 void RememberCampaignDragonAward(uint32_t) noexcept;
 int ApplyCampaignDragonAward(uint32_t) noexcept;
-const UniqueQuestReward::Entry* NativeUniqueRewardSource() noexcept;
-uint64_t NativeUniqueRewardEpoch() noexcept;
+uint32_t NativeUniqueRewardQuest() noexcept;
+uint16_t NativeUniqueRewardStage() noexcept;
 #include <HomeSnapshot.h>
 #include <HomePermissions.h>
 #include <TradeLedger.h>
@@ -509,136 +509,53 @@ void ApplySharedDragonGrants(World& world,const CampaignJournal::Journal& journa
     }
 }
 
-// Reuse the campaign journal, pull and existing progress window. Only audited,
-// exact direct grants can be deferred; every unsupported call stays native.
+// Reuse the campaign journal, pull and existing progress window. A native
+// quest grant is deferred only for an explicitly catalogued reward.
 std::atomic<uint64_t> uniqueRewardEpoch{};
-std::mutex uniqueRewardMutex;
-struct PreparedUniqueReward
-{
-    const UniqueQuestReward::Entry* Entry{};
-    uint32_t QuestForm{},ItemForm{};
-    TESGlobal* Field{};
-    const void* Setter{};
-};
-std::array<PreparedUniqueReward,UniqueQuestReward::CatalogSize> preparedUniqueRewards{};
 std::map<uint32_t,uint32_t> uniqueRewardChoices;
-std::map<uint32_t,std::chrono::steady_clock::time_point> uniqueRewardFallback;
-std::chrono::steady_clock::time_point nextUniqueRewardTick{};
-void ClearUniqueRewardReadiness()
-{
-    std::lock_guard lock(uniqueRewardMutex);
-    uniqueRewardEpoch.store(0,std::memory_order_release);
-}
-uint32_t ResolveRewardForm(const char* plugin,uint32_t local)
-{
-    auto* mods=ModManager::Get();
-    auto* mod=mods?mods->GetByName(plugin):nullptr;
-    return mod&&mod->IsLoaded()&&(!mod->IsLite()||local<=0xFFF)?mod->GetFormId(local):0;
-}
 TESGlobal* UniqueRewardField(const UniqueQuestReward::Entry& entry)
 {
-    const auto id=ResolveRewardForm("SkyrimCoopTrade.esp",entry.Receipt);
-    auto* form=id?TESForm::GetById(id):nullptr;
+    auto* mods=ModManager::Get();
+    auto* plugin=mods?mods->GetByName("SkyrimCoopTrade.esp"):nullptr;
+    auto* form=plugin&&plugin->IsLoaded()?TESForm::GetById(plugin->GetFormId(entry.Receipt)):nullptr;
     return form&&static_cast<unsigned>(form->formType)==9?static_cast<TESGlobal*>(form):nullptr;
-}
-float ReadUniqueRewardField(const UniqueQuestReward::Entry& entry)
-{
-    std::lock_guard lock(uniqueRewardMutex);
-    auto* field=UniqueRewardField(entry);
-    return field?field->f:-1.f;
-}
-bool WriteUniqueRewardField(TESGlobal* field,const void* setter,float value)
-{
-    auto* vm=GameVM::Get();
-    if (!field||!setter||!vm||!vm->virtualMachine||vm->inactive) return false;
-    PapyrusFunction<void,TESGlobal,float> set(setter);set(field,value);
-    return field->f==value;
 }
 bool SetUniqueRewardField(World& world,const UniqueQuestReward::Entry& entry,float value)
 {
-    std::lock_guard lock(uniqueRewardMutex);
-    return WriteUniqueRewardField(UniqueRewardField(entry),world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue"),value);
-}
-TESBoundObject* RewardObject(const UniqueQuestReward::Entry& entry)
-{
-    const auto form=ResolveRewardForm(entry.ItemPlugin,entry.Item);
-    return form?Cast<TESBoundObject>(TESForm::GetById(form)):nullptr;
-}
-void MaybeFallbackUniqueReward(World& world,const UniqueQuestReward::Entry& entry,PlayerCharacter& player)
-{
-    if (!UniqueQuestReward::Pending(ReadUniqueRewardField(entry)))
-    {uniqueRewardFallback.erase(entry.Key);return;}
-    const auto now=std::chrono::steady_clock::now();
-    const auto [it,inserted]=uniqueRewardFallback.try_emplace(entry.Key,now+std::chrono::seconds(30));
-    if (now<it->second) return;
-    auto* item=RewardObject(entry);
-    if (!item) return;
-    if (player.GetItemCountInInventory(item)==0)
-        player.AddObjectToContainer(item,nullptr,1,nullptr);
-    if (player.GetItemCountInInventory(item)>0&&SetUniqueRewardField(world,entry,3.f))
-    {
-        uniqueRewardFallback.erase(entry.Key);
-        spdlog::warn("STM unique reward uses native fallback {:X}",entry.Key);
-    }
-}
-void TickOrphanedUniqueRewards(World& world) noexcept
-{
-    try
-    {
-        const auto now=std::chrono::steady_clock::now();
-        if (now<nextUniqueRewardTick||world.IsLoadingSave()||!SaveWorldReady()) return;
-        nextUniqueRewardTick=now+std::chrono::seconds(1);
-        auto* player=PlayerCharacter::Get();
-        if (!player||campaignLink.State()!=CampaignReplication::Link::Mode::Ready) return;
-        // An ESS from another campaign, or a save whose identity cannot be
-        // validated, must never receive this journal's fallback.
-        const auto credential=CampaignIdentity::ReadCredential(campaignLink.Root);
-        const auto stamp=credential?ReadSave(world,*credential,false):std::nullopt;
-        if (!stamp) {uniqueRewardFallback.clear();return;}
-        for (const auto& entry:UniqueQuestReward::Catalog)
-        {
-            if (!UniqueQuestReward::Pending(ReadUniqueRewardField(entry))) continue;
-            const auto state=UniqueQuestReward::Read(campaignLink.Journal.Operations(),entry);
-            // Preserve a durable offer/choice during a disconnect. Only a
-            // deferred award without a corresponding offer is orphaned.
-            if (!state||state->Item!=entry.Key)
-                MaybeFallbackUniqueReward(world,entry,*player);
-        }
-    }
-    catch (...) {spdlog::warn("STM could not check pending reward fallback");}
+    auto* field=UniqueRewardField(entry);
+    const auto* setter=world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue");
+    if (!field||!setter) return false;
+    PapyrusFunction<void,TESGlobal,float> set(setter);set(field,value);
+    return field->f==value;
 }
 void SendUniqueReward(World& world,const CampaignIdentity::Stamp& stamp,RequestCampaignPull& request)
 {
     if (!request.QuestReceipt.empty()||!world.GetPartyService().IsInParty()) return;
     for (const auto& entry:UniqueQuestReward::Catalog)
     {
-        const auto state=UniqueQuestReward::Read(campaignLink.Journal.Operations(),entry);
-        if (!state) continue;
-        if (state->Item==entry.Key&&state->Recipient==stamp.Character&&!state->Delivered&&
-            UniqueQuestReward::DeliveredLocally(ReadUniqueRewardField(entry)))
+        const auto state=UniqueQuestReward::Read(campaignLink.Journal.Operations(),entry.Quest);
+        if (!state||state->Recipient) continue;
+        if (state->Item==entry.Item&&state->Source==stamp.Character)
         {
-            request.QuestReceipt=("reward-delivered "+std::to_string(entry.Key)).c_str();
-            return;
-        }
-        if (state->Recipient) continue;
-        if (state->Item==entry.Key&&state->Source==stamp.Character)
-        {
-            const auto selection=uniqueRewardChoices.find(entry.Key);
+            const auto selection=uniqueRewardChoices.find(entry.Item);
             if (selection!=uniqueRewardChoices.end())
             {
                 const auto& members=world.GetPartyService().GetPartyMembers();
                 if (std::find(members.begin(),members.end(),selection->second)!=members.end()||
                     selection->second==world.GetTransport().GetLocalPlayerId())
-                    request.QuestReceipt=("reward-choice "+std::to_string(entry.Key)+" "+std::to_string(selection->second)).c_str();
+                    request.QuestReceipt=("reward-choice "+std::to_string(entry.Item)+" "+std::to_string(selection->second)).c_str();
                 else uniqueRewardChoices.erase(selection);
                 if (!request.QuestReceipt.empty()) return;
             }
         }
-        else if (!state->Item&&UniqueQuestReward::StageSource(campaignLink.Journal.Operations(),entry)==stamp.Character&&
-            UniqueQuestReward::Pending(ReadUniqueRewardField(entry)))
+        else if (!state->Item&&UniqueQuestReward::StageSource(campaignLink.Journal.Operations(),entry)==stamp.Character)
         {
-            request.QuestReceipt=("reward-offer "+std::to_string(entry.Key)).c_str();
-            return;
+            const auto* field=UniqueRewardField(entry);
+            if (field&&field->f==1.f)
+            {
+                request.QuestReceipt=("reward-offer "+std::to_string(entry.Item)).c_str();
+                return;
+            }
         }
     }
 }
@@ -656,7 +573,7 @@ std::string RewardPeerName(World& world,uint32_t peer)
 }
 void UpdateUniqueRewards(World& world,const CampaignIdentity::Stamp& stamp)
 {
-    ClearUniqueRewardReadiness();
+    uniqueRewardEpoch.store(0,std::memory_order_release);
     if (!world.GetTransport().IsOnline()||!world.GetPartyService().IsInParty()||world.IsLoadingSave()||!SaveWorldReady()) return;
     auto* player=PlayerCharacter::Get();
     if (!player) return;
@@ -665,79 +582,52 @@ void UpdateUniqueRewards(World& world,const CampaignIdentity::Stamp& stamp)
     uint32_t peer{};
     for (auto id:world.GetPartyService().GetPartyMembers())
         if (id&&id!=own) {if (peer&&peer!=id) return;peer=id;}
-    const auto* setter=world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue");
-    std::array<PreparedUniqueReward,UniqueQuestReward::CatalogSize> ready{};
-    for (size_t i=0;i<UniqueQuestReward::CatalogSize;++i)
+    bool ready=own&&peer&&world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue");
+    for (const auto& entry:UniqueQuestReward::Catalog)
+        ready=ready&&UniqueRewardField(entry)&&UniqueQuestReward::KnownQuest(campaignLink.Journal.Operations(),entry.Quest);
+    uniqueRewardEpoch.store(ready?epoch:0,std::memory_order_release);
+    for (const auto& entry:UniqueQuestReward::Catalog)
     {
-        const auto& entry=UniqueQuestReward::Catalog[i];
-        const auto state=UniqueQuestReward::Read(campaignLink.Journal.Operations(),entry);
-        const auto questForm=ResolveRewardForm(entry.QuestPlugin,entry.Quest);
-        auto* quest=questForm?Cast<TESQuest>(TESForm::GetById(questForm)):nullptr;
-        auto* item=RewardObject(entry);
+        const auto state=UniqueQuestReward::Read(campaignLink.Journal.Operations(),entry.Quest);
+        if (!state||state->Item!=entry.Item) continue;
         auto* field=UniqueRewardField(entry);
-        if (own&&peer&&setter&&state&&(!state->Item||state->Item==entry.Key)&&quest&&item&&field&&
-            !(quest->flags&TESQuest::AllowRepeatStages)&&quest->GetStageItemCount(entry.Stage)==1&&
-            !world.GetOverlayService().IsPersonalQuest(questForm)&&
-            UniqueQuestReward::KnownQuest(campaignLink.Journal.Operations(),entry))
-            ready[i]={&entry,questForm,item->formID,field,setter};
-        if (!state||state->Item!=entry.Key||!field) continue;
-        const auto receipt=ReadUniqueRewardField(entry);
+        if (!field) continue;
         if (state->Recipient)
         {
-            uniqueRewardChoices.erase(entry.Key);
+            uniqueRewardChoices.erase(entry.Item);
+            if (field->f==2.f) continue;
             if (state->Recipient!=stamp.Character)
-            {
-                // Do not discard a deferred award until the chosen recipient
-                // has acknowledged their own durable receipt. If delivery
-                // cannot be confirmed, retain the native award instead.
-                if (state->Delivered)
-                {
-                    uniqueRewardFallback.erase(entry.Key);
-                    if (receipt==0.f||receipt==1.f) SetUniqueRewardField(world,entry,2.f);
-                }
-                else MaybeFallbackUniqueReward(world,entry,*player);
-                continue;
-            }
-            uniqueRewardFallback.erase(entry.Key);
-            if (UniqueQuestReward::DeliveredLocally(receipt)||!item) continue;
-            // New offers require a local deferred receipt before adding.
-            // Legacy DA01 offers may already have finalized the other
-            // character before this upgrade, so retain their old recovery.
-            if ((receipt==1.f||(state->Legacy&&receipt==0.f))&&player->GetItemCountInInventory(item)==0)
+            {SetUniqueRewardField(world,entry,2.f);continue;}
+            auto* item=Cast<TESBoundObject>(TESForm::GetById(entry.Item));
+            if (!item) continue;
+            // A previously obtained native item is not granted a second time.
+            if (player->GetItemCountInInventory(item)==0)
                 player->AddObjectToContainer(item,nullptr,1,nullptr);
-            if ((receipt==0.f||receipt==1.f)&&player->GetItemCountInInventory(item)>0&&
-                SetUniqueRewardField(world,entry,2.f)) nextPull={};
+            if (player->GetItemCountInInventory(item)>0)
+                SetUniqueRewardField(world,entry,2.f);
             continue;
         }
-        uniqueRewardFallback.erase(entry.Key);
-        if (!own||!peer||state->Source!=stamp.Character||uniqueRewardChoices.contains(entry.Key)||!item) continue;
+        if (!own||!peer||state->Source!=stamp.Character||uniqueRewardChoices.contains(entry.Item)) continue;
+        auto* item=TESForm::GetById(entry.Item);
+        if (!item) continue;
         const auto* name=item->GetName();
         const auto* self=player->baseForm?player->baseForm->GetName():nullptr;
         const auto other=RewardPeerName(world,peer);
-        const auto key=entry.Key;
+        const auto form=entry.Item,quest=entry.Quest;
         const auto character=stamp.Character,campaign=stamp.Campaign;
-        auto needed=[epoch,key,character,campaign,peer]{
+        auto needed=[epoch,form,quest,character,campaign,peer]{
             if (epoch!=dragonLoadEpoch.load(std::memory_order_acquire)||campaign!=campaignLink.Campaign||
-                uniqueRewardChoices.contains(key)||!World::Exists()) return false;
+                uniqueRewardChoices.contains(form)||!World::Exists()) return false;
             auto& w=World::Get();
             if (!w.GetTransport().IsOnline()||!w.GetPartyService().IsInParty()||w.IsLoadingSave()) return false;
             const auto& members=w.GetPartyService().GetPartyMembers();
             if (std::find(members.begin(),members.end(),peer)==members.end()) return false;
-            const auto* entry=UniqueQuestReward::Find(key);
-            const auto state=entry?UniqueQuestReward::Read(campaignLink.Journal.Operations(),*entry):std::nullopt;
-            return state&&state->Item==key&&state->Source==character&&!state->Recipient;
+            const auto state=UniqueQuestReward::Read(campaignLink.Journal.Operations(),quest);
+            return state&&state->Item==form&&state->Source==character&&!state->Recipient;
         };
-        world.GetOverlayService().QueueRewardChoice(key,name?name:"Уникальная награда",
+        world.GetOverlayService().QueueRewardChoice(form,name?name:"Уникальная награда",
             self&&*self?self:"Ваш персонаж",other,
-            [key,own,peer](bool chooseSelf){uniqueRewardChoices[key]=chooseSelf?own:peer;nextPull={};},needed);
-    }
-    {
-        std::lock_guard lock(uniqueRewardMutex);
-        if (epoch==dragonLoadEpoch.load(std::memory_order_acquire))
-        {
-            preparedUniqueRewards=ready;
-            uniqueRewardEpoch.store(epoch,std::memory_order_release);
-        }
+            [form,own,peer](bool chooseSelf){uniqueRewardChoices[form]=chooseSelf?own:peer;nextPull={};},needed);
     }
 }
 
@@ -918,8 +808,7 @@ bool CampaignCheckpointClient::Queue(CampaignCheckpoint::Record r) noexcept
 }
 void CampaignCheckpointClient::ForgetLoaded() noexcept
 {
-    ResetCampaignDragonAwards();
-    {std::lock_guard lock(uniqueRewardMutex);uniqueRewardEpoch.store(0,std::memory_order_release);dragonLoadEpoch.fetch_add(1,std::memory_order_acq_rel);}
+    ResetCampaignDragonAwards();dragonLoadEpoch.fetch_add(1,std::memory_order_acq_rel);
     std::lock_guard lock(checkpointLoadMutex);loadedDigest.clear();confirmedLoad=false;
 }
 void CampaignCheckpointClient::NoteLoadedFile(std::string digest) noexcept
@@ -1340,7 +1229,7 @@ void ResetQuestReplayForLoad()
     if (questObservedLoadEpoch==epoch) return;
     questObservedLoadEpoch=epoch;
     repeatJoins.clear();
-    ClearUniqueRewardReadiness();uniqueRewardChoices.clear();uniqueRewardFallback.clear();nextUniqueRewardTick={};
+    uniqueRewardEpoch.store(0,std::memory_order_release);uniqueRewardChoices.clear();
     attemptedQuestPickups.clear();
     attemptedQuestConsumption.clear();
     deferredQuestPickup.reset();
@@ -1620,60 +1509,12 @@ void QueueQuestItemReceipt(World& world,const RequestInventoryChanges& message) 
     catch (...) {spdlog::warn("STM could not queue quest item receipt");}
 }
 
-const UniqueQuestReward::Entry* ResolveUniqueRewardSource(uint32_t quest,std::string_view script,std::string_view fragment,uint64_t& sourceEpoch) noexcept
+bool CaptureUniqueQuestAward(uint32_t) noexcept
 {
-    try
-    {
-        std::lock_guard lock(uniqueRewardMutex);
-        const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
-        if (uniqueRewardEpoch.load(std::memory_order_acquire)!=epoch) return nullptr;
-        for (const auto& prepared:preparedUniqueRewards)
-            if (prepared.Entry&&prepared.QuestForm==quest&&UniqueQuestReward::SameName(prepared.Entry->Script,script)&&
-                UniqueQuestReward::SameName(prepared.Entry->Fragment,fragment))
-            {sourceEpoch=epoch;return prepared.Entry;}
-    }
-    catch (...) {}
-    return nullptr;
-}
-
-bool CaptureUniqueQuestAward(uint32_t item) noexcept
-{
-    try
-    {
-        const auto* source=NativeUniqueRewardSource();
-        if (!source||!World::Exists()) return false;
-        auto& world=World::Get();
-        if (world.IsLoadingSave()||!world.GetTransport().IsOnline()) return false;
-        const auto epoch=NativeUniqueRewardEpoch();
-        if (!epoch) return false;
-        {
-            std::lock_guard lock(uniqueRewardMutex);
-            if (uniqueRewardEpoch.load(std::memory_order_acquire)!=epoch||
-                dragonLoadEpoch.load(std::memory_order_acquire)!=epoch) return false;
-            for (const auto& prepared:preparedUniqueRewards)
-            {
-                if (!prepared.Entry||prepared.ItemForm!=item||!UniqueQuestReward::SameSource(*source,*prepared.Entry)) continue;
-                auto* field=prepared.Field;
-                if (!field) return false;
-                if (UniqueQuestReward::CanSuppress(field->f)) return true;
-                if (field->f!=0.f) return false;
-                // The original native callback is already executing in the VM.
-                // Use the registered, non-latent GlobalVariable.SetValue
-                // adapter with pointers prepared on the game thread. Never
-                // suppress AddItem based merely on a queued observation.
-                if (!WriteUniqueRewardField(field,prepared.Setter,1.f)) return false;
-                break;
-            }
-            bool recorded=false;
-            for (const auto& prepared:preparedUniqueRewards)
-                if (prepared.Entry&&prepared.ItemForm==item&&UniqueQuestReward::SameSource(*source,*prepared.Entry)&&
-                    prepared.Field&&UniqueQuestReward::Pending(prepared.Field->f)) {recorded=true;break;}
-            if (!recorded) return false;
-        }
-        world.GetRunner().Queue([epoch]{if (epoch==dragonLoadEpoch.load(std::memory_order_acquire)) nextPull={};});
-        return true;
-    }
-    catch (...) {return false;}
+    // The per-item reward interception was superseded by keyword-based
+    // classification. Never suppress a native award using the old catalog.
+    // Previously saved DA01 receipts/choices are still read by the recovery path.
+    return false;
 }
 
 bool DeferSharedQuestTurnIn(uint32_t questId,uint32_t baseId,uint32_t npc,uint32_t info) noexcept
@@ -1726,11 +1567,10 @@ void QuestService::PollCampaign(const UpdateEvent&) noexcept
 {
     ResetQuestReplayForLoad();
     questDialogueThread=true;
-    TickOrphanedUniqueRewards(m_world);
     if (CampaignRewardPolicy::SupplementDragonSouls&&!m_world.IsLoadingSave()&&SaveWorldReady()) RefreshCampaignDragonAwards();
     if (!m_world.GetTransport().IsOnline()||!m_world.GetPartyService().IsInParty())
     {
-        ClearUniqueRewardReadiness();uniqueRewardChoices.clear();
+        uniqueRewardEpoch.store(0,std::memory_order_release);uniqueRewardChoices.clear();
         deferredQuestPickup.reset();deferredQuestTurnIn.reset();
         attemptedQuestPickups.clear();
         attemptedQuestConsumption.clear();
@@ -1741,7 +1581,7 @@ void QuestService::PollCampaign(const UpdateEvent&) noexcept
     }
     if (!m_world.GetTransport().IsOnline()||m_world.IsLoadingSave()||!SaveWorldReady())
     {
-        ClearUniqueRewardReadiness();
+        uniqueRewardEpoch.store(0,std::memory_order_release);
         wordBaseline.reset();pendingWord.reset();attemptedWords.clear();wordAttemptCharacter=0;
         deferredQuestPickup.reset();deferredQuestTurnIn.reset();
     }

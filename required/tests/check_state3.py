@@ -1194,55 +1194,19 @@ int main(){
     const auto key=TradeProperties::FormKey{"skyrim.esm",azura.Quest}.Encode();
     std::vector<CampaignJournal::Operation> ops={{"1","quest-progress-v1",key+" 1 1 0 7 101"},
         {"2","quest-progress-v1",key+" 1 0 100 7 202"}};
-    assert(KnownQuest(ops,azura)&&StageSource(ops,azura)==202&&!StageSource(ops,black));
-    assert(!Read(ops,azura)->Item);
+    assert(KnownQuest(ops,azura.Quest)&&StageSource(ops,azura)==202&&!StageSource(ops,black));
+    assert(!Read(ops,azura.Quest)->Item);
     auto offer=Decode("reward-offer "+std::to_string(azura.Item));assert(offer&&!offer->Choice);
     auto select=Decode("reward-choice "+std::to_string(azura.Item)+" 9");assert(select&&select->Choice&&select->Peer==9);
     assert(!Decode("reward-choice 15 9")&&!Decode("reward-choice "+std::to_string(azura.Item)+" 0"));
     ops.push_back({"3","quest-unique-offer-v1",std::to_string(azura.Item)+" 202"});
-    auto state=Read(ops,azura);assert(state&&state->Source==202&&!state->Recipient);
+    auto state=Read(ops,azura.Quest);assert(state&&state->Source==202&&!state->Recipient);
     ops.push_back({"4","quest-unique-choice-v1",std::to_string(azura.Item)+" 202 101"});
-    state=Read(ops,azura);assert(state&&state->Recipient==101&&!state->Delivered);
-    auto ack=Decode("reward-delivered "+std::to_string(azura.Key));
-    assert(ack&&ack->Delivered&&!ack->Choice&&!Decode("reward-delivered "+std::to_string(azura.Key)+" 9"));
-    ops.push_back({"5","quest-unique-delivered-v1",std::to_string(azura.Key)+" 202 202"});
-    assert(!Read(ops,azura));ops.pop_back();
-    ops.push_back({"5","quest-unique-delivered-v1",std::to_string(azura.Key)+" 202 101"});
-    assert(Read(ops,azura)->Delivered);
-    ops.push_back({"6","quest-unique-delivered-v1",std::to_string(azura.Key)+" 202 101"});
-    assert(!Read(ops,azura));ops.pop_back();ops.pop_back();
+    state=Read(ops,azura.Quest);assert(state&&state->Recipient==101);
     ops.push_back({"5","quest-unique-choice-v1",std::to_string(azura.Item)+" 202 202"});
-    assert(!Read(ops,azura));
+    assert(!Read(ops,azura.Quest));
     ops.pop_back();ops.push_back({"5","quest-unique-offer-v1",std::to_string(black.Item)+" 101"});
-    assert(!Read(ops,azura));ops.pop_back();
-    assert(SameGroup(azura,black));
-    for (size_t i=2;i<CatalogSize;++i)
-    {
-        const auto& e=Catalog[i];
-        assert(!SameGroup(azura,e)&&Find(e.Key)==&e);
-        assert(FindSource(e.Quest,e.Script,e.Fragment)==&e);
-        assert(!FindSource(e.Quest,e.Script,"wrong"));
-        assert(!Read(ops,e)->Item);
-        auto form=TradeProperties::FormKey{e.QuestPlugin,e.Quest}.Encode();
-        ops.push_back({"stage"+std::to_string(i),"quest-progress-v1",form+" 1 0 "+std::to_string(e.Stage)+" 7 101"});
-        assert(StageSource(ops,e)==101);
-        ops.push_back({"offer"+std::to_string(i),"quest-unique-offer-v1",std::to_string(e.Key)+" 101"});
-        ops.push_back({"choice"+std::to_string(i),"quest-unique-choice-v1",std::to_string(e.Key)+" 101 202"});
-        assert(Read(ops,e)->Recipient==202&&!Read(ops,e)->Delivered);
-        ops.push_back({"ack"+std::to_string(i),"quest-unique-delivered-v1",std::to_string(e.Key)+" 101 202"});
-        assert(Read(ops,e)->Delivered);
-    }
-    assert(Read(ops,azura)->Recipient==101);
-    Entry mod{0x1000838,0x123,0x456,40,0x838,0,"example.esl","example.esl","qf_example","fragment_0","test"};
-    assert(!StageSource(ops,mod));
-    ops.push_back({"mod","quest-progress-v1",TradeProperties::FormKey{"example.esl",0x123}.Encode()+" 1 0 40 7 101"});
-    assert(StageSource(ops,mod)==101&&KnownQuest(ops,mod));
-    ops.push_back({"mod2","quest-progress-v1",TradeProperties::FormKey{"example.esl",0x123}.Encode()+" 2 0 40 7 202"});
-    assert(!KnownQuest(ops,mod)); // prior run is not permission for the new run
-    auto other=mod;other.Key++;other.Item++;
-    assert(SameSource(mod,other)&&!SameGroup(mod,other));
-    assert(!CanSuppress(0.f)&&CanSuppress(1.f)&&CanSuppress(2.f)&&!CanSuppress(3.f));
-    assert(!DeliveredLocally(1.f)&&DeliveredLocally(2.f)&&DeliveredLocally(3.f));
+    assert(!Read(ops,azura.Quest));
 }
 ''', ['-I'+str(code/'common')])
 
@@ -1623,89 +1587,8 @@ assert 'QuestPickupPermit::PhysicalHolder(character,item.Character,item.Copies.c
 assert 'ObserveSharedQuestRemoval' not in physical_client
 print('PASS physical-holder quest turn-in policy wiring',flush=True)
 
-# Verify integration boundaries: exact native source, receipt before suppression,
-# authenticated delivery acknowledgment, and native fallback without removal.
-reward_client=(code/'client/Services/Generic/QuestJournal.cpp').read_text()
-reward_capture=extract('client/Services/Generic/QuestJournal.cpp','bool CaptureUniqueQuestAward(', 'bool DeferSharedQuestTurnIn(')
-assert 'WriteUniqueRewardField(field,prepared.Setter,1.f)' in reward_capture
-assert reward_capture.index('WriteUniqueRewardField(field,prepared.Setter,1.f)')<reward_capture.index('world.GetRunner().Queue(')
-assert 'UniqueQuestReward::SameSource(*source,*prepared.Entry)' in reward_capture
-assert 'if (field->f!=0.f) return false;' in reward_capture
-reward_update=extract('client/Services/Generic/QuestJournal.cpp','void UpdateUniqueRewards(', 'struct DeferredQuestPickup')
-assert 'if (state->Delivered)' in reward_update and 'else MaybeFallbackUniqueReward(world,entry,*player);' in reward_update
-assert 'if ((receipt==1.f||(state->Legacy&&receipt==0.f))&&player->GetItemCountInInventory(item)==0)' in reward_update
-assert 'UniqueQuestReward::KnownQuest(campaignLink.Journal.Operations(),entry)' in reward_update
-assert 'quest->GetStageItemCount(entry.Stage)==1' in reward_update
-reward_server=extract('server/Services/QuestService.cpp','void ApplyUniqueRewardCommand(', 'void CampaignAccess::ReplayQuestReceipt(')
-assert 'state->Recipient!=character||state->Delivered' in reward_server
-assert 'source=state->Source;recipient=character;' in reward_server
-assert 'quest-unique-delivered-v1' in reward_server
-reward_native=(code/'client/Games/Misc/BSScript.cpp').read_text()
-assert 'quest->currentStage==source->Stage' in reward_native
-assert 'ResolveUniqueRewardSource(quest->formID,script,fragment,nativeUniqueRewardEpoch)' in reward_native
-print('PASS Q-13 native award receipt and safe fallback integration',flush=True)
-
-
-# Compile the actual server handler with the real persistent campaign journal.
-# Only the network party/identity lookup is modeled.
-reward_handler=extract('server/Services/QuestService.cpp','void ApplyUniqueRewardCommand(', 'void CampaignAccess::ReplayQuestReceipt(')
-run('authenticated Q-13 offer, choice, delivery and replay in the real journal',headers+'''
-#include <UniqueQuestReward.h>
-#include <filesystem>
-struct Player{uint32_t Id;uint64_t Character;uint32_t GetId()const{return Id;}};
-struct Party{std::vector<Player*> Members;};
-struct World{Party party;World& GetPartyService(){return *this;}
- Party* GetPlayerParty(Player* p){return std::find(party.Members.begin(),party.Members.end(),p)!=party.Members.end()?&party:nullptr;}
-};
-namespace CampaignReplication{struct Link{enum class Mode{Ready,Disabled};Mode mode=Mode::Ready;CampaignJournal::Journal Journal;Mode State()const{return mode;}};}
-namespace CampaignAccess{
- CampaignReplication::Link link;
- auto& Authority(){return link;}uint64_t Character(Player& p){return p.Character;}
-}
-namespace spdlog{template<class...T>void error(T&&...){}}
-'''+reward_handler+'''
-int main(){
- namespace U=UniqueQuestReward;using namespace CampaignJournal;
- auto root=std::filesystem::temp_directory_path()/("stm-reward-journal-"+std::to_string(
-   std::chrono::steady_clock::now().time_since_epoch().count()));
- assert(!std::filesystem::exists(root));
- auto& j=CampaignAccess::link.Journal;
- assert(j.Open(root,42,"test",true));
- Player a{1,101},b{2,202},outsider{3,303};World w{{{&a,&b}}};
- for (size_t i: {size_t(0),size_t(2),size_t(3),size_t(4)}){
-   const auto& e=U::Catalog[i];const auto key=TradeProperties::FormKey{e.QuestPlugin,e.Quest}.Encode();
-   auto op="stage-"+std::to_string(i);
-   assert(j.Append(j.Current(),{op,"quest-progress-v1",key+" 1 0 "+std::to_string(e.Stage)+" 7 101"})==Result::Committed);
-   auto token=std::to_string(e.Key);
-   auto before=j.Current();
-   ApplyUniqueRewardCommand(w,b,"reward-offer "+token);
-   ApplyUniqueRewardCommand(w,outsider,"reward-offer "+token);
-   assert(j.Current()==before);
-   ApplyUniqueRewardCommand(w,a,"reward-offer "+token);
-   auto st=U::Read(j.Operations(),e);assert(st&&st->Source==101&&!st->Legacy&&!st->Recipient);
-   before=j.Current();
-   ApplyUniqueRewardCommand(w,a,"reward-offer "+token);
-   ApplyUniqueRewardCommand(w,b,"reward-choice "+token+" 2");
-   ApplyUniqueRewardCommand(w,a,"reward-choice "+token+" 3");
-   assert(j.Current()==before);
-   ApplyUniqueRewardCommand(w,a,"reward-choice "+token+" 2");
-   st=U::Read(j.Operations(),e);assert(st&&st->Recipient==202&&!st->Delivered);
-   before=j.Current();
-   ApplyUniqueRewardCommand(w,a,"reward-delivered "+token);
-   ApplyUniqueRewardCommand(w,a,"reward-choice "+token+" 1");
-   assert(j.Current()==before);
-   ApplyUniqueRewardCommand(w,b,"reward-delivered "+token);
-   assert(U::Read(j.Operations(),e)->Delivered);
-   before=j.Current();ApplyUniqueRewardCommand(w,b,"reward-delivered "+token);assert(j.Current()==before);
- }
- auto saved=j.Current();CampaignJournal::Journal reopened;
- assert(reopened.Open(root,42,"test",false)&&reopened.Current()==saved);
- assert(U::Read(reopened.Operations(),U::Catalog[0])->Delivered);
- assert(U::Read(reopened.Operations(),U::Catalog[1])->Item==U::Catalog[0].Key);
- assert(U::Read(reopened.Operations(),U::Catalog[4])->Recipient==202);
- std::filesystem::remove_all(root);
-}
-''',['-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp')])
-assert 'const auto epoch=NativeUniqueRewardEpoch();' in reward_capture
-assert 'ReadSave(world,*credential,false)' in extract('client/Services/Generic/QuestJournal.cpp','void TickOrphanedUniqueRewards(', 'void SendUniqueReward(')
-print('PASS Q-13 stale native source and unrelated save guards',flush=True)
+# Historical named grants may be recovered, but cannot intercept new native rewards.
+legacy_reward_capture=extract('client/Services/Generic/QuestJournal.cpp','bool CaptureUniqueQuestAward(', 'bool DeferSharedQuestTurnIn(')
+assert 'return false;' in legacy_reward_capture and 'return true;' not in legacy_reward_capture
+assert 'GetRunner().Queue' not in legacy_reward_capture
+print('PASS superseded named reward capture stays disabled',flush=True)
