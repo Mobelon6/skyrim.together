@@ -1762,7 +1762,7 @@ void OverlayService::SpendRescue(uint32_t target,uint32_t fall) noexcept
     if (!player || !other || player->actorState.IsBleedingOut() || m_world.IsLoadingSave() ||
         !m_world.ctx().at<PlayerService>().IsFallenPeer(target) || TradePeer(other->formID) != target ||
         player->GetParentCellEx() != other->GetParentCellEx() ||
-        glm::distance(player->position,other->position) > 250.f) { CloseRescue(); return; }
+        glm::distance(glm::vec3(player->position), glm::vec3(other->position)) > 250.f) { CloseRescue(); return; }
     auto pocket = RescuePotions(*player);
     for (const auto& [id,count] : rescue.selected)
         if (count <= 0 || pocket[id] < count) { CloseRescue(); return; }
