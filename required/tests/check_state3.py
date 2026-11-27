@@ -1194,19 +1194,53 @@ int main(){
     const auto key=TradeProperties::FormKey{"skyrim.esm",azura.Quest}.Encode();
     std::vector<CampaignJournal::Operation> ops={{"1","quest-progress-v1",key+" 1 1 0 7 101"},
         {"2","quest-progress-v1",key+" 1 0 100 7 202"}};
-    assert(KnownQuest(ops,azura.Quest)&&StageSource(ops,azura)==202&&!StageSource(ops,black));
-    assert(!Read(ops,azura.Quest)->Item);
+    assert(KnownQuest(ops,azura)&&StageSource(ops,azura)==202&&!StageSource(ops,black));
+    assert(!Read(ops,azura)->Item);
     auto offer=Decode("reward-offer "+std::to_string(azura.Item));assert(offer&&!offer->Choice);
     auto select=Decode("reward-choice "+std::to_string(azura.Item)+" 9");assert(select&&select->Choice&&select->Peer==9);
     assert(!Decode("reward-choice 15 9")&&!Decode("reward-choice "+std::to_string(azura.Item)+" 0"));
     ops.push_back({"3","quest-unique-offer-v1",std::to_string(azura.Item)+" 202"});
-    auto state=Read(ops,azura.Quest);assert(state&&state->Source==202&&!state->Recipient);
+    auto state=Read(ops,azura);assert(state&&state->Source==202&&!state->Recipient);
     ops.push_back({"4","quest-unique-choice-v1",std::to_string(azura.Item)+" 202 101"});
-    state=Read(ops,azura.Quest);assert(state&&state->Recipient==101);
+    state=Read(ops,azura);assert(state&&state->Recipient==101&&!state->Delivered);
+    auto ack=Decode("reward-delivered "+std::to_string(azura.Key));
+    assert(ack&&ack->Delivered&&!ack->Choice&&!Decode("reward-delivered "+std::to_string(azura.Key)+" 9"));
+    ops.push_back({"5","quest-unique-delivered-v1",std::to_string(azura.Key)+" 202 202"});
+    assert(!Read(ops,azura));ops.pop_back();
+    ops.push_back({"5","quest-unique-delivered-v1",std::to_string(azura.Key)+" 202 101"});
+    assert(Read(ops,azura)->Delivered);
+    ops.push_back({"6","quest-unique-delivered-v1",std::to_string(azura.Key)+" 202 101"});
+    assert(!Read(ops,azura));ops.pop_back();ops.pop_back();
     ops.push_back({"5","quest-unique-choice-v1",std::to_string(azura.Item)+" 202 202"});
-    assert(!Read(ops,azura.Quest));
+    assert(!Read(ops,azura));
     ops.pop_back();ops.push_back({"5","quest-unique-offer-v1",std::to_string(black.Item)+" 101"});
-    assert(!Read(ops,azura.Quest));
+    assert(!Read(ops,azura));ops.pop_back();
+    assert(SameGroup(azura,black));
+    for (size_t i=2;i<CatalogSize;++i)
+    {
+        const auto& e=Catalog[i];
+        assert(!SameGroup(azura,e)&&Find(e.Key)==&e);
+        assert(FindSource(e.Quest,e.Script,e.Fragment)==&e);
+        assert(!FindSource(e.Quest,e.Script,"wrong"));
+        assert(!Read(ops,e)->Item);
+        auto form=TradeProperties::FormKey{e.QuestPlugin,e.Quest}.Encode();
+        ops.push_back({"stage"+std::to_string(i),"quest-progress-v1",form+" 1 0 "+std::to_string(e.Stage)+" 7 101"});
+        assert(StageSource(ops,e)==101);
+        ops.push_back({"offer"+std::to_string(i),"quest-unique-offer-v1",std::to_string(e.Key)+" 101"});
+        ops.push_back({"choice"+std::to_string(i),"quest-unique-choice-v1",std::to_string(e.Key)+" 101 202"});
+        assert(Read(ops,e)->Recipient==202&&!Read(ops,e)->Delivered);
+        ops.push_back({"ack"+std::to_string(i),"quest-unique-delivered-v1",std::to_string(e.Key)+" 101 202"});
+        assert(Read(ops,e)->Delivered);
+    }
+    assert(Read(ops,azura)->Recipient==101);
+    Entry mod{0x1000838,0x123,0x456,40,0x838,0,"example.esl","example.esl","qf_example","fragment_0","test"};
+    assert(!StageSource(ops,mod));
+    ops.push_back({"mod","quest-progress-v1",TradeProperties::FormKey{"example.esl",0x123}.Encode()+" 1 0 40 7 101"});
+    assert(StageSource(ops,mod)==101&&KnownQuest(ops,mod));
+    auto other=mod;other.Key++;other.Item++;
+    assert(SameSource(mod,other)&&!SameGroup(mod,other));
+    assert(!CanSuppress(0.f)&&CanSuppress(1.f)&&CanSuppress(2.f)&&!CanSuppress(3.f));
+    assert(!DeliveredLocally(1.f)&&DeliveredLocally(2.f)&&DeliveredLocally(3.f));
 }
 ''', ['-I'+str(code/'common')])
 
@@ -1586,3 +1620,25 @@ physical_client=(code/'client/Services/Generic/QuestJournal.cpp').read_text()
 assert 'QuestPickupPermit::PhysicalHolder(character,item.Character,item.Copies.contains(character),count)' in physical_client
 assert 'ObserveSharedQuestRemoval' not in physical_client
 print('PASS physical-holder quest turn-in policy wiring',flush=True)
+
+# Verify integration boundaries: exact native source, receipt before suppression,
+# authenticated delivery acknowledgment, and native fallback without removal.
+reward_client=(code/'client/Services/Generic/QuestJournal.cpp').read_text()
+reward_capture=extract('client/Services/Generic/QuestJournal.cpp','bool CaptureUniqueQuestAward(', 'bool DeferSharedQuestTurnIn(')
+assert 'WriteUniqueRewardField(field,prepared.Setter,1.f)' in reward_capture
+assert reward_capture.index('WriteUniqueRewardField(field,prepared.Setter,1.f)')<reward_capture.index('world.GetRunner().Queue(')
+assert 'UniqueQuestReward::SameSource(*source,*prepared.Entry)' in reward_capture
+assert 'if (field->f!=0.f) return false;' in reward_capture
+reward_update=extract('client/Services/Generic/QuestJournal.cpp','void UpdateUniqueRewards(', 'struct DeferredQuestPickup')
+assert 'if (state->Delivered)' in reward_update and 'else MaybeFallbackUniqueReward(world,entry,*player);' in reward_update
+assert 'if (receipt==1.f&&player->GetItemCountInInventory(item)==0)' in reward_update
+assert 'UniqueQuestReward::KnownQuest(campaignLink.Journal.Operations(),entry)' in reward_update
+assert 'quest->GetStageItemCount(entry.Stage)==1' in reward_update
+reward_server=extract('server/Services/QuestService.cpp','void ApplyUniqueRewardCommand(', 'void CampaignAccess::ReplayQuestReceipt(')
+assert 'state->Recipient!=character||state->Delivered' in reward_server
+assert 'source=state->Source;recipient=character;' in reward_server
+assert 'quest-unique-delivered-v1' in reward_server
+reward_native=(code/'client/Games/Misc/BSScript.cpp').read_text()
+assert 'quest->currentStage==source->Stage' in reward_native
+assert 'ResolveUniqueRewardSource(quest->formID,script,fragment)' in reward_native
+print('PASS Q-13 native award receipt and safe fallback integration',flush=True)

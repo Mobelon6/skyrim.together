@@ -308,22 +308,29 @@ void ApplyUniqueRewardCommand(World& world,Player& player,std::string_view value
     auto* party=world.GetPartyService().GetPlayerParty(&player);
     if (!character||!party||authority.State()!=CampaignReplication::Link::Mode::Ready) return;
     const auto* entry=UniqueQuestReward::Find(command->Item);
-    const auto state=UniqueQuestReward::Read(authority.Journal.Operations(),entry->Quest);
+    const auto state=UniqueQuestReward::Read(authority.Journal.Operations(),*entry);
     if (!state) return;
     uint64_t recipient{};
-    if (command->Choice)
+    uint64_t source=character;
+    if (command->Delivered)
     {
-        if (state->Item!=entry->Item||state->Source!=character||state->Recipient) return;
-        for (auto* member:party->Members)
+        if (state->Item!=entry->Key||state->Recipient!=character||state->Delivered) return;
+        source=state->Source;recipient=character;
+    }
+    else if (command->Choice)
+    {
+        if (state->Item!=entry->Key||state->Source!=character||state->Recipient) return;
+        if (command->Peer==player.GetId()) recipient=character;
+        else for (auto* member:party->Members)
             if (member&&member->GetId()==command->Peer) recipient=CampaignAccess::Character(*member);
         if (!recipient) return;
     }
     else if (state->Item||UniqueQuestReward::StageSource(authority.Journal.Operations(),*entry)!=character) return;
     const auto head=authority.Journal.Current();
-    auto payload=std::to_string(entry->Item)+" "+std::to_string(character);
-    if (command->Choice) payload+=" "+std::to_string(recipient);
+    auto payload=std::to_string(entry->Key)+" "+std::to_string(source);
+    if (command->Choice||command->Delivered) payload+=" "+std::to_string(recipient);
     if (authority.Journal.Append(head,{"quest-unique-"+std::to_string(head.Revision+1),
-        command->Choice?"quest-unique-choice-v1":"quest-unique-offer-v1",payload})!=CampaignJournal::Result::Committed)
+        command->Delivered?"quest-unique-delivered-v1":command->Choice?"quest-unique-choice-v1":"quest-unique-offer-v1",payload})!=CampaignJournal::Result::Committed)
         spdlog::error("STM unique quest reward choice could not be committed");
 }
 
@@ -331,7 +338,7 @@ void CampaignAccess::ReplayQuestReceipt(World& world,Player& player,std::string_
 {
     try
     {
-        if (value.starts_with("reward-offer ")||value.starts_with("reward-choice "))
+        if (value.starts_with("reward-offer ")||value.starts_with("reward-choice ")||value.starts_with("reward-delivered "))
         {ApplyUniqueRewardCommand(world,player,value);return;}
         const auto receipt=QuestPickupPermit::DecodeReceipt(std::string(value));
         if (!receipt) return;

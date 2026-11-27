@@ -68,10 +68,9 @@ TP_THIS_FUNCTION(TDragonNativeCall, BSScript::CallResult, BSScript::NativeFuncti
                  void*, void*, BSScript::IVirtualMachine*, bool);
 TDragonNativeCall* realDragonNativeCall{};
 std::atomic<const void*> modActorValueNative{},addItemNative{};
-thread_local uint32_t nativeUniqueRewardQuest{};
-thread_local uint16_t nativeUniqueRewardStage{};
-uint32_t NativeUniqueRewardQuest() noexcept {return nativeUniqueRewardQuest;}
-uint16_t NativeUniqueRewardStage() noexcept {return nativeUniqueRewardStage;}
+const UniqueQuestReward::Entry* ResolveUniqueRewardSource(uint32_t,std::string_view,std::string_view) noexcept;
+thread_local const UniqueQuestReward::Entry* nativeUniqueRewardSource{};
+const UniqueQuestReward::Entry* NativeUniqueRewardSource() noexcept {return nativeUniqueRewardSource;}
 namespace
 {
 enum class DragonAwardState { NativePending, NativePaid, SupplementPending, SupplementPaid, Retired };
@@ -235,10 +234,10 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
     // not merely a QF script name or the quest's maximum stage.
     struct RestoreScope
     {
-        uint32_t Quest;uint16_t Stage;
-        ~RestoreScope(){nativeUniqueRewardQuest=Quest;nativeUniqueRewardStage=Stage;}
-    } restore{nativeUniqueRewardQuest,nativeUniqueRewardStage};
-    nativeUniqueRewardQuest=0;nativeUniqueRewardStage=0;
+        const UniqueQuestReward::Entry* Previous;
+        ~RestoreScope(){nativeUniqueRewardSource=Previous;}
+    } restore{nativeUniqueRewardSource};
+    nativeUniqueRewardSource=nullptr;
     if (apThis==addItemNative.load(std::memory_order_acquire)&&stackArgument)
     {
         auto* stack=*static_cast<DragonStackView**>(stackArgument);
@@ -257,11 +256,9 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
                 const auto* script=caller->Function->GetObjectTypeName().AsAscii();
                 const auto* fragment=caller->Function->GetName().AsAscii();
                 if (quest&&quest->formType==FormType::QuestItem&&script&&fragment)
-                    if (const auto* source=UniqueQuestReward::FindSource(quest->formID,script,fragment))
-                    {
-                        nativeUniqueRewardQuest=source->Quest;
-                        nativeUniqueRewardStage=source->Stage;
-                    }
+                    if (const auto* source=ResolveUniqueRewardSource(quest->formID,script,fragment);
+                        source&&quest->currentStage==source->Stage&&!(quest->flags&TESQuest::AllowRepeatStages))
+                        nativeUniqueRewardSource=source;
             }
         }
     }
@@ -277,8 +274,7 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
     return result;
 }
 #else
-uint32_t NativeUniqueRewardQuest() noexcept {return 0;}
-uint16_t NativeUniqueRewardStage() noexcept {return 0;}
+const UniqueQuestReward::Entry* NativeUniqueRewardSource() noexcept {return nullptr;}
 bool DragonAwardHookReady() noexcept {return false;}
 void ResetCampaignDragonAwards() noexcept {}
 void RefreshCampaignDragonAwards() noexcept {}
