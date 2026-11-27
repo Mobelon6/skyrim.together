@@ -80,12 +80,22 @@ inline uint64_t StageSource(const std::vector<CampaignJournal::Operation>& ops,c
 }
 inline bool KnownQuest(const std::vector<CampaignJournal::Operation>& ops,const Entry& entry)
 {
-    const auto prefix=TradeProperties::FormKey{entry.QuestPlugin,entry.Quest}.Encode()+" 1 ";
+    const auto key=TradeProperties::FormKey{entry.QuestPlugin,entry.Quest}.Encode();
+    bool known=false;
     for (const auto& op:ops)
-        if (op.Kind=="quest-progress-v1"&&op.Payload.starts_with(prefix)) return true;
-    return false;
+    {
+        if (op.Kind!="quest-progress-v1") continue;
+        std::istringstream row(op.Payload);
+        std::string form;uint32_t run{};
+        if (row>>form>>run&&form==key)
+        {
+            if (run!=1) return false; // no suppression in a restarted quest
+            known=true;
+        }
+    }
+    return known;
 }
-struct State {uint32_t Item{};uint64_t Source{},Recipient{};bool Delivered{};};
+struct State {uint32_t Item{};uint64_t Source{},Recipient{};bool Delivered{},Legacy{};};
 inline std::optional<State> Read(const std::vector<CampaignJournal::Operation>& ops,const Entry& target)
 {
     State state;
@@ -93,7 +103,8 @@ inline std::optional<State> Read(const std::vector<CampaignJournal::Operation>& 
     {
         const bool choice=op.Kind=="quest-unique-choice-v1";
         const bool delivered=op.Kind=="quest-unique-delivered-v1";
-        if (!choice&&!delivered&&op.Kind!="quest-unique-offer-v1") continue;
+        const bool legacy=op.Kind=="quest-unique-offer-v1";
+        if (!choice&&!delivered&&!legacy&&op.Kind!="quest-unique-offer-v2") continue;
         std::istringstream row(op.Payload);
         std::string extra;uint32_t item{};uint64_t source{},recipient{};
         if (!(row>>item>>source)||!source||((choice||delivered)&&(!(row>>recipient)||!recipient))||row>>extra) return {};
@@ -108,7 +119,7 @@ inline std::optional<State> Read(const std::vector<CampaignJournal::Operation>& 
         else if (!choice)
         {
             if (state.Item||StageSource(ops,*entry)!=source) return {};
-            state={item,source,0,false};
+            state={item,source,0,false,legacy};
         }
         else
         {

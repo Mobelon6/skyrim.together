@@ -68,9 +68,11 @@ TP_THIS_FUNCTION(TDragonNativeCall, BSScript::CallResult, BSScript::NativeFuncti
                  void*, void*, BSScript::IVirtualMachine*, bool);
 TDragonNativeCall* realDragonNativeCall{};
 std::atomic<const void*> modActorValueNative{},addItemNative{};
-const UniqueQuestReward::Entry* ResolveUniqueRewardSource(uint32_t,std::string_view,std::string_view) noexcept;
+const UniqueQuestReward::Entry* ResolveUniqueRewardSource(uint32_t,std::string_view,std::string_view,uint64_t&) noexcept;
 thread_local const UniqueQuestReward::Entry* nativeUniqueRewardSource{};
+thread_local uint64_t nativeUniqueRewardEpoch{};
 const UniqueQuestReward::Entry* NativeUniqueRewardSource() noexcept {return nativeUniqueRewardSource;}
+uint64_t NativeUniqueRewardEpoch() noexcept {return nativeUniqueRewardEpoch;}
 namespace
 {
 enum class DragonAwardState { NativePending, NativePaid, SupplementPending, SupplementPaid, Retired };
@@ -235,9 +237,10 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
     struct RestoreScope
     {
         const UniqueQuestReward::Entry* Previous;
-        ~RestoreScope(){nativeUniqueRewardSource=Previous;}
-    } restore{nativeUniqueRewardSource};
-    nativeUniqueRewardSource=nullptr;
+        uint64_t Epoch;
+        ~RestoreScope(){nativeUniqueRewardSource=Previous;nativeUniqueRewardEpoch=Epoch;}
+    } restore{nativeUniqueRewardSource,nativeUniqueRewardEpoch};
+    nativeUniqueRewardSource=nullptr;nativeUniqueRewardEpoch=0;
     if (apThis==addItemNative.load(std::memory_order_acquire)&&stackArgument)
     {
         auto* stack=*static_cast<DragonStackView**>(stackArgument);
@@ -246,7 +249,7 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
         if (frame&&frame->Parent&&caller&&caller->Parent&&caller->Function)
         {
             auto* gameVM=GameVM::Get();
-            auto* policy=gameVM&&gameVM->virtualMachine?gameVM->virtualMachine->GetObjectHandlePolicy():nullptr;
+            auto* policy=gameVM&&vm&&gameVM->virtualMachine==vm&&!gameVM->inactive?vm->GetObjectHandlePolicy():nullptr;
             auto* object=caller->Self.GetObject();
             const auto handle=object?object->GetHandle():0;
             constexpr auto questType=static_cast<uint32_t>(FormType::QuestItem); // QUST (77)
@@ -256,7 +259,7 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
                 const auto* script=caller->Function->GetObjectTypeName().AsAscii();
                 const auto* fragment=caller->Function->GetName().AsAscii();
                 if (quest&&quest->formType==FormType::QuestItem&&script&&fragment)
-                    if (const auto* source=ResolveUniqueRewardSource(quest->formID,script,fragment);
+                    if (const auto* source=ResolveUniqueRewardSource(quest->formID,script,fragment,nativeUniqueRewardEpoch);
                         source&&quest->currentStage==source->Stage&&!(quest->flags&TESQuest::AllowRepeatStages))
                         nativeUniqueRewardSource=source;
             }
@@ -275,6 +278,7 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
 }
 #else
 const UniqueQuestReward::Entry* NativeUniqueRewardSource() noexcept {return nullptr;}
+uint64_t NativeUniqueRewardEpoch() noexcept {return 0;}
 bool DragonAwardHookReady() noexcept {return false;}
 void ResetCampaignDragonAwards() noexcept {}
 void RefreshCampaignDragonAwards() noexcept {}

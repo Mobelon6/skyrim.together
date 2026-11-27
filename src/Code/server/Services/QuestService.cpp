@@ -330,7 +330,7 @@ void ApplyUniqueRewardCommand(World& world,Player& player,std::string_view value
     auto payload=std::to_string(entry->Key)+" "+std::to_string(source);
     if (command->Choice||command->Delivered) payload+=" "+std::to_string(recipient);
     if (authority.Journal.Append(head,{"quest-unique-"+std::to_string(head.Revision+1),
-        command->Delivered?"quest-unique-delivered-v1":command->Choice?"quest-unique-choice-v1":"quest-unique-offer-v1",payload})!=CampaignJournal::Result::Committed)
+        command->Delivered?"quest-unique-delivered-v1":command->Choice?"quest-unique-choice-v1":"quest-unique-offer-v2",payload})!=CampaignJournal::Result::Committed)
         spdlog::error("STM unique quest reward choice could not be committed");
 }
 

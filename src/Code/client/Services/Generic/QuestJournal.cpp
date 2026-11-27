@@ -55,6 +55,7 @@ void RefreshCampaignDragonAwards() noexcept;
 void RememberCampaignDragonAward(uint32_t) noexcept;
 int ApplyCampaignDragonAward(uint32_t) noexcept;
 const UniqueQuestReward::Entry* NativeUniqueRewardSource() noexcept;
+uint64_t NativeUniqueRewardEpoch() noexcept;
 #include <HomeSnapshot.h>
 #include <HomePermissions.h>
 #include <TradeLedger.h>
@@ -536,7 +537,8 @@ uint32_t ResolveRewardForm(const char* plugin,uint32_t local)
 }
 TESGlobal* UniqueRewardField(const UniqueQuestReward::Entry& entry)
 {
-    auto* form=TESForm::GetById(ResolveRewardForm("SkyrimCoopTrade.esp",entry.Receipt));
+    const auto id=ResolveRewardForm("SkyrimCoopTrade.esp",entry.Receipt);
+    auto* form=id?TESForm::GetById(id):nullptr;
     return form&&static_cast<unsigned>(form->formType)==9?static_cast<TESGlobal*>(form):nullptr;
 }
 float ReadUniqueRewardField(const UniqueQuestReward::Entry& entry)
@@ -579,22 +581,31 @@ void MaybeFallbackUniqueReward(World& world,const UniqueQuestReward::Entry& entr
         spdlog::warn("STM unique reward uses native fallback {:X}",entry.Key);
     }
 }
-void TickOrphanedUniqueRewards(World& world)
+void TickOrphanedUniqueRewards(World& world) noexcept
 {
-    const auto now=std::chrono::steady_clock::now();
-    if (now<nextUniqueRewardTick||world.IsLoadingSave()||!SaveWorldReady()) return;
-    nextUniqueRewardTick=now+std::chrono::seconds(1);
-    auto* player=PlayerCharacter::Get();
-    if (!player) return;
-    for (const auto& entry:UniqueQuestReward::Catalog)
+    try
     {
-        if (!UniqueQuestReward::Pending(ReadUniqueRewardField(entry))) continue;
-        const auto state=UniqueQuestReward::Read(campaignLink.Journal.Operations(),entry);
-        // A durable offer/choice must survive a short disconnect. Only a
-        // locally deferred award without a corresponding offer is orphaned.
-        if (!state||state->Item!=entry.Key)
-            MaybeFallbackUniqueReward(world,entry,*player);
+        const auto now=std::chrono::steady_clock::now();
+        if (now<nextUniqueRewardTick||world.IsLoadingSave()||!SaveWorldReady()) return;
+        nextUniqueRewardTick=now+std::chrono::seconds(1);
+        auto* player=PlayerCharacter::Get();
+        if (!player||campaignLink.State()!=CampaignReplication::Link::Mode::Ready) return;
+        // An ESS from another campaign, or a save whose identity cannot be
+        // validated, must never receive this journal's fallback.
+        const auto credential=CampaignIdentity::ReadCredential(campaignLink.Root);
+        const auto stamp=credential?ReadSave(world,*credential,false):std::nullopt;
+        if (!stamp) {uniqueRewardFallback.clear();return;}
+        for (const auto& entry:UniqueQuestReward::Catalog)
+        {
+            if (!UniqueQuestReward::Pending(ReadUniqueRewardField(entry))) continue;
+            const auto state=UniqueQuestReward::Read(campaignLink.Journal.Operations(),entry);
+            // Preserve a durable offer/choice during a disconnect. Only a
+            // deferred award without a corresponding offer is orphaned.
+            if (!state||state->Item!=entry.Key)
+                MaybeFallbackUniqueReward(world,entry,*player);
+        }
     }
+    catch (...) {spdlog::warn("STM could not check pending reward fallback");}
 }
 void SendUniqueReward(World& world,const CampaignIdentity::Stamp& stamp,RequestCampaignPull& request)
 {
@@ -689,9 +700,10 @@ void UpdateUniqueRewards(World& world,const CampaignIdentity::Stamp& stamp)
             }
             uniqueRewardFallback.erase(entry.Key);
             if (UniqueQuestReward::DeliveredLocally(receipt)||!item) continue;
-            // Do not synthesize a fresh copy from a zero receipt: the native
-            // stage may still run, or an untracked native award was moved.
-            if (receipt==1.f&&player->GetItemCountInInventory(item)==0)
+            // New offers require a local deferred receipt before adding.
+            // Legacy DA01 offers may already have finalized the other
+            // character before this upgrade, so retain their old recovery.
+            if ((receipt==1.f||(state->Legacy&&receipt==0.f))&&player->GetItemCountInInventory(item)==0)
                 player->AddObjectToContainer(item,nullptr,1,nullptr);
             if ((receipt==0.f||receipt==1.f)&&player->GetItemCountInInventory(item)>0&&
                 SetUniqueRewardField(world,entry,2.f)) nextPull={};
@@ -1608,16 +1620,17 @@ void QueueQuestItemReceipt(World& world,const RequestInventoryChanges& message) 
     catch (...) {spdlog::warn("STM could not queue quest item receipt");}
 }
 
-const UniqueQuestReward::Entry* ResolveUniqueRewardSource(uint32_t quest,std::string_view script,std::string_view fragment) noexcept
+const UniqueQuestReward::Entry* ResolveUniqueRewardSource(uint32_t quest,std::string_view script,std::string_view fragment,uint64_t& sourceEpoch) noexcept
 {
     try
     {
         std::lock_guard lock(uniqueRewardMutex);
-        if (uniqueRewardEpoch.load(std::memory_order_acquire)!=dragonLoadEpoch.load(std::memory_order_acquire)) return nullptr;
+        const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
+        if (uniqueRewardEpoch.load(std::memory_order_acquire)!=epoch) return nullptr;
         for (const auto& prepared:preparedUniqueRewards)
             if (prepared.Entry&&prepared.QuestForm==quest&&UniqueQuestReward::SameName(prepared.Entry->Script,script)&&
                 UniqueQuestReward::SameName(prepared.Entry->Fragment,fragment))
-                return prepared.Entry;
+            {sourceEpoch=epoch;return prepared.Entry;}
     }
     catch (...) {}
     return nullptr;
@@ -1631,7 +1644,8 @@ bool CaptureUniqueQuestAward(uint32_t item) noexcept
         if (!source||!World::Exists()) return false;
         auto& world=World::Get();
         if (world.IsLoadingSave()||!world.GetTransport().IsOnline()) return false;
-        const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
+        const auto epoch=NativeUniqueRewardEpoch();
+        if (!epoch) return false;
         {
             std::lock_guard lock(uniqueRewardMutex);
             if (uniqueRewardEpoch.load(std::memory_order_acquire)!=epoch||
