@@ -14,6 +14,10 @@
 #include <QuestWordReward.h>
 #include <CampaignRewardPolicy.h>
 #include <UniqueQuestReward.h>
+#include <KeywordQuestReward.h>
+#include <Services/QuestRewardClient.h>
+#include <Components/BGSKeywordForm.h>
+#include <Forms/BGSKeyword.h>
 #include <array>
 #include <Components.h>
 #include <QuestPickupPermit.h>
@@ -56,6 +60,7 @@ void RememberCampaignDragonAward(uint32_t) noexcept;
 int ApplyCampaignDragonAward(uint32_t) noexcept;
 uint32_t NativeUniqueRewardQuest() noexcept;
 uint16_t NativeUniqueRewardStage() noexcept;
+uint32_t NativeUniqueRewardInstance() noexcept;
 #include <HomeSnapshot.h>
 #include <HomePermissions.h>
 #include <TradeLedger.h>
@@ -582,10 +587,9 @@ void UpdateUniqueRewards(World& world,const CampaignIdentity::Stamp& stamp)
     uint32_t peer{};
     for (auto id:world.GetPartyService().GetPartyMembers())
         if (id&&id!=own) {if (peer&&peer!=id) return;peer=id;}
-    bool ready=own&&peer&&world.ctx().at<PapyrusService>().Get("GlobalVariable","SetValue");
-    for (const auto& entry:UniqueQuestReward::Catalog)
-        ready=ready&&UniqueRewardField(entry)&&UniqueQuestReward::KnownQuest(campaignLink.Journal.Operations(),entry.Quest);
-    uniqueRewardEpoch.store(ready?epoch:0,std::memory_order_release);
+    // Legacy receipt recovery below is independent of new keyword observations.
+    // Readiness is the confirmed full journal prefix for this loaded campaign.
+    uniqueRewardEpoch.store(own&&peer?epoch:0,std::memory_order_release);
     for (const auto& entry:UniqueQuestReward::Catalog)
     {
         const auto state=UniqueQuestReward::Read(campaignLink.Journal.Operations(),entry.Quest);
@@ -659,6 +663,198 @@ std::string StablePickupKey(uint32_t id)
     const TradeProperties::FormKey key{stable->Plugin,stable->Local};
     return key.Valid()?key.Encode():std::string{};
 }
+// Q-13 native-first observation. No grants are suppressed, no new
+// per-item ESS fields. Only a verified native duplicate may be debited.
+namespace KR=KeywordQuestReward;
+struct KeywordObservation
+{
+    KR::Key Key;
+    uint32_t Quest{},Item{},Instance{},ObservedRevision{},Selection{};
+    uint64_t Epoch{},Version{},Character{},Campaign{};
+    bool FragmentDone{},Debited{};
+};
+std::map<std::string,KeywordObservation> keywordObservations;
+std::mutex rewardVersionMutex;
+std::map<uint32_t,uint64_t> rewardVersions;
+uint64_t rewardVersionCounter{};
+thread_local unsigned rewardAddDepth{};
+uint64_t TrackRewardVersion(uint32_t id)
+{
+    std::lock_guard lock(rewardVersionMutex);
+    auto version=++rewardVersionCounter;
+    rewardVersions[id]=version;
+    return version;
+}
+bool CurrentRewardVersion(uint32_t id,uint64_t version)
+{
+    std::lock_guard lock(rewardVersionMutex);
+    const auto it=rewardVersions.find(id);
+    return it!=rewardVersions.end()&&it->second==version;
+}
+bool HasRewardKeyword(TESForm* item)
+{
+    if (!item||item->IsTemporary()) return false;
+    const auto* form=Cast<BGSKeywordForm>(item);
+    if (!form) return false;
+    const auto has=[form](uint32_t id){
+        auto* keyword=Cast<BGSKeyword>(TESForm::GetById(id));
+        return keyword&&form->Contains(keyword);
+    };
+    return KR::Classify(true,false,has(KR::Artifact),has(KR::VendorArtifact),has(KR::DisallowEnchanting))==KR::Policy::Choice;
+}
+bool CleanReward(PlayerCharacter& player,TESBoundObject* item)
+{
+    if (!item||player.GetItemCountInInventory(item)!=1) return false;
+    // Same conservative clean-stack rule as native trade; protected,
+    // equipped, modified, owned or otherwise ambiguous copies stay native.
+    if (const auto* base=player.GetContainer())
+    {
+        if (base->count&&!base->entries) return false;
+        for (uint32_t i=0;i<base->count;++i)
+        {
+            const auto* e=base->entries[i];
+            if (e&&e->form==item&&e->data) return false;
+        }
+    }
+    const auto* changes=player.GetContainerChanges();
+    if (!changes||!changes->entries) return false;
+    for (auto* e:*changes->entries)
+    {
+        if (!e||!e->form||e->form!=item) continue;
+        if (e->IsQuestObject()) return false;
+        if (!e->dataList) continue;
+        for (auto* list:*e->dataList)
+        {
+            if (!list) continue;
+            list->lock.LockForRead();
+            bool special=false;
+            for (auto* x=list->data;x;x=x->next)
+                if (x->GetType()!=ExtraDataType::Count) {special=true;break;}
+            list->lock.UnlockRead();
+            if (special) return false;
+        }
+    }
+    return true;
+}
+bool LiveReward(World& world,const KeywordObservation& r,const CampaignIdentity::Stamp& stamp)
+{
+    if (!r.FragmentDone||r.Debited||r.Epoch!=dragonLoadEpoch.load(std::memory_order_acquire)||
+        r.Character!=stamp.Character||r.Campaign!=stamp.Campaign||
+        !CurrentRewardVersion(r.Item,r.Version)||!world.GetPartyService().IsInParty()||
+        !world.GetTransport().IsOnline()||world.IsLoadingSave()||!SaveWorldReady()) return false;
+    auto* player=PlayerCharacter::Get();
+    auto* q=Cast<TESQuest>(TESForm::GetById(r.Quest));
+    auto* item=Cast<TESBoundObject>(TESForm::GetById(r.Item));
+    // Complete the quest natively before touching a reward. Intermediate
+    // quest items and more complex script paths are not redistributed.
+    return player&&q&&q->currentInstanceID==r.Instance&&q->IsStageReached(r.Key.Stage)&&
+        (q->flags&TESQuest::Completed)&&!(q->flags&TESQuest::Failed)&&
+        !world.GetOverlayService().IsPersonalQuest(r.Quest)&&HasRewardKeyword(item)&&CleanReward(*player,item);
+}
+void RememberKeywordReward(uint32_t questId,uint16_t stage,uint32_t instance,uint32_t itemId,
+                           uint64_t epoch,uint64_t version)
+{
+    auto& world=World::Get();
+    if (epoch!=dragonLoadEpoch.load(std::memory_order_acquire)||!CurrentRewardVersion(itemId,version)||
+        world.IsLoadingSave()||!world.GetPartyService().IsInParty()||!SaveWorldReady()) return;
+    auto identity=CampaignAccess::Current(world);
+    auto* q=Cast<TESQuest>(TESForm::GetById(questId));
+    auto* item=Cast<TESBoundObject>(TESForm::GetById(itemId));
+    auto* player=PlayerCharacter::Get();
+    if (!identity||!q||!item||!player||q->currentInstanceID!=instance||
+        !(q->flags&TESQuest::RunOnce)||(q->flags&TESQuest::AllowRepeatStages)||
+        q->GetStageItemCount(stage)!=1||QuestService::IsNonSyncableQuest(q)||
+        world.GetOverlayService().IsPersonalQuest(questId)||!HasRewardKeyword(item)||!CleanReward(*player,item)) return;
+    KR::Key key{StablePickupKey(questId),StablePickupKey(itemId),stage};
+    if (key.Quest.empty()||key.Item.empty()) return;
+    const auto encoded=key.Encode();
+    // Two additions of the same item from one stage are ambiguous.
+    if (keywordObservations.contains(encoded)) {keywordObservations.erase(encoded);return;}
+    keywordObservations.emplace(encoded,KeywordObservation{key,questId,itemId,instance,
+        campaignLink.Journal.Current().Revision,0,epoch,version,identity->Save.Character,identity->Save.Campaign,false,false});
+    nextPull={};
+}
+void ResetKeywordRewards()
+{
+    keywordObservations.clear();
+    std::lock_guard lock(rewardVersionMutex);
+    rewardVersions.clear();
+}
+void SendKeywordRewards(World& world,const CampaignIdentity::Stamp& stamp,RequestCampaignPull& request)
+{
+    if (!request.QuestReceipt.empty()||!world.GetPartyService().IsInParty()) return;
+    for (auto& [encoded,r]:keywordObservations)
+    {
+        auto state=KR::Read(campaignLink.Journal.Operations(),r.Key);
+        if (!state||r.Character!=stamp.Character||r.Campaign!=stamp.Campaign) continue;
+        std::string verb,tail;
+        if (r.Debited&&state->Kept&&!state->Removed&&state->Recipient!=stamp.Character)
+            verb="reward-keyword-removed";
+        else if (!LiveReward(world,r,stamp)) continue;
+        else if (!state->Recipient&&!state->Ready.contains(stamp.Character))
+            verb="reward-keyword-ready";
+        else if (!state->Recipient&&state->BothReady()&&state->Source==stamp.Character&&r.Selection)
+        {
+            const auto own=world.GetTransport().GetLocalPlayerId();
+            const auto& members=world.GetPartyService().GetPartyMembers();
+            if (r.Selection!=own&&std::find(members.begin(),members.end(),r.Selection)==members.end())
+            {r.Selection=0;continue;}
+            verb="reward-keyword-choice";tail=" "+std::to_string(r.Selection);
+        }
+        else if (state->Recipient==stamp.Character&&!state->Kept&&KR::LiveChoice(*state,r.ObservedRevision))
+            verb="reward-keyword-keep";
+        if (!verb.empty()) {request.QuestReceipt=(verb+" "+encoded+tail).c_str();return;}
+    }
+}
+void UpdateKeywordRewards(World& world,const CampaignIdentity::Stamp& stamp)
+{
+    if (!world.GetTransport().IsOnline()||!world.GetPartyService().IsInParty()||world.IsLoadingSave()||!SaveWorldReady()) return;
+    const auto own=world.GetTransport().GetLocalPlayerId();
+    uint32_t peer{};
+    for (auto id:world.GetPartyService().GetPartyMembers())
+        if (id&&id!=own) {if (peer&&peer!=id) return;peer=id;}
+    if (!own||!peer) return;
+    for (auto& [encoded,r]:keywordObservations)
+    {
+        auto state=KR::Read(campaignLink.Journal.Operations(),r.Key);
+        if (!state||!LiveReward(world,r,stamp)) continue;
+        if (KR::CanRemove(*state,stamp.Character,r.ObservedRevision,true))
+        {
+            auto* p=PlayerCharacter::Get();
+            auto* item=Cast<TESBoundObject>(TESForm::GetById(r.Item));
+            // No compensating AddItem is issued. The selected character
+            // confirmed its own native copy; only our exact clean unit goes.
+            if (p&&item&&LiveReward(world,r,stamp))
+            {
+                p->RemoveItem(item,1,ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
+                if (p->GetItemCountInInventory(item)==0)
+                {r.Debited=true;nextPull={};}
+            }
+            continue;
+        }
+        if (state->Recipient||!state->BothReady()||state->Source!=stamp.Character||r.Selection) continue;
+        auto* player=PlayerCharacter::Get();
+        auto* item=TESForm::GetById(r.Item);
+        if (!player||!item) continue;
+        const auto key=encoded;
+        const auto saved=stamp;
+        const auto needed=[key,saved]{
+            if (!World::Exists()) return false;
+            auto& w=World::Get();
+            auto it=keywordObservations.find(key);
+            if (it==keywordObservations.end()||it->second.Selection||!LiveReward(w,it->second,saved)) return false;
+            auto s=KR::Read(campaignLink.Journal.Operations(),it->second.Key);
+            return s&&s->BothReady()&&!s->Recipient&&s->Source==saved.Character;
+        };
+        const auto* self=player->baseForm?player->baseForm->GetName():nullptr;
+        world.GetOverlayService().QueueRewardChoice(r.Item,item->GetName(),self&&*self?self:"Ваш персонаж",
+            RewardPeerName(world,peer),[key,own,peer,needed](bool chooseSelf){
+                if (!needed()) return;
+                keywordObservations.at(key).Selection=chooseSelf?own:peer;nextPull={};
+            },needed);
+    }
+}
+
 struct PendingQuestReceipt
 {
     QuestPickupPermit::Receipt Receipt;
@@ -1229,6 +1425,7 @@ void ResetQuestReplayForLoad()
     if (questObservedLoadEpoch==epoch) return;
     questObservedLoadEpoch=epoch;
     repeatJoins.clear();
+    ResetKeywordRewards();
     uniqueRewardEpoch.store(0,std::memory_order_release);uniqueRewardChoices.clear();
     attemptedQuestPickups.clear();
     attemptedQuestConsumption.clear();
@@ -1509,6 +1706,61 @@ void QueueQuestItemReceipt(World& world,const RequestInventoryChanges& message) 
     catch (...) {spdlog::warn("STM could not queue quest item receipt");}
 }
 
+void QuestRewardInventoryTouched(TESObjectREFR* owner,uint32_t id) noexcept
+{
+    if (!owner||owner!=PlayerCharacter::Get()||!id) return;
+    try
+    {
+        std::lock_guard lock(rewardVersionMutex);
+        auto it=rewardVersions.find(id);
+        if (it!=rewardVersions.end()) it->second=++rewardVersionCounter;
+    }
+    catch (...) {}
+}
+QuestRewardAddObservation::QuestRewardAddObservation(TESObjectREFR* owner,TESBoundObject* item,ExtraDataList* extra,
+    int32_t count,TESObjectREFR* oldOwner) noexcept
+{
+    if (!owner||owner!=PlayerCharacter::Get()||!item) return;
+    Local=true;
+    if (rewardAddDepth++!=0) return;
+    QuestRewardInventoryTouched(owner,item->formID);
+    try
+    {
+        const auto epoch=dragonLoadEpoch.load(std::memory_order_acquire);
+        const auto quest=NativeUniqueRewardQuest();
+        if (!quest||!NativeUniqueRewardStage()||count!=1||oldOwner||extra||
+            ScopedInventoryOverride::IsOverriden()||uniqueRewardEpoch.load(std::memory_order_acquire)!=epoch||
+            !World::Exists()||World::Get().IsLoadingSave()||!HasRewardKeyword(item)||
+            owner->GetItemCountInInventory(item)!=0) return;
+        Version=TrackRewardVersion(item->formID);
+        Owner=owner;Item=item;Quest=quest;Stage=NativeUniqueRewardStage();
+        Instance=NativeUniqueRewardInstance();Epoch=epoch;
+    }
+    catch (...) {}
+}
+QuestRewardAddObservation::~QuestRewardAddObservation() noexcept
+{
+    if (!Local) return;
+    --rewardAddDepth;
+    if (!Owner||!Item) return;
+    try
+    {
+        if (Epoch!=dragonLoadEpoch.load(std::memory_order_acquire)||!CurrentRewardVersion(Item->formID,Version)||
+            !World::Exists()||World::Get().IsLoadingSave()||Owner!=PlayerCharacter::Get()||
+            !CleanReward(*PlayerCharacter::Get(),Item)) return;
+        World::Get().GetRunner().Queue([quest=Quest,stage=Stage,instance=Instance,item=Item->formID,epoch=Epoch,version=Version]{
+            RememberKeywordReward(quest,stage,instance,item,epoch,version);
+        });
+    }
+    catch (...) {}
+}
+void QuestRewardStageDone(uint32_t quest,uint16_t stage) noexcept
+{
+    for (auto& [key,r]:keywordObservations)
+        if (r.Quest==quest&&r.Key.Stage==stage&&r.Epoch==dragonLoadEpoch.load(std::memory_order_acquire))
+            r.FragmentDone=true;
+}
+
 bool CaptureUniqueQuestAward(uint32_t) noexcept
 {
     // The per-item reward interception was superseded by keyword-based
@@ -1619,6 +1871,7 @@ void QuestService::PollCampaign(const UpdateEvent&) noexcept
         request.Credential=credential->Secret.c_str();
         request.Checkpoint=NextCheckpoint(*stamp).c_str();
         SendQuestReceipt(*stamp,request);
+        SendKeywordRewards(m_world,*stamp,request);
         SendUniqueReward(m_world,*stamp,request);
         ObserveLearnedWord(m_world,stamp->Character,request);
         SendDragonAbsorption(*stamp,request);
@@ -1697,6 +1950,7 @@ void QuestService::OnCampaignRecord(const NotifyCampaignRecord& packet) noexcept
             {
                 ApplySharedDragonGrants(m_world,campaignLink.Journal,stamp->Character);
                 UpdateUniqueRewards(m_world,*stamp);
+                UpdateKeywordRewards(m_world,*stamp);
                 RestoreLearnedWords(m_world,campaignLink.Journal,stamp->Character);
                 RestoreOwnQuestPickups(m_world,campaignLink.Journal,stamp->Character);
                 // Reconcile against observed native state, not a permanent

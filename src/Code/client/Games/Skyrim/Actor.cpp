@@ -1,5 +1,6 @@
 #include <Games/References.h>
 #include <QuestPickupInventoryScope.h>
+#include <Services/QuestRewardClient.h>
 #include <Games/Skyrim/EquipManager.h>
 #include <AI/AIProcess.h>
 #include <Misc/MiddleProcess.h>
@@ -1123,6 +1124,7 @@ void* TP_MAKE_THISCALL(HookRegenAttributes, Actor, int aId, float aRegenValue)
 void TP_MAKE_THISCALL(HookAddInventoryItem, Actor, TESBoundObject* apItem, ExtraDataList* apExtraData, int32_t aCount, TESObjectREFR* apOldOwner)
 {
     if (NativeTrade::BlockAdd(apThis,apOldOwner)) return;
+    QuestRewardAddObservation reward(apThis,apItem,apExtraData,aCount,apOldOwner);
     if (!ScopedInventoryOverride::IsOverriden())
     {
         auto& modSystem = World::Get().GetModSystem();
@@ -1231,6 +1233,7 @@ void CaptureQuestPickup(TESObjectREFR* object,InventoryChangeEvent& event)
 void* TP_MAKE_THISCALL(HookPickUpObject, Actor, TESObjectREFR* apObject, int32_t aCount, bool aUnk1, float aUnk2)
 {
     if (HomeActorProtection::Resident(apThis) || HomeActorProtection::PickupBlocked(apObject)) return nullptr;
+    if (apObject&&apObject->baseForm) QuestRewardInventoryTouched(apThis,apObject->baseForm->formID);
     if (!ScopedInventoryOverride::IsOverriden())
     {
         auto& modSystem = World::Get().GetModSystem();
@@ -1287,6 +1290,7 @@ void* TP_MAKE_THISCALL(HookDropObject, Actor, void* apResult, TESBoundObject* ap
         if (apResult) static_cast<BSPointerHandle<TESObjectREFR>*>(apResult)->handle.iBits=0;
         return apResult;
     }
+    if (apObject) QuestRewardInventoryTouched(apThis,apObject->formID);
     auto& modSystem = World::Get().GetModSystem();
 
     Inventory::Entry item{};

@@ -2,6 +2,7 @@
 
 #include <Games/References.h>
 #include <QuestPickupInventoryScope.h>
+#include <Services/QuestRewardClient.h>
 #include <Games/Overrides.h>
 
 #include <World.h>
@@ -1114,9 +1115,7 @@ void TP_MAKE_THISCALL(HookAddInventoryItem, TESObjectREFR, TESBoundObject* apIte
         TiltedPhoques::ThisCall(RealAddInventoryItem,apThis,apItem,apExtraData,aCount,apOldOwner);
         return;
     }
-    extern bool CaptureUniqueQuestAward(uint32_t) noexcept;
-    if (!ScopedInventoryOverride::IsOverriden()&&apThis==PlayerCharacter::Get()&&apItem&&
-        !apOldOwner&&!apExtraData&&aCount==1&&CaptureUniqueQuestAward(apItem->formID)) return;
+    QuestRewardAddObservation reward(apThis,apItem,apExtraData,aCount,apOldOwner);
     if (!ScopedInventoryOverride::IsOverriden())
     {
         auto& modSystem = World::Get().GetModSystem();
@@ -1167,6 +1166,7 @@ TP_MAKE_THISCALL(HookRemoveInventoryItem, TESObjectREFR, BSPointerHandle<TESObje
         if (apResult) apResult->handle.iBits=0;
         return apResult;
     }
+    if (apItem) QuestRewardInventoryTouched(apThis,apItem->formID);
     if (!ScopedInventoryOverride::IsOverriden())
     {
         auto& modSystem = World::Get().GetModSystem();

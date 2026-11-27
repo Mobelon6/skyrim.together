@@ -6,6 +6,7 @@
 #include <Events/UpdateEvent.h>
 
 #include <Services/QuestService.h>
+#include <Services/QuestRewardClient.h>
 #include <Services/ImguiService.h>
 #include <Services/OverlayService.h>
 #include <Services/TransportService.h>
@@ -479,6 +480,7 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageItemDoneEvent* apEvent, 
     m_world.GetRunner().Queue(
         [this, questFormId = apEvent->formId, stage = apEvent->stageId]()
         {
+            QuestRewardStageDone(questFormId,stage);
             auto it = m_heldStages.find(questFormId);
             if (it == m_heldStages.end())
                 return;

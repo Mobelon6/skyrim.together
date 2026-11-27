@@ -175,6 +175,7 @@ void SetStopped(){actions.push_back(-1);stopped=true;reached.clear();}
 enum class BSTEventResult{kOk};
 template<class T> struct EventDispatcher{};
 struct TESQuestStageItemDoneEvent{uint32_t formId;uint16_t stageId;};
+void QuestRewardStageDone(uint32_t,uint16_t) noexcept {}
 TESForm* TESForm::GetById(uint32_t id){return id==2?&quest:nullptr;}
 struct ModSystem{uint32_t GetGameId(uint32_t id){return id;}};
 struct Party{bool leader=true;bool IsLeader(){return leader;}};
@@ -782,6 +783,7 @@ struct World{static World& Get(){static World world;return world;}ModSystem mods
 struct InventoryChangeEvent{uint32_t id;Inventory::Entry Item;bool Drop,UpdateClients;uint32_t QuestId{},QuestRef{},QuestAlias{};};
 void CaptureQuestPickup(TESObjectREFR* object,InventoryChangeEvent& change){if(!object->temporary){change.QuestId=30;change.QuestRef=40;change.QuestAlias=3;}}
 std::vector<InventoryChangeEvent> sent;
+void QuestRewardInventoryTouched(Actor*,uint32_t) noexcept {}
 void QueueActorInventoryChange(InventoryChangeEvent e){sent.push_back(e);}
 void* RealPickUpObject(Actor* actor,TESObjectREFR* object,int32_t,bool,float){
  if(actor==PlayerCharacter::Get()&&object->extra.quest)
@@ -1541,7 +1543,8 @@ namespace HomePlacementClient{bool InterceptDrop(TESObjectREFR*,TESBoundObject*,
 namespace spdlog{template<class...T>void debug(T&&...){}}
 struct ModSystem{void GetServerModId(uint32_t a,uint32_t& b){b=a;}};
 struct World{ModSystem mods;static World& Get(){static World w;return w;}ModSystem& GetModSystem(){return mods;}};
-bool CaptureUniqueQuestAward(uint32_t)noexcept{return false;}
+struct QuestRewardAddObservation{QuestRewardAddObservation(TESObjectREFR*,TESBoundObject*,ExtraDataList*,int32_t,TESObjectREFR*){}};
+void QuestRewardInventoryTouched(TESObjectREFR*,uint32_t) noexcept {}
 bool IdentifyQuestRemoval(TESObjectREFR& owner,TESBoundObject*,ExtraDataList*,InventoryChangeEvent& e){
  if(!owner.exact||owner.count!=1)return false;
  e.Item.IsQuestItem=true;e.Item.Count=-1;e.QuestId=100;e.QuestRef=200;e.QuestAlias=3;return true;
@@ -1592,3 +1595,82 @@ legacy_reward_capture=extract('client/Services/Generic/QuestJournal.cpp','bool C
 assert 'return false;' in legacy_reward_capture and 'return true;' not in legacy_reward_capture
 assert 'GetRunner().Queue' not in legacy_reward_capture
 print('PASS superseded named reward capture stays disabled',flush=True)
+
+
+# Dynamic keyword selection with arbitrary plugin forms and authoritative
+# stage source. Compile the actual server handler with the real journal.
+reward_handler=extract('server/Services/QuestService.cpp','void ApplyKeywordRewardCommand(', 'void CampaignAccess::ReplayQuestReceipt(')
+run('Q-13 keyword policy and authenticated native-copy choice',headers+'''
+#include <KeywordQuestReward.h>
+#include <filesystem>
+struct Player{uint32_t Id;uint64_t Character;uint32_t GetId()const{return Id;}};
+struct Party{std::vector<Player*> Members;};
+struct World{Party party;World& GetPartyService(){return *this;}
+ Party* GetPlayerParty(Player* p){return std::find(party.Members.begin(),party.Members.end(),p)!=party.Members.end()?&party:nullptr;}
+};
+namespace CampaignReplication{struct Link{enum class Mode{Ready,Disabled};Mode mode=Mode::Ready;CampaignJournal::Journal Journal;Mode State()const{return mode;}};}
+namespace CampaignAccess{
+ CampaignReplication::Link link;
+ auto& Authority(){return link;}uint64_t Character(Player& p){return p.Character;}
+}
+namespace spdlog{template<class...T>void error(T&&...){}}
+'''+reward_handler+'''
+int main(){
+ namespace R=KeywordQuestReward;using namespace CampaignJournal;
+ assert(R::Classify(true,false,true,false,false)==R::Policy::Choice);
+ assert(R::Classify(true,false,false,true,false)==R::Policy::Choice);
+ assert(R::Classify(true,false,false,false,true)==R::Policy::Choice);
+ assert(R::Classify(true,false,false,false,false)==R::Policy::Native);
+ assert(R::Classify(true,true,true,true,true)==R::Policy::Protected);
+ assert(R::Classify(false,false,true,true,true)==R::Policy::Native);
+ R::Key k{TradeProperties::FormKey{"testquest.esm",0x999}.Encode(),TradeProperties::FormKey{"reward.esl",0xabc}.Encode(),55};
+ auto root=std::filesystem::temp_directory_path()/("stm-keyword-reward-"+std::to_string(
+   std::chrono::steady_clock::now().time_since_epoch().count()));
+ assert(!std::filesystem::exists(root));
+ auto& j=CampaignAccess::link.Journal;
+ assert(j.Open(root,42,"test",true));
+ Player a{1,101},b{2,202},outside{3,303};World w{{{&a,&b}}};
+ auto key=k.Encode();
+ auto ready="reward-keyword-ready "+key,choice="reward-keyword-choice "+key+" 2",
+      keep="reward-keyword-keep "+key,removed="reward-keyword-removed "+key;
+ ApplyKeywordRewardCommand(w,a,ready);assert(j.Current().Revision==0);
+ assert(j.Append(j.Current(),{"stage","quest-progress-v1",k.Quest+" 1 0 55 8 101"})==Result::Committed);
+ auto before=j.Current();ApplyKeywordRewardCommand(w,outside,ready);assert(j.Current()==before);
+ ApplyKeywordRewardCommand(w,b,ready);
+ assert(!R::Read(j.Operations(),k)->BothReady());
+ before=j.Current();ApplyKeywordRewardCommand(w,a,choice);assert(j.Current()==before);
+ ApplyKeywordRewardCommand(w,a,ready);
+ auto s=R::Read(j.Operations(),k);assert(s&&s->BothReady());
+ before=j.Current();ApplyKeywordRewardCommand(w,a,ready);ApplyKeywordRewardCommand(w,b,choice);assert(j.Current()==before);
+ ApplyKeywordRewardCommand(w,a,choice);
+ s=R::Read(j.Operations(),k);assert(s&&s->Recipient==202&&!s->Kept);
+ assert(!R::CanRemove(*s,101,0,true));
+ before=j.Current();ApplyKeywordRewardCommand(w,a,keep);ApplyKeywordRewardCommand(w,a,removed);assert(j.Current()==before);
+ ApplyKeywordRewardCommand(w,b,keep);
+ s=R::Read(j.Operations(),k);assert(s&&s->Kept&&R::CanRemove(*s,101,0,true));
+ assert(!R::CanRemove(*s,202,0,true)&&!R::CanRemove(*s,101,0,false));
+ assert(!R::CanRemove(*s,101,s->ChoiceRevision,true));
+ ApplyKeywordRewardCommand(w,a,removed);
+ s=R::Read(j.Operations(),k);assert(s&&s->Removed&&!R::CanRemove(*s,101,0,true));
+ before=j.Current();ApplyKeywordRewardCommand(w,a,removed);assert(j.Current()==before);
+ CampaignJournal::Journal reopened;assert(reopened.Open(root,42,"test",false)&&reopened.Current()==before);
+ assert(R::Read(reopened.Operations(),k)->Recipient==202);
+ assert(R::Read(reopened.Operations(),k)->Removed);
+ auto ops=j.Operations();ops.push_back({"restart","quest-progress-v1",k.Quest+" 2 0 55 8 202"});
+ assert(!R::Read(ops,k));
+ assert(!R::Decode("reward-keyword-choice "+key+" 0"));
+ assert(!R::Decode("reward-keyword-ready "+key+" extra"));
+ std::filesystem::remove_all(root);
+}
+''',['-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp'),str(code/'common/QuestJournalDisk.cpp')])
+native=(code/'client/Games/Misc/BSScript.cpp').read_text()
+assert 'UniqueQuestReward::FindSource' not in native
+assert 'nativeUniqueRewardQuest=quest->formID;' in native
+client=(code/'client/Services/Generic/QuestJournal.cpp').read_text()
+assert 'QuestRewardAddObservation reward' in (code/'client/Games/Skyrim/Actor.cpp').read_text()
+assert 'QuestRewardAddObservation reward' in (code/'client/Games/Skyrim/TESObjectREFR.cpp').read_text()
+assert 'QuestRewardStageDone(questFormId,stage);' in (code/'client/Services/Generic/QuestService.cpp').read_text()
+assert 'e->IsQuestObject()' in extract('client/Services/Generic/QuestJournal.cpp','bool CleanReward(', 'bool LiveReward(')
+assert 'p->RemoveItem(item,1,ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);' in extract('client/Services/Generic/QuestJournal.cpp','void UpdateKeywordRewards(', 'struct PendingQuestReceipt')
+assert 'AddObjectToContainer' not in extract('client/Services/Generic/QuestJournal.cpp','void UpdateKeywordRewards(', 'struct PendingQuestReceipt')
+print('PASS keyword reward native observation, stage barrier, protected/modified copy exclusion and no artificial grant',flush=True)

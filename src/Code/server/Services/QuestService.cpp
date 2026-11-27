@@ -7,6 +7,7 @@
 #include <TradeProperties.h>
 #include <QuestPickupPermit.h>
 #include <UniqueQuestReward.h>
+#include <KeywordQuestReward.h>
 #include <QuestRunMember.h>
 #include <sstream>
 #include <Messages/RequestInventoryChanges.h>
@@ -327,10 +328,46 @@ void ApplyUniqueRewardCommand(World& world,Player& player,std::string_view value
         spdlog::error("STM unique quest reward choice could not be committed");
 }
 
+void ApplyKeywordRewardCommand(World& world,Player& player,std::string_view value)
+{
+    namespace KR=KeywordQuestReward;
+    auto cmd=KR::Decode(value);
+    if (!cmd) return;
+    auto& authority=CampaignAccess::Authority();
+    const auto who=CampaignAccess::Character(player);
+    auto* party=world.GetPartyService().GetPlayerParty(&player);
+    if (!who||!party||authority.State()!=CampaignReplication::Link::Mode::Ready) return;
+    std::map<uint32_t,uint64_t> peers{{player.GetId(),who}};
+    for (auto* member:party->Members)
+        if (member)
+            if (auto character=CampaignAccess::Character(*member)) peers[member->GetId()]=character;
+    if (peers.size()!=2) return;
+    std::set<uint64_t> active;
+    for (const auto& [id,character]:peers) active.insert(character);
+    auto state=KR::Read(authority.Journal.Operations(),cmd->Reward);
+    if (!state||active.size()!=2||!active.contains(state->Source)) return;
+    for (auto ready:state->Ready) if (!active.contains(ready)) return;
+    uint64_t recipient{};
+    if (cmd->Type==KR::Action::Choice)
+    {
+        const auto target=peers.find(cmd->Peer);
+        if (target==peers.end()) return;
+        recipient=target->second;
+    }
+    const auto head=authority.Journal.Current();
+    if (!KR::Advance(*state,cmd->Type,who,recipient,head.Revision+1)) return;
+    auto payload=cmd->Reward.Encode()+" "+std::to_string(who);
+    if (recipient) payload+=" "+std::to_string(recipient);
+    if (authority.Journal.Append(head,{"quest-keyword-"+std::to_string(head.Revision+1),KR::Kind(cmd->Type),payload})!=CampaignJournal::Result::Committed)
+        spdlog::error("STM keyword reward could not be committed");
+}
+
 void CampaignAccess::ReplayQuestReceipt(World& world,Player& player,std::string_view value) noexcept
 {
     try
     {
+        if (value.starts_with("reward-keyword-"))
+        {ApplyKeywordRewardCommand(world,player,value);return;}
         if (value.starts_with("reward-offer ")||value.starts_with("reward-choice "))
         {ApplyUniqueRewardCommand(world,player,value);return;}
         const auto receipt=QuestPickupPermit::DecodeReceipt(std::string(value));
