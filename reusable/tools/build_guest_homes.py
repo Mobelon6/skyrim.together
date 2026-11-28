@@ -12,6 +12,7 @@ parser.add_argument('output',type=Path)
 mode=parser.add_mutually_exclusive_group()
 mode.add_argument('--estate-catalog', action='store_true', help='Write Hearthfire evidence only, not runtime permissions')
 mode.add_argument('--native-capabilities', action='store_true', help='Write original interaction metadata only')
+mode.add_argument('--residence-catalog', action='store_true', help='Derive rental and granted residence candidate metadata')
 mode.add_argument('--instances', action='store_true', help='Build generic isolated projection cells, not legacy decorative homes')
 args=parser.parse_args()
 P=args.output;P.mkdir(parents=True,exist_ok=True)
@@ -82,7 +83,13 @@ def reader(want):
   key=lambda id,ms=ms: (ms[id>>24],id&0xffffff) if id and id>>24<len(ms) else None
   for _,k,f,id,a,b,ctx in records(data):
    if k not in want or not key(id):continue
-   yield k,key(id),f,ctx,key,lambda data=data,a=a,b=b,f=f: {t:raw[x:y] for raw in [payload(data,a,b,f)] for t,_,x,y in fields(raw)}
+   def read(data=data,a=a,b=b,f=f,k=k):
+    raw=payload(data,a,b,f)
+    pairs=[(t,raw[x:y]) for t,_,x,y in fields(raw)]
+    out=dict(pairs)
+    if k==b'QUST':out[b'ALFR_ALL']=[v for t,v in pairs if t==b'ALFR']
+    return out
+   yield k,key(id),f,ctx,key,read
 def home_info():
  locs={};cells={}
  for k,id,f,ctx,key,read in reader({b'LCTN',b'CELL'}):
@@ -124,6 +131,10 @@ if args.estate_catalog:
   raise ValueError('Inconsistent loadorder/plugins exports')
  from build_estate_catalog import build
  build(P,reader,unpack,order)
+ sys.exit(0)
+if args.residence_catalog:
+ from build_residence_points import build
+ build(P,reader,unpack)
  sys.exit(0)
 if args.native_capabilities:
  from build_native_home_capabilities import build

@@ -263,12 +263,12 @@ public:
     std::optional<HomeSnapshot::Ref> InnContainer(uint64_t character,const HomeInn::Room& room)
     {
         if(!authority||!Stream()||!character||!room.Container||
-            HomeInn::Storage(room.Plugin,room.Cell,room.Plugin,room.Container)!=&room)return {};
+            HomeInn::Storage(room.Plugin,room.Cell,room.RefKey().Plugin,room.Container)!=&room)return {};
         auto* items=LoadHome(PersonalAccount(character),authority->Operations().size()+1);
         if(!items)return {};
         HomeSnapshot::Ref row;
-        row.Key={std::string(room.Plugin),room.Container};
-        row.Base={"skyrim.esm",room.Base};row.Type=28;row.Inventory=1;row.Scale=100;
+        row.Key=room.RefKey();
+        row.Base=room.BaseKey();row.Type=28;row.Inventory=1;row.Scale=100;
         for(const auto& [key,count]:*items)
         {
             if(count<0||count>INT32_MAX)return {};

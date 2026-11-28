@@ -368,13 +368,16 @@ void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexc
             // connection/location, distance and character; never accepts an
             // account supplied by the requester or imports original NPC stock.
             if(!campaign||!HomeEstateConstruction::SharedMode()||e.Session||e.Peer||e.Count||
-                e.BeforePlusOne||!e.Text.empty()||!e.Variant.empty()||!e.Item.BaseId||
+                e.BeforePlusOne||e.Text.empty()||e.Text.size()>1400||!e.Variant.empty()||!e.Item.BaseId||
                 ActiveAccount(user)||ledger.HasOutstanding(user))return;
             const auto& cell=p.GetCellComponent();
             const auto* room=HomeInn::Storage(InventoryEvidence::CanonicalPlugin(Plugin(m_world,cell.Cell.ModId)),
                 cell.Cell.BaseId,InventoryEvidence::CanonicalPlugin(Plugin(m_world,e.Item.ModId)),e.Item.BaseId);
-            if(!room)return;
-            HomeSession h{id,0,CampaignAccess::Character(p),{std::string(room->Plugin),room->Container},now+20s};
+            if(!room||room->Binding()!=std::string(e.Text.data(),e.Text.size())||
+                (room->Plugin=="skyrim.esm"&&HomeCityPurchase::Find(room->Cell))||
+                room->Plugin=="hearthfires.esm")
+            {Send(p,{TradeOp::Error,0,0});return;}
+            HomeSession h{id,0,CampaignAccess::Character(p),room->RefKey(),now+20s};
             h.Inn=room;h.InnConnection=uint64_t(p.GetConnectionId());h.InnLocation=p.LocationEpoch();
             auto container=HomeContainer(ledger,m_world,p,h);
             if(!container){Send(p,{TradeOp::Error,0,0});return;}

@@ -34,6 +34,7 @@
 #include <Services/HomeGuestSave.h>
 #include <mutex>
 #include <Forms/TESObjectCELL.h>
+#include <Forms/TESFaction.h>
 #include <ExtraData/ExtraCount.h>
 #include <ExtraData/ExtraHealth.h>
 #include <ExtraData/ExtraCharge.h>
@@ -1829,6 +1830,62 @@ bool InnRentalClient::LocalVariable(const Actor* actor) noexcept
     }
     catch (...) {return false;}
 }
+namespace
+{
+bool IsSleepFurniture(const TESObjectREFR* ref)
+{
+    if(!ref||!ref->baseForm||static_cast<uint32_t>(ref->baseForm->formType)!=40||
+        ref->IsDeleted()||ref->IsDisabled())return false;
+    // TESFurniture::furnFlags, 0xE4, kCanSleep (CommonLibSSE-NG AE).
+    uint32_t flags{};
+    std::memcpy(&flags,reinterpret_cast<const char*>(ref->baseForm)+0xE4,sizeof(flags));
+    return (flags&0x80000000u)!=0;
+}
+TESForm* ExplicitResidenceOwner(const TESObjectREFR* ref)
+{
+    using GetOwner=TESForm*(const TESObjectREFR*);
+    const auto* get=Address<GetOwner>(20194);
+    return get&&ref?get(ref):nullptr;
+}
+TESForm* ResidenceOwner(const TESObjectREFR* ref,TESObjectCELL* cell)
+{
+    if(auto* owner=ExplicitResidenceOwner(ref))return owner;
+    auto& vm=World::Get().ctx().at<PapyrusService>();
+    const auto* actor=vm.Get("Cell","GetActorOwner");
+    const auto* faction=vm.Get("Cell","GetFactionOwner");
+    if(!actor||!faction||!cell)return nullptr;
+    if(auto* owner=PapyrusFunction<TESNPC*,TESObjectCELL>(actor)(cell))return owner;
+    return PapyrusFunction<TESFaction*,TESObjectCELL>(faction)(cell);
+}
+bool PlayerOwns(const TESForm* owner,const PlayerCharacter& player)
+{return owner&&(owner->formID==7||owner==player.baseForm);}
+bool GrantedOwner(TESForm* owner,PlayerCharacter& player)
+{
+    if(PlayerOwns(owner,player))return true;
+    if(!owner||owner->formType!=static_cast<FormType>(0x0B))return false;
+    auto& vm=World::Get().ctx().at<PapyrusService>();
+    const auto* rank=vm.Get("Actor","GetFactionRank");
+    return rank&&PapyrusFunction<int32_t,Actor,TESFaction*>(rank)(&player,static_cast<TESFaction*>(owner))>=0;
+}
+bool NativeAllowed(const TESObjectREFR* ref)
+{
+    if(!ref)return false;
+    const auto* offLimits=World::Get().ctx().at<PapyrusService>().Get("ObjectReference","IsOffLimits");
+    return offLimits&&!PapyrusFunction<bool,TESObjectREFR>(offLimits)(const_cast<TESObjectREFR*>(ref));
+}
+}
+bool InnRentalClient::CanSleepAt(const TESObjectREFR* bed) noexcept
+{
+    try
+    {
+        if(!World::Exists()||VersionDb::Get().GetLoadedVersionString()!="1.6.1170.0"||!IsSleepFurniture(bed))return false;
+        auto* player=PlayerCharacter::Get();
+        return player&&!player->IsDead()&&player->GetParentCellEx()==bed->GetParentCellEx()&&
+            glm::distance(glm::vec3(player->position),glm::vec3(bed->position))<=420.f&&
+            std::abs(player->position.z-bed->position.z)<=128.f&&NativeAllowed(bed);
+    }
+    catch (...) {return false;}
+}
 const HomeInn::Room* InnRentalClient::RentedRoom(const TESObjectREFR* object) noexcept
 {
     try
@@ -1843,18 +1900,35 @@ const HomeInn::Room* InnRentalClient::RentedRoom(const TESObjectREFR* object) no
         if(!player||!player->baseForm||!cell||cell->worldspace||player->GetParentCellEx()!=cell||
             HomeInstance::PrivateCell(cell->formID)||HomeInstance::NativeGuestCell(cell->formID))return nullptr;
         const auto ck=PropertyKey(cell->formID),rk=PropertyKey(object->formID),bk=PropertyKey(object->baseForm->formID);
-        if(!ck||!rk||!bk)return nullptr;
+        if(!ck||!rk||!bk||
+            (ck->Plugin=="skyrim.esm"&&HomeCityPurchase::Find(ck->Local))||
+            ck->Plugin=="hearthfires.esm")return nullptr;
         const auto* room=HomeInn::Storage(ck->Plugin,ck->Local,rk->Plugin,rk->Local);
-        if(!room||bk->Plugin!="skyrim.esm"||bk->Local!=room->Base||
+        if(!room||bk->Encode()!=room->BaseKey().Encode()||
             !HomeInn::Near(*room,object->position.x,object->position.y,object->position.z,96.f)||
             !HomeInn::Near(*room,player->position.x,player->position.y,player->position.z))return nullptr;
         if(const auto* lock=object->GetLock();lock&&lock->IsLocked())return nullptr;
-        auto* bed=Cast<TESObjectREFR>(ResolvePropertyForm({std::string(room->Plugin),room->Bed}));
-        if(!bed||!bed->baseForm||static_cast<uint32_t>(bed->baseForm->formType)!=40||
-            bed->GetParentCellEx()!=cell||bed->IsDeleted()||bed->IsDisabled())return nullptr;
-        using GetOwner=TESForm*(const TESObjectREFR*);
-        auto* owner=Address<GetOwner>(20194);
-        return owner&&owner(bed)==player->baseForm?room:nullptr;
+        for(const auto& key:{room->BedKey(),room->AltKey()})
+        {
+            if(!key.Valid())continue;
+            auto* bed=Cast<TESObjectREFR>(ResolvePropertyForm(key));
+            if(!IsSleepFurniture(bed)||bed->GetParentCellEx()!=cell)continue;
+            if(room->Rental)
+            {
+                if(PlayerOwns(ExplicitResidenceOwner(bed),*player))return room;
+                continue;
+            }
+            // Native rank/ownership and the engine's full ownership check
+            // are both required. Friendship alone is not a storage grant.
+            auto* bedOwner=ResidenceOwner(bed,cell);
+            auto* storageOwner=ResidenceOwner(object,cell);
+            if(!GrantedOwner(bedOwner,*player)||!NativeAllowed(bed)||!NativeAllowed(object))continue;
+            if(storageOwner&&!GrantedOwner(storageOwner,*player))continue;
+            const auto* direct=ExplicitResidenceOwner(object);
+            if(direct&&direct!=bedOwner&&!PlayerOwns(direct,*player))continue;
+            return room;
+        }
+        return nullptr;
     }
     catch (...) {return nullptr;}
 }
@@ -2086,13 +2160,14 @@ bool OverlayService::TryTrade(uint32_t form) noexcept
         {walletReady=false;pollAt={};}
         return true;
     }
-    if(InnRentalClient::RentedRoom(object))
+    if(const auto* point=InnRentalClient::RentedRoom(object))
     {
         Wallet w;
         if(!CampaignAccess::TradeEnabled()||!NativeEnabled()||!m_transport.IsOnline()||
             !w.Load(m_world)||!Ready(w)||session||m_active||sharedOpening)
         {pollAt={};Utils::ShowHudMessage("Личное хранилище: ожидается журнал имущества.");return true;}
         PartyTrade request{TradeOp::InnOpen,0,0,w.Cursor(),0,w.Stream()};
+        request.Text=point->Binding().c_str();
         if(!m_world.GetModSystem().GetServerModId(object->formID,request.Item))return true;
         if(Send(request))
         {sharedOpening=form;innPending=true;sharedOpenUntil=Clock::now()+15s;sharedSeed={};}

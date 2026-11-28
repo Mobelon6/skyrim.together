@@ -2383,6 +2383,14 @@ int main(){
  assert(I::Keeper(a.Plugin,a.KeeperA)&&!I::Keeper("dragonborn.esm",a.KeeperA));
  assert(!I::Keeper(a.Plugin,0)&&!I::Storage(no.Plugin,no.Cell,no.Plugin,0));
  assert(I::Near(a,a.X,a.Y,a.Z)&&!I::Near(a,a.X+421,a.Y,a.Z));
+ const auto* guild=I::Storage("skyrim.esm",93136,"skyrim.esm",463155);
+ assert(guild&&!guild->Rental&&guild->AlternateBed==954127);
+ const auto* college=I::Storage("skyrim.esm",830353,"skyrim.esm",537037);
+ assert(college&&!college->Rental);
+ const auto* mod=I::Storage("alternate start - live another life.esp",201591,"alternate start - live another life.esp",201778);
+ assert(mod&&mod->BaseKey().Plugin=="skyrim.esm");
+ assert(I::Keeper("skyrim.esm",78438));
+ std::istringstream bad("STM-RESIDENCE-POINTS 1\nG invalid\n");assert(!I::Read(bad));
  TradeLedger ledger(j,81);assert(ledger.Stream()==81);
  TradeProperties::FormKey sword{"skyrim.esm",400},salt{"skyrim.esm",401};
  assert(ledger.InnContainer(11,a)->Items.empty()&&ledger.InnContainer(22,a)->Items.empty());
@@ -2392,6 +2400,9 @@ int main(){
  assert(ledger.CommitInn(22,a,salt,"",-1,3,0));
  assert(ledger.Ack("11",1)&&ledger.Ack("22",1));
  assert(ledger.InnContainer(11,b)->Items[0].Base.Encode()==sword.Encode());
+ assert(ledger.InnContainer(11,*guild)->Items[0].Base.Encode()==sword.Encode());
+ assert(ledger.InnContainer(22,*college)->Items[0].Base.Encode()==salt.Encode());
+ assert(ledger.InnContainer(11,*mod)->Items[0].Base.Encode()==sword.Encode());
  assert(ledger.InnContainer(22,a)->Items[0].Base.Encode()==salt.Encode());
  assert(!ledger.CommitInn(22,a,sword,"",1,0,1));
  assert(!ledger.Commit({ "22",TradeLedger::PersonalAccount(11),"skyrim.esm",400,1,0,false,{}},1));
@@ -2416,7 +2427,10 @@ int main(){
 ''',['-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp'),str(code/'common/QuestJournalDisk.cpp')])
 assert 'ledger.CommitInn(h.Character,*h.Inn' in shared_trade_server
 assert 'if(innPending){innTarget=form;sharedTarget.store(0);}' in shared_trade_client
-assert 'owner(bed)==player->baseForm' in shared_trade_client
+assert 'PlayerOwns(ExplicitResidenceOwner(bed),*player)' in shared_trade_client
+assert 'GrantedOwner(bedOwner,*player)' in shared_trade_client
+assert 'NativeAllowed(bed)||!NativeAllowed(object)' in shared_trade_client
+assert 'room->Binding()!=std::string(e.Text.data(),e.Text.size())' in shared_trade_server
 assert 'if(innPending&&!InnRentalClient::RentedRoom' in shared_trade_client
 assert 'if(innTarget&&!InnRentalClient::RentedRoom' in shared_trade_client
 assert 'if(innPending||!sharedOpening' in shared_trade_client

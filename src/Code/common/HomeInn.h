@@ -3,6 +3,15 @@
 #include <cstdint>
 #include <cmath>
 #include <string_view>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <locale>
+#include <set>
+#include <sstream>
+#include <vector>
+#include "TradeProperties.h"
+#include "HomeResidenceEvidence.h"
 
 // The winning NPC_ VMAD RentRoomScript.Bed bindings in the archived
 // 2026-11-20 active profile (95 plugins). Container points are explicit
@@ -13,12 +22,25 @@ namespace HomeInn
 {
 struct Room
 {
-    std::string_view Plugin;
+    std::string Plugin;
     uint32_t Cell,Bed,Container,Base;
     float X,Y,Z;
     uint32_t KeeperA,KeeperB;
+    std::string BedMod{},RefMod{},BaseMod{"skyrim.esm"},AltBedMod{};
+    uint32_t AlternateBed{};
+    bool Rental{true};
+    TradeProperties::FormKey CellKey()const{return {Plugin,Cell};}
+    TradeProperties::FormKey BedKey()const{return {BedMod.empty()?Plugin:BedMod,Bed};}
+    TradeProperties::FormKey RefKey()const{return {RefMod.empty()?Plugin:RefMod,Container};}
+    TradeProperties::FormKey BaseKey()const{return {BaseMod,Base};}
+    TradeProperties::FormKey AltKey()const{return AlternateBed?TradeProperties::FormKey{AltBedMod,AlternateBed}:TradeProperties::FormKey{};}
+    std::string Binding()const
+    {
+        return std::string(Rental?"R ":"G ")+CellKey().Encode()+" "+BedKey().Encode()+" "+
+            AltKey().Encode()+" "+RefKey().Encode()+" "+BaseKey().Encode();
+    }
 };
-inline constexpr std::array<Room,18> Rooms{{
+inline const std::array<Room,18> Rooms{{
     {"skyrim.esm",0x13A7C,0x13E41,0xE53AA,0x24CA5,1524.370f,795.490f,0.000f,0x26F0F,0x19A28}, // Dragon Bridge
     {"skyrim.esm",0x13814,0x1759F,0xDDA12,0x3AC21,1691.804f,-711.451f,0.000f,0x1C184,0x1C183}, // Winterhold
     {"skyrim.esm",0x1605E,0x616CA,0xC903E,0xC2A06,-193.325f,170.342f,318.700f,0x1A670,0x13BA3}, // Whiterun
@@ -38,17 +60,117 @@ inline constexpr std::array<Room,18> Rooms{{
     {"skyrim.esm",0x16A0E,0x608A6,0xD4954,0x6B30E,773.306f,-1741.009f,287.752f,0x132A7,0x13266}, // Solitude
     {"dragonborn.esm",0x17EC0,0x25032,0x35915,0x9AF19,-2440.885f,-505.389f,-382.371f,0x18290,0x0}, // Raven Rock
 }};
+// Generated profile evidence contains candidates, never a permission grant.
+// Explicit legacy rental points remain as compatibility exceptions for the
+// archived default profile. A supplied complete profile replaces that default.
+struct Index
+{
+    std::vector<Room> Points;
+    std::set<std::string> Keepers;
+    bool Legacy{};
+};
+inline std::optional<Index> Read(std::istream& input)
+{
+    Index out;
+    std::string line;
+    if(!std::getline(input,line)||line!="STM-RESIDENCE-POINTS 1")return {};
+    std::set<std::string> refs;
+    while(std::getline(input,line))
+    {
+        if(line.empty()||line.size()>2048||out.Points.size()+out.Keepers.size()>=100000)return {};
+        std::istringstream row(line);row.imbue(std::locale::classic());
+        char tag{};std::string cell,bed,alt,ref,base,extra;
+        if(!(row>>tag>>cell))return {};
+        const auto ck=TradeProperties::DecodeForm(cell);
+        if(!ck||!ck->Valid()||ck->Encode()!=cell)return {};
+        if(tag=='K')
+        {
+            if(row>>extra||!out.Keepers.insert(cell).second)return {};
+            continue;
+        }
+        Room r{};
+        if((tag!='R'&&tag!='G')||!(row>>bed>>alt>>ref>>base>>r.X>>r.Y>>r.Z)||
+            row>>extra||!std::isfinite(r.X)||!std::isfinite(r.Y)||!std::isfinite(r.Z))return {};
+        const auto bk=TradeProperties::DecodeForm(bed),ak=TradeProperties::DecodeForm(alt),
+            rk=TradeProperties::DecodeForm(ref),basek=TradeProperties::DecodeForm(base);
+        if(!bk||!bk->Valid()||bk->Encode()!=bed||!ak||ak->Encode()!=alt||
+            !rk||!rk->Valid()||rk->Encode()!=ref||!basek||!basek->Valid()||basek->Encode()!=base||
+            bed==ref||bed==alt||alt==ref||!refs.insert(ref).second)return {};
+        r.Plugin=ck->Plugin;r.Cell=ck->Local;r.BedMod=bk->Plugin;r.Bed=bk->Local;
+        r.AltBedMod=ak->Plugin;r.AlternateBed=ak->Local;r.RefMod=rk->Plugin;r.Container=rk->Local;
+        r.BaseMod=basek->Plugin;r.Base=basek->Local;r.Rental=tag=='R';
+        out.Points.push_back(std::move(r));
+    }
+    if(!input.eof())return {};
+    return out;
+}
+inline const std::optional<Index>& Profile()
+{
+    static const auto profile=[]()->std::optional<Index>
+    {
+        if(const auto* root=std::getenv("STM_CAMPAIGN_ROOT");root&&*root)
+        {
+            const auto path=std::filesystem::path(root)/"CoopResidenceIndex.txt";
+            std::error_code ec;
+            const bool exists=std::filesystem::exists(path,ec);
+            if(ec)return {};
+            if(exists){std::ifstream input(path);return Read(input);}
+        }
+        std::istringstream input{ResidenceEvidence};
+        auto index=Read(input);
+        if(index)index->Legacy=true;
+        return index;
+    }();
+    return profile;
+}
 inline const Room* Find(std::string_view plugin,uint32_t cell) noexcept
-{for(const auto& r:Rooms)if(r.Plugin==plugin&&r.Cell==cell)return &r;return nullptr;}
+{
+    try
+    {
+        const auto& index=Profile();if(!index)return nullptr;
+        if(index->Legacy)for(const auto& r:Rooms)if(r.Plugin==plugin&&r.Cell==cell)return &r;
+        for(const auto& r:index->Points)if(r.Plugin==plugin&&r.Cell==cell)return &r;
+    }
+    catch (...) {}
+    return nullptr;
+}
 inline const Room* Storage(std::string_view plugin,uint32_t cell,std::string_view refPlugin,uint32_t ref) noexcept
 {
-    const auto* r=Find(plugin,cell);
-    return r&&r->Container&&r->Plugin==refPlugin&&r->Container==ref?r:nullptr;
+    try
+    {
+        if(!ref)return nullptr;
+        const auto& index=Profile();if(!index)return nullptr;
+        const auto matches=[&](const Room& r)
+        {
+            return r.Plugin==plugin&&r.Cell==cell&&r.Container==ref&&r.RefKey().Plugin==refPlugin;
+        };
+        if(index->Legacy)for(const auto& r:Rooms)if(matches(r))return &r;
+        for(const auto& r:index->Points)
+        {
+            if(!matches(r))continue;
+            // Do not create a second rental point for a previously selected bed.
+            if(index->Legacy&&r.Rental)
+                for(const auto& old:Rooms)
+                    if(old.Container&&old.CellKey().Encode()==r.CellKey().Encode()&&
+                        (old.BedKey().Encode()==r.BedKey().Encode()||old.BedKey().Encode()==r.AltKey().Encode()))
+                        return nullptr;
+            return &r;
+        }
+    }
+    catch (...) {}
+    return nullptr;
 }
 inline bool Keeper(std::string_view plugin,uint32_t base) noexcept
 {
-    if(!base)return false;
-    for(const auto& r:Rooms)if(r.Plugin==plugin&&(r.KeeperA==base||r.KeeperB==base))return true;
+    try
+    {
+        if(!base)return false;
+        const auto& index=Profile();if(!index)return false;
+        if(index->Keepers.count(TradeProperties::FormKey{std::string(plugin),base}.Encode()))return true;
+        if(index->Legacy)for(const auto& r:Rooms)
+            if(r.Plugin==plugin&&(r.KeeperA==base||r.KeeperB==base))return true;
+    }
+    catch (...) {}
     return false;
 }
 inline bool Near(const Room& r,float x,float y,float z,float distance=420.f) noexcept
