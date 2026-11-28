@@ -2021,3 +2021,90 @@ int main(){
  }
 }
 ''',['-I'+str(code/'common')])
+
+
+# Verify the actual TIF adapter's dispatch preconditions and one argument.
+# Simulated VM cannot establish that Skyrim has bound a specific INFO in game.
+tif_args=extract('client/Games/Misc/BSScript.cpp','struct CityTifArguments','bool FrameIsHouseQuest')
+tif_dispatch=extract('client/Games/Misc/BSScript.cpp','CityHomeClient::TifDispatch CityHomeClient::TryTif','bool CityHomeClient::DispatchNative')
+run('native TIF dispatch adapter: bound INFO, None argument, no fabricated binding',headers+'''
+#include <HomeCityPurchase.h>
+#include <cstdlib>
+#include <cstddef>
+#include <new>
+struct TESForm{uint32_t formID{},formType{0x4C};static TESForm* GetById(uint32_t);};
+TESForm info{HomeCityPurchase::Furniture[0].Info};
+TESForm* TESForm::GetById(uint32_t id){return id==info.formID?&info:nullptr;}
+struct BSFixedString{std::string value;explicit BSFixedString(const char* s):value(s){}};
+namespace Memory{void* Allocate(size_t n){return std::malloc(n);}void Free(void* p){std::free(p);}}
+namespace spdlog{template<class...T>void info(T&&...){}}
+namespace BSScript{
+ struct Object{uint64_t handle{123};uint64_t GetHandle(){return handle;}};
+ struct Variable{bool none{};void Clear(){none=true;}};
+ struct IFunctionArguments{
+  struct Statement{uint8_t pad0[8];Variable* vars{};uint32_t capacity{},pad14{},size{},pad1C{};
+   Variable storage[2];void SetSize(uint32_t n){size=n;capacity=2;vars=storage;}
+  };
+  virtual ~IFunctionArguments()=default;
+  virtual bool Prepare(Statement&)const noexcept=0;
+ };
+ struct Policy{
+  bool valid=true,available=true,matching=true;uint64_t handle=123;
+  uint64_t GetHandleForObject(uint32_t t,const TESForm* f){assert(t==0x4C&&f==&info);return handle;}
+  bool HandleIsType(uint32_t t,uint64_t h){return valid&&t==0x4C&&h==handle;}
+  bool IsHandleObjectAvailable(uint64_t){return available;}
+  void* GetObjectForHandle(uint32_t,uint64_t){return matching?&info:nullptr;}
+ };
+ struct IVirtualMachine{
+  Policy policy;Object object;bool bound=true,accept=true;int calls=0;
+  Policy* GetObjectHandlePolicy(){return &policy;}
+  bool FindBoundObject(uint64_t h,const char* scope,Object*& out){
+   assert(h==policy.handle&&std::string(scope)==HomeCityPurchase::Furniture[0].Variable);
+   if(!bound)return false;
+   out=&object;return true;
+  }
+  bool DispatchMethodCall2(uint64_t h,const BSFixedString& scope,const BSFixedString& method,
+        IFunctionArguments* args,void*& callback){
+   assert(h==policy.handle&&scope.value==HomeCityPurchase::Furniture[0].Variable&&
+      method.value==HomeCityPurchase::Furniture[0].Fragment&&!callback);
+   IFunctionArguments::Statement out;assert(args->Prepare(out)&&out.size==1&&out.vars[0].none);
+   delete args;++calls;return accept;
+  }
+ };
+}
+struct GameVM{
+ BSScript::IVirtualMachine* virtualMachine{};bool inactive{};
+ static GameVM* Get();
+};
+BSScript::IVirtualMachine engine;GameVM game{&engine};
+GameVM* GameVM::Get(){return &game;}
+struct BoundScript{BSScript::Object* Value{};};
+namespace CityHomeClient{
+ enum class Local:uint8_t{Unknown,Unowned,Owned,Partial};
+ enum class TifDispatch:uint8_t{Unavailable,Dispatched,Rejected};
+ Local local=Local::Unowned;bool ready=true;
+ Local ReadNative(uint32_t){return local;}
+ bool NativeReady(){return ready;}
+ uint32_t RuntimeInfo(uint32_t){return info.formID;}
+ uint32_t OperationForInfo(uint32_t i){return i==info.formID?HomeCityPurchase::Furniture[0].Cell:0;}
+ TifDispatch TryTif(uint32_t)noexcept;
+}
+'''+tif_args+tif_dispatch+'''
+int main(){
+ using namespace CityHomeClient;const auto id=HomeCityPurchase::Furniture[0].Cell;
+ engine.bound=false;assert(TryTif(id)==TifDispatch::Unavailable&&engine.calls==0);
+ engine.bound=true;engine.policy.matching=false;assert(TryTif(id)==TifDispatch::Unavailable&&engine.calls==0);
+ engine.policy.matching=true;engine.object.handle=456;assert(TryTif(id)==TifDispatch::Unavailable&&engine.calls==0);
+ engine.object.handle=123;info.formType=77;assert(TryTif(id)==TifDispatch::Unavailable&&engine.calls==0);
+ info.formType=0x4C;local=Local::Owned;assert(TryTif(id)==TifDispatch::Rejected&&engine.calls==0);
+ local=Local::Unowned;ready=false;assert(TryTif(id)==TifDispatch::Rejected&&engine.calls==0);
+ ready=true;assert(TryTif(id)==TifDispatch::Dispatched&&engine.calls==1);
+ engine.accept=false;assert(TryTif(id)==TifDispatch::Rejected&&engine.calls==2);
+}
+''',['-I'+str(code/'common')])
+# Production ordering: accepted/rejected native dispatch both return before
+# the old effect/debit path. Only an unbound preflight may fall back.
+tif_path=city_client[city_client.index('const auto outcome=CityHomeClient::TryTif(house.Cell)'):]
+assert tif_path.index('TifDispatch::Dispatched')<tif_path.index('TifDispatch::Rejected')<tif_path.index('p->RemoveItem(gold,')
+assert 'ClearCityPending();return;' in tif_path[:tif_path.index('p->RemoveItem(gold,')]
+assert 'if(waive)cityWaive.store(house.Cell,std::memory_order_release);' in city_client

@@ -239,6 +239,22 @@ struct EmptyHouseArguments final:BSScript::IFunctionArguments
     static void operator delete(void* p) noexcept {Memory::Free(p);}
     bool Prepare(Statement& out) const noexcept override {out.SetSize(0);return out.size==0;}
 };
+// The existing verified simple furniture fragments take one ObjectReference
+// argument but do not use akSpeaker after its initial cast. A null reference
+// is packed as Papyrus None (CommonLib PackHandle with null source).
+// Do not use this argument adapter for arbitrary TIFs or speaker-dependent mods.
+struct CityTifArguments final:BSScript::IFunctionArguments
+{
+    static void operator delete(void* p) noexcept {Memory::Free(p);}
+    bool Prepare(Statement& out) const noexcept override
+    {
+        static_assert(offsetof(Statement,vars)==8&&offsetof(Statement,size)==0x18);
+        out.SetSize(1);
+        if(!out.vars||out.size!=1||out.capacity<1)return false;
+        out.vars[0].Clear();
+        return true;
+    }
+};
 bool FrameIsHouseQuest(const DragonFrameView* frame,BSScript::IObjectHandlePolicy* policy)
 {
     if (!frame||!frame->Function||!policy) return false;
@@ -354,6 +370,47 @@ CityHomeClient::Local CityHomeClient::ReadNative(uint32_t id) noexcept
     }
     catch (...) {return Local::Unknown;}
 }
+CityHomeClient::TifDispatch CityHomeClient::TryTif(uint32_t id) noexcept
+{
+    // Do not create/bind an empty TIF object: its VMAD properties and quest
+    // context must have been supplied by Skyrim itself.
+    try
+    {
+        const auto* op=HomeCityPurchase::Find(id);
+        if(!op||!op->Parent||ReadNative(id)!=Local::Unowned||!NativeReady())
+            return TifDispatch::Rejected;
+        auto* gameVM=GameVM::Get();
+        auto* info=TESForm::GetById(RuntimeInfo(id));
+        constexpr uint32_t infoType=0x4C;
+        if(!gameVM||!gameVM->virtualMachine||gameVM->inactive||!info||
+            static_cast<uint32_t>(info->formType)!=infoType||OperationForInfo(info->formID)!=id)
+            return TifDispatch::Unavailable;
+        auto* vm=gameVM->virtualMachine;
+        auto* policy=vm->GetObjectHandlePolicy();
+        const auto handle=policy?policy->GetHandleForObject(infoType,info):0;
+        if(!handle||!policy->HandleIsType(infoType,handle)||!policy->IsHandleObjectAvailable(handle)||
+            policy->GetObjectForHandle(infoType,handle)!=info)
+        {
+            spdlog::info("STM TIF {:X}: native INFO handle unavailable before dispatch",info->formID);
+            return TifDispatch::Unavailable;
+        }
+        BoundScript object;
+        if(!vm->FindBoundObject(handle,op->Variable,object.Value)||!object.Value||object.Value->GetHandle()!=handle)
+        {
+            spdlog::info("STM TIF {:X}: script {} not bound before dispatch",info->formID,op->Variable);
+            return TifDispatch::Unavailable;
+        }
+        BSFixedString scope(op->Variable),method(op->Fragment);void* callback=nullptr;
+        auto* storage=Memory::Allocate(sizeof(CityTifArguments));
+        if(!storage)return TifDispatch::Rejected;
+        auto* args=::new(storage) CityTifArguments;
+        const bool accepted=vm->DispatchMethodCall2(handle,scope,method,args,callback);
+        spdlog::info("STM TIF {:X}: {}.{} dispatch accepted={}",info->formID,op->Variable,op->Fragment,accepted);
+        return accepted?TifDispatch::Dispatched:TifDispatch::Rejected;
+    }
+    catch (...) {return TifDispatch::Rejected;}
+}
+
 bool CityHomeClient::DispatchNative(uint32_t id) noexcept
 {
     try
@@ -665,6 +722,7 @@ uint32_t CityHomeClient::ChargeContext() noexcept {return 0;}
 bool CityHomeClient::NativeReady() noexcept {return false;}
 CityHomeClient::Local CityHomeClient::ReadNative(uint32_t) noexcept {return Local::Unknown;}
 bool CityHomeClient::DispatchNative(uint32_t) noexcept {return false;}
+CityHomeClient::TifDispatch CityHomeClient::TryTif(uint32_t) noexcept {return TifDispatch::Unavailable;}
 uint32_t NativeUniqueRewardQuest() noexcept {return 0;}
 uint16_t NativeUniqueRewardStage() noexcept {return 0;}
 uint32_t NativeUniqueRewardInstance() noexcept {return 0;}

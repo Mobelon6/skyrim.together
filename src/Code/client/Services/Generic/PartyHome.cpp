@@ -1509,6 +1509,7 @@ struct CityPending
     bool Started{},Replay{},Waive{},Warned{};
     Clock::time_point Deadline{},Next{};
     int64_t GoldBefore{};
+    bool NativeTif{};
 };
 CityPending cityPending;
 std::set<uint32_t> cityAttempted;
@@ -1579,6 +1580,12 @@ void UpdateCityHomes(World& world)
         // keep the save guard armed merely because a journal ACK is delayed.
         if(finished)
         {
+            if(cityPending.NativeTif&&!cityPending.Warned)
+            {
+                spdlog::info("STM TIF operation {:X}: marker and gold readback confirmed (waived={})",
+                    cityPending.Cell,cityPending.Waive);
+                cityPending.Warned=true;
+            }
             cityWaive.store(0,std::memory_order_release);
             cityActiveEpoch.store(0,std::memory_order_release);
             if(cityPending.Replay){ClearCityPending();return;}
@@ -1679,7 +1686,25 @@ void UpdateCityHomes(World& world)
         cityAttempted.insert(house.Cell);
         cityPending.GoldBefore=CityGold();
         cityActiveEpoch.store(cityEpoch,std::memory_order_release);
-        if(waive&&!house.Parent)cityWaive.store(house.Cell,std::memory_order_release);
+        if(waive)cityWaive.store(house.Cell,std::memory_order_release);
+        if(house.Parent)
+        {
+            // Prefer Skyrim's own paid fragment. The existing scoped native
+            // debit guard waives only this replay's exact gold removal.
+            // For an older ESS of the payer, the native TIF pays normally.
+            const auto outcome=CityHomeClient::TryTif(house.Cell);
+            if(outcome==CityHomeClient::TifDispatch::Dispatched)
+            {cityPending.NativeTif=true;return;}
+            if(outcome==CityHomeClient::TifDispatch::Rejected)
+            {
+                // A failed/ambiguous dispatch may have scheduled work.
+                // Never execute the fallback or charge again after it.
+                spdlog::warn("STM TIF operation {:X}: dispatch rejected; no fallback",house.Cell);
+                Utils::ShowHudMessage("Не удалось применить улучшение дома. Проверьте сохранение.");
+                ClearCityPending();return;
+            }
+            spdlog::info("STM TIF operation {:X}: unbound before invocation; known-effect fallback",house.Cell);
+        }
         if(house.Parent&&!waive)
         {
             // Recover a missing, previously paid non-replaceable decoration
@@ -1806,13 +1831,23 @@ bool CityHomeClient::Busy() noexcept
 }
 bool CityHomeClient::SkipCharge(uint32_t cell) noexcept
 {
-    return cell&&Busy()&&cityWaive.load(std::memory_order_acquire)==cell;
+    const bool skip=cell&&Busy()&&cityWaive.load(std::memory_order_acquire)==cell;
+    if(skip)
+        if(const auto* op=City::Find(cell);op&&op->Parent)
+            spdlog::info("STM TIF operation {:X}: exact native gold debit waived",cell);
+    return skip;
 }
 void CityHomeClient::ObservedDebit(uint32_t cell,uint32_t amount,uint64_t epoch) noexcept
 {
     RefreshCityEpoch();
     if(epoch==cityEpoch&&cityPending.Started&&cityPending.Cell==cell&&amount<=UINT32_MAX-cityPending.Paid)
         cityPending.Paid+=amount;
+}
+uint32_t CityHomeClient::RuntimeInfo(uint32_t operation) noexcept
+{
+    const auto* op=City::Find(operation);
+    if(!op||!op->Parent)return 0;
+    return op->Hearthfire?CatalogForm({"hearthfires.esm",op->Info}):op->Info;
 }
 uint32_t CityHomeClient::OperationForInfo(uint32_t info) noexcept
 {
