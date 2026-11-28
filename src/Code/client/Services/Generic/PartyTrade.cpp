@@ -217,7 +217,7 @@ UI_MESSAGE_RESULTS ContainerChestMessage(IMenu* menu,UIMessage& message)
 {
     // BSUIScaleformData::scaleformEvent at 0x10. GFxEvent::type 00;
     // GFxMouseEvent::button 10. Only left down/up targeted at this menu.
-    if(message.eType==UIMessage::kScaleformEvent&&message.data)
+    if((hudPhase.load()||chestPress.Captured)&&message.eType==UIMessage::kScaleformEvent&&message.data)
     {
         const void* event{};
         std::memcpy(&event,static_cast<const char*>(message.data)+0x10,sizeof(event));
@@ -273,7 +273,7 @@ bool GuardChestHud()
 void ShowChestHud(OverlayService& overlay,uint32_t phase,uint32_t token)
 {
     static uint32_t previousPhase{},previousToken{},previousHover{};
-    const auto point=ChestCursor();
+    const auto point=phase?ChestCursor():std::nullopt;
     if(!point)phase=HomeChestHud::Hidden;
     if(!phase)token=0;
     const auto hover=point?HomeChestHud::Hit(phase,*point):0;
@@ -2189,7 +2189,7 @@ void OverlayService::TradeAction(uint32_t token,int action,uint32_t id,uint32_t 
     }
     if (!session || session!=token) return;
     Wallet w;
-    if(action>=HomeChestHud::Ask&&action<=HomeChestHud::MakeShared)
+    if(action>=int(HomeChestHud::Ask)&&action<=int(HomeChestHud::MakeShared))
     {
         if(!sharedTarget.load()||nativeToken.load()!=token||!hudAvailable||!nativeOpened||
             !NativeMenuOpen()||GetActive()||m_promptOpen||m_showingProgress||m_observerCamera||sharedSwitchPending)return;

@@ -120,7 +120,8 @@ interface SkyrimTogether {
   off(event: 'rescueReturn'): void;
   on(event: 'partyTrade', callback: (session: number, name: string, open: boolean, pocket: string, buffer: string) => void): void;
   on(event: 'hideTrade', callback: () => void): void;
-  off(event: 'partyTrade' | 'hideTrade'): void;
+  on(event: 'homeChestHud', callback: (phase: number, session: number, hover: number) => void): void;
+  off(event: 'partyTrade' | 'hideTrade' | 'homeChestHud'): void;
   tradeAction(session: number, action: number, row: number, count: number): void;
   on(event: 'offerCarriage', callback: (rider: number, trip: number, name: string, marker: number) => void): void;
   on(event: 'hideCarriage', callback: () => void): void;
