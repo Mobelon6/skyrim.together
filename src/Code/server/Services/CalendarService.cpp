@@ -22,9 +22,42 @@ CalendarService::CalendarService(World& aWorld, entt::dispatcher& aDispatcher)
 
 void CalendarService::OnRest(const PacketEvent<RequestRestTime>& event) noexcept
 {
-    if (!event.pPlayer->GetCharacter() || !m_world.GetPartyService().GetPlayerParty(event.pPlayer))
+    auto* player=event.pPlayer;
+    auto* party=m_world.GetPartyService().GetPlayerParty(player);
+    if (!player->GetCharacter()||!party) return;
+    const auto& request=event.Packet;
+    if(request.Generation!=m_restGeneration)
+    {
+        SendTimeResync(false);
         return;
-    const auto& target = event.Packet.Arrival;
+    }
+    const auto& cell=player->GetCellComponent();
+    if(request.StartSleep)
+    {
+        if(request.Slept||!request.Bed||!cell.Cell||cell.WorldSpaceId) return;
+        const auto* movement=m_world.try_get<MovementComponent>(*player->GetCharacter());
+        if(!movement||m_sleepCohorts.count(player->GetId()))return;
+        SleepCohort cohort;
+        cohort.Connection=uint64_t(player->GetConnectionId());
+        cohort.Bed=request.Bed;cohort.Cell=cell.Cell;
+        ServerTimeSettings notice;
+        notice.timeModel=m_dateTime.m_timeModel;notice.Generation=m_restGeneration;
+        notice.SleepPhase=1;notice.Source=player->GetId();notice.Bed=request.Bed;
+        for(auto* peer:party->Members)
+        {
+            if(peer==player||!peer->GetCharacter())continue;
+            const auto& other=peer->GetCellComponent();
+            if(other.Cell!=cell.Cell||other.WorldSpaceId)continue;
+            const auto* pos=m_world.try_get<MovementComponent>(*peer->GetCharacter());
+            if(!pos||glm::distance(pos->Position,movement->Position)>420.f||
+                std::abs(pos->Position.z-movement->Position.z)>128.f)continue;
+            cohort.Peers.push_back({peer->GetId(),uint64_t(peer->GetConnectionId()),peer->LocationEpoch()});
+            peer->Send(notice);
+        }
+        m_sleepCohorts.emplace(player->GetId(),std::move(cohort));
+        return;
+    }
+    const auto& target = request.Arrival;
     if (!std::isfinite(target.Time) || target.Time < 0 || target.Time >= 24 ||
         target.Month >= 12 || !target.Day || target.Day > DateTime::GetNumberOfDaysByMonthIndex(target.Month) ||
         target.Year > 9999)
@@ -42,8 +75,32 @@ void CalendarService::OnRest(const PacketEvent<RequestRestTime>& event) noexcept
         const float scale = current.TimeScale;
         m_dateTime.m_timeModel = target;
         m_dateTime.m_timeModel.TimeScale = scale;
+        const auto completed=m_restGeneration++;
+        const auto it=m_sleepCohorts.find(player->GetId());
+        SleepCohort cohort;
+        if(request.Slept&&it!=m_sleepCohorts.end()&&it->second.Connection==uint64_t(player->GetConnectionId())&&it->second.Bed==request.Bed)
+            cohort=std::move(it->second);
+        m_sleepCohorts.clear();
+        SendTimeResync(true);
+        // Only a peer present in the same room at native sleep start, with
+        // unchanged connection/location, may consume the local eligibility snapshot.
+        for(auto* peer:party->Members)
+        {
+            for(const auto& candidate:cohort.Peers)
+            {
+                if(peer->GetId()!=candidate.Id||uint64_t(peer->GetConnectionId())!=candidate.Connection||
+                    peer->LocationEpoch()!=candidate.Location||peer->GetCellComponent().Cell!=cohort.Cell||
+                    peer->GetCellComponent().WorldSpaceId)continue;
+                ServerTimeSettings notice;
+                notice.timeModel=m_dateTime.m_timeModel;notice.Generation=completed;
+                notice.SleepPhase=2;notice.Source=player->GetId();notice.Bed=cohort.Bed;
+                peer->Send(notice);
+            }
+        }
+        return;
     }
-    SendTimeResync(true);
+    m_sleepCohorts.erase(player->GetId());
+    SendTimeResync(false);
 }
 
 void CalendarService::OnUpdate(const UpdateEvent&) noexcept
@@ -70,6 +127,7 @@ void CalendarService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept
 
     if (playerHasFurthestTime)
     {
+        ++m_restGeneration;m_sleepCohorts.clear();
         // Note that this doesn't set timescale because the server config should set that.
         if (!m_timeSetFromFirstPlayer)
         {
@@ -86,6 +144,7 @@ void CalendarService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept
     timeMsg.timeModel.Month = m_dateTime.m_timeModel.Month;
     timeMsg.timeModel.Year = m_dateTime.m_timeModel.Year;
 
+    timeMsg.Generation=m_restGeneration;
     if (playerHasFurthestTime)
         GameServer::Get()->SendToPlayers(timeMsg);
     else
@@ -103,6 +162,7 @@ bool CalendarService::SetTime(int aHours, int aMinutes, float aScale) noexcept
         minutes = floor(minutes * 100) / 1000;
         m_dateTime.m_timeModel.Time = static_cast<float>(aHours) + minutes;
 
+        ++m_restGeneration;m_sleepCohorts.clear();
         SendTimeResync();
 
         GameServer::Get()->GetWorld().GetScriptService().HandleSetTime(aHours, aMinutes, aScale);
@@ -121,7 +181,8 @@ bool CalendarService::SetDate(int aDay, int aMonth, float aYear) noexcept
             m_dateTime.m_timeModel.Day = aDay;
             m_dateTime.m_timeModel.Month = aMonth;
             m_dateTime.m_timeModel.Year = aYear;
-            SendTimeResync();
+            ++m_restGeneration;m_sleepCohorts.clear();
+        SendTimeResync();
             return true;
         }
     }
@@ -132,6 +193,7 @@ void CalendarService::SendTimeResync(bool restCompleted) noexcept
 {
     ServerTimeSettings timeMsg;
     timeMsg.RestCompleted = restCompleted;
+    timeMsg.Generation=m_restGeneration;
     timeMsg.timeModel.TimeScale = m_dateTime.m_timeModel.TimeScale;
     timeMsg.timeModel.Time = m_dateTime.m_timeModel.Time;
     timeMsg.timeModel.Day = m_dateTime.m_timeModel.Day;
@@ -169,6 +231,7 @@ bool CalendarService::SetTimeScale(float aScale) noexcept
         m_dateTime.m_timeModel.TimeScale = aScale;
 
         ServerTimeSettings timeMsg;
+        timeMsg.Generation=m_restGeneration;
         timeMsg.timeModel.TimeScale = m_dateTime.m_timeModel.TimeScale;
         timeMsg.timeModel.Time = m_dateTime.m_timeModel.Time;
         timeMsg.timeModel.Day = m_dateTime.m_timeModel.Day;

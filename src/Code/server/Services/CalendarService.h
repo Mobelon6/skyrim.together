@@ -3,6 +3,8 @@
 #include <Events/PacketEvent.h>
 #include <DateTime.h>
 #include <Structs/GameId.h>
+#include <map>
+#include <vector>
 
 struct World;
 struct UpdateEvent;
@@ -43,6 +45,15 @@ private:
     entt::scoped_connection m_restConnection;
     void SendTimeResync(bool restCompleted = false) noexcept;
 
+    struct SleepPeer {uint32_t Id{};uint64_t Connection{},Location{};};
+    struct SleepCohort
+    {
+        uint64_t Connection{};
+        GameId Bed{0,0},Cell{0,0};
+        std::vector<SleepPeer> Peers;
+    };
+    uint32_t m_restGeneration{};
+    std::map<uint32_t,SleepCohort> m_sleepCohorts;
     DateTime m_dateTime;
     uint64_t m_lastTick = 0;
     bool m_timeSetFromFirstPlayer = false;

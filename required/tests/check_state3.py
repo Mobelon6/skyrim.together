@@ -1413,31 +1413,56 @@ int main(){
 
 rest=extract('server/Services/CalendarService.cpp','void CalendarService::OnRest(', 'void CalendarService::OnUpdate(')
 days=extract('common/DateTime.cpp','const uint32_t cDayLengthArray','void DateTime::Update(')
-run('existing shared sleep and wait arrival without a second time increment',headers+'''
+run('rest generations, single authoritative arrival and scoped sleep cohort',headers+'''
 #include <cmath>
+#include <map>
+#include <optional>
+#include <vector>
 struct TimeModel{float TimeScale=20.f,Time=12.f;uint32_t Year=201,Month=0,Day=1;};
 struct DateTime{TimeModel m_timeModel;static uint32_t GetNumberOfDaysByMonthIndex(int);};
-struct RequestRestTime{TimeModel Arrival;};
-struct Player{bool party=true,character=true;bool GetCharacter()const{return character;}};
+struct GameId{uint32_t ModId{},BaseId{};explicit operator bool()const{return BaseId!=0;}bool operator==(const GameId&)const=default;};
+struct RequestRestTime{TimeModel Arrival;uint32_t Generation{};GameId Bed{};bool StartSleep{},Slept{};};
+struct ServerTimeSettings{TimeModel timeModel;uint32_t Generation{},Source{};uint8_t SleepPhase{};GameId Bed{};};
+struct CellIdComponent{GameId Cell{0,10},WorldSpaceId{};};
+struct Vec3{float x{},y{},z{};};
+namespace glm{float distance(Vec3 a,Vec3 b){return std::sqrt((a.x-b.x)*(a.x-b.x)+(a.y-b.y)*(a.y-b.y)+(a.z-b.z)*(a.z-b.z));}}
+struct MovementComponent{Vec3 Position;};
+struct Player{uint32_t id{};uint64_t conn=1,epoch=1;bool party=true,character=true;CellIdComponent cell;std::vector<ServerTimeSettings> messages;
+ std::optional<uint32_t> GetCharacter()const{return character?std::optional(id):std::nullopt;}
+ uint32_t GetId()const{return id;}uint64_t GetConnectionId()const{return conn;}uint64_t LocationEpoch()const{return epoch;}
+ const CellIdComponent& GetCellComponent()const{return cell;}void Send(const ServerTimeSettings& m){messages.push_back(m);}
+};
 template<class T>struct PacketEvent{Player* pPlayer;T Packet;};
-struct World{World& GetPartyService(){return *this;}bool GetPlayerParty(Player* p){return p->party;}};
+struct Party{std::vector<Player*> Members;};
+struct World{Party party;std::map<uint32_t,MovementComponent> movement;World& GetPartyService(){return *this;}Party* GetPlayerParty(Player* p){return p->party?&party:nullptr;}template<class T>T* try_get(uint32_t id){auto it=movement.find(id);return it==movement.end()?nullptr:&it->second;}};
 struct CalendarService{
- World m_world;DateTime m_dateTime;int broadcasts=0;void SendTimeResync(bool rest){assert(rest);++broadcasts;}
+ struct SleepPeer{uint32_t Id{};uint64_t Connection{},Location{};};
+ struct SleepCohort{uint64_t Connection{};GameId Bed{},Cell{};std::vector<SleepPeer> Peers;};
+ uint32_t m_restGeneration{};std::map<uint32_t,SleepCohort> m_sleepCohorts;
+ World m_world;DateTime m_dateTime;int broadcasts=0,commits=0;void SendTimeResync(bool rest){++broadcasts;if(rest)++commits;}
  void OnRest(const PacketEvent<RequestRestTime>&)noexcept;
 };
 '''+days+rest+'''
 int main(){
- CalendarService s;Player a,b;
+ CalendarService s;Player a,b,c;a.id=1;b.id=2;c.id=3;c.cell.Cell={0,11};
+ s.m_world.party.Members={&a,&b,&c};s.m_world.movement={{1,{}},{2,{{50,0,0}}},{3,{}}};
  s.m_dateTime.m_timeModel={20.f,23.f,201,11,31};
- TimeModel arrival{99.f,7.f,202,0,1};
- s.OnRest({&a,{arrival}});
+ TimeModel arrival{99.f,7.f,202,0,1};GameId bed{0,50};
+ s.OnRest({&a,{arrival,0,bed,true,false}});
+ assert(b.messages.size()==1&&b.messages[0].SleepPhase==1&&c.messages.empty());
+ s.OnRest({&a,{arrival,0,bed,true,false}});assert(b.messages.size()==1);
+ s.OnRest({&a,{arrival,0,bed,false,true}});
  assert(s.m_dateTime.m_timeModel.Day==1&&s.m_dateTime.m_timeModel.Year==202&&s.m_dateTime.m_timeModel.Time==7.f);
- assert(s.m_dateTime.m_timeModel.TimeScale==20.f&&s.broadcasts==1);
- s.OnRest({&b,{arrival}});assert(s.m_dateTime.m_timeModel.Time==7.f&&s.broadcasts==2);
- s.OnRest({&b,{{1.f,8.f,202,0,3}}});assert(s.m_dateTime.m_timeModel.Time==7.f&&s.m_dateTime.m_timeModel.Day==1);
- s.OnRest({&a,{{1.f,8.f,202,1,30}}});assert(s.broadcasts==3);
- b.party=false;s.OnRest({&b,{{1.f,8.f,202,0,1}}});assert(s.broadcasts==3);
- b.party=true;s.OnRest({&b,{{1.f,9.f,202,0,1}}});assert(s.m_dateTime.m_timeModel.Time==9.f&&s.broadcasts==4);
+ assert(s.m_dateTime.m_timeModel.TimeScale==20.f&&s.commits==1&&s.m_restGeneration==1);
+ assert(b.messages.size()==2&&b.messages.back().SleepPhase==2&&b.messages.back().Generation==0);
+ s.OnRest({&b,{{1.f,9.f,202,0,1},0,bed,false,true}});
+ assert(s.m_dateTime.m_timeModel.Time==7.f&&s.commits==1&&b.messages.size()==2);
+ s.OnRest({&a,{{1.f,8.f,202,0,3},1}});assert(s.commits==1);
+ s.OnRest({&a,{{1.f,8.f,202,1,30},1}});assert(s.commits==1);
+ s.OnRest({&a,{arrival,1,bed,true,false}});++b.epoch;
+ s.OnRest({&a,{{1.f,9.f,202,0,1},1,bed,false,true}});assert(s.commits==2&&b.messages.size()==3);
+ s.OnRest({&a,{{1.f,10.f,202,0,1},2}});assert(s.commits==3&&b.messages.size()==3);
+ b.party=false;s.OnRest({&b,{{1.f,11.f,202,0,1},3}});assert(s.commits==3);
 }
 ''')
 
@@ -2390,7 +2415,7 @@ int main(){
  const auto* mod=I::Storage("alternate start - live another life.esp",201591,"alternate start - live another life.esp",201778);
  assert(mod&&mod->BaseKey().Plugin=="skyrim.esm");
  assert(I::Keeper("skyrim.esm",78438));
- std::istringstream bad("STM-RESIDENCE-POINTS 1\nG invalid\n");assert(!I::Read(bad));
+ std::istringstream bad("bad header");assert(!I::Read(bad));
  TradeLedger ledger(j,81);assert(ledger.Stream()==81);
  TradeProperties::FormKey sword{"skyrim.esm",400},salt{"skyrim.esm",401};
  assert(ledger.InnContainer(11,a)->Items.empty()&&ledger.InnContainer(22,a)->Items.empty());
