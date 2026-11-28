@@ -35,6 +35,7 @@
 #include <mutex>
 #include <Forms/TESObjectCELL.h>
 #include <Forms/TESFaction.h>
+#include <Forms/TESNPC.h>
 #include <ExtraData/ExtraCount.h>
 #include <ExtraData/ExtraHealth.h>
 #include <ExtraData/ExtraCharge.h>
