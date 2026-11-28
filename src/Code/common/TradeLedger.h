@@ -7,6 +7,7 @@
 #include "HomeObjects.h"
 #include "HomePlacement.h"
 #include "HomePermissions.h"
+#include "HomeSharedStorage.h"
 #include <tuple>
 #include <algorithm>
 #include <fstream>
@@ -196,6 +197,28 @@ public:
             count,before,false,std::move(variant)};
         return CommitRow(r,cursor,true);
     }
+    std::optional<HomeSnapshot::Ref> SharedContainer(const HomeSharedStorage::Address& address)
+    {
+        if(!authority||!Stream()||!HomeCityPurchase::NativeContainerRoute(*authority,address.Cell))return {};
+        auto row=HomeSharedStorage::Read(*authority,address);
+        if(!row)return {};
+        auto* items=LoadHome(address.Encode(),authority->Operations().size()+1);
+        if(!items)return {};
+        row->Items.clear();
+        for(const auto& [key,count]:*items)
+        {
+            if(count<0||count>INT32_MAX)return {};
+            if(count)row->Items.push_back({{key.first,key.second},static_cast<uint32_t>(count),key.variant});
+        }
+        return row;
+    }
+    bool CommitShared(uint64_t character,const HomeSharedStorage::Address& address,
+                      const TradeProperties::FormKey& item,std::string variant,int count,int64_t before,uint32_t cursor)
+    {
+        if(!authority||!character||!item.Valid()||!SharedContainer(address))return false;
+        return CommitRow({std::to_string(character),address.Encode(),item.Plugin,item.Local,
+                          count,before,false,std::move(variant)},cursor,true);
+    }
     // The same H receipt and ACK govern inventory and placed objects.
     // A negative receipt creates a new empty account; ACK makes it visible.
     bool CommitPlacement(uint64_t character,uint32_t slot,const TradeProperties::FormKey& item,
@@ -358,6 +381,15 @@ private:
     {
         if (!authority || !account.starts_with("home/")) return nullptr;
         if (auto it=homeStock.find(account);it!=homeStock.end()) return &it->second;
+        if(const auto shared=HomeSharedStorage::Decode(account))
+        {
+            const auto row=HomeSharedStorage::Read(*authority,*shared,beforePosition);
+            if(!row)return nullptr;
+            Items items;
+            for(const auto& item:row->Items)
+                items.emplace(ItemKey{item.Base.Plugin,item.Base.Local,item.Variant},item.Count);
+            return &homeStock.emplace(account,std::move(items)).first->second;
+        }
         const auto sep=account.find('/',5);
         uint32_t slot{};
         if (sep==std::string::npos || !TradeProperties::Number(std::string_view(account).substr(5,sep-5),slot)) return nullptr;

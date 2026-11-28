@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <TradeLedger.h>
+#include <HomeEstateConstruction.h>
 #include <Services/PartyService.h>
 #include <Services/PlayerService.h>
 #include <Messages/RequestCoopInteraction.h>
@@ -118,7 +119,9 @@ void ResetNativeIntents()
 }
 // Only a local scratch reference is passed to ContainerMenu; it is never a
 // real escrow or a peer's actor. IDs are looked up anew, pointers are not retained.
-std::atomic_uint32_t proxyId{}, nativeToken{};
+std::atomic_uint32_t proxyId{}, nativeToken{}, sharedTarget{};
+uint32_t sharedOpening{};
+Clock::time_point sharedOpenUntil{};
 thread_local bool shadowMutation{};
 struct ShadowWrite
 {
@@ -148,13 +151,22 @@ TESObjectREFR* Proxy()
         object->baseForm->formID!=mod->GetFormId(0x810)) return nullptr;
     return object;
 }
+TESObjectREFR* NativeTarget()
+{
+    const auto id=sharedTarget.load();
+    if(!id)return Proxy();
+    auto* ref=Cast<TESObjectREFR>(TESForm::GetById(id));
+    auto* player=PlayerCharacter::Get();
+    return ref&&player&&NativeTrade::IsSharedContainer(ref)&&!ref->IsDisabled()&&!ref->IsDeleted()&&
+        ref->GetParentCellEx()==player->GetParentCellEx()?ref:nullptr;
+}
 bool NativeMenuOpen()
 {
     if (VersionDb::Get().GetLoadedVersionString()!="1.6.1170.0") return false;
     auto* ui=UI::Get();
     if (!ui || !ui->GetMenuOpen("ContainerMenu")) return false;
     auto* target=Address<uint32_t>(405962); // RE::ContainerMenu::GetTargetRefHandle, AE
-    auto* object=Proxy();
+    auto* object=NativeTarget();
     return target && object &&
         *target==object->GetHandle().handle.iBits && *target;
 }
@@ -793,8 +805,71 @@ std::optional<LocalStock> ShadowVariants(TESObjectREFR& object)
     std::erase_if(result,[](const auto& row){return !row.second;});
     return result;
 }
+// The canonical original is a local replica of the durable account.
+// Unlike the empty exchange scratch chest, base inventory counts must be
+// included. Only synchronize after a complete stock reply, never clear it on close.
+std::optional<LocalStock> OriginalStock(TESObjectREFR& object)
+{
+    auto rows=HomeInventory::Capture(object);
+    if(!rows)return {};
+    LocalStock result;
+    for(const auto& row:*rows)
+    {
+        auto* form=ResolvePropertyForm(row.Base);
+        if(!form||!result.emplace(LocalItem{form->formID,row.Variant},static_cast<int>(row.Count)).second)return {};
+    }
+    return result;
+}
+bool SetOriginalStock(TESObjectREFR& object,const LocalStock& desired)
+{
+    const auto current=OriginalStock(object);
+    if(!current)return false;
+    if(*current==desired)return true;
+    std::set<uint32_t> changed;
+    for(const auto& [key,n]:*current)
+        if(!desired.contains(key)||desired.at(key)!=n)changed.insert(key.first);
+    for(const auto& [key,n]:desired)
+    {
+        auto* form=Cast<TESBoundObject>(TESForm::GetById(key.first));
+        const auto props=TradeProperties::Decode(key.second);
+        if(!form||n<=0||!props||!PropertiesAvailable(*props))return false;
+        if(props->Created&&!RecreateEnchant(*props->Created))return false;
+        if(!current->contains(key)||current->at(key)!=n)changed.insert(key.first);
+    }
+    auto* refresh=Address<void(TESObjectREFR*,const TESBoundObject*)>(52849);
+    if(!refresh)return false;
+    {
+        ShadowWrite guard;
+        for(auto id:changed)
+        {
+            auto* form=Cast<TESBoundObject>(TESForm::GetById(id));
+            if(!form)return false;
+            const auto count=object.GetItemCountInInventory(form);
+            if(count<0||count>INT32_MAX)return false;
+            if(count)object.RemoveItem(form,static_cast<int32_t>(count),ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
+            if(object.GetItemCountInInventory(form)!=0)return false;
+        }
+        for(const auto& [key,n]:desired)
+        {
+            if(!changed.contains(key.first))continue;
+            if(!key.second.empty()){if(!ChangeVariant(object,key,n))return false;}
+            else object.AddObjectToContainer(Cast<TESBoundObject>(TESForm::GetById(key.first)),nullptr,n,nullptr);
+        }
+    }
+    const auto updated=OriginalStock(object);
+    if(!updated||*updated!=desired)return false;
+    if(NativeMenuOpen())
+        for(auto id:changed)
+            if(auto* form=Cast<TESBoundObject>(TESForm::GetById(id)))refresh(&object,form);
+    return true;
+}
 bool SetShadow(World&,const LocalStock& desired)
 {
+    if(sharedTarget.load())
+    {
+        auto* object=NativeTarget();
+        return object&&SetOriginalStock(*object,desired);
+    }
     auto* object=Proxy();
     if (!object || !UnownedProxy(*object)) return false;
     auto current=ShadowVariants(*object);
@@ -877,7 +952,7 @@ void MaintainShadow()
 bool OpenNative(World& world)
 {
     if (VersionDb::Get().GetLoadedVersionString()!="1.6.1170.0") return false;
-    auto* object=Proxy();
+    auto* object=NativeTarget();
     auto* ui=UI::Get();
     using Open=void(const TESObjectREFR*,int32_t);
     auto* open=Address<Open>(51140); // RE::TESObjectREFR::OpenContainer, AE
@@ -1625,8 +1700,26 @@ bool NativeTrade::IsProxy(const TESObjectREFR* object) noexcept
     const auto id=proxyId.load();
     return id && object && object->formID==id;
 }
+bool NativeTrade::IsSharedContainer(const TESObjectREFR* object) noexcept
+{
+    try
+    {
+        if(!object||!object->baseForm||object->baseForm->formType!=FormType::Container||
+            object->IsTemporary()||!HomeEstateConstruction::SharedMode()||!World::Exists())return false;
+        const auto mode=CampaignAccess::Mode();
+        if(mode==CampaignReplication::Link::Mode::Disabled)return false;
+        const auto* cell=const_cast<TESObjectREFR*>(object)->GetParentCellEx();
+        if(!cell||cell->worldspace||HomeInstance::PrivateCell(cell->formID)||HomeInstance::NativeGuestCell(cell->formID))return false;
+        const auto* house=HomeCityPurchase::Find(cell->formID);
+        return house&&!house->Parent&&(mode!=CampaignReplication::Link::Mode::Ready||
+            CampaignAccess::NativeSharedCityHome(cell->formID));
+    }
+    catch (...) {return false;}
+}
 bool NativeTrade::BlockAdd(const TESObjectREFR* to,const TESObjectREFR* from) noexcept
 {
+    if(IsSharedContainer(to)||IsSharedContainer(from))
+        return !(shadowMutation&&to&&to->formID==sharedTarget.load()&&!from);
     if (ProtectHome(to) || ProtectHome(from)) return true;
     if (HomeActorProtection::Resident(to) || HomeActorProtection::Resident(from))
         return !(ScopedInventoryOverride::IsOverriden() && !from && HomeActorProtection::Resident(to));
@@ -1636,10 +1729,19 @@ bool NativeTrade::BlockAdd(const TESObjectREFR* to,const TESObjectREFR* from) no
 bool NativeTrade::BlockRemove(const TESObjectREFR* from,const TESObjectREFR* to,
                               const TESBoundObject* item,int32_t count,ExtraDataList* extra) noexcept
 {
-    if (ProtectHome(from) || ProtectHome(to)) return true;
-    if (HomeActorProtection::Resident(from) || HomeActorProtection::Resident(to))
-        return !(ScopedInventoryOverride::IsOverriden() && !to && HomeActorProtection::Resident(from));
-    const bool source=IsProxy(from), destination=IsProxy(to);
+    const bool sharedFrom=IsSharedContainer(from),sharedTo=IsSharedContainer(to);
+    if(sharedFrom||sharedTo)
+    {
+        const auto target=sharedTarget.load();
+        if(!target||(sharedFrom&&from->formID!=target)||(sharedTo&&to->formID!=target))return true;
+    }
+    else
+    {
+        if (ProtectHome(from) || ProtectHome(to)) return true;
+        if (HomeActorProtection::Resident(from) || HomeActorProtection::Resident(to))
+            return !(ScopedInventoryOverride::IsOverriden() && !to && HomeActorProtection::Resident(from));
+    }
+    const bool source=sharedFrom||IsProxy(from), destination=sharedTo||IsProxy(to);
     if (!source && !destination) return false;
     if (shadowMutation && source && !to) return false;
     const auto token=nativeToken.load();
@@ -1820,6 +1922,36 @@ bool OverlayService::TryTrade(uint32_t form) noexcept
         {walletReady=false;pollAt={};}
         return true;
     }
+    if(NativeTrade::IsSharedContainer(object))
+    {
+        if(const auto* lock=object->GetLock();lock&&lock->IsLocked())return false;
+        Wallet w;
+        auto* player=PlayerCharacter::Get();
+        auto* cell=object->GetParentCellEx();
+        if(!player||!cell||player->GetParentCellEx()!=cell||object->IsDisabled()||object->IsDeleted()||
+            !CampaignAccess::NativeSharedCityHome(cell->formID)||!CampaignAccess::TradeEnabled()||
+            !NativeEnabled()||!m_transport.IsOnline()||!w.Load(m_world)||!Ready(w)||session||m_active||sharedOpening)
+        {pollAt={};Utils::ShowHudMessage("Общий сундук: ожидается журнал имущества.");return true;}
+        const auto key=PropertyKey(object->formID),base=PropertyKey(object->baseForm->formID);
+        const auto items=HomeInventory::Capture(*object);
+        if(!key||!base||!items)return true;
+        HomeSnapshot::Ref row;
+        row.Key=*key;row.Base=*base;row.Type=28;row.Inventory=1;row.Scale=object->scale;row.Items=*items;
+        const std::array<float,6> pose{object->position.x,object->position.y,object->position.z,
+            object->rotation.x,object->rotation.y,object->rotation.z};
+        for(size_t i=0;i<pose.size();++i)row.Transform[i]=std::bit_cast<uint32_t>(pose[i]);
+        HomeSnapshot::State seed;seed.Refs.push_back(std::move(row));
+        if(!seed.Valid())return true;
+        PartyTrade request{TradeOp::HomeOpen,0,0,w.Cursor(),0,w.Stream()};
+        if(!m_world.GetModSystem().GetServerModId(object->formID,request.Item))return true;
+        const auto bytes=seed.Encode();
+        // Existing accounts need no replacement baseline; the server ignores
+        // a proposed snapshot once one exists. Bound the initial native payload.
+        if(bytes.size()<=1400)request.Text=bytes.c_str();
+        if(Send(request)){sharedOpening=form;sharedOpenUntil=Clock::now()+5s;}
+        else Utils::ShowHudMessage("Не удалось открыть общий сундук.");
+        return true;
+    }
     if (auto home=ManagedHome(object))
     {
         Wallet w;
@@ -1897,6 +2029,7 @@ void OverlayService::ClearTrade() noexcept
     ResetNativeIntents();takeAllRegistered=false;
     shadowCleanupPending=true;cleanupRetry={};
     if (nativeRequested && CampaignAccess::GameReady()) NativeHide();
+    sharedTarget.store(0);sharedOpening=0;sharedOpenUntil={};
     nativeRequested=nativeOpened=stockComplete=false;
     nativeDeadline={};stockRemaining=0;incomingStock.clear();
     if (session && m_pOverlay) m_pOverlay->ExecuteAsync("hideTrade");
@@ -2082,6 +2215,7 @@ void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
     }
     if (e.Op==TradeOp::Error)
     {
+        sharedOpening=0;sharedOpenUntil={};
         ResetNativeIntents();walletReady=false;pollAt={};
         Utils::ShowHudMessage("Сервер не подтвердил операцию обмена.");return;
     }
@@ -2089,6 +2223,15 @@ void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
     {
         if (!Ready(w) || (session && session!=e.Session) || m_promptOpen || m_showingProgress || m_observerCamera || (GetActive() && !ownsUI))
         {Send({TradeOp::Close,e.Peer,e.Session});return;}
+        if(e.Op==TradeOp::Open&&e.Item.BaseId)
+        {
+            const auto form=m_world.GetModSystem().GetGameId(e.Item);
+            auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
+            if(!sharedOpening||form!=sharedOpening||!NativeTrade::IsSharedContainer(object)||!NativeEnabled())
+            {Send({TradeOp::Close,e.Peer,e.Session});return;}
+            sharedTarget.store(form);sharedOpening=0;sharedOpenUntil={};
+        }
+        else if(sharedOpening){Send({TradeOp::Close,e.Peer,e.Session});return;}
         session=e.Session;peer=e.Peer;partner=e.Text.c_str();tradeOpen=e.Op==TradeOp::Open;
         if (tradeOpen && NativeEnabled())
         {
@@ -2128,6 +2271,7 @@ void OverlayService::UpdateTrade() noexcept
             (rescue.awaiting && Clock::now() >= rescue.deadline))
             CloseRescue();
     }
+    if(sharedOpening&&Clock::now()>=sharedOpenUntil){sharedOpening=0;sharedOpenUntil={};}
     MaintainShadow();
     HomePlacementClient::Update(m_world);
     if (receiptFailure || !m_transport.IsOnline() || !m_inGame || !CampaignAccess::GameReady())

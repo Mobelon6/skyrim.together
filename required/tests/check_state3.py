@@ -1282,7 +1282,7 @@ struct TESObjectREFR:TESForm{
 TESForm* TESForm::GetById(uint32_t id){return id==1?&door:nullptr;}
 struct TESFaction{struct{TESObjectREFR* playerInventoryContainer{};TESObjectREFR* stolenGoodsContainer{};}crimeData;};
 struct ModManager{std::vector<TESFaction*> factions;static ModManager* Get(){static ModManager m;return &m;}};
-namespace NativeTrade{bool IsProxy(const TESObjectREFR* p){return p==&proxy;}}
+namespace NativeTrade{bool IsProxy(const TESObjectREFR* p){return p==&proxy;}bool IsSharedContainer(const TESObjectREFR* p){return p==&stashA;}}
 namespace CampaignReplication{struct Link{enum class Mode{Ready,Disabled,Faulted};};}
 namespace CampaignAccess{auto mode=CampaignReplication::Link::Mode::Disabled;auto Mode(){return mode;}}
 namespace HomeInstance{bool ManagedCell(uint32_t id){return id==99;}}
@@ -2162,3 +2162,55 @@ shared_object_assign=extract('client/Services/Generic/ObjectService.cpp',
 assert 'if (HomeInstance::ManagedCell(pCell->formID)) return;' in shared_object_assign
 assert 'if (!World::Get().GetServerSettings().SyncPlayerHomes && IsPlayerHome(pCell))' in shared_object_assign
 assert 'HomeInstance::ManagedCell(cell->formID)) continue;' in (code/'client/Services/Generic/ObjectService.cpp').read_text()
+
+
+# Existing trade cursor and journal, canonical original container rather
+# than a legacy per-owner house instance. Exercise actual receipt code.
+run('durable shared city storage: two players, one balance, restart and older cursor',headers+'''
+#include <TradeLedger.h>
+#include <filesystem>
+int main(){
+ namespace C=HomeCityPurchase;namespace S=HomeSharedStorage;
+ const auto path=std::filesystem::temp_directory_path()/"stm-shared-city-stock";
+ std::filesystem::remove_all(path);
+ CampaignJournal::Journal j;assert(j.Open(path,71,"test",true));
+ S::Address a{C::Houses[0].Cell,{"skyrim.esm",12345}};
+ TradeProperties::FormKey sword{"skyrim.esm",400};
+ HomeSnapshot::Ref r;r.Key=a.Ref;r.Base={"skyrim.esm",500};r.Type=28;r.Inventory=1;r.Scale=100;
+ r.Items.push_back({sword,1,{}});
+ HomeSnapshot::State seed;seed.Refs.push_back(r);
+ assert(!S::Seed(j,a,seed.Encode()));
+ assert(C::Publish(j,{a.Cell,0,5000,11,C::Action::Reserve}));
+ auto reserved=C::Read(j,a.Cell);
+ assert(reserved&&C::Publish(j,{a.Cell,reserved->Revision,5000,11,C::Action::Confirm}));
+ assert(S::Seed(j,a,seed.Encode()));
+ auto rev=j.Current();
+ seed.Refs[0].Items[0].Count=99;assert(S::Seed(j,a,seed.Encode())&&j.Current()==rev);
+ TradeLedger ledger(j,71);assert(ledger.Stream()==71);
+ auto stock=ledger.SharedContainer(a);assert(stock&&stock->Items.size()==1&&stock->Items[0].Count==1);
+ assert(ledger.CommitShared(11,a,sword,"",1,0,0));
+ assert(!ledger.CommitShared(22,a,sword,"",1,0,0));
+ assert(ledger.Ack("11",1));
+ assert(ledger.CommitShared(22,a,sword,"",-1,3,0));
+ assert(ledger.SharedContainer(a)->Items.empty()); // deposit not spendable before receipt ACK
+ assert(ledger.Ack("22",1));
+ assert(ledger.SharedContainer(a)->Items[0].Count==1);
+ assert(!ledger.CommitShared(22,a,sword,"",-1,3,0)); // stale cursor
+ CampaignJournal::Journal reload;assert(reload.Open(path,71,"test",false));
+ TradeLedger after(reload,71);
+ assert(after.Stream()==71&&after.AcceptCursor("11",71,0));
+ assert(after.MatchesReceipt("11",71,0,1,"skyrim.esm",400,1,0));
+ assert(after.Ack("11",1)&&after.SharedContainer(a)->Items[0].Count==1);
+ assert(after.CommitShared(11,a,sword,"",1,1,1));
+ assert(after.SharedContainer(a)->Items.empty());
+ assert(!after.CommitShared(22,a,sword,"",1,2,1));
+ std::filesystem::remove_all(path);
+}
+''',['-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp'),str(code/'common/QuestJournalDisk.cpp')])
+shared_trade_client=(code/'client/Services/Generic/PartyTrade.cpp').read_text()
+shared_trade_server=(code/'server/Services/PartyTrade.cpp').read_text()
+assert 'object&&SetOriginalStock(*object,desired)' in shared_trade_client
+assert 'open(object,0)' in shared_trade_client and 'auto* object=NativeTarget();' in shared_trade_client
+assert 'ledger.CommitShared(h.Character' in shared_trade_server
+assert 'HomeSharedStorage::Seed(j,address,bytes)' in shared_trade_server
+assert 'NativeTrade::IsSharedContainer(pObject)) continue;' in (code/'client/Services/Generic/ObjectService.cpp').read_text()

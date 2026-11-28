@@ -95,7 +95,7 @@ Set<const TESObjectREFR*> GetPlayerStashContainers() noexcept
 
 bool ShouldSyncObject(const TESObjectREFR* apObject, const Set<const TESObjectREFR*>& acPlayerStashContainers) noexcept
 {
-    if (!apObject || NativeTrade::IsProxy(apObject))
+    if (!apObject || NativeTrade::IsProxy(apObject) || NativeTrade::IsSharedContainer(apObject))
         return false;
 
     if (acPlayerStashContainers.contains(apObject))
@@ -238,6 +238,7 @@ void ObjectService::OnAssignObjectsResponse(const AssignObjectsResponse& acMessa
         }
 
         if (auto* cell=pObject->GetParentCellEx();cell && HomeInstance::ManagedCell(cell->formID)) continue;
+        if (NativeTrade::IsSharedContainer(pObject)) continue; // never overwrite durable stock with a transient snapshot
         CreateObjectEntity(pObject->formID, objectData.ServerId);
 
         if (objectData.IsSenderFirst)

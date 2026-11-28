@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <InventoryEvidence.h>
 #include <Services/HomeVisit.h>
+#include <HomeEstateConstruction.h>
 
 namespace
 {
@@ -17,7 +18,7 @@ using Clock=std::chrono::steady_clock;
 using namespace std::chrono_literals;
 struct Session {uint32_t a,b; bool open{}; Clock::time_point expires; std::string accountA,accountB;};
 std::map<uint32_t,Session> sessions;
-struct HomeSession {uint32_t Connection{},Slot{};uint64_t Character{};TradeProperties::FormKey Ref;Clock::time_point Until;};
+struct HomeSession {uint32_t Connection{},Slot{};uint64_t Character{};TradeProperties::FormKey Ref;Clock::time_point Until;uint32_t SharedCell{};};
 std::map<uint32_t,HomeSession> homeSessions;
 uint32_t serial{};
 TradeLedger legacy("config/CoopTrade");
@@ -94,6 +95,19 @@ void ShowStock(TradeLedger& ledger,Player& p,Player& q,uint32_t session)
 std::optional<HomeSnapshot::Ref> HomeContainer(TradeLedger& ledger,World& world,Player& player,const HomeSession& h)
 {
     const auto& cell=player.GetCellComponent();
+    if(h.SharedCell)
+    {
+        if(!HomeEstateConstruction::SharedMode()||h.Connection!=player.GetId()||
+            h.Character!=CampaignAccess::Character(player)||!player.GetCharacter()||
+            cell.WorldSpaceId||HomeScope::Private(cell.Cell.ModId)||cell.Cell.BaseId!=h.SharedCell||
+            InventoryEvidence::CanonicalPlugin(Plugin(world,cell.Cell.ModId))!="skyrim.esm"||
+            !world.GetPartyService().GetPlayerParty(&player))return {};
+        auto row=ledger.SharedContainer({h.SharedCell,h.Ref});
+        const auto* movement=world.try_get<MovementComponent>(*player.GetCharacter());
+        if(!row||!movement)return {};
+        const glm::vec3 pos{std::bit_cast<float>(row->Transform[0]),std::bit_cast<float>(row->Transform[1]),std::bit_cast<float>(row->Transform[2])};
+        return glm::distance(movement->Position,pos)<=420.f?row:std::nullopt;
+    }
     if (h.Connection!=player.GetId() || h.Character!=CampaignAccess::Character(player) ||
         !HomeVisit::CanEnter(player,cell.Cell.ModId,cell.Cell.BaseId) ||
         (cell.Cell.ModId&HomeRegistry::MaxSlot)!=h.Slot || !player.GetCharacter()) return {};
@@ -299,6 +313,39 @@ void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexc
             {Send(p,{TradeOp::Error,0,0});return;}
             next();return;
         }
+        if(e.Op==TradeOp::HomeOpen&&e.Peer==0)
+        {
+            if(!campaign||!HomeEstateConstruction::SharedMode()||e.Session||e.Count||
+                !e.Item.BaseId||ActiveAccount(user)||ledger.HasOutstanding(user)||
+                e.Text.size()>1400||!m_world.GetPartyService().GetPlayerParty(&p))return;
+            const auto& cell=p.GetCellComponent();
+            if(cell.WorldSpaceId||HomeScope::Private(cell.Cell.ModId)||
+                InventoryEvidence::CanonicalPlugin(Plugin(m_world,cell.Cell.ModId))!="skyrim.esm")return;
+            const auto character=CampaignAccess::Character(p);
+            HomeSharedStorage::Address address{cell.Cell.BaseId,
+                {InventoryEvidence::CanonicalPlugin(Plugin(m_world,e.Item.ModId)),e.Item.BaseId}};
+            auto& j=link.Journal;
+            if(!HomeCityPurchase::NativeContainerRoute(j,address.Cell)||!address.Ref.Valid()||!character)return;
+            if(!HomeSharedStorage::Read(j,address))
+            {
+                const std::string_view bytes(e.Text.data(),e.Text.size());
+                const auto row=HomeSharedStorage::Validate(address,bytes);
+                const auto* movement=m_world.try_get<MovementComponent>(*p.GetCharacter());
+                if(!row||!movement)return;
+                const glm::vec3 pos{std::bit_cast<float>(row->Transform[0]),std::bit_cast<float>(row->Transform[1]),std::bit_cast<float>(row->Transform[2])};
+                if(glm::distance(movement->Position,pos)>420.f||
+                    !HomeSharedStorage::Seed(j,address,bytes))
+                {Send(p,{TradeOp::Error,0,0});return;}
+            }
+            HomeSession h{id,0,character,address.Ref,now+20s,address.Cell};
+            auto container=HomeContainer(ledger,m_world,p,h);
+            if(!container){Send(p,{TradeOp::Error,0,0});return;}
+            do{if(!++serial)++serial;}while(sessions.count(serial)||homeSessions.count(serial));
+            homeSessions.emplace(serial,std::move(h));
+            PartyTrade open{TradeOp::Open,0,serial,0,0,uuid};
+            open.Item=e.Item;open.Text="Общий сундук";Send(p,open);
+            ShowHomeStock(p,serial,*container);return;
+        }
         if (e.Op==TradeOp::HomeOpen)
         {
             if (!campaign || e.Session || e.Count || !e.Peer || e.Peer>HomeRegistry::MaxSlot ||
@@ -330,8 +377,11 @@ void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexc
                 auto plugin=Plugin(m_world,e.Item.ModId);
                 TradeProperties::FormKey key{InventoryEvidence::CanonicalPlugin(plugin),e.Item.BaseId};
                 const std::string variant(e.Variant.data(),e.Variant.size());
-                if (!ledger.Ack(user,e.Cursor) || !ledger.CommitHome(h.Character,h.Slot,h.Ref,key,variant,
-                    (e.Op==TradeOp::Take?1:-1)*int(e.Count),int64_t(e.BeforePlusOne)-1,e.Cursor))
+                const auto count=(e.Op==TradeOp::Take?1:-1)*int(e.Count);
+                const auto before=int64_t(e.BeforePlusOne)-1;
+                if (!ledger.Ack(user,e.Cursor) || !(h.SharedCell?
+                    ledger.CommitShared(h.Character,{h.SharedCell,h.Ref},key,variant,count,before,e.Cursor):
+                    ledger.CommitHome(h.Character,h.Slot,h.Ref,key,variant,count,before,e.Cursor)))
                     Send(p,{TradeOp::Error,0,e.Session});
                 next();
             }
