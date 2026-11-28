@@ -1950,7 +1950,7 @@ int main(){
  auto restored=City::Read(reload,a.Cell);assert(restored&&restored->Status==City::Phase::Purchased&&restored->Buyer==11);
  std::filesystem::remove_all(root);
 }
-''',('-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp')))
+''',('-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp'),str(code/'common/QuestJournalDisk.cpp')))
 city_client=(code/'client/Services/Generic/PartyHome.cpp').read_text()
 city_vm=(code/'client/Games/Misc/BSScript.cpp').read_text()
 city_inv=(code/'client/Games/Skyrim/TESObjectREFR.cpp').read_text()

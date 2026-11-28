@@ -1508,6 +1508,7 @@ struct CityPending
     uint32_t Cell{},Info{},Target{},Cost{},Expected{},Paid{};
     bool Started{},Replay{},Waive{},Warned{};
     Clock::time_point Deadline{},Next{};
+    int64_t GoldBefore{};
 };
 CityPending cityPending;
 std::set<uint32_t> cityAttempted;
@@ -1557,11 +1558,31 @@ void UpdateCityHomes(World& world)
 {
     RefreshCityEpoch();
     if(!HomeEstateConstruction::SharedMode()||world.IsLoadingSave()||
-        !CampaignAccess::GameReady()||!world.GetPartyService().IsInParty()||
-        !world.GetTransport().IsOnline()||!CityHomeClient::NativeReady())return;
+        !CampaignAccess::GameReady()||!CityHomeClient::NativeReady())return;
+    const auto now=Clock::now();
+    if(cityPending.Started)
+    {
+        const auto* house=City::Find(cityPending.Cell);
+        const bool finished=house&&CityHomeClient::ReadNative(cityPending.Cell)==CityHomeClient::Local::Owned&&
+            CityHasKey(*house)&&(cityPending.Waive?
+                cityPending.Paid==0&&CityGold()==cityPending.GoldBefore:cityPending.Paid==cityPending.Cost);
+        // Native execution can finish even if the transport is lost. Never
+        // keep the save guard armed merely because a journal ACK is delayed.
+        if(finished)
+        {
+            cityWaive.store(0,std::memory_order_release);
+            cityActiveEpoch.store(0,std::memory_order_release);
+            if(cityPending.Replay){ClearCityPending();return;}
+        }
+        else if(now>=cityPending.Deadline)
+        {
+            Utils::ShowHudMessage("Не удалось подтвердить покупку дома. Проверьте сохранение.");
+            cityAttempted.insert(cityPending.Cell);ClearCityPending();return;
+        }
+    }
+    if(!world.GetPartyService().IsInParty()||!world.GetTransport().IsOnline())return;
     const auto identity=CampaignAccess::Current(world);
     if(!identity)return;
-    const auto now=Clock::now();
     if(cityPending.Cell&&(cityPending.Campaign!=identity->Save.Campaign||
         cityPending.Character!=identity->Save.Character)){ClearCityPending();cityAttempted.clear();}
     if(cityPending.Cell)
@@ -1577,7 +1598,7 @@ void UpdateCityHomes(World& world)
         {
             if(local==CityHomeClient::Local::Owned&&CityHasKey(*house))
             {
-                const bool validDebit=p.Waive?p.Paid==0:p.Paid==p.Cost;
+                const bool validDebit=p.Waive?p.Paid==0&&CityGold()==p.GoldBefore:p.Paid==p.Cost;
                 if(!validDebit)
                 {
                     if(now<p.Deadline)return; // inventory receipt can be queued after the native readback
@@ -1615,7 +1636,7 @@ void UpdateCityHomes(World& world)
             CityPrice(*house)!=p.Cost||CityGold()<p.Cost||now>=p.Deadline)
         {SendCity(world,*identity,*state,p.Cell,state->Cost,City::Action::Cancel);ClearCityPending();return;}
         auto* menu=MenuTopicManager::Get();
-        p.Started=true;p.Deadline=now+30s;
+        p.Started=true;p.Deadline=now+30s;p.GoldBefore=CityGold();
         cityActiveEpoch.store(cityEpoch,std::memory_order_release);
         if(!menu||!menu->ResumeCityHomePurchase(p.Target,p.Info))
         {SendCity(world,*identity,*state,p.Cell,state->Cost,City::Action::Cancel);ClearCityPending();}
@@ -1644,6 +1665,7 @@ void UpdateCityHomes(World& world)
         cityPending={identity->Save.Campaign,identity->Save.Character,cityEpoch,
             house.Cell,0,0,state->Cost,state->Revision,0,true,true,waive,false,now+30s,now+1s};
         cityAttempted.insert(house.Cell);
+        cityPending.GoldBefore=CityGold();
         cityActiveEpoch.store(cityEpoch,std::memory_order_release);
         if(waive)cityWaive.store(house.Cell,std::memory_order_release);
         if(!CityHomeClient::DispatchNative(house.Cell))
