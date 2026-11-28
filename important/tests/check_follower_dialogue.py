@@ -10,6 +10,7 @@ common = (root.parent.parent / "common").resolve()
 mocks = r"""
 #include <cassert>
 #include <QuestPickupPermit.h>
+#include <HomeCityPurchase.h>
 #include <cmath>
 #include <optional>
 #include <cstdint>
@@ -24,12 +25,14 @@ TESObjectREFR* TESObjectREFR::pick=nullptr;
 struct PlayerCharacter:TESObjectREFR{static PlayerCharacter* Get(){static PlayerCharacter p;return &p;}};
 struct TESQuest:TESForm{};
 static bool defer=false;
+namespace CityHomeClient { bool defer=false; bool DeferPurchase(uint32_t quest,uint32_t info,uint32_t npc) noexcept {return defer&&quest==HomeCityPurchase::Quest&&HomeCityPurchase::FromInfo(info)&&npc==10;} }
 bool DeferSharedQuestTurnIn(uint32_t quest,uint32_t item,uint32_t npc,uint32_t info) noexcept{return defer&&quest==100&&item==200&&npc==10&&info==49;}
 struct TESTopicInfo:TESForm{TESForm* parentTopic{};TESCondition conditions;};
 struct MenuTopicManager{struct Opt{const char* text;TESTopicInfo* info;TESForm* quest{};};std::vector<Opt*>* pOptions;Handle speaker;bool menuOpen{};
  static MenuTopicManager* Get(){static MenuTopicManager m{};return &m;}bool IsDialogueOpen() const noexcept{return menuOpen;}bool IsCurrentSpeaker(const Handle& h)const noexcept{return menuOpen&&h.handle.iBits==speaker.handle.iBits;}
  bool OffersHire()const noexcept;bool ResumeHire(int32_t,uint32_t,uint32_t) noexcept;
- bool ResumeQuestTurnIn(uint32_t,uint32_t,uint32_t,uint32_t) noexcept;};
+ bool ResumeQuestTurnIn(uint32_t,uint32_t,uint32_t,uint32_t) noexcept;
+ bool ResumeCityHomePurchase(uint32_t,uint32_t) noexcept;};
 struct PlayerDialogueEvent{std::string text;unsigned handle;unsigned info;unsigned quest;};
 struct OverlayService{static inline unsigned holder{};static bool FollowerBusy(unsigned id){return holder==id;}
  static inline int hires{};bool BeginHire(unsigned,unsigned,int){++hires;return true;}};
@@ -81,6 +84,12 @@ int main(){
  defer=true;assert(!HookPlayDialogueOption(m,0)&&played==2);
  assert(!m->ResumeQuestTurnIn(10,49,100,201)&&played==2);
  assert(m->ResumeQuestTurnIn(10,49,100,200)&&played==3);
+ defer=false;quest.formID=HomeCityPurchase::Quest;info.formID=HomeCityPurchase::Houses[0].Info;
+ CityHomeClient::defer=true;assert(!HookPlayDialogueOption(m,0)&&played==3);
+ assert(!m->ResumeCityHomePurchase(999,info.formID)&&!m->ResumeCityHomePurchase(10,1234)&&played==3);
+ assert(m->ResumeCityHomePurchase(10,info.formID)&&played==4);
+ assert(w.sent.back().quest==HomeCityPurchase::Quest&&w.sent.back().info==info.formID);
+ CityHomeClient::defer=false;assert(HookPlayDialogueOption(m,0)&&played==5);
 }
 """
 with tempfile.TemporaryDirectory() as folder:

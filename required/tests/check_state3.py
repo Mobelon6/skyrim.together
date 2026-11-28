@@ -1565,6 +1565,9 @@ adds=extract('client/Games/Skyrim/TESObjectREFR.cpp','void TP_MAKE_THISCALL(Hook
 removes=extract('client/Games/Skyrim/TESObjectREFR.cpp','BSPointerHandle<TESObjectREFR>*\nTP_MAKE_THISCALL(HookRemoveInventoryItem,','void TP_MAKE_THISCALL(HookRotateX,')
 run('confirmed native inventory deltas and nested pickup guard',headers+'''
 #include <QuestPickupInventoryScope.h>
+#include <HomeCityPurchase.h>
+namespace CityHomeClient {uint32_t context{},waive{},paid{};uint32_t ChargeContext(){return context;}bool SkipCharge(uint32_t cell){return cell==waive;}void ObservedDebit(uint32_t cell,uint32_t count,uint64_t epoch){assert(cell==context&&epoch==1);paid+=count;}}
+uint64_t ScriptedTravelEpoch(){return 1;}
 #define TP_MAKE_THISCALL(name,cls,...) name(cls* apThis,__VA_ARGS__)
 struct TESBoundObject{uint32_t formID=40;};
 struct ExtraDataList{bool quest{};};
@@ -1586,7 +1589,8 @@ bool BlockRemove(TESObjectREFR*,TESObjectREFR*,TESBoundObject*,int32_t,ExtraData
 namespace HomePlacementClient{bool InterceptDrop(TESObjectREFR*,TESBoundObject*,ExtraDataList*,int32_t,const NiPoint3*,const NiPoint3*){return false;}}
 namespace spdlog{template<class...T>void debug(T&&...){}}
 struct ModSystem{void GetServerModId(uint32_t a,uint32_t& b){b=a;}};
-struct World{ModSystem mods;static World& Get(){static World w;return w;}ModSystem& GetModSystem(){return mods;}};
+struct World{ModSystem mods;static World& Get(){static World w;return w;}ModSystem& GetModSystem(){return mods;}
+ struct Runner{template<class F>void Queue(F f){f();}} runner;Runner& GetRunner(){return runner;}};
 struct QuestRewardAddObservation{QuestRewardAddObservation(TESObjectREFR*,TESBoundObject*,ExtraDataList*,int32_t,TESObjectREFR*){}};
 void QuestRewardInventoryTouched(TESObjectREFR*,uint32_t) noexcept {}
 bool NativeQuestTransfer(TESObjectREFR*,ITEM_REMOVE_REASON,const InventoryChangeEvent&){return false;}
@@ -1615,6 +1619,12 @@ int main(){
    assert(QuestPickupInventory::IsNestedAdd(player->formID,item.formID));}
  assert(!QuestPickupInventory::IsNestedAdd(player->formID,item.formID));
  player->remove=0;remove(2);assert(sent.size()==4&&player->count==1);
+ // The actual removal hook must waive only the replay's scoped gold debit.
+ item.formID=HomeCityPurchase::Gold;player->count=100;player->remove=20;
+ CityHomeClient::context=HomeCityPurchase::Houses[0].Cell;CityHomeClient::waive=CityHomeClient::context;
+ const int calls=player->calls;assert(remove(20)==&out);assert(player->count==100&&player->calls==calls&&CityHomeClient::paid==0&&sent.size()==4);
+ CityHomeClient::waive=0;remove(20);assert(player->count==80&&CityHomeClient::paid==20&&sent.size()==5);
+ CityHomeClient::context=0;remove(20);assert(player->count==60&&CityHomeClient::paid==20&&sent.size()==6);
 }
 ''',['-I'+str(code/'common')])
 server_inventory=(code/'server/Services/InventoryService.cpp').read_text()
