@@ -1513,6 +1513,7 @@ struct CityPending
 CityPending cityPending;
 std::set<uint32_t> cityAttempted;
 uint64_t cityEpoch{};
+Clock::time_point cityPoll{};
 std::atomic_uint64_t cityActiveEpoch{};
 std::atomic_uint32_t cityWaive{};
 void ClearCityPending()
@@ -1524,7 +1525,7 @@ void ClearCityPending()
 void RefreshCityEpoch()
 {
     const auto epoch=ScriptedTravelEpoch();
-    if(cityEpoch!=epoch){ClearCityPending();cityAttempted.clear();cityEpoch=epoch;}
+    if(cityEpoch!=epoch){ClearCityPending();cityAttempted.clear();cityEpoch=epoch;cityPoll={};}
 }
 uint32_t CityPrice(const City::House& house)
 {
@@ -1541,8 +1542,17 @@ int64_t CityGold()
 }
 bool CityHasKey(const City::House& house)
 {
-    auto* p=PlayerCharacter::Get();auto* key=TESForm::GetById(house.Key);
+    const auto* property=City::Find(house.Property());
+    auto* p=PlayerCharacter::Get();auto* key=property?TESForm::GetById(property->Key):nullptr;
     return p&&key&&p->GetItemCountInInventory(key)>0;
+}
+bool CityDebitConfirmed(const CityPending& p,const City::House& house)
+{
+    if(p.Waive)return p.Paid==0&&CityGold()==p.GoldBefore;
+    // Actual scoped debit is preferred. For the verified ordinary TIFs the
+    // selected operation + new marker readback + exact native gold delta is
+    // also sufficient if the VM did not expose a persistent INFO handle.
+    return p.Paid==p.Cost||(house.Parent&&!p.Paid&&p.GoldBefore-CityGold()==p.Cost);
 }
 bool SendCity(World& world,const CampaignAccess::Identity& id,const City::State& state,
     uint32_t cell,uint32_t cost,City::Action action)
@@ -1564,8 +1574,7 @@ void UpdateCityHomes(World& world)
     {
         const auto* house=City::Find(cityPending.Cell);
         const bool finished=house&&CityHomeClient::ReadNative(cityPending.Cell)==CityHomeClient::Local::Owned&&
-            CityHasKey(*house)&&(cityPending.Waive?
-                cityPending.Paid==0&&CityGold()==cityPending.GoldBefore:cityPending.Paid==cityPending.Cost);
+            CityHasKey(*house)&&CityDebitConfirmed(cityPending,*house);
         // Native execution can finish even if the transport is lost. Never
         // keep the save guard armed merely because a journal ACK is delayed.
         if(finished)
@@ -1598,7 +1607,7 @@ void UpdateCityHomes(World& world)
         {
             if(local==CityHomeClient::Local::Owned&&CityHasKey(*house))
             {
-                const bool validDebit=p.Waive?p.Paid==0&&CityGold()==p.GoldBefore:p.Paid==p.Cost;
+                const bool validDebit=CityDebitConfirmed(p,*house);
                 if(!validDebit)
                 {
                     if(now<p.Deadline)return; // inventory receipt can be queued after the native readback
@@ -1642,8 +1651,11 @@ void UpdateCityHomes(World& world)
         {SendCity(world,*identity,*state,p.Cell,state->Cost,City::Action::Cancel);ClearCityPending();}
         return;
     }
-    for(const auto& house:City::Houses)
+    if(now<cityPoll)return;
+    cityPoll=now+1s;
+    for(const auto* op:City::All)
     {
+        const auto& house=*op;
         if(cityAttempted.contains(house.Cell))continue;
         const auto state=CampaignAccess::CityHome(identity->Save.Campaign,house.Cell);
         if(!state||state->Status==City::Phase::Free)continue;
@@ -1667,7 +1679,21 @@ void UpdateCityHomes(World& world)
         cityAttempted.insert(house.Cell);
         cityPending.GoldBefore=CityGold();
         cityActiveEpoch.store(cityEpoch,std::memory_order_release);
-        if(waive)cityWaive.store(house.Cell,std::memory_order_release);
+        if(waive&&!house.Parent)cityWaive.store(house.Cell,std::memory_order_release);
+        if(house.Parent&&!waive)
+        {
+            // Recover a missing, previously paid non-replaceable decoration
+            // in the payer's older ESS; its ordinary gold debit happens once
+            // before the exact native marker actions.
+            auto* p=PlayerCharacter::Get();
+            auto* gold=Cast<TESBoundObject>(TESForm::GetById(City::Gold));
+            if(!p||!gold||CityGold()<state->Cost)
+            {ClearCityPending();return;}
+            p->RemoveItem(gold,static_cast<int32_t>(state->Cost),ITEM_REMOVE_REASON::kRemove,nullptr,nullptr);
+            if(cityPending.GoldBefore-CityGold()!=state->Cost)
+            {ClearCityPending();return;}
+            cityPending.Paid=state->Cost;
+        }
         if(!CityHomeClient::DispatchNative(house.Cell))
         {
             ClearCityPending();
@@ -1788,12 +1814,20 @@ void CityHomeClient::ObservedDebit(uint32_t cell,uint32_t amount,uint64_t epoch)
     if(epoch==cityEpoch&&cityPending.Started&&cityPending.Cell==cell&&amount<=UINT32_MAX-cityPending.Paid)
         cityPending.Paid+=amount;
 }
+uint32_t CityHomeClient::OperationForInfo(uint32_t info) noexcept
+{
+    if(const auto* op=City::FromInfo(info))return op->Cell;
+    for(const auto& op:City::Furniture)
+        if(op.Hearthfire&&CatalogForm({"hearthfires.esm",op.Info})==info&&info)
+            return op.Cell;
+    return 0;
+}
 bool CityHomeClient::DeferPurchase(uint32_t quest,uint32_t info,uint32_t target) noexcept
 {
     try
     {
         if(quest!=City::Quest||!HomeEstateConstruction::SharedMode())return false;
-        const auto* house=City::FromInfo(info);if(!house)return false;
+        const auto* house=City::Find(OperationForInfo(info));if(!house)return false;
         if(CampaignAccess::Mode()==CampaignReplication::Link::Mode::Disabled)return false;
         auto& world=World::Get();RefreshCityEpoch();
         auto identity=CampaignAccess::Current(world);
@@ -1802,6 +1836,12 @@ bool CityHomeClient::DeferPurchase(uint32_t quest,uint32_t info,uint32_t target)
         if(cityPending.Cell||cityAttempted.contains(house->Cell))
         {Utils::ShowHudMessage("Дождитесь завершения покупки дома.");return true;}
         const auto state=CampaignAccess::CityHome(identity->Save.Campaign,house->Cell);
+        if(house->Parent)
+        {
+            const auto property=CampaignAccess::CityHome(identity->Save.Campaign,house->Parent);
+            if(!property||property->Status!=City::Phase::Purchased||!CityHasKey(*house))
+            {Utils::ShowHudMessage("Сначала завершите общую покупку дома.");return true;}
+        }
         const auto cost=CityPrice(*house);
         if(!state||!cost||ReadNative(house->Cell)!=Local::Unowned||CityGold()<cost)
         {Utils::ShowHudMessage("Покупка дома недоступна.");return true;}

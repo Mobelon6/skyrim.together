@@ -149,7 +149,7 @@ bool MenuTopicManager::ResumeQuestTurnIn(uint32_t target,uint32_t info,uint32_t 
 bool MenuTopicManager::ResumeCityHomePurchase(uint32_t target,uint32_t info) noexcept
 {
     const auto* npc=TESObjectREFR::GetByHandle(speaker.handle.iBits);
-    if(!IsDialogueOpen()||!pOptions||!npc||npc->formID!=target||!HomeCityPurchase::FromInfo(info))return false;
+    if(!IsDialogueOpen()||!pOptions||!npc||npc->formID!=target||!CityHomeClient::OperationForInfo(info))return false;
     int index=-1;
     for(auto* opt:*pOptions)
     {

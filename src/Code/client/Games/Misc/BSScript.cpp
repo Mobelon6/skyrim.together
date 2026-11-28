@@ -247,6 +247,34 @@ bool FrameIsHouseQuest(const DragonFrameView* frame,BSScript::IObjectHandlePolic
     return h&&policy->HandleIsType(questFormType,h)&&policy->IsHandleObjectAvailable(h)&&
         policy->GetObjectForHandle(questFormType,h)==HouseQuest();
 }
+// Exact native REFR operations used by the non-replaceable TIF fragments.
+struct DecorRefs{TESObjectREFR* Marker{};TESObjectREFR* Old{};};
+DecorRefs CityDecorRefs(const HomeCityPurchase::House& house)
+{
+    auto get=[](uint32_t id)->TESObjectREFR*{
+        auto* ref=Cast<TESObjectREFR>(TESForm::GetById(id));
+        return ref&&ref->baseForm&&ref->baseForm->formID==0x3B&&
+            !ref->IsDeleted()&&!ref->IsTemporary()?ref:nullptr;
+    };
+    return {get(house.Marker),house.OldMarker?get(house.OldMarker):nullptr};
+}
+CityHomeClient::Local ReadCityDecor(const HomeCityPurchase::House& house)
+{
+    const auto refs=CityDecorRefs(house);
+    if(!refs.Marker||(house.OldMarker&&!refs.Old))return CityHomeClient::Local::Unknown;
+    if(refs.Marker->IsDisabled()!=house.Hide)return CityHomeClient::Local::Unowned;
+    if(refs.Old&&!refs.Old->IsDisabled())return CityHomeClient::Local::Partial;
+    return CityHomeClient::Local::Owned;
+}
+bool ApplyCityDecor(const HomeCityPurchase::House& house)
+{
+    if(ReadCityDecor(house)!=CityHomeClient::Local::Unowned)return false;
+    const auto refs=CityDecorRefs(house);
+    if(!refs.Marker||(house.OldMarker&&!refs.Old))return false;
+    if(house.Hide)refs.Marker->Disable();else refs.Marker->Enable();
+    if(refs.Old&&!refs.Old->IsDisabled())refs.Old->Disable();
+    return true; // read back on the normal main-thread update
+}
 // Only a player's exact native RemoveItem within PurchaseHouse, below the
 // verified QF branch and with the matching CELL argument, may skip a debit.
 uint32_t CityCharge(void* stackArgument)
@@ -259,10 +287,27 @@ uint32_t CityCharge(void* stackArgument)
     auto* policy=vm&&vm->virtualMachine&&!vm->inactive?vm->virtualMachine->GetObjectHandlePolicy():nullptr;
     if(!frame||!frame->Parent||!caller||caller->Parent!=frame->Parent||!policy||
         !PlayerCharacter::Get()||DragonFrameActor(&frame->Self)!=PlayerCharacter::Get()||
-        !FrameIsHouseQuest(caller,policy)||caller->Size<4)return 0;
+        !caller->Function)return 0;
     const auto* script=caller->Function->GetObjectTypeName().AsAscii();
     const auto* name=caller->Function->GetName().AsAscii();
-    if(!script||!name||_stricmp(script,houseScript)||_stricmp(name,"PurchaseHouse")||
+    if(!script||!name)return 0;
+    // INFO (0x4C), actual bound script + original plugin identity. This
+    // observes the buyer's genuine TIF payment, not any unrelated debit.
+    constexpr uint32_t infoType=0x4C;
+    if(auto* obj=caller->Self.GetObject();obj)
+    {
+        const auto h=obj->GetHandle();
+        if(h&&policy->HandleIsType(infoType,h)&&policy->IsHandleObjectAvailable(h))
+        {
+            const auto* form=static_cast<const TESForm*>(policy->GetObjectForHandle(infoType,h));
+            if(form&&static_cast<uint32_t>(form->formType)==infoType)
+                if(const auto* op=HomeCityPurchase::Find(CityHomeClient::OperationForInfo(form->formID));
+                    op&&op->Parent&&!_stricmp(script,op->Variable)&&!_stricmp(name,op->Fragment))
+                    return op->Cell;
+        }
+    }
+    if(!FrameIsHouseQuest(caller,policy)||caller->Size<4||
+        _stricmp(script,houseScript)||_stricmp(name,"PurchaseHouse")||
         caller->Function->GetParamCount()!=4)return 0;
     auto* args=reinterpret_cast<BSScript::StackFrame*>(caller);
     auto* arg=args->GetStackFrameVariable(0,args->GetPageForFrame());
@@ -285,6 +330,8 @@ CityHomeClient::Local CityHomeClient::ReadNative(uint32_t id) noexcept
     try
     {
         const auto* house=HomeCityPurchase::Find(id);
+        if(house&&house->Parent)
+            return ReadNative(house->Parent)==Local::Owned?ReadCityDecor(*house):Local::Unknown;
         auto* gameVM=GameVM::Get();auto* quest=HouseQuest();
         auto* cell=TESForm::GetById(id);
         if(!house||!quest||quest->IsStopped()||!gameVM||!gameVM->virtualMachine||gameVM->inactive||
@@ -311,7 +358,10 @@ bool CityHomeClient::DispatchNative(uint32_t id) noexcept
 {
     try
     {
-        const auto* house=HomeCityPurchase::Find(id);auto* gameVM=GameVM::Get();auto* quest=HouseQuest();
+        const auto* house=HomeCityPurchase::Find(id);
+        if(house&&house->Parent)
+            return ReadNative(house->Parent)==Local::Owned&&ApplyCityDecor(*house);
+        auto* gameVM=GameVM::Get();auto* quest=HouseQuest();
         if(!house||!quest||!gameVM||!gameVM->virtualMachine||gameVM->inactive||
             ReadNative(id)!=Local::Unowned)return false;
         auto* vm=gameVM->virtualMachine;const auto handle=HouseHandle(vm,quest);

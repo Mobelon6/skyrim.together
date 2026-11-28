@@ -1942,6 +1942,13 @@ int main(){
  assert(City::FromInfo(a.Info)==&a&&City::FromInfo(0xC6E28)==&b);
  for(const auto& h:City::Houses)assert(City::FromKey(City::Key(h.Cell))==&h);
  assert(!City::FromInfo(0x1234)&&!City::FromKey("bad"));
+ assert(City::Furniture.size()==26);
+ std::set<std::string> keys;std::set<uint32_t> ids;
+ for(const auto* op:City::All){assert(keys.insert(City::Key(op->Cell)).second);assert(ids.insert(op->Cell).second);assert(City::FromKey(City::Key(op->Cell))==op);}
+ const auto& decor=City::Furniture[0];const auto& next=City::Furniture[1];
+ assert(decor.Parent==a.Cell&&City::FromInfo(decor.Info)==&decor);
+ const auto& dlc=City::Furniture[4];assert(!City::FromInfo(dlc.Info)&&City::FromInfo(dlc.Info,true)==&dlc);
+ assert(!City::Publish(j,{decor.Cell,0,300,11,City::Action::Reserve}));
  assert(City::Publish(j,{a.Cell,0,5000,11,City::Action::Reserve}));
  auto s=City::Read(j,a.Cell);assert(s&&s->Status==City::Phase::Reserved&&s->Buyer==11);
  assert(!City::Publish(j,{a.Cell,s->Revision,5000,22,City::Action::Reserve}));
@@ -1954,10 +1961,18 @@ int main(){
  assert(!City::Publish(j,{b.Cell,other->Revision,25000,22,City::Action::Reserve}));
  assert(City::Publish(j,{a.Cell,s->Revision,5000,11,City::Action::Confirm}));
  auto owned=City::Read(j,a.Cell);assert(owned&&owned->Status==City::Phase::Purchased&&owned->Buyer==11);
+ assert(City::Publish(j,{decor.Cell,0,300,22,City::Action::Reserve}));
+ assert(!City::Publish(j,{next.Cell,0,250,11,City::Action::Reserve}));
+ auto d=City::Read(j,decor.Cell);assert(d&&d->Buyer==22&&d->Status==City::Phase::Reserved);
+ assert(City::Publish(j,{decor.Cell,d->Revision,300,22,City::Action::Confirm}));
+ assert(City::Publish(j,{next.Cell,0,250,11,City::Action::Reserve}));
+ assert(!City::Publish(j,{decor.Cell,d->Revision,300,22,City::Action::Confirm}));
  assert(!City::Publish(j,{a.Cell,owned->Revision,5000,22,City::Action::Reserve}));
  assert(!City::Publish(j,{a.Cell,s->Revision,5000,11,City::Action::Confirm}));
  CampaignJournal::Journal reload;assert(reload.Open(root,17,"test",false));
  auto restored=City::Read(reload,a.Cell);assert(restored&&restored->Status==City::Phase::Purchased&&restored->Buyer==11);
+ assert(City::Read(reload,decor.Cell)->Status==City::Phase::Purchased&&City::Read(reload,decor.Cell)->Buyer==22);
+ assert(City::Read(reload,next.Cell)->Status==City::Phase::Reserved);
  std::filesystem::remove_all(root);
 }
 ''',('-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp'),str(code/'common/QuestJournalDisk.cpp')))
@@ -1969,3 +1984,40 @@ assert 'menu->ResumeCityHomePurchase(p.Target,p.Info)' in city_client
 assert 'CityHomeClient::SkipCharge(city)' in city_inv and 'CityHomeClient::ObservedDebit(city,' in city_inv
 assert 'vm->DispatchMethodCall2(handle,scope,method,args,callback)' in city_vm
 print('PASS city house purchase wiring (native VM/game execution requires Skyrim)',flush=True)
+
+
+# Actual exact marker readback and native effect calls for ordinary decorations.
+# Not an engine or PEX test; simulate only Enable/Disable on original references.
+decor_body=extract('client/Games/Misc/BSScript.cpp','struct DecorRefs',"// Only a player's exact native RemoveItem")
+run('ordinary city furniture native marker actions and idempotence',headers+'''
+#include <HomeCityPurchase.h>
+namespace CityHomeClient{enum class Local:uint8_t{Unknown,Unowned,Owned,Partial};}
+struct TESForm{uint32_t formID{};static TESForm* GetById(uint32_t);};
+struct TESObjectREFR:TESForm{
+ TESForm* baseForm{};bool disabled{},deleted{},temporary{};int calls{};
+ bool IsDeleted()const{return deleted;}bool IsTemporary()const{return temporary;}
+ bool IsDisabled()const{return disabled;}
+ void Enable(){disabled=false;++calls;}void Disable(){disabled=true;++calls;}
+};
+template<class T>T* Cast(TESForm* p){return static_cast<T*>(p);}
+TESForm base{0x3B};
+std::map<uint32_t,TESObjectREFR> refs;
+TESForm* TESForm::GetById(uint32_t id){auto it=refs.find(id);return it==refs.end()?nullptr:&it->second;}
+'''+decor_body+'''
+int main(){
+ using namespace HomeCityPurchase;using L=CityHomeClient::Local;
+ for(const auto& op:Furniture){
+   refs.clear();refs[op.Marker]={{op.Marker},&base,!op.Hide,false,false,0};
+   if(op.OldMarker)refs[op.OldMarker]={{op.OldMarker},&base,false,false,false,0};
+   assert(ReadCityDecor(op)==L::Unowned);
+   assert(ApplyCityDecor(op));assert(ReadCityDecor(op)==L::Owned);
+   assert(!ApplyCityDecor(op)&&refs[op.Marker].calls==1);
+   if(op.OldMarker){
+      assert(refs[op.OldMarker].disabled&&refs[op.OldMarker].calls==1);
+      refs[op.OldMarker].disabled=false;
+      assert(ReadCityDecor(op)==L::Partial&&!ApplyCityDecor(op));
+   }
+   refs[op.Marker].deleted=true;assert(ReadCityDecor(op)==L::Unknown&&!ApplyCityDecor(op));
+ }
+}
+''',['-I'+str(code/'common')])

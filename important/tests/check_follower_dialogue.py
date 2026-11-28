@@ -25,7 +25,7 @@ TESObjectREFR* TESObjectREFR::pick=nullptr;
 struct PlayerCharacter:TESObjectREFR{static PlayerCharacter* Get(){static PlayerCharacter p;return &p;}};
 struct TESQuest:TESForm{};
 static bool defer=false;
-namespace CityHomeClient { bool defer=false; bool DeferPurchase(uint32_t quest,uint32_t info,uint32_t npc) noexcept {return defer&&quest==HomeCityPurchase::Quest&&HomeCityPurchase::FromInfo(info)&&npc==10;} }
+namespace CityHomeClient { bool defer=false; uint32_t OperationForInfo(uint32_t info) noexcept {auto* op=HomeCityPurchase::FromInfo(info);return op?op->Cell:0;} bool DeferPurchase(uint32_t quest,uint32_t info,uint32_t npc) noexcept {return defer&&quest==HomeCityPurchase::Quest&&OperationForInfo(info)&&npc==10;} }
 bool DeferSharedQuestTurnIn(uint32_t quest,uint32_t item,uint32_t npc,uint32_t info) noexcept{return defer&&quest==100&&item==200&&npc==10&&info==49;}
 struct TESTopicInfo:TESForm{TESForm* parentTopic{};TESCondition conditions;};
 struct MenuTopicManager{struct Opt{const char* text;TESTopicInfo* info;TESForm* quest{};};std::vector<Opt*>* pOptions;Handle speaker;bool menuOpen{};
@@ -90,6 +90,9 @@ int main(){
  assert(m->ResumeCityHomePurchase(10,info.formID)&&played==4);
  assert(w.sent.back().quest==HomeCityPurchase::Quest&&w.sent.back().info==info.formID);
  CityHomeClient::defer=false;assert(HookPlayDialogueOption(m,0)&&played==5);
+ info.formID=HomeCityPurchase::Furniture[0].Info;CityHomeClient::defer=true;
+ assert(!HookPlayDialogueOption(m,0)&&played==5);
+ assert(m->ResumeCityHomePurchase(10,info.formID)&&played==6);
 }
 """
 with tempfile.TemporaryDirectory() as folder:
