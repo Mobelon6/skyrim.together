@@ -56,6 +56,23 @@
       <button (click)="returnEntrance()">Вернуться ко входу</button>
     </section></div>
   }
+  @if (homeChestHud$ | async; as chest) {
+    @if (chest.phase === 1 || chest.phase === 2) {
+      <button class="home-chest-toggle" [class.chest-hover]="chest.hover !== 0"
+              (click)="tradeAction(chest.session,chest.phase === 1 ? 5 : 8)">{{ chest.phase === 1 ? 'Сделать личным' : 'Сделать общим' }}</button>
+    } @else if (chest.phase === 3) {
+      <div class="home-chest-shade" role="dialog" aria-modal="true" aria-labelledby="chest-question">
+        <section class="home-chest-confirm">
+          <p id="chest-question"><strong>Очистить текущее содержимое</strong> и назначить <strong>личным хранилищем</strong>?</p>
+          <p>Общие предметы будут удалены безвозвратно.</p>
+        </section>
+        <button class="home-chest-yes" [class.chest-hover]="chest.hover === 6" (click)="tradeAction(chest.session,6)">Да</button>
+        <button class="home-chest-no" [class.chest-hover]="chest.hover === 7" (click)="tradeAction(chest.session,7)">Нет</button>
+      </div>
+    } @else if (chest.phase === 4) {
+      <div class="home-chest-toggle home-chest-busy">Обновление…</div>
+    }
+  }
   @if (trade$ | async; as t) {
     <div class="carriage-shade trade-shade">
       <section class="carriage-offer" [class.trade-panel]="t.open" role="dialog" aria-modal="true" aria-labelledby="trade-title">

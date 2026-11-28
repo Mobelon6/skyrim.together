@@ -55,7 +55,7 @@ public:
         if (authority)
         {
             if (!campaignId) throw std::runtime_error("invalid campaign trade stream");
-            accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); looseAccounts.clear(); placements.clear(); confirmed.clear(); last=0;
+            accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); personalAssignments.clear(); looseAccounts.clear(); placements.clear(); confirmed.clear(); last=0;
             size_t position=0;
             for (const auto& op:authority->Operations())
             {
@@ -89,7 +89,7 @@ public:
                 }
         if (!id) id = QuestJournalDisk::CreateStream(root);
         if (!id) throw std::runtime_error("cannot initialize trade ledger");
-        accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); looseAccounts.clear(); placements.clear(); confirmed.clear(); last = 0;
+        accounts.clear(); stock.clear(); contributions.clear(); homeStock.clear(); personalAssignments.clear(); looseAccounts.clear(); placements.clear(); confirmed.clear(); last = 0;
         const auto size = QuestJournalDisk::Contiguous(root,id);
         const auto dir = root/std::to_string(id);
         for (const auto& entry : std::filesystem::directory_iterator(dir))
@@ -197,12 +197,48 @@ public:
             count,before,false,std::move(variant)};
         return CommitRow(r,cursor,true);
     }
-    std::optional<HomeSnapshot::Ref> SharedContainer(const HomeSharedStorage::Address& address)
+    // A personal assignment changes access, never the character's durable
+    // stock identity. The same receipt stream serves every access point.
+    struct Assignment {uint64_t Owner{};uint32_t Revision{};};
+    static std::string PersonalAccount(uint64_t character)
+    {return "home/personal/"+std::to_string(character);}
+    Assignment PersonalState(const HomeSharedStorage::Address& address) const
+    {
+        const auto it=personalAssignments.find(address.Encode());
+        return it==personalAssignments.end()?Assignment{}:it->second;
+    }
+    uint32_t HomeStockVersion() const {return last;}
+    // 0 unavailable, 1 assign, 2 release. No mutation by this query.
+    uint32_t PersonalAction(uint64_t character,const HomeSharedStorage::Address& address)
+    {
+        if(!authority||!Stream()||!character||!HomeCityPurchase::NativeContainerRoute(*authority,address.Cell))return 0;
+        const auto current=PersonalState(address);
+        const bool assign=!current.Owner;
+        return CanSwitchPersonal(character,address,current.Revision,assign,authority->Operations().size()+1)?
+            (assign?1u:2u):0u;
+    }
+    bool SwitchPersonal(uint64_t character,const HomeSharedStorage::Address& address,
+                        uint32_t expected,bool assign,uint32_t stockVersion)
+    {
+        if(!authority||!Stream()||stockVersion!=last||
+            !HomeCityPurchase::NativeContainerRoute(*authority,address.Cell)||
+            !CanSwitchPersonal(character,address,expected,assign,authority->Operations().size()+1))return false;
+        // The one durable P record both changes the assignment and discards
+        // the old COMMON balance. It never credits a backpack or personal stock.
+        std::ostringstream out;
+        out<<"P "<<std::quoted(std::to_string(character))<<' '<<std::quoted(address.Encode())<<' '<<expected<<' '<<unsigned(assign);
+        if(!Store(out.str()))return false;
+        ApplyPersonal(character,address,expected,assign);
+        return true;
+    }
+    std::optional<HomeSnapshot::Ref> SharedContainer(const HomeSharedStorage::Address& address,uint64_t character=0)
     {
         if(!authority||!Stream()||!HomeCityPurchase::NativeContainerRoute(*authority,address.Cell))return {};
+        const auto current=PersonalState(address);
+        if(current.Owner&&current.Owner!=character)return {};
         auto row=HomeSharedStorage::Read(*authority,address);
         if(!row)return {};
-        auto* items=LoadHome(address.Encode(),authority->Operations().size()+1);
+        auto* items=LoadHome(current.Owner?PersonalAccount(character):address.Encode(),authority->Operations().size()+1);
         if(!items)return {};
         row->Items.clear();
         for(const auto& [key,count]:*items)
@@ -215,8 +251,9 @@ public:
     bool CommitShared(uint64_t character,const HomeSharedStorage::Address& address,
                       const TradeProperties::FormKey& item,std::string variant,int count,int64_t before,uint32_t cursor)
     {
-        if(!authority||!character||!item.Valid()||!SharedContainer(address))return false;
-        return CommitRow({std::to_string(character),address.Encode(),item.Plugin,item.Local,
+        if(!authority||!character||!item.Valid()||!SharedContainer(address,character))return false;
+        const auto account=PersonalState(address).Owner?PersonalAccount(character):address.Encode();
+        return CommitRow({std::to_string(character),account,item.Plugin,item.Local,
                           count,before,false,std::move(variant)},cursor,true);
     }
     // The same H receipt and ACK govern inventory and placed objects.
@@ -331,6 +368,46 @@ private:
         Append(r); return true;
     }
     static bool HomePeer(const Row& r) {return r.peer.starts_with("home/");}
+    static uint64_t ParseCharacter(std::string_view text)
+    {
+        uint64_t value{};
+        const auto parsed=std::from_chars(text.data(),text.data()+text.size(),value);
+        return value&&parsed.ec==std::errc{}&&parsed.ptr==text.data()+text.size()&&std::to_string(value)==text?value:0;
+    }
+    static uint64_t PersonalOwner(std::string_view account)
+    {
+        constexpr std::string_view prefix="home/personal/";
+        return account.starts_with(prefix)?ParseCharacter(account.substr(prefix.size())):0;
+    }
+    bool PendingHomeAccount(const std::string& account)
+    {
+        for(const auto& [user,rows]:accounts)
+            if(!rows.empty()&&rows.size()>confirmed[user]&&rows.back().peer==account)return true;
+        return false;
+    }
+    bool CanSwitchPersonal(uint64_t character,const HomeSharedStorage::Address& address,
+                           uint32_t expected,bool assign,size_t beforePosition)
+    {
+        if(!character||!HomeSharedStorage::Decode(address.Encode())||expected==UINT32_MAX)return false;
+        const auto current=PersonalState(address);
+        if(current.Revision!=expected)return false;
+        if(assign)
+        {
+            if(current.Owner)return false;
+            const auto house="home/shared/"+std::to_string(address.Cell)+"/";
+            for(const auto& [key,record]:personalAssignments)
+                if(record.Owner==character&&key.starts_with(house))return false;
+        }
+        else if(current.Owner!=character)return false;
+        // In-flight receipts must settle before switching or discarding.
+        return LoadHome(address.Encode(),beforePosition)&&!PendingHomeAccount(address.Encode())&&
+            !PendingHomeAccount(PersonalAccount(character));
+    }
+    void ApplyPersonal(uint64_t character,const HomeSharedStorage::Address& address,uint32_t expected,bool assign)
+    {
+        if(assign)homeStock.at(address.Encode()).clear();
+        personalAssignments[address.Encode()]={assign?character:0,expected+1};
+    }
     bool BaselinePublished(uint32_t slot,size_t beforePosition) const
     {
         if (!authority || !beforePosition) return false;
@@ -381,6 +458,7 @@ private:
     {
         if (!authority || !account.starts_with("home/")) return nullptr;
         if (auto it=homeStock.find(account);it!=homeStock.end()) return &it->second;
+        if(PersonalOwner(account))return &homeStock.emplace(account,Items{}).first->second;
         if(const auto shared=HomeSharedStorage::Decode(account))
         {
             const auto row=HomeSharedStorage::Read(*authority,*shared,beforePosition);
@@ -448,6 +526,15 @@ private:
                 s.Item.Variant==r.variant && s.Item.Count==static_cast<uint32_t>(r.count) &&
                 balance!=stock.end() && balance->second==r.count;
         }
+        if(const auto shared=HomeSharedStorage::Decode(r.peer))
+        {
+            if(PersonalState(*shared).Owner)return false;
+        }
+        else if(const auto owner=PersonalOwner(r.peer))
+        {
+            if(owner!=character||std::none_of(personalAssignments.begin(),personalAssignments.end(),
+                [owner](const auto& entry){return entry.second.Owner==owner;}))return false;
+        }
         auto* items=LoadHome(r.peer,beforePosition);
         if (!items) return false;
         auto item=items->find({r.plugin,r.base,r.variant});
@@ -489,6 +576,17 @@ private:
             if (!(in>>pos) || in>>extra || pos!=confirmed[r.user]+1 || pos>accounts[r.user].size())
                 throw std::runtime_error("invalid acknowledgement");
             Confirmed(r.user,pos);
+        }
+        else if(kind=='P')
+        {
+            uint32_t expected{},assign{};std::string extra;
+            if(!authority||!beforePosition||!(in>>std::quoted(r.peer)>>expected>>assign)||assign>1||in>>extra)
+                throw std::runtime_error("invalid personal assignment");
+            const auto character=ParseCharacter(r.user);
+            const auto address=HomeSharedStorage::Decode(r.peer);
+            if(!address||!CanSwitchPersonal(character,*address,expected,assign!=0,beforePosition))
+                throw std::runtime_error("invalid personal assignment state");
+            ApplyPersonal(character,*address,expected,assign!=0);
         }
         else if (kind=='T' || kind=='R' || kind=='H')
         {
@@ -586,6 +684,7 @@ private:
     std::map<std::pair<std::string,std::string>,Items> stock;
     std::map<std::pair<std::string,std::string>,Items> contributions;
     std::map<std::string,Items> homeStock;
+    std::map<std::string,Assignment> personalAssignments;
     std::set<std::string> looseAccounts;
     std::map<std::string,HomePlacement::Stack> placements;
     size_t legacyScanned{};

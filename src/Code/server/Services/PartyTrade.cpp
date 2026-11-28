@@ -18,7 +18,7 @@ using Clock=std::chrono::steady_clock;
 using namespace std::chrono_literals;
 struct Session {uint32_t a,b; bool open{}; Clock::time_point expires; std::string accountA,accountB;};
 std::map<uint32_t,Session> sessions;
-struct HomeSession {uint32_t Connection{},Slot{};uint64_t Character{};TradeProperties::FormKey Ref;Clock::time_point Until;uint32_t SharedCell{};};
+struct HomeSession {uint32_t Connection{},Slot{};uint64_t Character{};TradeProperties::FormKey Ref;Clock::time_point Until;uint32_t SharedCell{},AssignmentRevision{};};
 std::map<uint32_t,HomeSession> homeSessions;
 struct SharedSeedUpload
 {
@@ -110,7 +110,9 @@ std::optional<HomeSnapshot::Ref> HomeContainer(TradeLedger& ledger,World& world,
             cell.WorldSpaceId||HomeScope::Private(cell.Cell.ModId)||cell.Cell.BaseId!=h.SharedCell||
             InventoryEvidence::CanonicalPlugin(Plugin(world,cell.Cell.ModId))!="skyrim.esm"||
             !world.GetPartyService().GetPlayerParty(&player))return {};
-        auto row=ledger.SharedContainer({h.SharedCell,h.Ref});
+        const HomeSharedStorage::Address address{h.SharedCell,h.Ref};
+        if(ledger.PersonalState(address).Revision!=h.AssignmentRevision)return {};
+        auto row=ledger.SharedContainer(address,h.Character);
         const auto* movement=world.try_get<MovementComponent>(*player.GetCharacter());
         if(!row||!movement)return {};
         const glm::vec3 pos{std::bit_cast<float>(row->Transform[0]),std::bit_cast<float>(row->Transform[1]),std::bit_cast<float>(row->Transform[2])};
@@ -143,9 +145,25 @@ bool PlacementNear(World& world,Player& player,uint32_t slot,const HomePlacement
     const glm::vec3 position{std::bit_cast<float>(pose[0]),std::bit_cast<float>(pose[1]),std::bit_cast<float>(pose[2])};
     return glm::distance(movement->Position,position)<=420.f;
 }
-void ShowHomeStock(Player& p,uint32_t session,const HomeSnapshot::Ref& ref)
+bool OtherHomeSession(uint32_t token,const HomeSession& home)
+{
+    for(const auto& [id,h]:homeSessions)
+        if(id!=token&&h.SharedCell==home.SharedCell&&h.Ref.Encode()==home.Ref.Encode())return true;
+    return false;
+}
+void ShowHomeStock(Player& p,uint32_t session,const HomeSnapshot::Ref& ref,
+                   TradeLedger* ledger=nullptr,const HomeSession* home=nullptr)
 {
     PartyTrade reset{TradeOp::Reset,0,session};
+    if(ledger&&home&&home->SharedCell)
+    {
+        const HomeSharedStorage::Address address{home->SharedCell,home->Ref};
+        const auto state=ledger->PersonalState(address);
+        reset.Cursor=state.Revision;reset.Peer=state.Owner?1u:0u;
+        reset.Text=std::to_string(ledger->HomeStockVersion()).c_str();
+        if(!OtherHomeSession(session,*home))
+            reset.BeforePlusOne=ledger->PersonalAction(home->Character,address);
+    }
     reset.Count=static_cast<uint32_t>(ref.Items.size());Send(p,reset);
     for (const auto& item:ref.Items)
     {
@@ -393,14 +411,19 @@ void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexc
                 if(part&&e.Peer+1!=e.Count)return;
                 sharedSeeds.erase(id);
             }
-            HomeSession h{id,0,character,address.Ref,now+20s,address.Cell};
+            const auto assignment=ledger.PersonalState(address);
+            if(assignment.Owner&&assignment.Owner!=character)
+            {
+                PartyTrade denied{TradeOp::Error,0,0};denied.Text="Это личный сундук другого игрока.";Send(p,denied);return;
+            }
+            HomeSession h{id,0,character,address.Ref,now+20s,address.Cell,assignment.Revision};
             auto container=HomeContainer(ledger,m_world,p,h);
             if(!container){Send(p,{TradeOp::Error,0,0});return;}
             do{if(!++serial)++serial;}while(sessions.count(serial)||homeSessions.count(serial));
             homeSessions.emplace(serial,std::move(h));
             PartyTrade open{TradeOp::Open,0,serial,0,0,uuid};
-            open.Item=e.Item;open.Text="Общий сундук";Send(p,open);
-            ShowHomeStock(p,serial,*container);return;
+            open.Item=e.Item;open.Text=assignment.Owner?"Личный сундук":"Общий сундук";Send(p,open);
+            ShowHomeStock(p,serial,*container,&ledger,&homeSessions.at(serial));return;
         }
         if (e.Op==TradeOp::HomeOpen)
         {
@@ -427,8 +450,25 @@ void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexc
             if (!container)
             {Send(p,{TradeOp::Close,0,e.Session});homeSessions.erase(found);return;}
             h.Until=now+20s;
+            if(e.Op==TradeOp::HomePersonal)
+            {
+                uint32_t version{};
+                const HomeSharedStorage::Address address{h.SharedCell,h.Ref};
+                const bool ok=h.SharedCell&&e.Peer==h.AssignmentRevision&&e.Count<=1&&
+                    !e.BeforePlusOne&&!e.Item.BaseId&&e.Variant.empty()&&
+                    TradeProperties::Number({e.Text.data(),e.Text.size()},version)&&
+                    !OtherHomeSession(e.Session,h)&&!ledger.HasOutstanding(user)&&
+                    ledger.SwitchPersonal(h.Character,address,e.Peer,e.Count==1,version);
+                if(ok)h.AssignmentRevision=ledger.PersonalState(address).Revision;
+                PartyTrade reply{TradeOp::HomePersonal,0,e.Session,h.AssignmentRevision,ok?1u:0u,uuid};Send(p,reply);
+                if(auto updated=HomeContainer(ledger,m_world,p,h))ShowHomeStock(p,e.Session,*updated,&ledger,&h);
+                else {Send(p,{TradeOp::Close,0,e.Session});homeSessions.erase(found);}
+                return;
+            }
             if (e.Op==TradeOp::Deposit || e.Op==TradeOp::Take)
             {
+                if(h.SharedCell&&e.Peer!=h.AssignmentRevision)
+                {Send(p,{TradeOp::Error,0,e.Session});return;}
                 if (!e.Count || e.Count>9999 || !e.Item.BaseId || !e.BeforePlusOne || e.BeforePlusOne>0x80000000u) return;
                 auto plugin=Plugin(m_world,e.Item.ModId);
                 TradeProperties::FormKey key{InventoryEvidence::CanonicalPlugin(plugin),e.Item.BaseId};
@@ -442,7 +482,11 @@ void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexc
                 next();
             }
             if (e.Op==TradeOp::Poll || e.Op==TradeOp::Deposit || e.Op==TradeOp::Take)
-                if (auto updated=HomeContainer(ledger,m_world,p,h)) ShowHomeStock(p,e.Session,*updated);
+                if (auto updated=HomeContainer(ledger,m_world,p,h))
+                {
+                    if(h.SharedCell)ShowHomeStock(p,e.Session,*updated,&ledger,&h);
+                    else ShowHomeStock(p,e.Session,*updated);
+                }
             return;
         }
         if (e.Op==TradeOp::Invite)

@@ -2266,3 +2266,102 @@ int main(){
  std::filesystem::remove_all(path);
 }
 ''',['-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp'),str(code/'common/QuestJournalDisk.cpp')])
+
+
+run('personal access points: one account, explicit irreversible common discard, stale confirmation and recovery',headers+'''
+#include <TradeLedger.h>
+#include <filesystem>
+int main(){
+ namespace C=HomeCityPurchase;namespace S=HomeSharedStorage;
+ const auto path=std::filesystem::temp_directory_path()/"stm-personal-stock";
+ std::filesystem::remove_all(path);
+ CampaignJournal::Journal j;assert(j.Open(path,79,"test",true));
+ S::Address a{C::Houses[0].Cell,{"skyrim.esm",12345}}, other{a.Cell,{"skyrim.esm",12346}};
+ S::Address b{C::Houses[1].Cell,{"skyrim.esm",12347}};
+ TradeProperties::FormKey sword{"skyrim.esm",400},salt{"skyrim.esm",401};
+ for(auto cell:{a.Cell,b.Cell}){
+   assert(C::Publish(j,{cell,0,5000,11,C::Action::Reserve}));
+   auto reserved=C::Read(j,cell);assert(reserved&&C::Publish(j,{cell,reserved->Revision,5000,11,C::Action::Confirm}));
+ }
+ auto seed=[&](const S::Address& address){
+   HomeSnapshot::Ref r;r.Key=address.Ref;r.Base={"skyrim.esm",500};r.Type=28;r.Inventory=1;r.Scale=100;
+   r.Items.push_back({sword,5,{}});HomeSnapshot::State s;s.Refs.push_back(r);assert(S::Seed(j,address,s.Encode()));
+ };
+ seed(a);seed(other);seed(b);
+ TradeLedger ledger(j,79);assert(ledger.Stream()==79);
+ assert(ledger.PersonalAction(11,a)==1&&ledger.SharedContainer(a)->Items[0].Count==5);
+ auto version=ledger.HomeStockVersion();
+ assert(ledger.CommitShared(22,a,sword,"",-1,3,0));
+ assert(!ledger.SwitchPersonal(11,a,0,true,version)); // inventory changed since displayed
+ assert(!ledger.SwitchPersonal(11,a,0,true,ledger.HomeStockVersion())); // pending deposit
+ assert(ledger.Ack("22",1));
+ assert(ledger.SharedContainer(a)->Items[0].Count==6);
+ assert(ledger.SwitchPersonal(11,a,0,true,ledger.HomeStockVersion()));
+ assert(!ledger.SharedContainer(a,22)&&ledger.SharedContainer(a,11)->Items.empty());
+ assert(ledger.PersonalAction(11,a)==2&&!ledger.PersonalAction(22,a)&&!ledger.PersonalAction(11,other));
+ assert(!ledger.SwitchPersonal(22,a,1,false,ledger.HomeStockVersion()));
+ assert(!ledger.SwitchPersonal(11,other,0,true,ledger.HomeStockVersion()));
+ assert(ledger.CommitShared(11,a,salt,"",-1,5,0));
+ assert(!ledger.SwitchPersonal(11,a,1,false,ledger.HomeStockVersion()));
+ assert(!ledger.SwitchPersonal(11,b,0,true,ledger.HomeStockVersion()));
+ assert(ledger.Ack("11",1)&&ledger.SharedContainer(a,11)->Items[0].Count==1);
+ assert(!ledger.SwitchPersonal(11,a,0,true,ledger.HomeStockVersion())); // replay cannot erase personal stock
+ assert(ledger.SwitchPersonal(11,b,0,true,ledger.HomeStockVersion()));
+ assert(ledger.SharedContainer(b,11)->Items[0].Base.Encode()==salt.Encode());
+ assert(!ledger.CommitShared(22,b,salt,"",1,0,1));
+ assert(ledger.SwitchPersonal(11,a,1,false,ledger.HomeStockVersion()));
+ assert(ledger.SharedContainer(a,22)->Items.empty()&&ledger.SharedContainer(b,11)->Items[0].Count==1);
+ assert(ledger.SwitchPersonal(11,b,1,false,ledger.HomeStockVersion()));
+ assert(ledger.SharedContainer(b)->Items.empty()); // no access points but stock remains
+ CampaignJournal::Journal restored;assert(restored.Open(path,79,"test",false));
+ TradeLedger after(restored,79);assert(after.Stream()==79);
+ assert(after.SharedContainer(a)->Items.empty()&&after.SharedContainer(b)->Items.empty());
+ assert(after.MatchesReceipt("11",79,0,1,"skyrim.esm",401,-1,5));
+ assert(after.MatchesReceipt("22",79,0,1,"skyrim.esm",400,-1,3));
+ assert(!after.SwitchPersonal(11,a,0,true,after.HomeStockVersion()));
+ assert(after.SwitchPersonal(11,other,0,true,after.HomeStockVersion()));
+ assert(after.SharedContainer(other,11)->Items[0].Base.Encode()==salt.Encode());
+ assert(after.SharedContainer(other,11)->Items[0].Count==1);
+ assert(after.SwitchPersonal(22,a,2,true,after.HomeStockVersion()));
+ assert(after.SharedContainer(a,22)->Items.empty()&&!after.SharedContainer(a,11));
+ assert(after.CommitShared(22,a,sword,"",-1,2,1));
+ assert(after.Ack("22",2)&&after.SharedContainer(a,22)->Items[0].Base.Encode()==sword.Encode());
+ assert(after.SharedContainer(other,11)->Items[0].Base.Encode()==salt.Encode());
+ std::filesystem::remove_all(path);
+}
+''',['-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp'),str(code/'common/QuestJournalDisk.cpp')])
+
+run('personal chest HUD native pointer capture: only matching press/release, modal and stale token',headers+'''
+#include <HomeChestHud.h>
+int main(){
+ using namespace HomeChestHud;
+ Press press;uint32_t action{};
+ assert(!press.Down(1,Assign,{.2f,.5f}));
+ assert(!press.Up(1,Assign,{.9f,.96f},action)&&action==None);
+ assert(press.Down(1,Assign,{.9f,.96f}));
+ assert(press.Up(1,Assign,{.9f,.96f},action)&&action==Ask);
+ assert(press.Down(1,Assign,{.9f,.96f}));
+ assert(press.Up(2,Assign,{.9f,.96f},action)&&action==None);
+ assert(press.Down(1,Release,{.9f,.96f}));
+ assert(press.Up(1,Release,{.2f,.5f},action)&&action==None);
+ assert(press.Down(1,Confirm,{.44f,.57f}));
+ assert(press.Up(1,Confirm,{.44f,.57f},action)&&action==Yes);
+ assert(press.Down(1,Confirm,{.2f,.5f}));
+ assert(press.Up(1,Confirm,{.56f,.57f},action)&&action==None);
+ assert(press.Down(1,Confirm,{.56f,.57f}));
+ assert(press.Up(1,Confirm,{.56f,.57f},action)&&action==No);
+ assert(!press.Down(1,Hidden,{.9f,.96f}));
+ assert(press.Down(1,Busy,{.2f,.5f}));
+ assert(press.Up(1,Busy,{.2f,.5f},action)&&action==None);
+ assert(Hit(Release,{.9f,.96f})==MakeShared);
+}
+''',['-I'+str(code/'common')])
+assert 'ledger.SwitchPersonal(h.Character,address,e.Peer,e.Count==1,version)' in shared_trade_server
+assert 'OtherHomeSession(e.Session,h)' in shared_trade_server
+assert 'ledger.SharedContainer(address,h.Character)' in shared_trade_server
+assert 'e.Peer!=h.AssignmentRevision' in shared_trade_server
+assert 'sharedPromptVersion!=sharedStockVersion' in shared_trade_client
+assert 'sharedSwitchPending&&sharedSwitchReply&&sharedRevision==sharedExpectedRevision' in shared_trade_client
+assert 'if(!SetShadow(m_world,buffer))' in shared_trade_client or 'if (!SetShadow(m_world,buffer))' in shared_trade_client
+assert 'ContainerChestMessage' in shared_trade_client and 'table[4]' in shared_trade_client
+assert 'sharedControlsBlocked.load()' in shared_trade_client

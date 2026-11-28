@@ -128,10 +128,12 @@ int main(){
     OverlayService overlay;
     receiptFailure=receiptFailureCampaign=walletReady=true;readyStream=7;readyCursor=9;
     sharedOpening=42;sharedOpenUntil=Clock::now()+std::chrono::seconds(15);
+    sharedPrompt=sharedSwitchPending=true;sharedControlsBlocked=true;sharedRevision=9;hudToken=42;hudPhase=3;
     sharedSeed={{3,42},2,9,7,123,"pending snapshot bytes"};
     overlay.RecheckTradeAfterLoad();
     assert(!receiptFailure&&!receiptFailureCampaign&&!walletReady&&!readyStream&&!readyCursor);
     assert(!sharedOpening&&sharedOpenUntil==Clock::time_point{});
+    assert(!sharedPrompt&&!sharedSwitchPending&&!sharedControlsBlocked&&!sharedRevision&&!hudToken&&!hudPhase);
     assert(!sharedSeed.Item.ModId&&!sharedSeed.Item.BaseId&&!sharedSeed.Next&&!sharedSeed.Cursor);
     assert(!sharedSeed.Stream&&!sharedSeed.Digest&&sharedSeed.Bytes.empty());
     assert(shadowCleanupPending && nativeResets==1 && placementForgets==1);

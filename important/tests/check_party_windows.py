@@ -37,6 +37,21 @@ with ThreadingHTTPServer(('127.0.0.1',0),partial(Files,directory=root)) as serve
    emit('partyTrade',17,'Гость',True,'[]','[]');expect(box).to_contain_text('Контейнер пуст')
    box.get_by_role('button',name='Закрыть').click();assert last()==['tradeAction',17,0,0,1]
    emit('hideTrade');expect(box).to_have_count(0)
+   emit('deactivate');emit('openingMenu',True)
+   emit('homeChestHud',1,27,5)
+   toggle=page.get_by_role('button',name='Сделать личным',exact=True)
+   expect(toggle).to_be_visible()
+   bounds=toggle.bounding_box();assert abs(bounds['x']/1920-.815)<.003 and abs(bounds['y']/1080-.937)<.003
+   toggle.click();assert last()==['tradeAction',27,5,0,1]
+   emit('homeChestHud',3,27,6)
+   expect(page.get_by_role('dialog')).to_contain_text('Общие предметы будут удалены безвозвратно.')
+   page.get_by_role('button',name='Нет',exact=True).click();assert last()==['tradeAction',27,7,0,1]
+   page.get_by_role('button',name='Да',exact=True).click();assert last()==['tradeAction',27,6,0,1]
+   emit('homeChestHud',4,27,0);expect(page.get_by_role('dialog')).to_have_count(0)
+   emit('homeChestHud',2,27,8)
+   page.get_by_role('button',name='Сделать общим',exact=True).click();assert last()==['tradeAction',27,8,0,1]
+   emit('homeChestHud',0,0,0);expect(toggle).to_have_count(0)
+   emit('openingMenu',False);emit('activate')
    # The client supplies complete labels, not bare names. Choices use
    # one-based indexes including owner access actions, not a visitor ID.
    emit('offerHome',22,'В гости к персонажу 202')

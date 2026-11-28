@@ -296,3 +296,26 @@
 .trade-columns li { display: flex; align-items: center; gap: .4em; padding: .35em 0; border-bottom: 1px solid #666; }
 .trade-columns li span { flex: 1; }
 .trade-columns input { width: 3.3em; color: white; background: #222; }
+
+/* Native HomeChestHud::Hit uses the same normalized screen rectangles. */
+.home-chest-toggle, .home-chest-yes, .home-chest-no {
+  position: fixed; box-sizing: border-box; margin: 0; padding: 0;
+  display: grid; place-items: center; z-index: 1003;
+  color: #eee; background: rgba(15, 17, 18, .92);
+  border: 1px solid rgba(240, 234, 214, .65);
+  font-size: clamp(14px, 1.8vh, 23px); line-height: 1.1;
+  pointer-events: auto;
+}
+.home-chest-toggle { left: 81.5vw; top: 93.7vh; width: 17vw; height: 4.5vh; }
+.home-chest-shade { position: fixed; inset: 0; z-index: 1002; background: rgba(0,0,0,.38); }
+.home-chest-confirm {
+  position: fixed; left: 30vw; top: 36vh; width: 40vw; height: 28vh;
+  box-sizing: border-box; padding: 2vh 2vw; text-align: center;
+  background: rgba(16, 17, 19, .97); border: 1px solid #999; color: white;
+  font-size: clamp(15px, 2vh, 25px);
+  p { margin: .5em 0; }
+}
+.home-chest-yes, .home-chest-no { top: 55vh; width: 8vw; height: 5vh; }
+.home-chest-yes { left: 40vw; } .home-chest-no { left: 52vw; }
+.chest-hover, .home-chest-toggle:hover, .home-chest-yes:hover, .home-chest-no:hover { background: #505050; border-color: white; }
+.home-chest-busy { pointer-events: none; color: #bbb; }

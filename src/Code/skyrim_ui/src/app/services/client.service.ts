@@ -41,6 +41,7 @@ export class ClientService implements OnDestroy {
   public readonly observerMode = new BehaviorSubject(false);
   public readonly progressOffer = new BehaviorSubject<{token: number; label: string; selfName?: string; peerName?: string} | null>(null);
   readonly home = new BehaviorSubject<{token: number;names: string[]} | null>(null);
+  readonly homeChestHud = new BehaviorSubject<{phase:number;session:number;hover:number} | null>(null);
   readonly trade = new BehaviorSubject<{session: number; name: string; open: boolean;
     pocket: {id: number; name: string; count: number}[]; buffer: {id: number; name: string; count: number}[]} | null>(null);
   public carriageOffer = new BehaviorSubject<{rider: number; trip: number; name: string; marker?: boolean} | null>(null);
@@ -164,6 +165,8 @@ export class ClientService implements OnDestroy {
       this.trade.next({session,name,open,pocket:JSON.parse(pocket),buffer:JSON.parse(buffer)});
     }));
     skyrimtogether.on('hideTrade', () => this.zone.run(() => this.trade.next(null)));
+    skyrimtogether.on('homeChestHud', (phase,session,hover) => this.zone.run(() =>
+      this.homeChestHud.next(phase ? {phase,session,hover} : null)));
     skyrimtogether.on('offerCarriage', (rider, trip, name, marker) =>
       this.zone.run(() => this.carriageOffer.next({rider, trip, name, marker: !!marker})));
     skyrimtogether.on('hideCarriage', () => this.zone.run(() => this.carriageOffer.next(null)));
@@ -226,6 +229,7 @@ export class ClientService implements OnDestroy {
     skyrimtogether.off('rescueReturn');
     skyrimtogether.off('partyTrade');
     skyrimtogether.off('hideTrade');
+    skyrimtogether.off('homeChestHud');
     skyrimtogether.off('offerCarriage');
     skyrimtogether.off('hideCarriage');
     skyrimtogether.off('openingMenu');
@@ -398,6 +402,7 @@ export class ClientService implements OnDestroy {
    */
   private onExitGame(): void {
     this.zone.run(() => {
+      this.homeChestHud.next(null);
       this.inGameStateChange.next(false);
     });
   }
@@ -429,6 +434,7 @@ export class ClientService implements OnDestroy {
    * Called when a connection is terminated.
    */
   private onDisconnect(isError: boolean): void {
+    this.homeChestHud.next(null);
     this.syncRange.next({});
     this.observerMode.next(false);
     this.progressOffer.next(null);

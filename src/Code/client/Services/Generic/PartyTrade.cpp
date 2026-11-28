@@ -12,6 +12,7 @@
 #include <cmath>
 #include <TradeLedger.h>
 #include <HomeEstateConstruction.h>
+#include <HomeChestHud.h>
 #include <Services/PartyService.h>
 #include <Services/PlayerService.h>
 #include <Messages/RequestCoopInteraction.h>
@@ -130,6 +131,19 @@ struct SharedSeedUpload
     std::string Bytes;
 };
 SharedSeedUpload sharedSeed;
+uint32_t sharedRevision{},sharedStockVersion{},sharedEligible{},sharedMode{};
+uint32_t sharedPromptRevision{},sharedPromptVersion{},sharedExpectedRevision{};
+bool sharedPrompt{},sharedSwitchPending{},sharedSwitchReply{},hudAvailable{};
+Clock::time_point sharedSwitchDeadline{};
+std::atomic_bool sharedControlsBlocked{};
+std::atomic_uint32_t hudPhase{},hudToken{};
+void ResetSharedHud()
+{
+    sharedRevision=sharedStockVersion=sharedEligible=sharedMode=0;
+    sharedPromptRevision=sharedPromptVersion=sharedExpectedRevision=0;
+    sharedPrompt=sharedSwitchPending=sharedSwitchReply=hudAvailable=false;
+    sharedSwitchDeadline={};sharedControlsBlocked=false;hudPhase=0;hudToken=0;
+}
 void CancelSharedOpen(){sharedOpening=0;sharedOpenUntil={};sharedSeed={};}
 thread_local bool shadowMutation{};
 struct ShadowWrite
@@ -179,6 +193,100 @@ bool NativeMenuOpen()
     return target && object &&
         *target==object->GetHandle().handle.iBits && *target;
 }
+// The AE MenuCursor singleton and fields match CommonLibSSE-NG's
+// MenuCursor (403551; cursor 04/08, screen size 14/18).
+struct ChestMenuCursor
+{
+    uint32_t Pad;
+    float X,Y,SafeX,SafeY,Width,Height;
+};
+std::optional<HomeChestHud::Point> ChestCursor()
+{
+    if(VersionDb::Get().GetLoadedVersionString()!="1.6.1170.0")return {};
+    auto** singleton=Address<ChestMenuCursor*>(403551);
+    const auto* cursor=singleton?*singleton:nullptr;
+    if(!cursor||!(cursor->Width>0)||!(cursor->Height>0))return {};
+    HomeChestHud::Point p{cursor->X/cursor->Width,cursor->Y/cursor->Height};
+    return HomeChestHud::Valid(p)?std::optional{p}:std::nullopt;
+}
+using ContainerMessageFn=UI_MESSAGE_RESULTS(IMenu*,UIMessage&);
+ContainerMessageFn* previousContainerMessage{};
+void** guardedChestTable{};
+HomeChestHud::Press chestPress;
+UI_MESSAGE_RESULTS ContainerChestMessage(IMenu* menu,UIMessage& message)
+{
+    // BSUIScaleformData::scaleformEvent at 0x10. GFxEvent::type 00;
+    // GFxMouseEvent::button 10. Only left down/up targeted at this menu.
+    if(message.eType==UIMessage::kScaleformEvent&&message.data)
+    {
+        const void* event{};
+        std::memcpy(&event,static_cast<const char*>(message.data)+0x10,sizeof(event));
+        if(event)
+        {
+            uint32_t type{};std::memcpy(&type,event,sizeof(type));
+            if(type==2||type==3)
+            {
+                uint32_t button{};std::memcpy(&button,static_cast<const char*>(event)+0x10,sizeof(button));
+                if(button==0)
+                {
+                    const auto token=hudToken.load(),phase=hudPhase.load();
+                    const auto point=ChestCursor().value_or(HomeChestHud::Point{-1,-1});
+                    if(type==2&&token&&token==nativeToken.load()&&chestPress.Down(token,phase,point))
+                        return UI_MESSAGE_RESULTS::kHandled;
+                    if(type==3)
+                    {
+                        uint32_t action{};
+                        if(chestPress.Up(token,phase,point,action))
+                        {
+                            if(action&&token==nativeToken.load()&&World::Exists())
+                                World::Get().GetRunner().Queue([token,action]{
+                                    World::Get().GetOverlayService().TradeAction(token,int(action),0,1);
+                                });
+                            return UI_MESSAGE_RESULTS::kHandled;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return previousContainerMessage(menu,message);
+}
+bool GuardChestHud()
+{
+    // Same pinned ContainerMenu vtable as GuardTakeAll. ProcessMessage slot 04.
+    auto** table=Address<void*>(215061);
+    if(!table)return false;
+    if(guardedChestTable)return table==guardedChestTable&&table[4]==reinterpret_cast<void*>(&ContainerChestMessage);
+    MEMORY_BASIC_INFORMATION info{};
+    if(!table[4]||!VirtualQuery(table[4],&info,sizeof(info))||info.State!=MEM_COMMIT||
+        (info.Protect&(PAGE_GUARD|PAGE_NOACCESS)))return false;
+    const auto prot=info.Protect&0xff;
+    if(prot!=PAGE_EXECUTE&&prot!=PAGE_EXECUTE_READ&&prot!=PAGE_EXECUTE_READWRITE&&prot!=PAGE_EXECUTE_WRITECOPY)return false;
+    DWORD prior{};
+    if(!VirtualProtect(table+4,sizeof(void*),PAGE_READWRITE,&prior))return false;
+    previousContainerMessage=reinterpret_cast<ContainerMessageFn*>(table[4]);
+    InterlockedExchangePointer(table+4,reinterpret_cast<void*>(&ContainerChestMessage));
+    guardedChestTable=table;
+    DWORD unused{};VirtualProtect(table+4,sizeof(void*),prior,&unused);
+    return true;
+}
+void ShowChestHud(OverlayService& overlay,uint32_t phase,uint32_t token)
+{
+    static uint32_t previousPhase{},previousToken{},previousHover{};
+    const auto point=ChestCursor();
+    if(!point)phase=HomeChestHud::Hidden;
+    if(!phase)token=0;
+    const auto hover=point?HomeChestHud::Hit(phase,*point):0;
+    hudToken=token;hudPhase=phase;
+    if(previousPhase==phase&&previousToken==token&&previousHover==hover)return;
+    if(auto* app=overlay.GetOverlayApp())
+    {
+        auto args=CefListValue::Create();
+        args->SetInt(0,phase);args->SetInt(1,token);args->SetInt(2,hover);
+        app->ExecuteAsync("homeChestHud",args);
+        previousPhase=phase;previousToken=token;previousHover=hover;
+    }
+}
 void NativeHide()
 {
     if (!NativeMenuOpen()) return;
@@ -205,13 +313,13 @@ void TakeAll(const FxDelegateArgs* args)
         if (previousTakeAll) previousTakeAll(args);
         return;
     }
-    if (!token || !World::Exists() || !args || args->GetArgCount()!=0) return;
+    if (!token || !World::Exists() || !args || args->GetArgCount()!=0 || sharedControlsBlocked.load()) return;
     World::Get().GetRunner().Queue([token]()
     {
         auto& world=World::Get();
         if (nativeToken.load()!=token || !world.GetTransport().IsOnline() ||
             !CampaignAccess::GameReady() || !NativeMenuOpen()) return;
-        if (!stockComplete || dirty || nativeAwaiting || !nativeIntents.empty())
+        if (sharedControlsBlocked.load() || !stockComplete || dirty || nativeAwaiting || !nativeIntents.empty())
         {
             Utils::ShowHudMessage("Обмен обновляется. Повторите после завершения операции.");
             return;
@@ -972,6 +1080,8 @@ bool OpenNative(World& world)
         !GuardPlayer(PlayerCharacter::Get()) || !GuardTakeAll() || !ClearShadow() || !SetShadow(world,buffer)) return false;
     shadowCleanupPending=true;
     takeAllRegistered=false;
+    hudAvailable=sharedTarget.load()&&GuardChestHud();
+    if(sharedTarget.load()&&!hudAvailable)spdlog::warn("STM: personal chest HUD input unavailable");
     nativeToken.store(session);
     open(object,0); // ContainerMode::kLoot, no actor inventory or pickpocket
     return true;
@@ -1075,7 +1185,7 @@ std::optional<int64_t> ReceiptCount(World& world,PlayerCharacter& player,const L
 }
 bool SubmitTransfer(World& world,const Wallet& wallet,const LocalItem& key,uint32_t count,bool take)
 {
-    if (!tradeOpen || !stockComplete || !count || count>9999 ||
+    if (sharedControlsBlocked.load() || !tradeOpen || !stockComplete || !count || count>9999 ||
         (!nativeRequested && !key.second.empty())) return false;
     auto* player=PlayerCharacter::Get();
     const auto properties=TradeProperties::Decode(key.second);
@@ -1089,7 +1199,7 @@ bool SubmitTransfer(World& world,const Wallet& wallet,const LocalItem& key,uint3
     auto before=ReceiptCount(world,*player,key,take);
     if (!before || (take ? (*before+count>INT32_MAX || !buffer.count(key) || buffer[key]<int(count))
                          : (*before<count))) return false;
-    PartyTrade e{take?TradeOp::Take:TradeOp::Deposit,peer,session,wallet.Cursor(),count,wallet.Stream()};
+    PartyTrade e{take?TradeOp::Take:TradeOp::Deposit,sharedTarget.load()?sharedRevision:peer,session,wallet.Cursor(),count,wallet.Stream()};
     if (!world.GetModSystem().GetServerModId(key.first,e.Item)) return false;
     e.Variant=key.second.c_str();e.BeforePlusOne=static_cast<uint32_t>(*before+1);
     if (!Send(e)) return false;
@@ -1753,6 +1863,7 @@ bool NativeTrade::BlockRemove(const TESObjectREFR* from,const TESObjectREFR* to,
     const bool source=sharedFrom||IsProxy(from), destination=sharedTo||IsProxy(to);
     if (!source && !destination) return false;
     if (shadowMutation && source && !to) return false;
+    if((sharedFrom||sharedTo)&&sharedControlsBlocked.load())return true;
     const auto token=nativeToken.load();
     // Always suppress native mutations involving this reference, including
     // stale menu callbacks, direct transfers and TakeAll loops.
@@ -1764,7 +1875,7 @@ bool NativeTrade::BlockRemove(const TESObjectREFR* from,const TESObjectREFR* to,
     {
         auto& world=World::Get();
         if (nativeToken.load()!=token || !world.GetTransport().IsOnline() ||
-            !CampaignAccess::GameReady() || !NativeMenuOpen() || !stockComplete) return;
+            !CampaignAccess::GameReady() || !NativeMenuOpen() || !stockComplete || sharedControlsBlocked.load()) return;
         if (!selected || (!selected->Variant.empty() && count>selected->Count))
         {
             Utils::ShowHudMessage("Этот экземпляр пока нельзя передать через обмен.");
@@ -2025,7 +2136,8 @@ void OverlayService::ClearTrade() noexcept
     ResetNativeIntents();takeAllRegistered=false;
     shadowCleanupPending=true;cleanupRetry={};
     if (nativeRequested && CampaignAccess::GameReady()) NativeHide();
-    sharedTarget.store(0);CancelSharedOpen();
+    ShowChestHud(*this,HomeChestHud::Hidden,0);
+    ResetSharedHud();sharedTarget.store(0);CancelSharedOpen();
     nativeRequested=nativeOpened=stockComplete=false;
     nativeDeadline={};stockRemaining=0;incomingStock.clear();
     if (session && m_pOverlay) m_pOverlay->ExecuteAsync("hideTrade");
@@ -2036,7 +2148,7 @@ void OverlayService::ClearTrade() noexcept
 void OverlayService::RecheckTradeAfterLoad() noexcept
 {
     HomePlacementClient::Forget();
-    CancelSharedOpen();
+    CancelSharedOpen();ResetSharedHud();
     ResetNativeIntents();
     shadowCleanupPending=true;cleanupRetry={};
     // A confirmed world replacement permits a new receipt check, not automatic acceptance.
@@ -2077,6 +2189,43 @@ void OverlayService::TradeAction(uint32_t token,int action,uint32_t id,uint32_t 
     }
     if (!session || session!=token) return;
     Wallet w;
+    if(action>=HomeChestHud::Ask&&action<=HomeChestHud::MakeShared)
+    {
+        if(!sharedTarget.load()||nativeToken.load()!=token||!hudAvailable||!nativeOpened||
+            !NativeMenuOpen()||GetActive()||m_promptOpen||m_showingProgress||m_observerCamera||sharedSwitchPending)return;
+        if(action==HomeChestHud::No)
+        {
+            sharedPrompt=false;sharedControlsBlocked=false;return;
+        }
+        if(!stockComplete||dirty||nativeAwaiting||!nativeIntents.empty()||!w.Load(m_world)||!Ready(w))return;
+        if(action==HomeChestHud::Ask)
+        {
+            if(sharedEligible!=1||sharedMode||sharedPrompt)return;
+            sharedPrompt=true;sharedPromptRevision=sharedRevision;sharedPromptVersion=sharedStockVersion;
+            sharedControlsBlocked=true;return;
+        }
+        const bool assign=action==HomeChestHud::Yes;
+        if(assign)
+        {
+            if(!sharedPrompt)return;
+            if(sharedEligible!=1||sharedMode||sharedPromptRevision!=sharedRevision||sharedPromptVersion!=sharedStockVersion)
+            {
+                sharedPrompt=false;sharedControlsBlocked=false;
+                Utils::ShowHudMessage("Содержимое или доступ изменились. Подтвердите заново.");return;
+            }
+        }
+        else if(action!=HomeChestHud::MakeShared||sharedEligible!=2||!sharedMode||sharedPrompt)return;
+        PartyTrade request{TradeOp::HomePersonal,sharedRevision,session,w.Cursor(),assign?1u:0u,w.Stream()};
+        request.Text=std::to_string(sharedStockVersion).c_str();
+        sharedPrompt=false;
+        if(Send(request))
+        {
+            sharedSwitchPending=true;sharedSwitchReply=false;
+            sharedExpectedRevision=sharedRevision;sharedSwitchDeadline=Clock::now()+15s;sharedControlsBlocked=true;
+        }
+        else {sharedControlsBlocked=false;Utils::ShowHudMessage("Не удалось изменить назначение сундука.");}
+        return;
+    }
     if (action==0) {Send({TradeOp::Close,peer,session}); ClearTrade();return;}
     if (!w.Load(m_world) || !Ready(w)) return;
     PartyTrade e{TradeOp::Accept,peer,session,w.Cursor(),count,w.Stream()};
@@ -2214,7 +2363,7 @@ void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
     {
         CancelSharedOpen();
         ResetNativeIntents();walletReady=false;pollAt={};
-        Utils::ShowHudMessage("Сервер не подтвердил операцию обмена.");return;
+        Utils::ShowHudMessage(e.Text.empty()?"Сервер не подтвердил операцию обмена.":e.Text.c_str());return;
     }
     if(e.Op==TradeOp::HomeStockNeeded)
     {
@@ -2256,7 +2405,7 @@ void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
             auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
             if(!sharedOpening||form!=sharedOpening||!NativeTrade::IsSharedContainer(object)||!NativeEnabled())
             {Send({TradeOp::Close,e.Peer,e.Session});return;}
-            sharedTarget.store(form);CancelSharedOpen();
+            ResetSharedHud();sharedTarget.store(form);CancelSharedOpen();
         }
         else if(sharedOpening){Send({TradeOp::Close,e.Peer,e.Session});return;}
         session=e.Session;peer=e.Peer;partner=e.Text.c_str();tradeOpen=e.Op==TradeOp::Open;
@@ -2270,8 +2419,26 @@ void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
     }
     else if (!session || e.Session!=session) return;
     else if (e.Op==TradeOp::Close) {ClearTrade();return;}
+    else if(e.Op==TradeOp::HomePersonal)
+    {
+        if(!sharedTarget.load()||!sharedSwitchPending||e.Count>1)return;
+        if(e.Cursor!=(sharedExpectedRevision+(e.Count?1u:0u)))
+        {Send({TradeOp::Close,peer,session});ClearTrade();return;}
+        sharedExpectedRevision=e.Cursor;sharedSwitchReply=true;
+        if(!e.Count)Utils::ShowHudMessage("Назначение сундука не изменилось. Повторите попытку.");
+        return;
+    }
     else if (e.Op==TradeOp::Reset)
     {
+        if(sharedTarget.load())
+        {
+            uint32_t version{};
+            if(e.Peer>1||e.BeforePlusOne>2||
+                (e.BeforePlusOne==1&&e.Peer)||(e.BeforePlusOne==2&&!e.Peer)||
+                !TradeProperties::Number({e.Text.data(),e.Text.size()},version))
+            {Send({TradeOp::Close,peer,session});ClearTrade();return;}
+            sharedRevision=e.Cursor;sharedMode=e.Peer;sharedEligible=e.BeforePlusOne;sharedStockVersion=version;
+        }
         incomingStock.clear();stockRemaining=e.Count;stockComplete=stockRemaining==0;
         if (stockComplete) buffer.clear();
     }
@@ -2304,6 +2471,7 @@ void OverlayService::UpdateTrade() noexcept
     HomePlacementClient::Update(m_world);
     if (receiptFailure || !m_transport.IsOnline() || !m_inGame || !CampaignAccess::GameReady())
     {
+        ShowChestHud(*this,HomeChestHud::Hidden,0);
         CancelSharedOpen();walletReady=false;pollAt={};return;
     }
     if(sharedOpening&&!sharedSeed.Bytes.empty())
@@ -2354,13 +2522,17 @@ void OverlayService::UpdateTrade() noexcept
             if (!SetShadow(m_world,buffer))
             {Utils::ShowHudMessage("Обмен закрыт: ошибка отображения буфера.");Send({TradeOp::Close,peer,session});ClearTrade();return;}
             dirty=false;
+            if(sharedSwitchPending&&sharedSwitchReply&&sharedRevision==sharedExpectedRevision)
+            {sharedSwitchPending=sharedSwitchReply=false;sharedControlsBlocked=false;}
         }
+        if(sharedSwitchPending&&Clock::now()>=sharedSwitchDeadline)
+        {Send({TradeOp::Close,peer,session});ClearTrade();return;}
         if (nativeAwaiting && Clock::now()>=nativeReceiptDeadline)
         {
             Utils::ShowHudMessage("Обмен закрыт: ожидание квитанции. Остаток будет возвращён.");
             Send({TradeOp::Close,peer,session});ClearTrade();return;
         }
-        if (nativeOpened && stockComplete && !dirty && !nativeIntents.empty())
+        if (nativeOpened && stockComplete && !dirty && !nativeIntents.empty() && !sharedControlsBlocked.load())
         {
             Wallet w;
             if (w.Load(m_world) && Ready(w))
@@ -2403,6 +2575,20 @@ void OverlayService::UpdateTrade() noexcept
         args->SetString(3,tradeOpen?Rows(Pocket(m_world,*p)):CefString("[]"));args->SetString(4,Rows(PlainBuffer()));
         m_pOverlay->ExecuteAsync("partyTrade",args);
     }
+    uint32_t phase=HomeChestHud::Hidden;
+    if(hudAvailable&&sharedTarget.load()&&nativeOpened&&NativeMenuOpen()&&!GetActive()&&
+        !m_promptOpen&&!m_showingProgress&&!m_observerCamera)
+    {
+        if(sharedSwitchPending)phase=HomeChestHud::Busy;
+        else if(sharedPrompt)phase=HomeChestHud::Confirm;
+        else if(stockComplete&&!dirty&&!nativeAwaiting&&nativeIntents.empty())
+        {
+            Wallet hudWallet;
+            if(hudWallet.Load(m_world)&&Ready(hudWallet))phase=sharedEligible;
+        }
+    }
+    else if(sharedPrompt){sharedPrompt=false;sharedControlsBlocked=sharedSwitchPending;}
+    ShowChestHud(*this,phase,session);
     const auto now=Clock::now();
     if (now<pollAt) return;
     pollAt=now+(session?1s:5s);
