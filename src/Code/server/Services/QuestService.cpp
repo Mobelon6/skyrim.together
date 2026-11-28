@@ -541,6 +541,20 @@ void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessa
 {
     const auto& message = acMessage.Packet;
 
+    // Do not admit a city's paid HousePurchase stage into the ordinary
+    // campaign quest journal, including messages from an older client.
+    // The local number alone is not enough: another plugin can reuse it.
+    if (message.Id.BaseId==0xA7B33)
+    {
+        try
+        {
+            if (CampaignAccess::Authority().State()!=CampaignReplication::Link::Mode::Disabled &&
+                QuestKey(m_world,message.Id)==TradeProperties::FormKey{"skyrim.esm",0xA7B33}.Encode())
+                return;
+        }
+        catch (...) {return;}
+    }
+
     auto* pPlayer = acMessage.pPlayer;
 
     auto& questComponent = pPlayer->GetQuestLogComponent();

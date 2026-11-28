@@ -1884,3 +1884,35 @@ assert physical_server.index('!RecordPhysicalStage(authority.Journal,key,next.Ge
 assert 'if(durable&&HasPhysicalStages(authority.Journal,key,run.Generation)) return;' in physical_server
 assert 'SubmitObservedQuestStage(m_world,' in (code/'client/Services/Generic/InventoryService.cpp').read_text()
 print('PASS Q-14 marker before stage, journal planner barrier, native source and alternate report wiring',flush=True)
+
+
+# HOME-01: do not replay HousePurchase's shared, repeatable location-
+# conditional stage as an ordinary quest. The native local purchase remains
+# unmodified. This does not implement ownership or charge reconciliation.
+house_filter=extract('client/Services/Generic/QuestService.cpp',
+    'static constexpr std::array kNonSyncableQuestIds', 'void QuestService::DebugDumpQuests(')
+run('city house purchases excluded from generic campaign stage replay',headers+'''
+namespace CampaignReplication{struct Link{enum class Mode{Disabled,Ready};};}
+namespace CampaignAccess{
+ CampaignReplication::Link::Mode current=CampaignReplication::Link::Mode::Disabled;
+ auto Mode(){return current;}
+}
+struct TESQuest{uint32_t formID;struct Stages{bool empty=false;bool Empty()const{return empty;}} stages;};
+struct QuestService{static bool IsNonSyncableQuest(TESQuest*);};
+'''+house_filter+'''
+int main(){
+ TESQuest house{0xA7B33},other{0x010A7B33},ordinary{0x1234},follower{0x750BA},empty{0x5678,{true}};
+ assert(!QuestService::IsNonSyncableQuest(&house));
+ CampaignAccess::current=CampaignReplication::Link::Mode::Ready;
+ assert(QuestService::IsNonSyncableQuest(&house));
+ assert(!QuestService::IsNonSyncableQuest(&other)&&!QuestService::IsNonSyncableQuest(&ordinary));
+ assert(QuestService::IsNonSyncableQuest(&follower)&&QuestService::IsNonSyncableQuest(&empty));
+ CampaignAccess::current=CampaignReplication::Link::Mode::Disabled;
+ assert(!QuestService::IsNonSyncableQuest(&house));
+}
+''')
+home_server=extract('server/Services/QuestService.cpp',
+    'void QuestService::OnQuestChanges(', 'auto* pPlayer = acMessage.pPlayer;')
+assert 'message.Id.BaseId==0xA7B33' in home_server
+assert 'TradeProperties::FormKey{"skyrim.esm",0xA7B33}.Encode()' in home_server
+assert 'CampaignAccess::Authority().State()!=CampaignReplication::Link::Mode::Disabled' in home_server

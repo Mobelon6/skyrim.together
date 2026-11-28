@@ -1224,6 +1224,13 @@ static constexpr std::array kNonSyncableQuestIds = std::to_array<uint32_t>({
 
 bool QuestService::IsNonSyncableQuest(TESQuest* apQuest)
 {
+    // HousePurchase has one repeatable, location-conditional stage 10 for
+    // five different paid transactions. A generic SetStage on the peer can
+    // buy the wrong house or charge again. Housing needs the actual operation,
+    // not this quest's numeric stage. Preserve unmodified non-campaign STR.
+    if (apQuest && apQuest->formID==0xA7B33 &&
+        CampaignAccess::Mode()!=CampaignReplication::Link::Mode::Disabled)
+        return true;
     // These framework quests own local-player and follower aliases. Replaying their fragments
     // would give a listener a second follower or make the listener the brawl challenger.
     if (apQuest && (apQuest->formID == 0xCA210 || apQuest->formID == 0x750BA || apQuest->formID == 0x47AE6))
