@@ -1815,6 +1815,7 @@ int main(){
  assert(journal.Append(journal.Current(),{"stage","quest-progress-v1",m.Quest+" 1 0 30 4 101"})==Result::Committed);
  assert(T::CurrentStage(journal.Operations(),m));
  assert(T::MayPublish(true,101,202,nullptr,true));
+ assert(T::MayPublish(true,202,101,nullptr,true)); // Either actual initiating member.
  assert(!T::MayPublish(false,202,101,nullptr,true));
  assert(!T::MayPublish(true,101,101,nullptr,true));
  assert(journal.Append(journal.Current(),{"move","quest-sleep-move-v1",T::Payload(m,101,202)})==Result::Committed);
@@ -1857,7 +1858,7 @@ assert '->MoveTo(' not in travel_client
 assert 'sleepAttempts.insert(r.Event.Key())' in travel_client
 assert 'quest->currentStage!=r.Event.Stage' in travel_client
 assert 'ApplyScriptedTravel(m_world,*stamp,canDispatch)' in (code/'client/Services/Generic/QuestJournal.cpp').read_text()
-assert 'ScriptedTravel::MayPublish(party->LeaderPlayerId==player.GetId()' in (code/'server/Services/QuestService.cpp').read_text()
+assert 'ScriptedTravel::MayPublish(std::find(party->Members.begin(),party->Members.end(),&player)' in (code/'server/Services/QuestService.cpp').read_text()
 print('PASS TRAVEL-01 native trigger integration, no coordinate fallback',flush=True)
 
 

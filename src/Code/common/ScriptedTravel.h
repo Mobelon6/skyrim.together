@@ -105,8 +105,8 @@ inline const Record* Find(const std::vector<Record>& records,const Move& m)
 }
 inline std::string Payload(const Move& m,uint64_t source,uint64_t recipient)
 {return m.Encode()+" "+std::to_string(source)+" "+std::to_string(recipient);}
-inline bool MayPublish(bool leader,uint64_t who,uint64_t other,const Record* existing,bool current)
-{return leader&&who&&other&&who!=other&&!existing&&current;}
+inline bool MayPublish(bool member,uint64_t who,uint64_t other,const Record* existing,bool current)
+{return member&&who&&other&&who!=other&&!existing&&current;}
 inline bool MayAck(const Record* record,uint64_t who,const Move& m)
 {return record&&!record->Arrived&&record->Recipient==who&&record->Event.Encode()==m.Encode();}
 inline bool MayDispatch(const Record& r,uint64_t who,bool current,bool nativeSeen,bool attempted,bool atTarget)

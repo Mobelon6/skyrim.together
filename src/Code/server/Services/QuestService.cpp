@@ -373,7 +373,7 @@ void ApplyScriptedTravelCommand(World& world,Player& player,std::string_view val
                 if (!other||recipient) return;
                 recipient=other;
             }
-        if (!ScriptedTravel::MayPublish(party->LeaderPlayerId==player.GetId(),who,recipient,existing,
+        if (!ScriptedTravel::MayPublish(std::find(party->Members.begin(),party->Members.end(),&player)!=party->Members.end(),who,recipient,existing,
             ScriptedTravel::CurrentStage(authority.Journal.Operations(),*move))) return;
     }
     const auto head=authority.Journal.Current();

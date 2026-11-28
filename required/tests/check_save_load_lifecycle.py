@@ -46,7 +46,7 @@ trade_reset=function(trade,"void OverlayService::RecheckTradeAfterLoad(")
 # Include the actual pending shared-container upload state and cancellation,
 # rather than stubbing away the new load-boundary operation.
 trade_source=(root/trade).read_text()
-shared_state=trade_source[trade_source.index("uint32_t sharedOpening{};"):
+shared_state=trade_source[trade_source.index("uint32_t sharedOpening{},innTarget{};"):
                           trade_source.index("void CancelSharedOpen(){")]
 shared_cancel=function(trade,"void CancelSharedOpen(")
 assert "walletReady=false;readyStream=0;readyCursor=0;" in function(trade,"void OverlayService::ClearTrade(")

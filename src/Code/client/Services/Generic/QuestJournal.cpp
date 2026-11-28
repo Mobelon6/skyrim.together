@@ -1339,7 +1339,7 @@ void SendScriptedTravel(World& w,const CampaignIdentity::Stamp& stamp,RequestCam
             // same native quest, stage and marker were actually observed.
             request.QuestReceipt=("script-sleep-arrived "+existing->Event.Encode()).c_str();return;
         }
-        if (!existing&&w.GetPartyService().IsLeader()&&
+        if (!existing&&
             ScriptedTravel::CurrentStage(campaignLink.Journal.Operations(),o.Event))
         {request.QuestReceipt=("script-sleep-move "+o.Event.Encode()).c_str();return;}
     }
