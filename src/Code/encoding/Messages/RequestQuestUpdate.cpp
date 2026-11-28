@@ -14,6 +14,7 @@ void RequestQuestUpdate::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) co
     aWriter.WriteBits(BindInstance,1);
     TiltedPhoques::Serialization::WriteVarInt(aWriter,Instance);
     TiltedPhoques::Serialization::WriteVarInt(aWriter,ExpectedRun);
+    aWriter.WriteBits(PhysicalStage,1);
 }
 
 void RequestQuestUpdate::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept
@@ -39,4 +40,5 @@ void RequestQuestUpdate::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) 
     BindInstance=tmp!=0;
     Instance=static_cast<uint32_t>(TiltedPhoques::Serialization::ReadVarInt(aReader));
     ExpectedRun=static_cast<uint32_t>(TiltedPhoques::Serialization::ReadVarInt(aReader));
+    aReader.ReadBits(tmp,1);PhysicalStage=tmp!=0;
 }

@@ -9,6 +9,7 @@
 #include <UniqueQuestReward.h>
 #include <KeywordQuestReward.h>
 #include <ScriptedTravel.h>
+#include <QuestPhysicalStage.h>
 #include <QuestRunMember.h>
 #include <sstream>
 #include <Messages/RequestInventoryChanges.h>
@@ -517,6 +518,25 @@ QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
     m_questUpdateConnection = aDispatcher.sink<PacketEvent<RequestQuestUpdate>>().connect<&QuestService::OnQuestChanges>(this);
 }
 
+// The marker is committed BEFORE the ordinary progress record. If the
+// second append fails, retry can finish it without ever publishing an
+// unclassified stage. A second member records their own native attainment.
+bool RecordPhysicalStage(CampaignJournal::Journal& journal,const std::string& key,uint32_t run,
+    uint16_t stage,uint64_t who)
+{
+    const auto markers=QuestPhysicalStage::Read(journal.Operations());
+    if(!markers||key.empty()||!run||!who) return false;
+    if(QuestPhysicalStage::Reached(*markers,key,run,stage,who)) return true;
+    const auto head=journal.Current();
+    return journal.Append(head,{"quest-physical-"+std::to_string(head.Revision+1),
+        "quest-physical-stage-v1",QuestPhysicalStage::Payload(key,run,stage,who)})==CampaignJournal::Result::Committed;
+}
+bool HasPhysicalStages(const CampaignJournal::Journal& journal,const std::string& key,uint32_t run)
+{
+    const auto markers=QuestPhysicalStage::Read(journal.Operations());
+    return !markers||QuestPhysicalStage::Any(*markers,key,run);
+}
+
 void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessage) noexcept
 {
     const auto& message = acMessage.Packet;
@@ -537,7 +557,7 @@ void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessa
     PartyService::Party* pParty = m_world.GetPartyService().GetPlayerParty(pPlayer);
     const PartyService::Party::Conversation* participants = nullptr;
     const std::string targets(message.Targets.data(),message.Targets.size());
-    if (!ValidQuestTargets(targets)) return;
+    if (!ValidQuestTargets(targets)|| (message.PhysicalStage&&message.Status!=RequestQuestUpdate::StageUpdate)) return;
     notify.Targets=message.Targets;
     // A replay-created native instance can attach only to the generation it
     // was started for. A stale attachment must never create a new run.
@@ -597,8 +617,14 @@ void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessa
                 // Late acceptance may happen while the rest of the party is
                 // elsewhere. Offer the recorded stages, never open a new run
                 // or force Stop on a client that has not finished the fragments.
-                if (message.Status == RequestQuestUpdate::Started ||
-                    (message.Status == RequestQuestUpdate::StageUpdate && run.Stages.contains(message.Stage)))
+                const auto key=QuestKey(m_world,message.Id);
+                const auto physical=QuestPhysicalStage::Read(authority.Journal.Operations());
+                if(physical&&message.Status==RequestQuestUpdate::StageUpdate&&run.Stages.contains(message.Stage)&&
+                    QuestPhysicalStage::Has(*physical,key,run.Generation,message.Stage))
+                    RecordPhysicalStage(authority.Journal,key,run.Generation,message.Stage,CampaignAccess::Character(*pPlayer));
+                if(!HasPhysicalStages(authority.Journal,key,run.Generation)&&
+                    (message.Status == RequestQuestUpdate::Started ||
+                    (message.Status == RequestQuestUpdate::StageUpdate && run.Stages.contains(message.Stage))))
                     OfferKnownStages(*pPlayer, *pParty, run, notify);
                 return;
             }
@@ -729,13 +755,22 @@ void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessa
                         !StoreQuestRun(authority.Journal,key,character,attached,notify,message.Instance,true)) return;
                     run=std::move(attached);
                 }
+                if(stage)
+                {
+                    const auto physical=QuestPhysicalStage::Read(authority.Journal.Operations());
+                    if(!physical) return;
+                    if(targets.empty()&&(message.PhysicalStage||QuestPhysicalStage::Has(*physical,key,run.Generation,message.Stage))&&
+                        !RecordPhysicalStage(authority.Journal,key,run.Generation,message.Stage,character)) return;
+                }
                 notify.CheckInstance=bind;notify.ExpectedInstance=bind?message.Instance:0;
-                OfferKnownStages(*pPlayer,*pParty,run,notify);
+                if(!HasPhysicalStages(authority.Journal,key,run.Generation)) OfferKnownStages(*pPlayer,*pParty,run,notify);
             }
             return;
         }
         if (bind&&!QuestRunMember::Remember(next.Members,character,next.Generation,message.Instance)) return;
         const auto instance=bind?std::optional<uint32_t>(message.Instance):std::nullopt;
+        if(durable&&stage&&message.PhysicalStage&&targets.empty()&&
+            !RecordPhysicalStage(authority.Journal,key,next.Generation,message.Stage,character)) return;
         if (durable && !StoreQuestRun(authority.Journal, key, character, next, notify,instance))
         {
             spdlog::error("STM could not persist quest progress {:X}", message.Id.LogFormat());
@@ -745,6 +780,10 @@ void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessa
         // Do not force-stop a listener while its native completion fragments are pending.
         // Confirmed history is replayed through the existing quest consent handler.
         if (completed) return;
+        // A run containing a physical barrier is delivered via the existing
+        // durable pull/catch-up path, which checks the local ESS before
+        // applying any later stage or Stop. Never bypass it with live offers.
+        if(durable&&HasPhysicalStages(authority.Journal,key,run.Generation)) return;
         if (!durable)
             RecordQuest(pPlayer, notify);
         notify.Speaker = pPlayer->GetId();

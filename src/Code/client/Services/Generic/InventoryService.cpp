@@ -17,6 +17,7 @@
 #include <Services/OverlayService.h>
 #include <Forms/TESQuest.h>
 #include <Messages/RequestQuestUpdate.h>
+#include <Services/QuestPhysicalStageClient.h>
 #include <Components/TESContainer.h>
 #include <ExtraData/ExtraContainerChanges.h>
 #include <cstdlib>
@@ -336,7 +337,8 @@ void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEven
     m_transport.Send(request);
     // Inventory evidence is sent first. If the native stage event already
     // arrived, the existing server deduplicator ignores this observation.
-    if (reportStage) m_transport.Send(observedStage);
+    if (reportStage)
+        SubmitObservedQuestStage(m_world,Cast<TESQuest>(TESForm::GetById(m_world.GetModSystem().GetGameId(observedStage.Id))),observedStage);
 
     spdlog::info("Sending item request, item: {:X}, count: {}, target object: {:X}", acEvent.Item.BaseId.BaseId, acEvent.Item.Count, acEvent.FormId);
 }

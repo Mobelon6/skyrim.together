@@ -200,6 +200,9 @@ void HoldStage(TESQuest*,uint16_t) noexcept;HeldStages* GetHeldStages(uint32_t,T
 void OnQuestUpdate(const NotifyQuestUpdate&) noexcept;static bool StopQuest(uint32_t);
 BSTEventResult OnEvent(const TESQuestStageItemDoneEvent*,const EventDispatcher<TESQuestStageItemDoneEvent>*);
 };
+void FlushPhysicalQuestStages(World&){}
+void FinishPhysicalQuestStage(World&,uint32_t,uint16_t){}
+void ClearPhysicalQuestStages(){}
 using HeldStages=QuestService::HeldStages;
 static bool MatchesQuestTargets(TESQuest* q,const NotifyQuestUpdate& u){return q&&(!u.CheckInstance||(!q->stopped&&q->currentInstanceID==u.ExpectedInstance))&&(u.Targets.empty()||(!q->stopped&&q->currentInstanceID==u.LocalInstance&&q->targets==u.Targets));}
 static void ReleaseStagesForWaitingPhases(TESQuest*,HeldStages&) noexcept;
@@ -592,6 +595,7 @@ catchup=extract('client/Services/Generic/QuestJournal.cpp',
     'template<class CanDispatch>\nvoid ReconcileRepeatStarts','\n}\n}\n\nuint32_t ExpectedRepeatRun')+'\n}'
 run('late completed run starts natively and missing stages remain retryable',headers+'''
 #include <QuestRunMember.h>
+#include <QuestPhysicalStage.h>
 #include <TradeProperties.h>
 #include <sstream>
 namespace CampaignJournal {
@@ -651,6 +655,8 @@ uint32_t LocalQuestForm(const std::string& value){const auto key=TradeProperties
 struct RepeatJoin{uint64_t Campaign{},Character{};uint32_t Run{},Before{};
  std::chrono::steady_clock::time_point RetryAt{};bool SawRunning{};};
 std::map<uint32_t,RepeatJoin> repeatJoins;
+bool physicalPending=false;
+bool QuestPhysicalStagePending(uint32_t,uint32_t,uint16_t){return physicalPending;}
 '''+history+catchup+'''
 int main(){
     World world;CampaignJournal::Journal journal;
@@ -669,6 +675,13 @@ int main(){
     quest.stopped=false;quest.reached.insert(0);
     auto stages=plan();assert(stages.size()==2&&stages[0].Stage==40&&stages[1].Stage==20);
     assert(stages[0].Status==NotifyQuestUpdate::StageUpdate&&stages[1].Status==NotifyQuestUpdate::StageUpdate);
+    journal.rows.push_back({"physical","quest-physical-stage-v1",QuestPhysicalStage::Payload(key,1,40,101)});
+    assert(plan().empty()); // cannot replay the physical stage or its successors
+    quest.reached.insert(40);physicalPending=true;assert(plan().empty());
+    physicalPending=false;stages=plan();assert(stages.size()==1&&stages[0].Stage==20);
+    journal.rows.push_back({"arrival","quest-physical-stage-v1",QuestPhysicalStage::Payload(key,1,40,202)});
+    quest.reached.erase(40);assert(plan().empty()); // old ESS overrides historical receipt
+    journal.rows.pop_back();journal.rows.pop_back();
     quest.reached.insert(40);stages=plan();assert(stages.size()==1&&stages[0].Stage==20);
     busy=true;assert(plan().empty());busy=false;
     quest.reached.insert(20);assert(plan().empty());
@@ -1836,3 +1849,38 @@ assert 'quest->currentStage!=r.Event.Stage' in travel_client
 assert 'ApplyScriptedTravel(m_world,*stamp,canDispatch)' in (code/'client/Services/Generic/QuestJournal.cpp').read_text()
 assert 'ScriptedTravel::MayPublish(party->LeaderPlayerId==player.GetId()' in (code/'server/Services/QuestService.cpp').read_text()
 print('PASS TRAVEL-01 native trigger integration, no coordinate fallback',flush=True)
+
+
+run('Q-14 physical fragment policy and journal barriers',headers+'''
+#include <QuestPhysicalStage.h>
+struct Row{std::string Kind,Payload;};
+int main(){
+ using namespace QuestPhysicalStage;
+ Observation o{2};o.Seen(Effect::Geometry);o.Done();
+ assert(o.Remaining==1&&o.Individual());
+ o.Seen(Effect::PlayerTravel);o.Done();assert(!o.Remaining&&!o.Individual());
+ Observation n{1};n.Done();assert(!n.Individual());
+ std::vector<Row> rows{{"quest-progress-v1","irrelevant"},{"quest-physical-stage-v1","quest 1 40 101"}};
+ auto r=Read(rows);assert(r&&Any(*r,"quest",1)&&!Any(*r,"quest",2));
+ assert(Has(*r,"quest",1,40)&&!Has(*r,"quest",1,20));
+ assert(Reached(*r,"quest",1,40,101)&&!Reached(*r,"quest",1,40,202));
+ assert(Blocks(*r,"quest",1,40,false,false)&&Blocks(*r,"quest",1,40,true,true));
+ assert(!Blocks(*r,"quest",1,40,true,false)&&!Blocks(*r,"quest",2,40,false,false));
+ rows.push_back({"quest-physical-stage-v1",Payload("quest",1,40,202)});
+ r=Read(rows);assert(r&&Reached(*r,"quest",1,40,202));
+ assert(Blocks(*r,"quest",1,40,false,false));
+ rows.push_back({"quest-physical-stage-v1","quest 1 99999 101"});
+ assert(!Read(rows));
+}
+''',['-I'+str(code/'common')])
+physical_native=(code/'client/Games/Misc/BSScript.cpp').read_text()
+assert 'caller=caller->Previous' in physical_native and 'ObserveQuestPhysicalEffect(physical->Form' in physical_native
+physical_client=(code/'client/Services/Generic/QuestService.cpp').read_text()
+assert 'FinishPhysicalQuestStage(m_world,questFormId,stage)' in physical_client
+assert 'QueuePhysicalQuestProgress(m_world,formId,instance,std::move(update),itemCount)' in physical_client
+assert 'if(quest->GetStageItemCount(message.Stage)&&!classifiedStages.contains(key)) return;' in physical_client
+physical_server=(code/'server/Services/QuestService.cpp').read_text()
+assert physical_server.index('!RecordPhysicalStage(authority.Journal,key,next.Generation,message.Stage,character)')<physical_server.index('if (durable && !StoreQuestRun(authority.Journal, key, character, next')
+assert 'if(durable&&HasPhysicalStages(authority.Journal,key,run.Generation)) return;' in physical_server
+assert 'SubmitObservedQuestStage(m_world,' in (code/'client/Services/Generic/InventoryService.cpp').read_text()
+print('PASS Q-14 marker before stage, journal planner barrier, native source and alternate report wiring',flush=True)

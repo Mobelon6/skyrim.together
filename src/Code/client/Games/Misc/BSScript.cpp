@@ -20,6 +20,7 @@
 #include <CampaignRewardPolicy.h>
 #include <array>
 #include <Services/ScriptedTravelClient.h>
+#include <Services/QuestPhysicalStageClient.h>
 #include <AI/Movement/PlayerControls.h>
 #include <Games/Memory.h>
 
@@ -217,6 +218,72 @@ static uint32_t NativeDragonSource(void* stackArgument,BSScript::Variable*& rewa
     if (!dragon||!dragon->IsDragon()||!dragon->IsDead()||dragon->IsTemporary()) return 0;
     reward=amount;return dragon->formID;
 }
+namespace
+{
+// Exact native registrations, not script or quest names. ObjectReference.psc
+// declares these methods in SE. TranslateToRef calls native TranslateTo.
+constexpr const char* physicalMethods[]={"Enable","Disable","EnableNoWait","DisableNoWait",
+    "Lock","SetOpen","SetDestroyed","MoveTo","MoveToMyEditorLocation","MoveToNode",
+    "MoveToInteractionLocation","SetPosition","SetAngle","SetScale","SetMotionType",
+    "TranslateTo","PlayAnimation","PlayAnimationAndWait"};
+std::array<std::atomic<const void*>,std::size(physicalMethods)> physicalNatives{};
+struct PhysicalCall
+{
+    uint32_t Form{},Instance{};uint16_t Stage{};uint64_t Epoch{};
+    QuestPhysicalStage::Effect Effect{};
+};
+std::optional<PhysicalCall> ObservePhysicalCall(const void* function,void* stackArgument)
+{
+    size_t index=std::size(physicalMethods);
+    for(size_t i=0;i<std::size(physicalMethods);++i)
+        if(function==physicalNatives[i].load(std::memory_order_acquire)){index=i;break;}
+    if(index==std::size(physicalMethods)||!stackArgument||!World::Exists()||World::Get().IsLoadingSave()) return {};
+    auto* stack=*static_cast<DragonStackView**>(stackArgument);
+    auto* frame=stack?stack->Top:nullptr;
+    auto* gameVM=GameVM::Get();
+    auto* policy=gameVM&&gameVM->virtualMachine&&!gameVM->inactive?gameVM->virtualMachine->GetObjectHandlePolicy():nullptr;
+    if(!frame||!frame->Parent||!policy) return {};
+    auto* self=frame->Self.GetObject();
+    const auto handle=self?self->GetHandle():0;
+    if(!handle||!policy->IsHandleObjectAvailable(handle)) return {};
+    using E=QuestPhysicalStage::Effect;
+    E effect=E::None;
+    const bool moves=index>=7&&index<=15;
+    if(moves&&DragonFrameActor(&frame->Self)==PlayerCharacter::Get()&&PlayerCharacter::Get())
+        effect=E::PlayerTravel;
+    else
+    {
+        constexpr uint32_t refrType=61;
+        if(!policy->HandleIsType(refrType,handle)) return {};
+        auto* ref=static_cast<TESObjectREFR*>(policy->GetObjectForHandle(refrType,handle));
+        if(!ref||static_cast<uint32_t>(ref->formType)!=refrType||ref->IsDeleted()||!ref->baseForm) return {};
+        const auto type=static_cast<uint8_t>(ref->baseForm->formType);
+        if(type!=0x18&&type!=0x19&&type!=0x1C&&type!=0x1D&&type!=0x22&&type!=0x23&&type!=0x24) return {};
+        // Ignore no-op enable/disable, and do not classify actor, loose
+        // inventory, lights or sound/effect records as geometry.
+        if((index==0||index==2)&&!ref->IsDisabled()) return {};
+        if((index==1||index==3)&&ref->IsDisabled()) return {};
+        effect=E::Geometry;
+    }
+    // Walk through synchronous helpers/latent continuation frames to the
+    // real QF fragment. Do not assign arbitrary quest methods to a stage.
+    for(auto* caller=frame->Previous;caller&&caller->Parent==frame->Parent;caller=caller->Previous)
+    {
+        if(!caller->Function) continue;
+        const auto* script=caller->Function->GetObjectTypeName().AsAscii();
+        const auto* method=caller->Function->GetName().AsAscii();
+        if(!script||!method||_strnicmp(script,"qf_",3)||_strnicmp(method,"fragment_",9)) continue;
+        auto* object=caller->Self.GetObject();const auto qh=object?object->GetHandle():0;
+        constexpr uint32_t qt=static_cast<uint32_t>(FormType::QuestItem);
+        if(!qh||!policy->HandleIsType(qt,qh)||!policy->IsHandleObjectAvailable(qh)) return {};
+        auto* quest=static_cast<TESQuest*>(policy->GetObjectForHandle(qt,qh));
+        if(!quest||quest->IsTemporary()||(quest->flags&TESQuest::AllowRepeatStages)) return {};
+        return PhysicalCall{quest->formID,quest->currentInstanceID,quest->currentStage,ScriptedTravelEpoch(),effect};
+    }
+    return {};
+}
+}
+
 static std::optional<ScriptedMoveObservation> NativeScriptedMove(void* stackArgument)
 {
     if (!stackArgument||!World::Exists()||World::Get().IsLoadingSave()||
@@ -385,7 +452,11 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
     std::optional<ScriptedMoveObservation> move;
     if (apThis==moveToNative.load(std::memory_order_acquire))
         try {move=NativeScriptedMove(stackArgument);} catch (...) {}
+    std::optional<PhysicalCall> physical;
+    try {physical=ObservePhysicalCall(apThis,stackArgument);} catch (...) {}
     const auto result=TiltedPhoques::ThisCall(realDragonNativeCall,apThis,stackArgument,logger,vm,flag);
+    if(physical&&(result==BSScript::CallResult::kCompleted||result==BSScript::CallResult::kInProgress))
+        ObserveQuestPhysicalEffect(physical->Form,physical->Instance,physical->Stage,physical->Effect,physical->Epoch);
     if (move&&(result==BSScript::CallResult::kCompleted||result==BSScript::CallResult::kInProgress))
         ObserveScriptedTravel(std::move(*move));
     bool paid=false;
@@ -430,6 +501,11 @@ void TP_MAKE_THISCALL(HookRegisterPapyrusFunction, BSScript::IVirtualMachine, Na
         !_stricmp(apFunction->typeName.AsAscii(),"ObjectReference")&&
         !_stricmp(apFunction->functionName.AsAscii(),"MoveTo"))
         moveToNative.store(apFunction,std::memory_order_release);
+    if(apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
+        !_stricmp(apFunction->typeName.AsAscii(),"ObjectReference"))
+        for(size_t i=0;i<std::size(physicalMethods);++i)
+            if(!_stricmp(apFunction->functionName.AsAscii(),physicalMethods[i]))
+                physicalNatives[i].store(apFunction,std::memory_order_release);
 #endif
     if (CampaignRewardPolicy::SupplementWords&&apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
         !std::strcmp(apFunction->typeName.AsAscii(),"Game")&&

@@ -16,6 +16,8 @@
 #include <UniqueQuestReward.h>
 #include <KeywordQuestReward.h>
 #include <ScriptedTravel.h>
+#include <QuestPhysicalStage.h>
+#include <Services/QuestPhysicalStageClient.h>
 #include <Services/ScriptedTravelClient.h>
 #include <AI/Movement/PlayerControls.h>
 #include <Services/QuestRewardClient.h>
@@ -1642,7 +1644,8 @@ std::vector<NotifyQuestUpdate> MissingActiveQuestStages(World& world,
         if (objective.instance&&objective.instance->quest)
             localQuests.insert(objective.instance->quest->formID);
     const auto history=ActiveQuestHistory(journal.Operations());
-    if (!history) return updates;
+    const auto physical=QuestPhysicalStage::Read(journal.Operations());
+    if (!history||!physical) return updates;
     for (const auto& [key,latest]:*history)
     {
         if (key.ends_with("~legacy")) continue;
@@ -1666,7 +1669,8 @@ std::vector<NotifyQuestUpdate> MissingActiveQuestStages(World& world,
             if (sharedStart)
             {
                 NotifyQuestUpdate start{};
-                start.Id=gameId;start.Stage=latest.StartStage;start.ClientQuestType=latest.StartType;
+                start.Id=gameId;start.Stage=QuestPhysicalStage::Has(*physical,key,latest.Generation,latest.StartStage)?0:latest.StartStage;
+                start.ClientQuestType=latest.StartType;
                 start.Status=NotifyQuestUpdate::Started;start.SharedRun=latest.Generation;
                 start.Speaker=world.GetPartyService().GetLeaderPlayerId();
                 updates.push_back(start);
@@ -1695,8 +1699,14 @@ std::vector<NotifyQuestUpdate> MissingActiveQuestStages(World& world,
         auto stages=state.Stages;
         if (bound&&state.StartedBy&&!quest->IsStageReached(state.StartStage))
             stages.insert(stages.begin(),{state.StartStage,state.StartType});
+        bool blocked=false;
         for (const auto& [stage,type]:stages)
         {
+            // An acknowledged historical arrival is not proof in an older
+            // loaded ESS. Only native local progress and fragment completion
+            // release this barrier; never synthesize its stage.
+            if(QuestPhysicalStage::Blocks(*physical,key,state.Generation,stage,quest->IsStageReached(stage),
+                QuestPhysicalStagePending(id,instance,stage))) {blocked=true;break;}
             if (quest->IsStageReached(stage)) continue;
             NotifyQuestUpdate update{};
             update.Id=gameId;update.Stage=stage;update.ClientQuestType=type;
@@ -1710,7 +1720,7 @@ std::vector<NotifyQuestUpdate> MissingActiveQuestStages(World& world,
         }
         // Queue an observed stop after the bound run's stages. Existing
         // native scene and fragment barriers still govern actual execution.
-        if (bound&&state.Stopped&&!state.CompletedRunOnce)
+        if (!blocked&&bound&&state.Stopped&&!state.CompletedRunOnce)
         {
             NotifyQuestUpdate stop{};
             stop.Id=gameId;stop.Stage=state.StopStage;stop.ClientQuestType=state.StopType;

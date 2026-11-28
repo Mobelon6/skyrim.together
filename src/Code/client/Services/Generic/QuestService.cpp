@@ -7,6 +7,11 @@
 
 #include <Services/QuestService.h>
 #include <Services/QuestRewardClient.h>
+#include <Services/QuestPhysicalStageClient.h>
+#include <Services/ScriptedTravelClient.h>
+#include <Services/CampaignAccess.h>
+#include <deque>
+#include <tuple>
 #include <Services/ImguiService.h>
 #include <Services/OverlayService.h>
 #include <Services/TransportService.h>
@@ -247,8 +252,146 @@ void QuestService::OnConnected(const ConnectedEvent&) noexcept
     */
 }
 
+// Main-thread observation queue. The original engine executes all fragments;
+// only publication is held. A completed classification never executes a
+// script or mutates a quest on either client.
+namespace
+{
+using StageKey=std::tuple<uint32_t,uint32_t,uint16_t>;
+struct OutgoingStage
+{
+    RequestQuestUpdate Message;
+    StageKey Key;
+    QuestPhysicalStage::Observation Evidence;
+    std::chrono::steady_clock::time_point Deadline;
+};
+std::map<uint32_t,std::deque<OutgoingStage>> outgoingStages;
+std::map<StageKey,bool> classifiedStages;
+uint64_t physicalEpoch{};
+void RefreshPhysicalEpoch()
+{
+    const auto epoch=ScriptedTravelEpoch();
+    if(physicalEpoch!=epoch){physicalEpoch=epoch;outgoingStages.clear();classifiedStages.clear();}
+}
+bool UsesPhysicalStages()
+{return CampaignAccess::Mode()==CampaignReplication::Link::Mode::Ready;}
+void ClearPhysicalQuestStages()
+{outgoingStages.clear();classifiedStages.clear();}
+void FlushPhysicalQuestStages(World& world)
+{
+    RefreshPhysicalEpoch();
+    if(world.IsLoadingSave()||!world.GetPartyService().IsInParty()||!world.GetTransport().IsConnected()) return;
+    const auto now=std::chrono::steady_clock::now();
+    for(auto it=outgoingStages.begin();it!=outgoingStages.end();)
+    {
+        auto& queue=it->second;
+        while(!queue.empty())
+        {
+            auto& e=queue.front();
+            auto* quest=Cast<TESQuest>(TESForm::GetById(std::get<0>(e.Key)));
+            if(!quest||quest->currentInstanceID!=std::get<1>(e.Key))
+            {queue.pop_front();continue;}
+            if(e.Evidence.Remaining&&now<e.Deadline) break;
+            auto& message=e.Message;
+            if(message.Status==RequestQuestUpdate::StageUpdate)
+            {
+                if(e.Evidence.Remaining)
+                    spdlog::warn("STM physical stage observation timed out {:X}:{}",std::get<0>(e.Key),message.Stage);
+                message.PhysicalStage=e.Evidence.Individual();
+            }
+            if(!world.GetTransport().Send(message)) break;
+            if(message.Status==RequestQuestUpdate::StageUpdate)
+                classifiedStages[e.Key]=message.PhysicalStage;
+            queue.pop_front();
+        }
+        if(queue.empty()) it=outgoingStages.erase(it);else ++it;
+    }
+}
+void QueuePhysicalQuestProgress(World& world,uint32_t form,uint32_t instance,
+    RequestQuestUpdate message,uint32_t itemCount)
+{
+    if(!UsesPhysicalStages()){world.GetTransport().Send(message);return;}
+    RefreshPhysicalEpoch();
+    // Starts carry a native current stage in STR. In campaign mode, don't
+    // replay a scripted initial stage as a side effect of a start packet.
+    if(message.Status==RequestQuestUpdate::Started&&itemCount) message.Stage=0;
+    const StageKey key{form,instance,message.Stage};
+    auto& queue=outgoingStages[form];
+    if(message.Status==RequestQuestUpdate::StageUpdate)
+    {
+        if(classifiedStages.contains(key)) message.PhysicalStage=classifiedStages.at(key);
+        for(const auto& e:queue)
+            if(e.Key==key&&e.Message.Status==RequestQuestUpdate::StageUpdate) return;
+    }
+    OutgoingStage e{message,key,{message.Status==RequestQuestUpdate::StageUpdate?itemCount:0},
+        std::chrono::steady_clock::now()+std::chrono::seconds(60)};
+    if(message.PhysicalStage)e.Evidence.Geometry=true;
+    queue.push_back(std::move(e));
+    FlushPhysicalQuestStages(world);
+}
+void FinishPhysicalQuestStage(World& world,uint32_t form,uint16_t stage)
+{
+    RefreshPhysicalEpoch();
+    auto it=outgoingStages.find(form);
+    if(it==outgoingStages.end()) return;
+    auto* quest=Cast<TESQuest>(TESForm::GetById(form));
+    if(!quest) return;
+    for(auto& e:it->second)
+        if(e.Key==StageKey{form,quest->currentInstanceID,stage}&&e.Message.Status==RequestQuestUpdate::StageUpdate&&e.Evidence.Remaining)
+        {e.Evidence.Done();break;}
+    FlushPhysicalQuestStages(world);
+}
+}
+bool QuestPhysicalStagePending(uint32_t form,uint32_t instance,uint16_t stage) noexcept
+{
+    RefreshPhysicalEpoch();
+    const auto it=outgoingStages.find(form);
+    if(it==outgoingStages.end()) return false;
+    for(const auto& e:it->second)
+        if(e.Key==StageKey{form,instance,stage}&&e.Message.Status==RequestQuestUpdate::StageUpdate&&e.Evidence.Remaining)
+            return true;
+    return false;
+}
+void ObserveQuestPhysicalEffect(uint32_t form,uint32_t instance,uint16_t stage,
+    QuestPhysicalStage::Effect effect,uint64_t epoch) noexcept
+{
+    try
+    {
+        World::Get().GetRunner().Queue([=]{
+            RefreshPhysicalEpoch();
+            if(epoch!=physicalEpoch||World::Get().IsLoadingSave()) return;
+            auto it=outgoingStages.find(form);
+            if(it==outgoingStages.end()) return;
+            // currentStage alone is ambiguous if multiple stages of the same
+            // native quest are executing simultaneously. Do not guess.
+            OutgoingStage* only=nullptr;
+            for(auto& e:it->second)
+                if(std::get<1>(e.Key)==instance&&e.Message.Status==RequestQuestUpdate::StageUpdate&&e.Evidence.Remaining)
+                {if(only)return;only=&e;}
+            if(only&&only->Key==StageKey{form,instance,stage}) only->Evidence.Seen(effect);
+        });
+    }
+    catch (...) {}
+}
+void SubmitObservedQuestStage(World& world,TESQuest* quest,const RequestQuestUpdate& message) noexcept
+{
+    try
+    {
+        if(!quest) return;
+        if(!UsesPhysicalStages()){world.GetTransport().Send(message);return;}
+        RefreshPhysicalEpoch();
+        // An inventory observation is not proof that a scripted stage
+        // finished. It may not bypass a pending or unknown classification.
+        const StageKey key{quest->formID,quest->currentInstanceID,message.Stage};
+        if(quest->GetStageItemCount(message.Stage)&&!classifiedStages.contains(key)) return;
+        QueuePhysicalQuestProgress(world,quest->formID,quest->currentInstanceID,message,0);
+    }
+    catch (...) {}
+}
+
 void QuestService::OnUpdate(const UpdateEvent&) noexcept
 {
+    FlushPhysicalQuestStages(m_world);
     if (m_heldStages.empty() && m_afterHeldStages.empty())
         return;
 
@@ -331,6 +474,7 @@ void QuestService::OnDisconnected(const DisconnectedEvent&) noexcept
 
 void QuestService::OnPartyLeft(const PartyLeftEvent&) noexcept
 {
+    ClearPhysicalQuestStages();
     m_afterHeldStages.clear();
     m_heldStages.clear();
     m_questRetryAt.clear();
@@ -378,7 +522,7 @@ BSTEventResult QuestService::OnEvent(const TESQuestStartStopEvent* apEvent, cons
         
         m_world.GetRunner().Queue(
             [&, formId = pQuest->formID, stageId = pQuest->currentStage, stopped = pQuest->IsStopped(), type = pQuest->type,
-                instance = pQuest->currentInstanceID, completedRunOnce = pQuest->IsStopped() && (pQuest->flags & TESQuest::RunOnce) &&
+                instance = pQuest->currentInstanceID, itemCount=pQuest->GetStageItemCount(pQuest->currentStage), completedRunOnce = pQuest->IsStopped() && (pQuest->flags & TESQuest::RunOnce) &&
                     (pQuest->flags & TESQuest::Completed) && !(pQuest->flags & (TESQuest::Failed | TESQuest::AllowRepeatStages))]()
             {
                 GameId Id;
@@ -395,7 +539,7 @@ BSTEventResult QuestService::OnEvent(const TESQuestStartStopEvent* apEvent, cons
                     if (!FillQuestTargets(formId, instance, update)) return;
                     update.ClientQuestType = static_cast<std::underlying_type_t<TESQuest::Type>>(type); 
 
-                    m_world.GetTransport().Send(update);
+                    QueuePhysicalQuestProgress(m_world,formId,instance,std::move(update),itemCount);
                 }
             });
     }
@@ -439,7 +583,8 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageEvent* apEvent, const Ev
         }
 
         m_world.GetRunner().Queue(
-            [&, formId = apEvent->formId, stageId = apEvent->stageId, type = pQuest->type, instance = pQuest->currentInstanceID]()
+            [&, formId = apEvent->formId, stageId = apEvent->stageId, type = pQuest->type, instance = pQuest->currentInstanceID,
+                itemCount=pQuest->GetStageItemCount(apEvent->stageId)]()
             {
                 // Observe the actual opponent picked by the vanilla brawl quest without changing its scripts.
                 if (formId == 0x47AE6)
@@ -466,7 +611,7 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageEvent* apEvent, const Ev
                     if (!FillQuestTargets(formId, instance, update)) return;
                     update.ClientQuestType = static_cast<std::underlying_type_t<TESQuest::Type>>(type);
 
-                    m_world.GetTransport().Send(update);
+                    QueuePhysicalQuestProgress(m_world,formId,instance,std::move(update),itemCount);
                 }
             });
     }
@@ -480,6 +625,7 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageItemDoneEvent* apEvent, 
     m_world.GetRunner().Queue(
         [this, questFormId = apEvent->formId, stage = apEvent->stageId]()
         {
+            FinishPhysicalQuestStage(m_world,questFormId,stage);
             QuestRewardStageDone(questFormId,stage);
             auto it = m_heldStages.find(questFormId);
             if (it == m_heldStages.end())
@@ -961,13 +1107,13 @@ void QuestService::OnQuestUpdate(const NotifyQuestUpdate& aUpdate) noexcept
             return;
         if (pQuest->IsStopped() && pQuest->getState() == TESQuest::State::WaitingPromotion)
             break;
-        if (pQuest->IsStopped() && pQuest->IsStageReached(aUpdate.Stage))
+        if (pQuest->IsStopped() && (aUpdate.Stage==0||pQuest->IsStageReached(aUpdate.Stage)))
         {
             bool started = false;
             pQuest->EnsureQuestStarted(started, false);
             if (pQuest->IsStopped()) break;
         }
-        const bool alreadyReached = pQuest->IsStageReached(aUpdate.Stage);
+        const bool alreadyReached = aUpdate.Stage==0||pQuest->IsStageReached(aUpdate.Stage);
         bResult = (alreadyReached || pQuest->ScriptSetStage(aUpdate.Stage)) && !pQuest->IsStopped();
         if (bResult)
         {

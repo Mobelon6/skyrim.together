@@ -15,7 +15,7 @@ struct RequestQuestUpdate final : ClientMessage
     void SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept override;
     void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
 
-    bool operator==(const RequestQuestUpdate& acRhs) const noexcept { return GetOpcode() == acRhs.GetOpcode() && Id == acRhs.Id && Stage == acRhs.Stage && Status == acRhs.Status && ClientQuestType == acRhs.ClientQuestType && JournalObjective == acRhs.JournalObjective && CompletedRunOnce == acRhs.CompletedRunOnce && Targets == acRhs.Targets && BindInstance == acRhs.BindInstance && Instance == acRhs.Instance && ExpectedRun == acRhs.ExpectedRun; }
+    bool operator==(const RequestQuestUpdate& acRhs) const noexcept { return GetOpcode() == acRhs.GetOpcode() && Id == acRhs.Id && Stage == acRhs.Stage && Status == acRhs.Status && ClientQuestType == acRhs.ClientQuestType && JournalObjective == acRhs.JournalObjective && CompletedRunOnce == acRhs.CompletedRunOnce && Targets == acRhs.Targets && BindInstance == acRhs.BindInstance && Instance == acRhs.Instance && ExpectedRun == acRhs.ExpectedRun && PhysicalStage == acRhs.PhysicalStage; }
 
     enum StatusCode : uint8_t
     {
@@ -26,6 +26,7 @@ struct RequestQuestUpdate final : ClientMessage
 
     bool JournalObjective{};
     bool CompletedRunOnce{};
+    bool PhysicalStage{}; // actual local fragment observed a geometry effect
     String Targets{};
     bool BindInstance{};
     uint32_t Instance{};
