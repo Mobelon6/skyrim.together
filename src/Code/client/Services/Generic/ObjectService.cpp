@@ -7,6 +7,7 @@
 #include <Events/CellChangeEvent.h>
 #include <Services/HomeInstance.h>
 #include <Services/Workbench.h>
+#include <Services/CampaignAccess.h>
 #include <Events/ActivateEvent.h>
 #include <Events/LockChangeEvent.h>
 #include <Events/ScriptAnimationEvent.h>
@@ -112,6 +113,31 @@ bool ShouldSyncObject(const TESObjectREFR* apObject, const Set<const TESObjectRE
     }
 }
 
+// Ordinary world geometry is local in a campaign. Keep object entities and
+// container inventories on the existing shared route. This is not a filter
+// for quest stages, NPC interactions, item pickups or furniture leases.
+static bool LocalPhysicalWorld()
+{
+    return CampaignAccess::Mode()==CampaignReplication::Link::Mode::Ready;
+}
+static bool LocalPhysicalActivation(const TESObjectREFR* object)
+{
+    if (!object||!object->baseForm||!LocalPhysicalWorld()) return false;
+    switch (static_cast<uint8_t>(object->baseForm->formType))
+    {
+    case 0x18: // ACTI: switches, levers, pressure plates, other activators
+    case 0x19: // TACT
+    case 0x1C: // CONT
+    case 0x1D: // DOOR
+    case 0x22: // STAT
+    case 0x23: // SCOL
+    case 0x24: // MSTT
+        return true;
+    default:
+        return false;
+    }
+}
+
 void ObjectService::OnDisconnected(const DisconnectedEvent&) noexcept
 {
     // Server object IDs are connection-scoped. Remove the entire entities
@@ -180,11 +206,12 @@ void ObjectService::OnCellChange(const CellChangeEvent& acEvent) noexcept
             continue;
         }
 
-        if (Lock* pLock = pObject->GetLock())
-        {
-            objectData.CurrentLockData.IsLocked = pLock->IsLocked();
-            objectData.CurrentLockData.LockLevel = pLock->lockLevel;
-        }
+        if (!LocalPhysicalWorld())
+            if (Lock* pLock = pObject->GetLock())
+            {
+                objectData.CurrentLockData.IsLocked = pLock->IsLocked();
+                objectData.CurrentLockData.LockLevel = pLock->lockLevel;
+            }
 
         if (pObject->baseForm->formType == FormType::Container)
             objectData.CurrentInventory = pObject->GetInventory();
@@ -213,7 +240,7 @@ void ObjectService::OnAssignObjectsResponse(const AssignObjectsResponse& acMessa
         if (objectData.IsSenderFirst)
             continue;
 
-        if (objectData.CurrentLockData != LockData{})
+        if (!LocalPhysicalWorld() && objectData.CurrentLockData != LockData{})
         {
             Lock* pLock = pObject->GetLock();
 
@@ -269,7 +296,7 @@ void ObjectService::OnActivate(const ActivateEvent& acEvent) noexcept
     // Managed interiors use the journal; never publish an unscoped activation.
     if (auto* cell=acEvent.pObject->GetParentCellEx();cell && HomeInstance::ManagedCell(cell->formID)&&
         !Workbench::OrdinaryRoute(acEvent.pObject)) return;
-    if (!m_transport.IsConnected())
+    if (!m_transport.IsConnected() || LocalPhysicalActivation(acEvent.pObject))
         return;
 
     if (Lock* pLock = acEvent.pObject->GetLock())
@@ -335,7 +362,7 @@ void ObjectService::OnActivateNotify(const NotifyActivate& acMessage) noexcept
         return;
     }
 
-    if (!pObject->baseForm||Workbench::Owns(pObject)) return;
+    if (!pObject->baseForm||Workbench::Owns(pObject)||LocalPhysicalActivation(pObject)) return;
     if (auto* cell=pObject->GetParentCellEx();cell && HomeInstance::ManagedCell(cell->formID)&&
         !Workbench::OrdinaryRoute(pObject)) return;
     if (pObject->baseForm->formType == FormType::Door)
@@ -361,7 +388,7 @@ void ObjectService::OnLockChange(const LockChangeEvent& acEvent) noexcept
     if (auto* object=Cast<TESObjectREFR>(TESForm::GetById(acEvent.FormId)))
         if (auto* cell=object->GetParentCellEx();cell && HomeInstance::ManagedCell(cell->formID))
         {HomeInstance::ObserveLock(acEvent.FormId);return;}
-    if (!m_transport.IsConnected())
+    if (!m_transport.IsConnected() || LocalPhysicalWorld())
         return;
 
     LockChangeRequest request;
@@ -373,6 +400,7 @@ void ObjectService::OnLockChange(const LockChangeEvent& acEvent) noexcept
     }
 
     const auto* const pObject = Cast<TESObjectREFR>(TESForm::GetById(acEvent.FormId));
+    if (!pObject) return;
 
     TESObjectCELL* pCell = pObject->GetParentCellEx();
     if (!pCell)
@@ -410,6 +438,7 @@ void ObjectService::OnLockChangeNotify(const NotifyLockChange& acMessage) noexce
     }
 
     if (auto* cell=pObject->GetParentCellEx();cell && HomeInstance::ManagedCell(cell->formID)) return;
+    if (LocalPhysicalWorld()) return;
     auto* pLock = pObject->GetLock();
 
     if(!acMessage.IsLocked)

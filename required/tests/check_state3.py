@@ -1247,9 +1247,9 @@ objects = 'client/Services/Generic/ObjectService.cpp'
 stash = extract(objects, 'Set<const TESObjectREFR*> GetPlayerStashContainers()', 'void ObjectService::OnDisconnected(')
 activate = extract(objects, 'void ObjectService::OnActivateNotify(', 'void ObjectService::OnLockChange(')
 lock = extract(objects, 'void ObjectService::OnLockChangeNotify(', 'void ObjectService::OnScriptAnimationEvent(')
-run('ordinary doors and locks use native replay; confiscated inventory remains personal', headers+'''
+run('campaign physical doors, locks and activators stay local; legacy STR and confiscated inventory unchanged', headers+'''
 template<class T> using Set=std::set<T>;
-enum class FormType{Door,Container,Activator};
+enum class FormType{Door=0x1D,Container=0x1C,Activator=0x18,TalkingActivator=0x19,Static=0x22,StaticCollection=0x23,MovableStatic=0x24,Furniture=0x28,Book=27,Character=62};
 struct TESObjectCELL{uint32_t formID=10;};
 struct TESForm{uint32_t formID{};FormType formType{};static TESForm* GetById(uint32_t);};
 template<class T>T* Cast(TESForm* p){return static_cast<T*>(p);}
@@ -1270,6 +1270,8 @@ TESForm* TESForm::GetById(uint32_t id){return id==1?&door:nullptr;}
 struct TESFaction{struct{TESObjectREFR* playerInventoryContainer{};TESObjectREFR* stolenGoodsContainer{};}crimeData;};
 struct ModManager{std::vector<TESFaction*> factions;static ModManager* Get(){static ModManager m;return &m;}};
 namespace NativeTrade{bool IsProxy(const TESObjectREFR* p){return p==&proxy;}}
+namespace CampaignReplication{struct Link{enum class Mode{Ready,Disabled,Faulted};};}
+namespace CampaignAccess{auto mode=CampaignReplication::Link::Mode::Disabled;auto Mode(){return mode;}}
 namespace HomeInstance{bool ManagedCell(uint32_t id){return id==99;}}
 namespace Workbench{bool owned=false,ordinary=false;bool Owns(const TESObjectREFR*){return owned;}bool OrdinaryRoute(const TESObjectREFR*){return ordinary;}}
 struct World{struct ModSystem{uint32_t GetGameId(uint32_t id){return id;}} mods;static World& Get(){static World w;return w;}ModSystem& GetModSystem(){return mods;}};
@@ -1306,8 +1308,37 @@ int main(){
  svc.OnActivateNotify({1,2,TESObjectREFR::kClosed});assert(door.activations==3);
  Workbench::owned=true;svc.OnActivateNotify({1,2,TESObjectREFR::kClosed});assert(door.activations==3);
  Workbench::owned=false;Workbench::ordinary=false;
+ // The actual incoming handlers must not open/close or unlock a peer's
+ // geometry in campaign mode, including stale legacy packets.
+ CampaignAccess::mode=CampaignReplication::Link::Mode::Ready;
+ door.cell.formID=10;door.base.formType=FormType::Door;
+ svc.OnActivateNotify({1,2,TESObjectREFR::kClosed});
+ svc.OnLockChangeNotify({1,true,50});
+ assert(door.activations==3&&!door.lock.locked&&door.lockChanges==2);
+ for(auto t:{FormType::Activator,FormType::TalkingActivator,FormType::Container,
+             FormType::Static,FormType::StaticCollection,FormType::MovableStatic}){
+    door.base.formType=t;assert(LocalPhysicalActivation(&door));
+    svc.OnActivateNotify({1,2,TESObjectREFR::kClosed});assert(door.activations==3);
+ }
+ for(auto t:{FormType::Book,FormType::Character,FormType::Furniture}){
+    door.base.formType=t;assert(!LocalPhysicalActivation(&door));
+ }
+ CampaignAccess::mode=CampaignReplication::Link::Mode::Disabled;
+ door.base.formType=FormType::Door;
+ assert(!LocalPhysicalActivation(&door));
+ svc.OnActivateNotify({1,2,TESObjectREFR::kClosed});assert(door.activations==4);
 }
 ''')
+physical_objects=(code/objects).read_text()
+assert 'if (!m_transport.IsConnected() || LocalPhysicalActivation(acEvent.pObject))' in physical_objects
+assert 'if (!m_transport.IsConnected() || LocalPhysicalWorld())' in physical_objects
+assert 'if (!LocalPhysicalWorld() && objectData.CurrentLockData != LockData{})' in physical_objects
+assert 'if (!LocalPhysicalWorld())\n            if (Lock* pLock = pObject->GetLock())' in physical_objects
+assert 'objectData.CurrentInventory = pObject->GetInventory();' in physical_objects
+assert 'pObject->SetInventoryRetainingQuestItems(currentInventory, objectData.CurrentInventory);' in physical_objects
+assert 'pObject->SetInventory(objectData.CurrentInventory);' in physical_objects
+assert physical_objects.index('acEvent.pObject->Activate(acEvent.pActivator') < physical_objects.index('LocalPhysicalActivation(acEvent.pObject)')
+print('PASS campaign local physical state preserves native activation, object inventory snapshots and existing leases',flush=True)
 
 # The original server still relays weather and optional combat XP; test the
 # actual network handler branches. An in-memory transport represents recipients.
