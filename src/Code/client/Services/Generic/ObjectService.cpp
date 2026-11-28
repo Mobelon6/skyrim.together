@@ -156,7 +156,10 @@ void ObjectService::OnCellChange(const CellChangeEvent& acEvent) noexcept
     TESObjectCELL* pCell = pPlayer?pPlayer->parentCell:nullptr;
     if (!pCell) return;
 
-    if (HomeInstance::PrivateCell(pCell->formID)) return;
+    if (HomeInstance::ManagedCell(pCell->formID)) return;
+    // Keep STR's existing home-inventory opt-in until the durable shared
+    // storage path is ready. The shared mode alone must not enable an
+    // unprotected first-entrant snapshot.
     // Player homes should not be synced, so that chest contents,
     // which are often used as storage, are never accidentally wiped.
     if (!World::Get().GetServerSettings().SyncPlayerHomes && IsPlayerHome(pCell))

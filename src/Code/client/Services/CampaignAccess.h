@@ -37,6 +37,7 @@ std::optional<std::vector<HomePlacement::Stack>> HomePlacements(uint64_t campaig
 std::optional<HomeEstateConstruction::Record> EstateConstruction(uint64_t campaign,uint64_t owner,const std::string& plot);
 std::optional<HomeEstateConstruction::Record> SharedEstateConstruction(uint64_t campaign,const std::string& plot);
 std::optional<HomeCityPurchase::State> CityHome(uint64_t campaign,uint32_t cell);
+bool NativeSharedCityHome(uint32_t cell);
 std::optional<std::string> EstateRoomShape(uint64_t campaign,uint32_t slot,const std::string& root);
 bool HomeCanModify(uint64_t campaign,uint32_t slot,uint64_t character);
 bool ConfirmReceipt(World&, uint64_t stream, uint64_t savedStream, uint32_t cursor, uint32_t receipt,

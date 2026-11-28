@@ -2751,6 +2751,14 @@ bool HomeInstance::ManagedCell(uint32_t local) noexcept
     {
         if (ProjectionForm(local) || PrivateCell(local) || NativeGuestCell(local)) return true;
         if (CampaignAccess::Mode()==CampaignReplication::Link::Mode::Disabled) return false;
+        if (HomeEstateConstruction::SharedMode())
+        {
+            // The common original CELL must not be excluded by the old
+            // projection catalog. Unpurchased city homes or a historical
+            // per-owner ledger stay protected, even without that catalog.
+            if (const auto* house=City::Find(local);house&&!house->Parent)
+                return !CampaignAccess::NativeSharedCityHome(local);
+        }
         return CatalogCell(local)!=nullptr;
     }
     catch (...) {return false;}

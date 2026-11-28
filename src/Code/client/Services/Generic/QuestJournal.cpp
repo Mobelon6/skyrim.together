@@ -259,6 +259,12 @@ std::optional<HomeCityPurchase::State> CampaignAccess::CityHome(uint64_t campaig
     return HomeCityPurchase::Read(campaignLink.Journal,cell);
 }
 
+bool CampaignAccess::NativeSharedCityHome(uint32_t cell)
+{
+    if(Mode()!=CampaignReplication::Link::Mode::Ready||!HomeEstateConstruction::SharedMode())return false;
+    return HomeCityPurchase::NativeContainerRoute(campaignLink.Journal,cell);
+}
+
 bool CampaignAccess::TradeEnabled()
 {
     using Mode=CampaignReplication::Link::Mode;

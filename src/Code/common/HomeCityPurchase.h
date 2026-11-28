@@ -1,5 +1,6 @@
 #pragma once
 #include "CampaignJournal.h"
+#include "HomeRegistry.h"
 #include "TradeProperties.h"
 #include <array>
 #include <sstream>
@@ -174,5 +175,22 @@ inline bool Publish(CampaignJournal::Journal& journal,const Change& c)
     }
     return journal.Append(head,{"home-city-"+std::to_string(head.Revision+1),
         "home-city-purchase-v1",c.Encode()})==CampaignJournal::Result::Committed;
+}
+
+// Only the new, acquired physical property can enter the ordinary STR
+// inventory route. Never merge historical per-owner ledger balances into it.
+// This does not enable the STR server option or make snapshots durable.
+inline bool NativeContainerRoute(const CampaignJournal::Journal& journal,uint32_t cell)
+{
+    const auto* house=Find(cell);
+    if(!house||house->Parent)return false;
+    const auto state=Read(journal,cell);
+    if(!state||state->Status!=Phase::Purchased)return false;
+    const auto legacy=HomeRegistry::Read(journal);
+    if(!legacy)return false;
+    const TradeProperties::FormKey root{"skyrim.esm",cell};
+    for(const auto& old:*legacy)
+        if(old.Root.Encode()==root.Encode())return false;
+    return true;
 }
 }

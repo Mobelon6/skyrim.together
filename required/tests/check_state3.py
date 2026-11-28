@@ -1949,7 +1949,9 @@ int main(){
  assert(decor.Parent==a.Cell&&City::FromInfo(decor.Info)==&decor);
  const auto& dlc=City::Furniture[4];assert(!City::FromInfo(dlc.Info)&&City::FromInfo(dlc.Info,true)==&dlc);
  assert(!City::Publish(j,{decor.Cell,0,300,11,City::Action::Reserve}));
+ assert(!City::NativeContainerRoute(j,a.Cell)&&!City::NativeContainerRoute(j,decor.Cell));
  assert(City::Publish(j,{a.Cell,0,5000,11,City::Action::Reserve}));
+ assert(!City::NativeContainerRoute(j,a.Cell));
  auto s=City::Read(j,a.Cell);assert(s&&s->Status==City::Phase::Reserved&&s->Buyer==11);
  assert(!City::Publish(j,{a.Cell,s->Revision,5000,22,City::Action::Reserve}));
  assert(!City::Publish(j,{a.Cell,s->Revision,5000,22,City::Action::Confirm}));
@@ -1973,6 +1975,11 @@ int main(){
  auto restored=City::Read(reload,a.Cell);assert(restored&&restored->Status==City::Phase::Purchased&&restored->Buyer==11);
  assert(City::Read(reload,decor.Cell)->Status==City::Phase::Purchased&&City::Read(reload,decor.Cell)->Buyer==22);
  assert(City::Read(reload,next.Cell)->Status==City::Phase::Reserved);
+ assert(City::NativeContainerRoute(reload,a.Cell));
+ assert(!City::NativeContainerRoute(reload,b.Cell)&&!City::NativeContainerRoute(reload,decor.Cell));
+ // A historical per-owner balance is not imported to the common route.
+ assert(HomeRegistry::Register(reload,22,{"skyrim.esm",a.Cell}));
+ assert(!City::NativeContainerRoute(reload,a.Cell));
  std::filesystem::remove_all(root);
 }
 ''',('-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp'),str(code/'common/QuestJournalDisk.cpp')))
@@ -2108,3 +2115,50 @@ tif_path=city_client[city_client.index('const auto outcome=CityHomeClient::TryTi
 assert tif_path.index('TifDispatch::Dispatched')<tif_path.index('TifDispatch::Rejected')<tif_path.index('p->RemoveItem(gold,')
 assert 'ClearCityPending();return;' in tif_path[:tif_path.index('p->RemoveItem(gold,')]
 assert 'if(waive)cityWaive.store(house.Cell,std::memory_order_release);' in city_client
+
+
+# HOME-02: the same classification governs outgoing assignment and incoming
+# inventory snapshots. Preserve existing legacy/guest routes and individual
+# physical state, do not enable STR SyncPlayerHomes automatically.
+managed_home_cell=extract('client/Services/Generic/PartyHome.cpp',
+    'bool HomeInstance::ManagedCell(', 'void HomeInstance::ObserveLock(')
+run('shared acquired city homes use original STR container assignment route',headers+'''
+#include <HomeCityPurchase.h>
+namespace City=HomeCityPurchase;
+namespace CampaignReplication{struct Link{enum class Mode{Disabled,Ready,Blocked};};}
+namespace CampaignAccess{
+ CampaignReplication::Link::Mode mode=CampaignReplication::Link::Mode::Ready;
+ bool purchased=false;auto Mode(){return mode;}
+ bool NativeSharedCityHome(uint32_t){return purchased&&mode==CampaignReplication::Link::Mode::Ready;}
+}
+namespace HomeEstateConstruction{bool shared=true;bool SharedMode(){return shared;}}
+namespace HomeInstance{
+ bool ProjectionForm(uint32_t id){return id==91;}
+ bool PrivateCell(uint32_t id){return id==92;}
+ bool NativeGuestCell(uint32_t id){return id==93;}
+ bool ManagedCell(uint32_t)noexcept;
+}
+const int catalog=1;
+const int* CatalogCell(uint32_t id){return id==City::Houses[0].Cell||id==94?&catalog:nullptr;}
+'''+managed_home_cell+'''
+int main(){
+ const auto a=City::Houses[0].Cell,b=City::Houses[1].Cell;
+ assert(HomeInstance::ManagedCell(a)&&HomeInstance::ManagedCell(b));
+ CampaignAccess::purchased=true;
+ assert(!HomeInstance::ManagedCell(a)&&!HomeInstance::ManagedCell(b));
+ assert(HomeInstance::ManagedCell(91)&&HomeInstance::ManagedCell(92)&&HomeInstance::ManagedCell(93));
+ assert(HomeInstance::ManagedCell(94)&&!HomeInstance::ManagedCell(95));
+ CampaignAccess::mode=CampaignReplication::Link::Mode::Blocked;
+ assert(HomeInstance::ManagedCell(a)&&HomeInstance::ManagedCell(b));
+ CampaignAccess::mode=CampaignReplication::Link::Mode::Ready;
+ HomeEstateConstruction::shared=false;
+ assert(HomeInstance::ManagedCell(a)&&!HomeInstance::ManagedCell(b));
+ CampaignAccess::mode=CampaignReplication::Link::Mode::Disabled;
+ assert(!HomeInstance::ManagedCell(a)&&HomeInstance::ManagedCell(92));
+}
+''',['-I'+str(code/'common')])
+shared_object_assign=extract('client/Services/Generic/ObjectService.cpp',
+    'void ObjectService::OnCellChange(', 'void ObjectService::OnAssignObjectsResponse(')
+assert 'if (HomeInstance::ManagedCell(pCell->formID)) return;' in shared_object_assign
+assert 'if (!World::Get().GetServerSettings().SyncPlayerHomes && IsPlayerHome(pCell))' in shared_object_assign
+assert 'HomeInstance::ManagedCell(cell->formID)) continue;' in (code/'client/Services/Generic/ObjectService.cpp').read_text()
