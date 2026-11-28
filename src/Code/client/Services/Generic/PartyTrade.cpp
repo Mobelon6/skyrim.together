@@ -122,6 +122,15 @@ void ResetNativeIntents()
 std::atomic_uint32_t proxyId{}, nativeToken{}, sharedTarget{};
 uint32_t sharedOpening{};
 Clock::time_point sharedOpenUntil{};
+struct SharedSeedUpload
+{
+    GameId Item{};
+    uint32_t Next{},Cursor{};
+    uint64_t Stream{},Digest{};
+    std::string Bytes;
+};
+SharedSeedUpload sharedSeed;
+void CancelSharedOpen(){sharedOpening=0;sharedOpenUntil={};sharedSeed={};}
 thread_local bool shadowMutation{};
 struct ShadowWrite
 {
@@ -1932,23 +1941,10 @@ bool OverlayService::TryTrade(uint32_t form) noexcept
             !CampaignAccess::NativeSharedCityHome(cell->formID)||!CampaignAccess::TradeEnabled()||
             !NativeEnabled()||!m_transport.IsOnline()||!w.Load(m_world)||!Ready(w)||session||m_active||sharedOpening)
         {pollAt={};Utils::ShowHudMessage("Общий сундук: ожидается журнал имущества.");return true;}
-        const auto key=PropertyKey(object->formID),base=PropertyKey(object->baseForm->formID);
-        const auto items=HomeInventory::Capture(*object);
-        if(!key||!base||!items)return true;
-        HomeSnapshot::Ref row;
-        row.Key=*key;row.Base=*base;row.Type=28;row.Inventory=1;row.Scale=object->scale;row.Items=*items;
-        const std::array<float,6> pose{object->position.x,object->position.y,object->position.z,
-            object->rotation.x,object->rotation.y,object->rotation.z};
-        for(size_t i=0;i<pose.size();++i)row.Transform[i]=std::bit_cast<uint32_t>(pose[i]);
-        HomeSnapshot::State seed;seed.Refs.push_back(std::move(row));
-        if(!seed.Valid())return true;
         PartyTrade request{TradeOp::HomeOpen,0,0,w.Cursor(),0,w.Stream()};
         if(!m_world.GetModSystem().GetServerModId(object->formID,request.Item))return true;
-        const auto bytes=seed.Encode();
-        // Existing accounts need no replacement baseline; the server ignores
-        // a proposed snapshot once one exists. Bound the initial native payload.
-        if(bytes.size()<=1400)request.Text=bytes.c_str();
-        if(Send(request)){sharedOpening=form;sharedOpenUntil=Clock::now()+5s;}
+        // An established container never uploads its local ESS contents.
+        if(Send(request)){sharedOpening=form;sharedOpenUntil=Clock::now()+15s;sharedSeed={};}
         else Utils::ShowHudMessage("Не удалось открыть общий сундук.");
         return true;
     }
@@ -2029,7 +2025,7 @@ void OverlayService::ClearTrade() noexcept
     ResetNativeIntents();takeAllRegistered=false;
     shadowCleanupPending=true;cleanupRetry={};
     if (nativeRequested && CampaignAccess::GameReady()) NativeHide();
-    sharedTarget.store(0);sharedOpening=0;sharedOpenUntil={};
+    sharedTarget.store(0);CancelSharedOpen();
     nativeRequested=nativeOpened=stockComplete=false;
     nativeDeadline={};stockRemaining=0;incomingStock.clear();
     if (session && m_pOverlay) m_pOverlay->ExecuteAsync("hideTrade");
@@ -2040,6 +2036,7 @@ void OverlayService::ClearTrade() noexcept
 void OverlayService::RecheckTradeAfterLoad() noexcept
 {
     HomePlacementClient::Forget();
+    CancelSharedOpen();
     ResetNativeIntents();
     shadowCleanupPending=true;cleanupRetry={};
     // A confirmed world replacement permits a new receipt check, not automatic acceptance.
@@ -2215,9 +2212,39 @@ void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
     }
     if (e.Op==TradeOp::Error)
     {
-        sharedOpening=0;sharedOpenUntil={};
+        CancelSharedOpen();
         ResetNativeIntents();walletReady=false;pollAt={};
         Utils::ShowHudMessage("Сервер не подтвердил операцию обмена.");return;
+    }
+    if(e.Op==TradeOp::HomeStockNeeded)
+    {
+        const auto form=m_world.GetModSystem().GetGameId(e.Item);
+        auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
+        if(!sharedOpening||sharedOpening!=form||session||!sharedSeed.Bytes.empty()||
+            !NativeTrade::IsSharedContainer(object)||!Ready(w)||e.Cursor!=w.Cursor()||
+            !e.Stream||(w.Stream()&&e.Stream!=w.Stream()))return;
+        if(!object||object->IsDeleted()||object->IsDisabled()||
+            object->GetParentCellEx()!=p->GetParentCellEx())
+        {CancelSharedOpen();return;}
+        if(const auto* lock=object->GetLock();lock&&lock->IsLocked())
+        {CancelSharedOpen();return;}
+        const auto key=PropertyKey(object->formID),base=PropertyKey(object->baseForm->formID);
+        const auto items=HomeInventory::Capture(*object);
+        if(!key||!base||!items){CancelSharedOpen();Utils::ShowHudMessage("Не удалось прочитать содержимое общего сундука.");return;}
+        HomeSnapshot::Ref row;
+        row.Key=*key;row.Base=*base;row.Type=28;row.Inventory=1;row.Scale=object->scale;row.Items=*items;
+        const std::array<float,6> pose{object->position.x,object->position.y,object->position.z,
+            object->rotation.x,object->rotation.y,object->rotation.z};
+        for(size_t i=0;i<pose.size();++i)row.Transform[i]=std::bit_cast<uint32_t>(pose[i]);
+        HomeSnapshot::State seed;seed.Refs.push_back(std::move(row));
+        if(!seed.Valid()){CancelSharedOpen();return;}
+
+        auto bytes=seed.Encode();
+        if(bytes.empty()||bytes.size()>HomeSnapshot::MaxBytes)
+        {CancelSharedOpen();Utils::ShowHudMessage("Не удалось зарегистрировать содержимое общего сундука.");return;}
+        sharedSeed={e.Item,0,w.Cursor(),w.Stream(),HomeSnapshot::Digest(bytes),std::move(bytes)};
+        sharedOpenUntil=Clock::now()+15s;
+        return;
     }
     if (e.Op==TradeOp::Offer || e.Op==TradeOp::Open)
     {
@@ -2229,7 +2256,7 @@ void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
             auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
             if(!sharedOpening||form!=sharedOpening||!NativeTrade::IsSharedContainer(object)||!NativeEnabled())
             {Send({TradeOp::Close,e.Peer,e.Session});return;}
-            sharedTarget.store(form);sharedOpening=0;sharedOpenUntil={};
+            sharedTarget.store(form);CancelSharedOpen();
         }
         else if(sharedOpening){Send({TradeOp::Close,e.Peer,e.Session});return;}
         session=e.Session;peer=e.Peer;partner=e.Text.c_str();tradeOpen=e.Op==TradeOp::Open;
@@ -2271,12 +2298,36 @@ void OverlayService::UpdateTrade() noexcept
             (rescue.awaiting && Clock::now() >= rescue.deadline))
             CloseRescue();
     }
-    if(sharedOpening&&Clock::now()>=sharedOpenUntil){sharedOpening=0;sharedOpenUntil={};}
+    if(sharedOpening&&Clock::now()>=sharedOpenUntil)
+    {CancelSharedOpen();Utils::ShowHudMessage("Не удалось открыть общий сундук. Повторите попытку.");}
     MaintainShadow();
     HomePlacementClient::Update(m_world);
     if (receiptFailure || !m_transport.IsOnline() || !m_inGame || !CampaignAccess::GameReady())
     {
-        walletReady=false;pollAt={};return;
+        CancelSharedOpen();walletReady=false;pollAt={};return;
+    }
+    if(sharedOpening&&!sharedSeed.Bytes.empty())
+    {
+        auto* object=Cast<TESObjectREFR>(TESForm::GetById(sharedOpening));
+        auto* player=PlayerCharacter::Get();
+        Wallet w;
+        if(m_world.IsLoadingSave()||!player||!NativeTrade::IsSharedContainer(object)||
+            object->IsDisabled()||object->IsDeleted()||object->GetParentCellEx()!=player->GetParentCellEx()||
+            !w.Load(m_world)||w.Cursor()!=sharedSeed.Cursor||w.Stream()!=sharedSeed.Stream)
+        {CancelSharedOpen();return;}
+        auto& u=sharedSeed;
+        const auto count=static_cast<uint32_t>((u.Bytes.size()+HomeSnapshot::PartBytes-1)/HomeSnapshot::PartBytes);
+        // Same bounded batching as the existing home baseline uploader.
+        for(unsigned n=0;n<8&&u.Next<count;++n)
+        {
+            PartyTrade part{TradeOp::HomeStockPart,u.Next,0,u.Cursor,count,u.Stream};
+            part.Item=u.Item;part.Variant=std::to_string(u.Digest).c_str();
+            part.Text=u.Bytes.substr(size_t(u.Next)*HomeSnapshot::PartBytes,HomeSnapshot::PartBytes).c_str();
+            if(!Send(part)){CancelSharedOpen();return;}
+            ++u.Next;sharedOpenUntil=Clock::now()+15s;
+        }
+        // Keep the opening identity until Open/Error; no duplicate upload.
+        if(u.Next==count)u.Bytes.clear();
     }
     if (session && nativeRequested)
     {

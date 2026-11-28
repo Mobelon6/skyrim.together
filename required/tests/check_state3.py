@@ -2213,4 +2213,56 @@ assert 'object&&SetOriginalStock(*object,desired)' in shared_trade_client
 assert 'open(object,0)' in shared_trade_client and 'auto* object=NativeTarget();' in shared_trade_client
 assert 'ledger.CommitShared(h.Character' in shared_trade_server
 assert 'HomeSharedStorage::Seed(j,address,bytes)' in shared_trade_server
+assert 'TradeOp::HomeStockNeeded' in shared_trade_client and 'TradeOp::HomeStockPart' in shared_trade_client
+assert 'u.Data.Complete()' in shared_trade_server
 assert 'NativeTrade::IsSharedContainer(pObject)) continue;' in (code/'client/Services/Generic/ObjectService.cpp').read_text()
+
+
+run('large initial shared stock: chunk assembly, interrupted publication, existing receipt and restart',headers+'''
+#include <TradeLedger.h>
+#include <filesystem>
+int main(){
+ namespace C=HomeCityPurchase;namespace S=HomeSharedStorage;namespace H=HomeSnapshot;
+ const auto path=std::filesystem::temp_directory_path()/"stm-shared-large-stock";
+ std::filesystem::remove_all(path);
+ CampaignJournal::Journal j;assert(j.Open(path,73,"test",true));
+ S::Address a{C::Houses[0].Cell,{"skyrim.esm",12345}};
+ assert(C::Publish(j,{a.Cell,0,5000,11,C::Action::Reserve}));
+ auto reserved=C::Read(j,a.Cell);
+ assert(reserved&&C::Publish(j,{a.Cell,reserved->Revision,5000,11,C::Action::Confirm}));
+ H::Ref r;r.Key=a.Ref;r.Base={"skyrim.esm",500};r.Type=28;r.Inventory=1;r.Scale=100;
+ for(uint32_t n=10000;n<10200;++n)r.Items.push_back({{"skyrim.esm",n},3,{}});
+ H::State seed;seed.Refs.push_back(r);assert(seed.Valid());
+ const auto bytes=seed.Encode();
+ assert(bytes.size()>1800&&bytes.size()<H::MaxBytes);
+ const auto digest=H::Digest(bytes);
+ const auto count=static_cast<uint32_t>((bytes.size()+H::PartBytes-1)/H::PartBytes);
+ auto chunk=[&](uint32_t i){return std::string_view(bytes).substr(size_t(i)*H::PartBytes,H::PartBytes);};
+ H::Upload upload;
+ assert(!upload.Add(digest,count,1,chunk(1)));
+ assert(upload.Add(digest,count,0,chunk(0))&&!upload.Complete());
+ assert(!upload.Add(digest+1,count,1,chunk(1)));
+ for(uint32_t n=1;n<count;++n)assert(upload.Add(digest,count,n,chunk(n)));
+ assert(upload.Complete()&&upload.Bytes==bytes);
+ // Simulate a crash after a durable part but before the final marker.
+ const auto first=j.Current().Revision+1;
+ assert(j.Append(j.Current(),{S::PartId(first,0),"home-shared-stock-part-v2",std::string(chunk(0))})==CampaignJournal::Result::Committed);
+ assert(!S::Read(j,a));
+ CampaignJournal::Journal resumed;assert(resumed.Open(path,73,"test",false));
+ assert(!S::Read(resumed,a)&&S::Seed(resumed,a,upload.Bytes));
+ const auto committed=resumed.Current();
+ assert(S::Read(resumed,a)->Items.size()==200);
+ assert(!S::Read(resumed,a,committed.Revision)); // marker not yet visible
+ seed.Refs[0].Items[0].Count=99;
+ assert(S::Seed(resumed,a,seed.Encode())&&resumed.Current()==committed);
+ TradeLedger ledger(resumed,73);assert(ledger.Stream()==73);
+ assert(ledger.CommitShared(11,a,r.Items[0].Base,"",1,0,0));
+ assert(ledger.Ack("11",1));
+ CampaignJournal::Journal restart;assert(restart.Open(path,73,"test",false));
+ TradeLedger after(restart,73);assert(after.Stream()==73);
+ const auto stock=after.SharedContainer(a);
+ assert(stock&&stock->Items.size()==200&&stock->Items.front().Count==2);
+ assert(after.MatchesReceipt("11",73,0,1,"skyrim.esm",10000,1,0));
+ std::filesystem::remove_all(path);
+}
+''',['-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp'),str(code/'common/QuestJournalDisk.cpp')])

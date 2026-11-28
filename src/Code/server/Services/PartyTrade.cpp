@@ -20,6 +20,14 @@ struct Session {uint32_t a,b; bool open{}; Clock::time_point expires; std::strin
 std::map<uint32_t,Session> sessions;
 struct HomeSession {uint32_t Connection{},Slot{};uint64_t Character{};TradeProperties::FormKey Ref;Clock::time_point Until;uint32_t SharedCell{};};
 std::map<uint32_t,HomeSession> homeSessions;
+struct SharedSeedUpload
+{
+    uint64_t Campaign{},Character{},Connection{},Location{};
+    std::string Account;
+    HomeSnapshot::Upload Data;
+    Clock::time_point Until;
+};
+std::map<uint32_t,SharedSeedUpload> sharedSeeds;
 uint32_t serial{};
 TradeLedger legacy("config/CoopTrade");
 std::unique_ptr<TradeLedger> persistent;
@@ -181,6 +189,13 @@ void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexc
             }
         };
         const auto now=Clock::now();
+        std::erase_if(sharedSeeds,[&](const auto& entry)
+        {
+            const auto* player=m_world.GetPlayerManager().GetById(entry.first);
+            const auto& u=entry.second;
+            return !player||now>=u.Until||u.Campaign!=link.Campaign||
+                u.Connection!=uint64_t(player->GetConnectionId())||u.Location!=player->LocationEpoch();
+        });
         for (auto it=sessions.begin();it!=sessions.end();)
         {
             auto* a=m_world.GetPlayerManager().GetById(it->second.a);
@@ -313,11 +328,14 @@ void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexc
             {Send(p,{TradeOp::Error,0,0});return;}
             next();return;
         }
-        if(e.Op==TradeOp::HomeOpen&&e.Peer==0)
+        if((e.Op==TradeOp::HomeOpen&&e.Peer==0)||e.Op==TradeOp::HomeStockPart)
         {
-            if(!campaign||!HomeEstateConstruction::SharedMode()||e.Session||e.Count||
+            const bool part=e.Op==TradeOp::HomeStockPart;
+            if(!campaign||!HomeEstateConstruction::SharedMode()||e.Session||
                 !e.Item.BaseId||ActiveAccount(user)||ledger.HasOutstanding(user)||
-                e.Text.size()>1400||!m_world.GetPartyService().GetPlayerParty(&p))return;
+                e.Text.size()>HomeSnapshot::PartBytes||!m_world.GetPartyService().GetPlayerParty(&p)||
+                (!part&&(e.Count||!e.Variant.empty()))||
+                (part&&(!e.Count||e.Count>HomeSnapshot::MaxParts||e.Peer>=e.Count)))return;
             const auto& cell=p.GetCellComponent();
             if(cell.WorldSpaceId||HomeScope::Private(cell.Cell.ModId)||
                 InventoryEvidence::CanonicalPlugin(Plugin(m_world,cell.Cell.ModId))!="skyrim.esm")return;
@@ -328,14 +346,52 @@ void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexc
             if(!HomeCityPurchase::NativeContainerRoute(j,address.Cell)||!address.Ref.Valid()||!character)return;
             if(!HomeSharedStorage::Read(j,address))
             {
-                const std::string_view bytes(e.Text.data(),e.Text.size());
+                std::string_view bytes(e.Text.data(),e.Text.size());
+                if(!part&&bytes.empty())
+                {
+                    if(!sharedSeeds.contains(id)&&sharedSeeds.size()>=16)
+                    {Send(p,{TradeOp::Error,0,0});return;}
+                    sharedSeeds[id]={link.Campaign,character,uint64_t(p.GetConnectionId()),
+                        p.LocationEpoch(),address.Encode(),{},now+30s};
+                    PartyTrade needed{TradeOp::HomeStockNeeded,0,0,e.Cursor,0,uuid};
+                    needed.Item=e.Item;Send(p,needed);return;
+                }
+                if(part)
+                {
+                    auto found=sharedSeeds.find(id);
+                    if(found==sharedSeeds.end())return;
+                    auto& u=found->second;
+                    const std::string_view raw(e.Variant.data(),e.Variant.size());
+                    uint64_t digest{};
+                    const auto parsed=std::from_chars(raw.data(),raw.data()+raw.size(),digest);
+                    if(u.Character!=character||u.Account!=address.Encode()||
+                        parsed.ec!=std::errc{}||parsed.ptr!=raw.data()+raw.size()||
+                        std::to_string(digest)!=raw||!u.Data.Add(digest,e.Count,e.Peer,bytes))
+                    {sharedSeeds.erase(found);Send(p,{TradeOp::Error,0,0});return;}
+                    u.Until=now+30s;
+                    if(u.Data.Next!=u.Data.Parts)return;
+                    if(!u.Data.Complete())
+                    {sharedSeeds.erase(found);Send(p,{TradeOp::Error,0,0});return;}
+                    bytes=u.Data.Bytes;
+                }
                 const auto row=HomeSharedStorage::Validate(address,bytes);
                 const auto* movement=m_world.try_get<MovementComponent>(*p.GetCharacter());
-                if(!row||!movement)return;
-                const glm::vec3 pos{std::bit_cast<float>(row->Transform[0]),std::bit_cast<float>(row->Transform[1]),std::bit_cast<float>(row->Transform[2])};
-                if(glm::distance(movement->Position,pos)>420.f||
-                    !HomeSharedStorage::Seed(j,address,bytes))
-                {Send(p,{TradeOp::Error,0,0});return;}
+                bool seeded=false;
+                if(row&&movement)
+                {
+                    const glm::vec3 pos{std::bit_cast<float>(row->Transform[0]),std::bit_cast<float>(row->Transform[1]),std::bit_cast<float>(row->Transform[2])};
+                    seeded=glm::distance(movement->Position,pos)<=420.f&&
+                        HomeSharedStorage::Seed(j,address,bytes);
+                }
+                sharedSeeds.erase(id);
+                if(!seeded){Send(p,{TradeOp::Error,0,0});return;}
+            }
+            else
+            {
+                // A competing complete upload may have registered the same
+                // account first. Never overwrite it; finish the open once.
+                if(part&&e.Peer+1!=e.Count)return;
+                sharedSeeds.erase(id);
             }
             HomeSession h{id,0,character,address.Ref,now+20s,address.Cell};
             auto container=HomeContainer(ledger,m_world,p,h);
