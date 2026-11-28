@@ -70,6 +70,8 @@ struct DisconnectedEvent{};
 struct CalendarService {
     static inline bool s_gameClockLocked=true, s_restMenuOpen=false;
     float m_fadeTimer=4.f;
+    uint32_t m_generation=5;bool restReset=false;
+    void ResetRestTracking() noexcept {restReset=true;}
     uint64_t m_lastTick=9000,m_lastLogTick=8000;
     void OnDisconnected(const DisconnectedEvent&) noexcept;
 };
@@ -112,7 +114,7 @@ code+=r"""
 int main(){
     CalendarService calendar;
     calendar.OnDisconnected({});
-    assert(!calendar.s_gameClockLocked&&!calendar.m_lastTick&&!calendar.m_lastLogTick&&calendar.m_fadeTimer==0.f);
+    assert(!calendar.s_gameClockLocked&&!calendar.m_lastTick&&!calendar.m_lastLogTick&&calendar.m_fadeTimer==0.f&&!calendar.m_generation&&calendar.restReset);
     World w;w.m_transport.session=true;
     assert(w.BeginSaveLoad());
     assert(HomeGuestSave::cancels==1);

@@ -625,6 +625,43 @@ bool DispatchScriptedSleep(uint32_t questId,const std::string& script,float star
     catch (...) {return false;}
 }
 
+namespace
+{
+struct SleepBonusArguments final:BSScript::IFunctionArguments
+{
+    static void operator delete(void* p) noexcept {Memory::Free(p);}
+    bool Prepare(Statement& out) const noexcept override
+    {
+        out.SetSize(1);
+        if(!out.vars||out.size!=1||out.capacity<1)return false;
+        out.vars[0].Set(false);
+        return true;
+    }
+};
+}
+bool DispatchPersonalSleepBonus() noexcept
+{
+    // Do not broadcast sleep events: DBEntranceQuest and other story
+    // listeners must only see the initiating native sleep.
+    try
+    {
+        auto* game=GameVM::Get();
+        auto* quest=Cast<TESQuest>(TESForm::GetById(0xFC1A2));
+        if(!game||!game->virtualMachine||game->inactive||!quest||quest->IsStopped())return false;
+        auto* vm=game->virtualMachine;
+        const auto handle=HouseHandle(vm,quest);
+        BoundScript object;
+        constexpr const char* script="PlayerSleepQuestScript";
+        if(!handle||!vm->FindBoundObject(handle,script,object.Value)||!object.Value||object.Value->GetHandle()!=handle)return false;
+        BSFixedString scope(script),method("OnSleepStop");
+        void* callback=nullptr;
+        auto* storage=Memory::Allocate(sizeof(SleepBonusArguments));
+        if(!storage)return false;
+        return vm->DispatchMethodCall2(handle,scope,method,::new(storage) SleepBonusArguments(),callback);
+    }
+    catch (...) {return false;}
+}
+
 void RecordNativeDragonAbsorption(uint32_t form) noexcept;
 BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunctionBase,
     void* stackArgument, void* logger, BSScript::IVirtualMachine* vm, bool flag)
@@ -728,6 +765,7 @@ uint16_t NativeUniqueRewardStage() noexcept {return 0;}
 uint32_t NativeUniqueRewardInstance() noexcept {return 0;}
 uint32_t NativeQuestRemovalQuest() noexcept {return 0;}
 bool DispatchScriptedSleep(uint32_t,const std::string&,float,float) noexcept {return false;}
+bool DispatchPersonalSleepBonus() noexcept {return false;}
 bool DragonAwardHookReady() noexcept {return false;}
 void ResetCampaignDragonAwards() noexcept {}
 void RefreshCampaignDragonAwards() noexcept {}

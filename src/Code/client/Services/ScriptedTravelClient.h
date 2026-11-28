@@ -15,3 +15,4 @@ uint64_t ScriptedTravelEpoch() noexcept;
 bool AtScriptedTravelTarget(TESObjectREFR*) noexcept;
 void ObserveScriptedTravel(ScriptedMoveObservation) noexcept;
 bool DispatchScriptedSleep(uint32_t quest,const std::string& script,float start,float end) noexcept;
+bool DispatchPersonalSleepBonus() noexcept;

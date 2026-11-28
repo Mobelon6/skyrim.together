@@ -34,7 +34,9 @@ struct BGSEventProcessedEvent
 struct TESActivateEvent
 {
     TESObjectREFR* object;
+    TESObjectREFR* actor{};
 };
+static_assert(sizeof(TESActivateEvent)==0x10);
 
 struct TESActiveEffectApplyRemove
 {
@@ -236,7 +238,9 @@ struct TESSleepStartEvent
 
 struct TESSleepStopEvent
 {
+    bool interrupted;
 };
+static_assert(sizeof(TESSleepStopEvent)==1);
 
 struct TESSpellCastEvent
 {

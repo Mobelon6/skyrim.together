@@ -12,6 +12,9 @@
 #include <Messages/RequestRestTime.h>
 #include <Services/TransportService.h>
 #include <cmath>
+#include <Services/InnRentalClient.h>
+#include <Services/ScriptedTravelClient.h>
+#include <Forms/TESForm.h>
 
 constexpr float kTransitionSpeed = 5.f;
 
@@ -29,11 +32,84 @@ CalendarService::CalendarService(World& aWorld, entt::dispatcher& aDispatcher, T
     m_timeUpdateConnection = aDispatcher.sink<ServerTimeSettings>().connect<&CalendarService::OnTimeUpdate>(this);
     m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&CalendarService::HandleUpdate>(this);
     m_disconnectedConnection = aDispatcher.sink<DisconnectedEvent>().connect<&CalendarService::OnDisconnected>(this);
+    if(auto* events=EventDispatcherManager::Get())
+    {
+        events->activateEvent.RegisterSink(this);
+        events->unknownDispatcher39.RegisterSink(this);
+        events->sleepStopEvent.RegisterSink(this);
+    }
+}
+CalendarService::~CalendarService()
+{
+    if(auto* events=EventDispatcherManager::Get())
+    {
+        events->activateEvent.UnRegisterSink(this);
+        events->unknownDispatcher39.UnRegisterSink(this);
+        events->sleepStopEvent.UnRegisterSink(this);
+    }
+}
+void CalendarService::ResetRestTracking() noexcept
+{
+    m_activatedBed=0;m_bedTick=0;m_sleepBed={0,0};m_nativeSleep=false;m_nativeSleepCompleted=false;
+    m_restStartGeneration=m_generation;m_lastLocalSleepGeneration=UINT32_MAX;m_sleepGrant={};
+}
+BSTEventResult CalendarService::OnEvent(const TESActivateEvent* event,const EventDispatcher<TESActivateEvent>*)
+{
+    if(event&&event->actor==PlayerCharacter::Get()&&!m_world.IsLoadingSave())
+    {
+        m_activatedBed=InnRentalClient::CanSleepAt(event->object)?event->object->formID:0;
+        m_bedTick=m_world.GetTick();
+    }
+    return BSTEventResult::kOk;
+}
+BSTEventResult CalendarService::OnEvent(const TESSleepStartEvent*,const EventDispatcher<TESSleepStartEvent>*)
+{
+    if(!s_restMenuOpen||m_world.IsLoadingSave()||!m_world.GetPartyService().IsInParty())return BSTEventResult::kOk;
+    m_nativeSleep=true;m_nativeSleepCompleted=false;m_lastLocalSleepGeneration=m_restStartGeneration;
+    m_sleepGrant={};
+    const auto now=m_world.GetTick();
+    if(!m_activatedBed||now<m_bedTick||now-m_bedTick>600000)return BSTEventResult::kOk;
+    auto* bed=Cast<TESObjectREFR>(TESForm::GetById(m_activatedBed));
+    if(!InnRentalClient::CanSleepAt(bed)||!m_world.GetModSystem().GetServerModId(m_activatedBed,m_sleepBed))return BSTEventResult::kOk;
+    RequestRestTime start;
+    start.Arrival=m_restStartTime;start.Generation=m_restStartGeneration;
+    start.Bed=m_sleepBed;start.StartSleep=true;
+    m_transport.Send(start);
+    return BSTEventResult::kOk;
+}
+BSTEventResult CalendarService::OnEvent(const TESSleepStopEvent* event,const EventDispatcher<TESSleepStopEvent>*)
+{
+    if(event&&m_nativeSleep&&!m_world.IsLoadingSave())m_nativeSleepCompleted=!event->interrupted;
+    return BSTEventResult::kOk;
 }
 
 void CalendarService::OnTimeUpdate(const ServerTimeSettings& acMessage) noexcept
 {
-    if (acMessage.RestCompleted)
+    if(m_world.IsLoadingSave())return;
+    if(acMessage.SleepPhase==1)
+    {
+        if(acMessage.Generation!=m_generation||m_lastLocalSleepGeneration==m_generation)return;
+        auto* bed=Cast<TESObjectREFR>(TESForm::GetById(m_world.GetModSystem().GetGameId(acMessage.Bed)));
+        const auto* player=PlayerCharacter::Get();
+        auto* cell=player?player->GetParentCellEx():nullptr;
+        if(!cell||cell->worldspace||!InnRentalClient::CanSleepAt(bed))return;
+        m_sleepGrant={acMessage.Generation,acMessage.Source,cell->formID,acMessage.Bed,true,false};
+        return;
+    }
+    if(acMessage.SleepPhase==2)
+    {
+        if(m_sleepGrant.Eligible&&!m_sleepGrant.Ready&&m_sleepGrant.Generation==acMessage.Generation&&
+            m_sleepGrant.Source==acMessage.Source&&m_sleepGrant.Bed==acMessage.Bed&&
+            m_generation==acMessage.Generation+1&&m_lastLocalSleepGeneration!=acMessage.Generation)
+            m_sleepGrant.Ready=true;
+        return;
+    }
+    if(acMessage.SleepPhase!=0)return;
+    const auto previous=m_generation;
+    m_generation=acMessage.Generation;
+    if(m_sleepGrant.Eligible&&m_generation!=m_sleepGrant.Generation&&m_generation!=m_sleepGrant.Generation+1)
+        m_sleepGrant={};
+    if (acMessage.RestCompleted&&m_generation!=previous)
     {
         // Advance elapsed days only by the part the local engine has not already applied.
         auto* clock = TimeData::Get();
@@ -82,6 +158,7 @@ void CalendarService::OnDisconnected(const DisconnectedEvent&) noexcept
     m_fadeTimer = 0.f;
     m_lastTick = 0;
     m_lastLogTick = 0;
+    m_generation=0;ResetRestTracking();
 }
 
 float CalendarService::TimeInterpolate(const TimeModel& aFrom, TimeModel& aTo) const
@@ -123,6 +200,7 @@ void CalendarService::HandleUpdate(const UpdateEvent& aEvent) noexcept
     {
         s_restMenuOpen = false;
         m_lastTick = 0;
+        ResetRestTracking();
         return;
     }
     if (s_gameClockLocked)
@@ -144,6 +222,8 @@ void CalendarService::HandleUpdate(const UpdateEvent& aEvent) noexcept
         {
             m_restStartTime = m_onlineTime.m_timeModel;
             m_restStartDays = pGameTime->GameDaysPassed->f;
+            m_restStartGeneration=m_generation;
+            m_sleepBed={0,0};m_nativeSleep=false;m_nativeSleepCompleted=false;
         }
         if (resting)
         {
@@ -161,12 +241,16 @@ void CalendarService::HandleUpdate(const UpdateEvent& aEvent) noexcept
                 arrival.m_timeModel.Time += std::round(hours);
                 arrival.Update(0);
                 RequestRestTime request;
-                m_onlineTime = arrival;
+                if(m_restStartGeneration==m_generation)m_onlineTime=arrival;
                 m_lastTick = m_world.GetTick();
                 m_fadeTimer = kTransitionSpeed;
                 request.Arrival = arrival.m_timeModel;
+                request.Generation=m_restStartGeneration;
+                request.Bed=m_sleepBed;
+                request.Slept=m_nativeSleep&&m_nativeSleepCompleted;
                 m_transport.Send(request);
             }
+            m_activatedBed=0;m_sleepBed={0,0};m_nativeSleep=false;m_nativeSleepCompleted=false;
         }
 
         if (!m_lastTick)
@@ -199,5 +283,17 @@ void CalendarService::HandleUpdate(const UpdateEvent& aEvent) noexcept
         }
         else
             pGameTime->GameHour->f = m_onlineTime.m_timeModel.Time;
+        if(m_sleepGrant.Ready)
+        {
+            const auto grant=m_sleepGrant;m_sleepGrant={};
+            auto* player=PlayerCharacter::Get();
+            auto* cell=player?player->GetParentCellEx():nullptr;
+            auto* bed=Cast<TESObjectREFR>(TESForm::GetById(m_world.GetModSystem().GetGameId(grant.Bed)));
+            if(player&&!player->IsDead()&&cell&&cell->formID==grant.Cell&&bed&&!bed->IsDeleted()&&!bed->IsDisabled()&&
+                bed->GetParentCellEx()==cell&&glm::distance(glm::vec3(player->position),glm::vec3(bed->position))<=420.f&&
+                std::abs(player->position.z-bed->position.z)<=128.f&&m_world.GetPartyService().IsInParty()&&
+                m_generation==grant.Generation+1&&m_lastLocalSleepGeneration!=grant.Generation)
+                DispatchPersonalSleepBonus();
+        }
     }
 }
