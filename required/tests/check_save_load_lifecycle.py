@@ -43,6 +43,12 @@ assert "m_transport.IsConnected()" not in (root/magic).read_text()
 assert "bool m_isDeathSystemEnabled = false;" in (root/"Services/PlayerService.h").read_text()
 trade="Services/Generic/PartyTrade.cpp"
 trade_reset=function(trade,"void OverlayService::RecheckTradeAfterLoad(")
+# Include the actual pending shared-container upload state and cancellation,
+# rather than stubbing away the new load-boundary operation.
+trade_source=(root/trade).read_text()
+shared_state=trade_source[trade_source.index("uint32_t sharedOpening{};"):
+                          trade_source.index("void CancelSharedOpen(){")]
+shared_cancel=function(trade,"void CancelSharedOpen(")
 assert "walletReady=false;readyStream=0;readyCursor=0;" in function(trade,"void OverlayService::ClearTrade(")
 assert "!receiptFailure && walletReady" in function(trade,"bool Ready(")
 code=r"""
@@ -52,6 +58,9 @@ code=r"""
 #include <mutex>
 #include <thread>
 #include <chrono>
+#include <string>
+using Clock=std::chrono::steady_clock;
+struct GameId{uint32_t ModId{},BaseId{};};
 namespace spdlog { template<class... T> void info(const char*,T...){} template<class... T> void warn(const char*,T...){} }
 namespace CampaignCheckpointClient { void ForgetLoaded() noexcept {} }
 namespace HomeGuestSave { int cancels{}; void Cancel() noexcept {++cancels;} }
@@ -95,6 +104,8 @@ struct World {
 """
 code+=function(world,"bool World::BeginSaveLoad() noexcept")
 code+=function(world,"void World::EndSaveLoad(")
+code+=shared_state
+code+=shared_cancel
 code+=trade_reset
 code+=calendar_disconnect
 code+=r"""
@@ -116,12 +127,18 @@ int main(){
     assert(!w.m_successfulLoadPending);
     OverlayService overlay;
     receiptFailure=receiptFailureCampaign=walletReady=true;readyStream=7;readyCursor=9;
+    sharedOpening=42;sharedOpenUntil=Clock::now()+std::chrono::seconds(15);
+    sharedSeed={{3,42},2,9,7,123,"pending snapshot bytes"};
     overlay.RecheckTradeAfterLoad();
     assert(!receiptFailure&&!receiptFailureCampaign&&!walletReady&&!readyStream&&!readyCursor);
+    assert(!sharedOpening&&sharedOpenUntil==Clock::time_point{});
+    assert(!sharedSeed.Item.ModId&&!sharedSeed.Item.BaseId&&!sharedSeed.Next&&!sharedSeed.Cursor);
+    assert(!sharedSeed.Stream&&!sharedSeed.Digest&&sharedSeed.Bytes.empty());
     assert(shadowCleanupPending && nativeResets==1 && placementForgets==1);
     receiptFailure=true;receiptFailureCampaign=false;walletReady=true;
     overlay.RecheckTradeAfterLoad();
     assert(receiptFailure&&!walletReady && placementForgets==2);
+    assert(!sharedOpening&&sharedSeed.Bytes.empty());
     World active;active.m_transport.session=true;
     std::thread wrong([&]{threadId=2;assert(!active.BeginSaveLoad());});
     wrong.join();assert(active.m_disconnectBeforeLoad&&!active.IsLoadingSave()&&active.m_transport.session&&active.resets==0);
@@ -137,4 +154,4 @@ with tempfile.TemporaryDirectory() as tmp:
     exe=Path(tmp,"test")
     subprocess.run(["g++","-std=c++20","-pthread","-Wall","-Wextra","-Werror",str(src),"-o",str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-print("PASS early save-load boundary, nested worker, failed load release, off-thread active refusal, deferred offline cleanup and post-load discovery hint")
+print("PASS early save-load boundary, nested worker, failed load release, off-thread active refusal, deferred offline cleanup, shared stock upload cancellation and post-load discovery hint")
