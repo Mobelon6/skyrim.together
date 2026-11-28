@@ -13,6 +13,12 @@
 #include <HomeNativeCapabilities.h>
 #include <HomeLinkedAccess.h>
 #include <HomeEstateConstruction.h>
+#include <HomeCityPurchase.h>
+#include <Services/CityHomeClient.h>
+#include <Services/ScriptedTravelClient.h>
+#include <Games/Misc/MenuTopicManager.h>
+#include <Forms/TESGlobal.h>
+#include <cmath>
 #include <Forms/TESWorldSpace.h>
 #include <cstdlib>
 #include <Services/HomePlacementClient.h>
@@ -1495,6 +1501,159 @@ bool PrivateCell(uint32_t local) noexcept
 }
 namespace
 {
+namespace City=HomeCityPurchase;
+struct CityPending
+{
+    uint64_t Campaign{},Character{},Epoch{};
+    uint32_t Cell{},Info{},Target{},Cost{},Expected{},Paid{};
+    bool Started{},Replay{},Waive{},Warned{};
+    Clock::time_point Deadline{},Next{};
+};
+CityPending cityPending;
+std::set<uint32_t> cityAttempted;
+uint64_t cityEpoch{};
+std::atomic_uint64_t cityActiveEpoch{};
+std::atomic_uint32_t cityWaive{};
+void ClearCityPending()
+{
+    cityWaive.store(0,std::memory_order_release);
+    cityActiveEpoch.store(0,std::memory_order_release);
+    cityPending={};
+}
+void RefreshCityEpoch()
+{
+    const auto epoch=ScriptedTravelEpoch();
+    if(cityEpoch!=epoch){ClearCityPending();cityAttempted.clear();cityEpoch=epoch;}
+}
+uint32_t CityPrice(const City::House& house)
+{
+    const auto* form=TESForm::GetById(house.Price);
+    if(!form||static_cast<unsigned>(form->formType)!=9)return 0;
+    const auto value=static_cast<const TESGlobal*>(form)->f;
+    if(!std::isfinite(value)||value<1.f||double(value)>INT32_MAX)return 0;
+    return static_cast<uint32_t>(value);
+}
+int64_t CityGold()
+{
+    auto* p=PlayerCharacter::Get();auto* gold=TESForm::GetById(City::Gold);
+    return p&&gold?p->GetItemCountInInventory(gold):0;
+}
+bool CityHasKey(const City::House& house)
+{
+    auto* p=PlayerCharacter::Get();auto* key=TESForm::GetById(house.Key);
+    return p&&key&&p->GetItemCountInInventory(key)>0;
+}
+bool SendCity(World& world,const CampaignAccess::Identity& id,const City::State& state,
+    uint32_t cell,uint32_t cost,City::Action action)
+{
+    RequestPartyHome req;auto& e=req.Event;
+    e.Campaign=id.Save.Campaign;e.Character=id.Save.Character;e.SaveTag=id.Save.Applied.Tag;
+    e.SaveRevision=id.Save.Applied.Revision;e.Profile=id.Profile.c_str();e.Credential=id.Credential.Secret.c_str();
+    e.Root=City::Key(cell).c_str();e.AccessOp=City::Operation;e.AccessRevision=state.Revision;
+    e.AccessGuest=cost;e.AccessRight=static_cast<uint32_t>(action);
+    return world.GetTransport().Send(req);
+}
+void UpdateCityHomes(World& world)
+{
+    RefreshCityEpoch();
+    if(!HomeEstateConstruction::SharedMode()||world.IsLoadingSave()||
+        !CampaignAccess::GameReady()||!world.GetPartyService().IsInParty()||
+        !world.GetTransport().IsOnline()||!CityHomeClient::NativeReady())return;
+    const auto identity=CampaignAccess::Current(world);
+    if(!identity)return;
+    const auto now=Clock::now();
+    if(cityPending.Cell&&(cityPending.Campaign!=identity->Save.Campaign||
+        cityPending.Character!=identity->Save.Character)){ClearCityPending();cityAttempted.clear();}
+    if(cityPending.Cell)
+    {
+        auto& p=cityPending;
+        if(now<p.Next)return;
+        p.Next=now+1s;
+        const auto* house=City::Find(p.Cell);
+        auto state=CampaignAccess::CityHome(p.Campaign,p.Cell);
+        if(!house||!state)return;
+        const auto local=CityHomeClient::ReadNative(p.Cell);
+        if(p.Started)
+        {
+            if(local==CityHomeClient::Local::Owned&&CityHasKey(*house))
+            {
+                const bool validDebit=p.Waive?p.Paid==0:p.Paid==p.Cost;
+                if(!validDebit)
+                {
+                    if(now<p.Deadline)return; // inventory receipt can be queued after the native readback
+                    spdlog::error("STM city house {:X}: expected debit {}, observed {}",p.Cell,p.Waive?0:p.Cost,p.Paid);
+                    Utils::ShowHudMessage("Не удалось подтвердить оплату дома. Проверьте сохранение.");
+                    cityAttempted.insert(p.Cell);ClearCityPending();return;
+                }
+                if(p.Replay||state->Status==City::Phase::Purchased)
+                {ClearCityPending();return;}
+                if(state->Status==City::Phase::Reserved&&state->Buyer==p.Character&&state->Cost==p.Cost)
+                    SendCity(world,*identity,*state,p.Cell,p.Cost,City::Action::Confirm);
+                return;
+            }
+            if(now>=p.Deadline)
+            {
+                Utils::ShowHudMessage("Покупка дома не завершилась. Не повторяйте её до проверки сохранения.");
+                cityAttempted.insert(p.Cell);ClearCityPending();
+            }
+            return;
+        }
+        if(state->Status==City::Phase::Purchased||
+            (state->Status==City::Phase::Reserved&&state->Buyer!=p.Character))
+        {
+            Utils::ShowHudMessage(state->Status==City::Phase::Purchased?"Дом уже приобретён группой.":"Дом покупает другой игрок.");
+            ClearCityPending();return;
+        }
+        if(state->Status==City::Phase::Free)
+        {
+            if(now>=p.Deadline){ClearCityPending();return;}
+            SendCity(world,*identity,*state,p.Cell,p.Cost,City::Action::Reserve);return;
+        }
+        // Reservation is durable and belongs to this character. Recheck
+        // native conditions after network latency before invoking the menu.
+        if(state->Cost!=p.Cost||local!=CityHomeClient::Local::Unowned||
+            CityPrice(*house)!=p.Cost||CityGold()<p.Cost||now>=p.Deadline)
+        {SendCity(world,*identity,*state,p.Cell,state->Cost,City::Action::Cancel);ClearCityPending();return;}
+        auto* menu=MenuTopicManager::Get();
+        p.Started=true;p.Deadline=now+30s;
+        cityActiveEpoch.store(cityEpoch,std::memory_order_release);
+        if(!menu||!menu->ResumeCityHomePurchase(p.Target,p.Info))
+        {SendCity(world,*identity,*state,p.Cell,state->Cost,City::Action::Cancel);ClearCityPending();}
+        return;
+    }
+    for(const auto& house:City::Houses)
+    {
+        if(cityAttempted.contains(house.Cell))continue;
+        const auto state=CampaignAccess::CityHome(identity->Save.Campaign,house.Cell);
+        if(!state||state->Status==City::Phase::Free)continue;
+        const auto local=CityHomeClient::ReadNative(house.Cell);
+        if(state->Status==City::Phase::Reserved)
+        {
+            // Recover a completed native purchase in an authenticated ESS
+            // of the reserved buyer, e.g. after a crash before journal ACK.
+            if(state->Buyer==identity->Save.Character&&local==CityHomeClient::Local::Owned&&CityHasKey(house))
+                SendCity(world,*identity,*state,house.Cell,state->Cost,City::Action::Confirm);
+            continue;
+        }
+        if(local!=CityHomeClient::Local::Unowned)continue;
+        const bool waive=state->Buyer!=identity->Save.Character;
+        // A payer restoring an ESS before acquisition must pay once in
+        // that ESS. Do not retry an already-applied or partially paid save.
+        if(!waive&&(identity->Save.Applied.Revision>=state->Revision||
+            CityPrice(house)!=state->Cost||CityGold()<state->Cost))continue;
+        cityPending={identity->Save.Campaign,identity->Save.Character,cityEpoch,
+            house.Cell,0,0,state->Cost,state->Revision,0,true,true,waive,false,now+30s,now+1s};
+        cityAttempted.insert(house.Cell);
+        cityActiveEpoch.store(cityEpoch,std::memory_order_release);
+        if(waive)cityWaive.store(house.Cell,std::memory_order_release);
+        if(!CityHomeClient::DispatchNative(house.Cell))
+        {
+            ClearCityPending();
+            spdlog::warn("STM could not dispatch native city home {:X}",house.Cell);
+        }
+        return; // only one native purchase fragment at a time
+    }
+}
 struct ConstructionTrack
 {
     uint64_t Campaign{},Character{},SaveTag{},Binding{};
@@ -1590,6 +1749,52 @@ void ObserveEstateConstruction(World& world)
     e.Visible=payload.c_str();
     if (world.GetTransport().Send(request)) {track.Pending=bits;track.Next=now+3s;}
 }
+}
+
+bool CityHomeClient::Busy() noexcept
+{
+    return cityActiveEpoch.load(std::memory_order_acquire)==ScriptedTravelEpoch()&&
+        cityActiveEpoch.load(std::memory_order_acquire)!=0;
+}
+bool CityHomeClient::SkipCharge(uint32_t cell) noexcept
+{
+    return cell&&Busy()&&cityWaive.load(std::memory_order_acquire)==cell;
+}
+void CityHomeClient::ObservedDebit(uint32_t cell,uint32_t amount,uint64_t epoch) noexcept
+{
+    RefreshCityEpoch();
+    if(epoch==cityEpoch&&cityPending.Started&&cityPending.Cell==cell&&amount<=UINT32_MAX-cityPending.Paid)
+        cityPending.Paid+=amount;
+}
+bool CityHomeClient::DeferPurchase(uint32_t quest,uint32_t info,uint32_t target) noexcept
+{
+    try
+    {
+        if(quest!=City::Quest||!HomeEstateConstruction::SharedMode())return false;
+        const auto* house=City::FromInfo(info);if(!house)return false;
+        if(CampaignAccess::Mode()==CampaignReplication::Link::Mode::Disabled)return false;
+        auto& world=World::Get();RefreshCityEpoch();
+        auto identity=CampaignAccess::Current(world);
+        if(!identity||!world.GetPartyService().IsInParty()||!NativeReady()||world.IsLoadingSave())
+        {Utils::ShowHudMessage("Покупка общего дома пока недоступна.");return true;}
+        if(cityPending.Cell||cityAttempted.contains(house->Cell))
+        {Utils::ShowHudMessage("Дождитесь завершения покупки дома.");return true;}
+        const auto state=CampaignAccess::CityHome(identity->Save.Campaign,house->Cell);
+        const auto cost=CityPrice(*house);
+        if(!state||!cost||ReadNative(house->Cell)!=Local::Unowned||CityGold()<cost)
+        {Utils::ShowHudMessage("Покупка дома недоступна.");return true;}
+        if(state->Status==City::Phase::Purchased||
+            (state->Status==City::Phase::Reserved&&state->Buyer!=identity->Save.Character))
+        {Utils::ShowHudMessage("Дом уже приобретён или покупается группой.");return true;}
+        if(state->Status==City::Phase::Reserved&&state->Cost!=cost)
+        {Utils::ShowHudMessage("Цена дома изменилась. Требуется сверка покупки.");return true;}
+        const auto now=Clock::now();
+        cityPending={identity->Save.Campaign,identity->Save.Character,cityEpoch,
+            house->Cell,info,target,cost,state->Revision,0,false,false,false,false,now+20s,now};
+        if(state->Status==City::Phase::Free)SendCity(world,*identity,*state,house->Cell,cost,City::Action::Reserve);
+        return true;
+    }
+    catch (...) {return true;}
 }
 
 bool Workbench::IsStandard(const TESObjectREFR* object) noexcept
@@ -1970,6 +2175,7 @@ void OverlayService::UpdateHomes() noexcept
         !CampaignAccess::GameReady() || !m_transport.IsOnline()) lockContext={};
     UpdateSeat(m_world);
     try {UpdateWorkbench(m_world);} catch (...) {ReleaseWorkbench(m_world);}
+    try {UpdateCityHomes(m_world);} catch (...) {spdlog::warn("STM city house update failed");}
     try {ObserveEstateConstruction(m_world);} catch (...) {constructionTrack={};}
     if (HomeEstateConstruction::SharedMode()&&!originalGuestCell.load())
     {

@@ -23,6 +23,10 @@
 #include <Services/QuestPhysicalStageClient.h>
 #include <AI/Movement/PlayerControls.h>
 #include <Games/Memory.h>
+#include <HomeCityPurchase.h>
+#include <Services/CityHomeClient.h>
+#include <Forms/TESObjectCELL.h>
+#include <Forms/TESFaction.h>
 
 TP_THIS_FUNCTION(TRegisterPapyrusFunction, void, BSScript::IVirtualMachine, NativeFunction*);
 TP_THIS_FUNCTION(TBindEverythingToScript, void, BSScript::IVirtualMachine*);
@@ -72,6 +76,12 @@ TP_THIS_FUNCTION(TDragonNativeCall, BSScript::CallResult, BSScript::NativeFuncti
                  void*, void*, BSScript::IVirtualMachine*, bool);
 TDragonNativeCall* realDragonNativeCall{};
 std::atomic<const void*> modActorValueNative{},addItemNative{},removeItemNative{},moveToNative{};
+std::atomic<const void*> cityFactionOwner{};
+std::atomic_bool cityFactionOwnerLong{};
+thread_local uint32_t cityChargeContext{};
+uint32_t CityHomeClient::ChargeContext() noexcept {return cityChargeContext;}
+bool CityHomeClient::NativeReady() noexcept
+{return realDragonNativeCall&&removeItemNative.load(std::memory_order_acquire)&&cityFactionOwner.load(std::memory_order_acquire);}
 thread_local uint32_t nativeQuestRemovalQuest{};
 uint32_t NativeQuestRemovalQuest() noexcept {return nativeQuestRemovalQuest;}
 thread_local uint32_t nativeUniqueRewardQuest{};
@@ -191,6 +201,129 @@ static Actor* DragonFrameActor(const BSScript::Variable* variable)
     if (!handle||!policy->HandleIsType(static_cast<uint32_t>(Actor::Type),handle)||
         !policy->IsHandleObjectAvailable(handle)) return nullptr;
     return policy->GetObjectForHandle<Actor>(handle);
+}
+namespace
+{
+constexpr auto questFormType=static_cast<uint32_t>(FormType::QuestItem);
+constexpr const char* houseScript="HousePurchaseScript";
+constexpr const char* houseFragments="QF_HousePurchase_000A7B33";
+TESQuest* HouseQuest()
+{return Cast<TESQuest>(TESForm::GetById(HomeCityPurchase::Quest));}
+uint64_t HouseHandle(BSScript::IVirtualMachine* vm,TESQuest* quest)
+{
+    auto* p=vm?vm->GetObjectHandlePolicy():nullptr;
+    const auto h=p&&quest?p->GetHandleForObject(questFormType,quest):0;
+    return h&&p->HandleIsType(questFormType,h)&&p->IsHandleObjectAvailable(h)&&
+        p->GetObjectForHandle(questFormType,h)==quest?h:0;
+}
+// CommonLibSSE-NG Object::DecRef AE 104253, Object::Dtor AE 104246.
+// FindBoundObject returns an owning smart pointer, not a borrowed raw pointer.
+struct BoundScript
+{
+    BSScript::Object* Value{};
+    ~BoundScript()
+    {
+        if (!Value) return;
+        TP_THIS_FUNCTION(TDecRef,uint32_t,BSScript::Object);
+        POINTER_SKYRIMSE(TDecRef,dec,104253);
+        if (!TiltedPhoques::ThisCall(dec,Value))
+        {
+            TP_THIS_FUNCTION(TObjectDtor,void,BSScript::Object);
+            POINTER_SKYRIMSE(TObjectDtor,dtor,104246);
+            TiltedPhoques::ThisCall(dtor,Value);Memory::Free(Value);
+        }
+    }
+};
+struct EmptyHouseArguments final:BSScript::IFunctionArguments
+{
+    static void operator delete(void* p) noexcept {Memory::Free(p);}
+    bool Prepare(Statement& out) const noexcept override {out.SetSize(0);return out.size==0;}
+};
+bool FrameIsHouseQuest(const DragonFrameView* frame,BSScript::IObjectHandlePolicy* policy)
+{
+    if (!frame||!frame->Function||!policy) return false;
+    auto* object=frame->Self.GetObject();
+    const auto h=object?object->GetHandle():0;
+    return h&&policy->HandleIsType(questFormType,h)&&policy->IsHandleObjectAvailable(h)&&
+        policy->GetObjectForHandle(questFormType,h)==HouseQuest();
+}
+// Only a player's exact native RemoveItem within PurchaseHouse, below the
+// verified QF branch and with the matching CELL argument, may skip a debit.
+uint32_t CityCharge(void* stackArgument)
+{
+    if(!stackArgument||!World::Exists()||World::Get().IsLoadingSave())return 0;
+    auto* stack=*static_cast<DragonStackView**>(stackArgument);
+    auto* frame=stack?stack->Top:nullptr;
+    auto* caller=frame?frame->Previous:nullptr;
+    auto* vm=GameVM::Get();
+    auto* policy=vm&&vm->virtualMachine&&!vm->inactive?vm->virtualMachine->GetObjectHandlePolicy():nullptr;
+    if(!frame||!frame->Parent||!caller||caller->Parent!=frame->Parent||!policy||
+        !PlayerCharacter::Get()||DragonFrameActor(&frame->Self)!=PlayerCharacter::Get()||
+        !FrameIsHouseQuest(caller,policy)||caller->Size<4)return 0;
+    const auto* script=caller->Function->GetObjectTypeName().AsAscii();
+    const auto* name=caller->Function->GetName().AsAscii();
+    if(!script||!name||_stricmp(script,houseScript)||_stricmp(name,"PurchaseHouse")||
+        caller->Function->GetParamCount()!=4)return 0;
+    auto* args=reinterpret_cast<BSScript::StackFrame*>(caller);
+    auto* arg=args->GetStackFrameVariable(0,args->GetPageForFrame());
+    auto* object=arg?arg->GetObject():nullptr;
+    const auto handle=object?object->GetHandle():0;
+    constexpr uint32_t cellType=60;
+    if(!handle||!policy->HandleIsType(cellType,handle)||!policy->IsHandleObjectAvailable(handle))return 0;
+    const auto* cell=static_cast<const TESForm*>(policy->GetObjectForHandle(cellType,handle));
+    const auto* house=cell?HomeCityPurchase::Find(cell->formID):nullptr;
+    if(!house||static_cast<uint32_t>(cell->formType)!=cellType)return 0;
+    auto* fragment=caller->Previous;
+    if(!fragment||fragment->Parent!=frame->Parent||!FrameIsHouseQuest(fragment,policy))return 0;
+    const auto* f=fragment->Function->GetObjectTypeName().AsAscii();
+    const auto* method=fragment->Function->GetName().AsAscii();
+    return f&&method&&!_stricmp(f,houseFragments)&&!_stricmp(method,house->Fragment)?house->Cell:0;
+}
+}
+CityHomeClient::Local CityHomeClient::ReadNative(uint32_t id) noexcept
+{
+    try
+    {
+        const auto* house=HomeCityPurchase::Find(id);
+        auto* gameVM=GameVM::Get();auto* quest=HouseQuest();
+        auto* cell=TESForm::GetById(id);
+        if(!house||!quest||quest->IsStopped()||!gameVM||!gameVM->virtualMachine||gameVM->inactive||
+            !cell||static_cast<uint32_t>(cell->formType)!=60||!NativeReady())return Local::Unknown;
+        auto* vm=gameVM->virtualMachine;const auto handle=HouseHandle(vm,quest);
+        BoundScript object;
+        if(!handle||!vm->FindBoundObject(handle,houseScript,object.Value)||!object.Value)return Local::Unknown;
+        BSScript::Variable value;
+        if(!vm->GetPropertyValue(object.Value,house->Variable,value)||
+            value.type!=BSScript::Variable::kInteger||value.data.i<0)return Local::Unknown;
+        auto* address=cityFactionOwner.load(std::memory_order_acquire);
+        if(!address)return Local::Unknown;
+        const auto* owner=cityFactionOwnerLong.load(std::memory_order_acquire)?
+            reinterpret_cast<TESFaction*(__fastcall*)(BSScript::IVirtualMachine*,uint32_t,const TESForm*)>(const_cast<void*>(address))(vm,0,cell):
+            reinterpret_cast<TESFaction*(__fastcall*)(const TESForm*)>(const_cast<void*>(address))(cell);
+        const bool faction=owner&&owner->formID==HomeCityPurchase::PlayerFaction;
+        if(value.data.i>0&&faction)return Local::Owned;
+        if(value.data.i==0&&!faction)return Local::Unowned;
+        return Local::Partial;
+    }
+    catch (...) {return Local::Unknown;}
+}
+bool CityHomeClient::DispatchNative(uint32_t id) noexcept
+{
+    try
+    {
+        const auto* house=HomeCityPurchase::Find(id);auto* gameVM=GameVM::Get();auto* quest=HouseQuest();
+        if(!house||!quest||!gameVM||!gameVM->virtualMachine||gameVM->inactive||
+            ReadNative(id)!=Local::Unowned)return false;
+        auto* vm=gameVM->virtualMachine;const auto handle=HouseHandle(vm,quest);
+        BoundScript object;
+        if(!handle||!vm->FindBoundObject(handle,houseFragments,object.Value)||!object.Value)return false;
+        BSFixedString scope(houseFragments),method(house->Fragment);void* callback=nullptr;
+        auto* storage=Memory::Allocate(sizeof(EmptyHouseArguments));
+        if(!storage)return false;
+        auto* args=::new(storage) EmptyHouseArguments;
+        return vm->DispatchMethodCall2(handle,scope,method,args,callback);
+    }
+    catch (...) {return false;}
 }
 static uint32_t NativeDragonSource(void* stackArgument,BSScript::Variable*& reward)
 {
@@ -415,6 +548,14 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
     } restore{nativeUniqueRewardQuest,nativeUniqueRewardStage,nativeUniqueRewardInstance,nativeQuestRemovalQuest};
     nativeUniqueRewardQuest=0;nativeUniqueRewardStage=0;nativeUniqueRewardInstance=0;nativeQuestRemovalQuest=0;
     const bool removing=apThis==removeItemNative.load(std::memory_order_acquire);
+    struct CityScope
+    {
+        uint32_t Previous;
+        ~CityScope(){cityChargeContext=Previous;}
+    } cityScope{cityChargeContext};
+    cityChargeContext=0;
+    if(removing)
+        try {cityChargeContext=CityCharge(stackArgument);} catch (...) {}
     if ((removing||apThis==addItemNative.load(std::memory_order_acquire))&&stackArgument)
     {
         auto* stack=*static_cast<DragonStackView**>(stackArgument);
@@ -470,6 +611,10 @@ BSScript::CallResult TP_MAKE_THISCALL(HookDragonNativeCall, BSScript::NativeFunc
     return result;
 }
 #else
+uint32_t CityHomeClient::ChargeContext() noexcept {return 0;}
+bool CityHomeClient::NativeReady() noexcept {return false;}
+CityHomeClient::Local CityHomeClient::ReadNative(uint32_t) noexcept {return Local::Unknown;}
+bool CityHomeClient::DispatchNative(uint32_t) noexcept {return false;}
 uint32_t NativeUniqueRewardQuest() noexcept {return 0;}
 uint16_t NativeUniqueRewardStage() noexcept {return 0;}
 uint32_t NativeUniqueRewardInstance() noexcept {return 0;}
@@ -485,6 +630,13 @@ int ApplyCampaignDragonAward(uint32_t) noexcept {return 0;}
 void TP_MAKE_THISCALL(HookRegisterPapyrusFunction, BSScript::IVirtualMachine, NativeFunction* apFunction)
 {
 #ifdef TP_SKYRIM_1_6_1170
+    if(apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
+        !_stricmp(apFunction->typeName.AsAscii(),"Cell")&&!_stricmp(apFunction->functionName.AsAscii(),"GetFactionOwner")&&
+        apFunction->usesLongSignature<=1)
+    {
+        cityFactionOwnerLong.store(apFunction->usesLongSignature==1,std::memory_order_release);
+        cityFactionOwner.store(apFunction->functionAddress,std::memory_order_release);
+    }
     if (CampaignRewardPolicy::SupplementDragonSouls&&apFunction&&apFunction->typeName.AsAscii()&&apFunction->functionName.AsAscii()&&
         !_stricmp(apFunction->typeName.AsAscii(),"Actor")&&
         !_stricmp(apFunction->functionName.AsAscii(),"ModActorValue"))

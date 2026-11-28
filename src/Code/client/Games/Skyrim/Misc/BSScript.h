@@ -194,12 +194,13 @@ struct BSScript
         virtual void sub_19();
         virtual void sub_1A();
         virtual void sub_1B();
-        virtual void sub_1C();
+        // CommonLibSSE-NG IVirtualMachine, SE/AE slot 0x1C. A BSTSmartPointer<Object> is one pointer.
+        virtual bool FindBoundObject(uint64_t aHandle,const char* aClass,Object*& aResult) const;
         virtual void sub_1D();
         virtual void sub_1E();
         virtual void sub_1F();
         virtual void sub_20();
-        virtual void sub_21();
+        virtual bool GetPropertyValue(Object*& aObject,const char* aProperty,Variable& aResult); // SE/AE 0x21
         virtual void sub_22();
         virtual void sub_23();
         virtual void SendEvent(uint64_t aId, const BSFixedString& acEventName, IFunctionArguments* apArgs) const noexcept;

@@ -1916,3 +1916,46 @@ home_server=extract('server/Services/QuestService.cpp',
 assert 'message.Id.BaseId==0xA7B33' in home_server
 assert 'TradeProperties::FormKey{"skyrim.esm",0xA7B33}.Encode()' in home_server
 assert 'CampaignAccess::Authority().State()!=CampaignReplication::Link::Mode::Disabled' in home_server
+
+
+# HOME-01: actual durable per-house authorization and confirmation.
+# Real journal append/read/reopen; not a model of Papyrus execution.
+run('city house purchase journal serializes one buyer per original house',headers+'''
+#include <HomeCityPurchase.h>
+#include <filesystem>
+namespace City=HomeCityPurchase;
+int main(){
+ auto root=std::filesystem::temp_directory_path()/"stm-city-house-check";
+ std::filesystem::remove_all(root);
+ CampaignJournal::Journal j;assert(j.Open(root,17,"test",true));
+ const auto& a=City::Houses[0];const auto& b=City::Houses[1];
+ assert(City::FromInfo(a.Info)==&a&&City::FromInfo(0xC6E28)==&b);
+ for(const auto& h:City::Houses)assert(City::FromKey(City::Key(h.Cell))==&h);
+ assert(!City::FromInfo(0x1234)&&!City::FromKey("bad"));
+ assert(City::Publish(j,{a.Cell,0,5000,11,City::Action::Reserve}));
+ auto s=City::Read(j,a.Cell);assert(s&&s->Status==City::Phase::Reserved&&s->Buyer==11);
+ assert(!City::Publish(j,{a.Cell,s->Revision,5000,22,City::Action::Reserve}));
+ assert(!City::Publish(j,{a.Cell,s->Revision,5000,22,City::Action::Confirm}));
+ assert(!City::Publish(j,{a.Cell,s->Revision,1,11,City::Action::Confirm}));
+ assert(City::Publish(j,{b.Cell,0,25000,22,City::Action::Reserve}));
+ auto other=City::Read(j,b.Cell);assert(other&&other->Buyer==22);
+ assert(City::Publish(j,{b.Cell,other->Revision,25000,22,City::Action::Cancel}));
+ auto free=City::Read(j,b.Cell);assert(free&&free->Status==City::Phase::Free);
+ assert(!City::Publish(j,{b.Cell,other->Revision,25000,22,City::Action::Reserve}));
+ assert(City::Publish(j,{a.Cell,s->Revision,5000,11,City::Action::Confirm}));
+ auto owned=City::Read(j,a.Cell);assert(owned&&owned->Status==City::Phase::Purchased&&owned->Buyer==11);
+ assert(!City::Publish(j,{a.Cell,owned->Revision,5000,22,City::Action::Reserve}));
+ assert(!City::Publish(j,{a.Cell,s->Revision,5000,11,City::Action::Confirm}));
+ CampaignJournal::Journal reload;assert(reload.Open(root,17,"test",false));
+ auto restored=City::Read(reload,a.Cell);assert(restored&&restored->Status==City::Phase::Purchased&&restored->Buyer==11);
+ std::filesystem::remove_all(root);
+}
+''',('-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp')))
+city_client=(code/'client/Services/Generic/PartyHome.cpp').read_text()
+city_vm=(code/'client/Games/Misc/BSScript.cpp').read_text()
+city_inv=(code/'client/Games/Skyrim/TESObjectREFR.cpp').read_text()
+assert 'CityHomeClient::DispatchNative(house.Cell)' in city_client
+assert 'menu->ResumeCityHomePurchase(p.Target,p.Info)' in city_client
+assert 'CityHomeClient::SkipCharge(city)' in city_inv and 'CityHomeClient::ObservedDebit(city,' in city_inv
+assert 'vm->DispatchMethodCall2(handle,scope,method,args,callback)' in city_vm
+print('PASS city house purchase wiring (native VM/game execution requires Skyrim)',flush=True)

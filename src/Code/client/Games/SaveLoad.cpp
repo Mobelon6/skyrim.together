@@ -11,6 +11,7 @@
 #include <Services/HomeOriginalOverlay.h>
 #include <Services/HomeInstance.h>
 #include <Services/HomeGuestSave.h>
+#include <Services/CityHomeClient.h>
 #include <Services/CampaignAccess.h>
 #include <Utils.h>
 #include <atomic>
@@ -226,6 +227,9 @@ bool HookSaveRequest(BGSSaveLoadManager* manager,int32_t device,uint32_t stats,c
 {
     if (currentWrite) {currentWrite->Invalid=true;return false;}
     if (HomeGuestSave::Busy()) return false;
+    // Avoid persisting a half-executed native purchase / free replay stack.
+    if(CityHomeClient::Busy())
+    {Utils::ShowHudMessage("Сохранение: дождитесь завершения покупки дома.");return false;}
     auto* world=World::Exists()?&World::Get():nullptr;
     if (HomeOriginalOverlay::Dirty()||HomeInstance::NativeGuestActive())
     {

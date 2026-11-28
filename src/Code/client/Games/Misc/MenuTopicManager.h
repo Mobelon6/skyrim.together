@@ -28,6 +28,7 @@ struct MenuTopicManager
     bool OffersHire() const noexcept;
     bool ResumeHire(int32_t index, uint32_t target, uint32_t info) noexcept;
     bool ResumeQuestTurnIn(uint32_t target,uint32_t info,uint32_t quest,uint32_t base) noexcept;
+    bool ResumeCityHomePurchase(uint32_t target,uint32_t info) noexcept;
 
     uint8_t pad0[0x20];
     GameList<DialogueOption>* pOptions;

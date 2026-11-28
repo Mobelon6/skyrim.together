@@ -9,6 +9,7 @@
 #include <HomeLinkedAccess.h>
 #include <HomeEstateCatalog.h>
 #include <HomeEstateConstruction.h>
+#include <HomeCityPurchase.h>
 #include <HomeLocks.h>
 #include <HomeResidents.h>
 #include <HomeObjects.h>
@@ -131,6 +132,19 @@ void OverlayService::OnHome(const PacketEvent<RequestPartyHome>& packet) noexcep
             auto root=TradeProperties::DecodeForm({e.Root.data(),e.Root.size()});
             if (!root || !root->Valid()) return;
             const bool shared=HomeEstateConstruction::SharedMode();
+            if (e.AccessOp==HomeCityPurchase::Operation)
+            {
+                if (!shared||e.House||e.Owner||e.SnapshotDigest||e.SnapshotPart||e.SnapshotParts||
+                    !e.Visible.empty()||e.AccessRight>2||!e.AccessGuest||e.AccessGuest>INT32_MAX||
+                    !owner->GetCharacter()||!m_world.GetPartyService().GetPlayerParty(owner)) return;
+                const auto* house=HomeCityPurchase::FromKey({e.Root.data(),e.Root.size()});
+                const auto character=CampaignAccess::Character(*owner);
+                if (!house||!character||character!=e.Character) return;
+                HomeCityPurchase::Publish(link.Journal,{house->Cell,e.AccessRevision,
+                    static_cast<uint32_t>(e.AccessGuest),character,
+                    static_cast<HomeCityPurchase::Action>(e.AccessRight)});
+                return;
+            }
             if (shared&&e.AccessOp!=10) return; // no private registration/visit in transition campaign
             if (e.AccessOp==9||e.AccessOp==10)
             {

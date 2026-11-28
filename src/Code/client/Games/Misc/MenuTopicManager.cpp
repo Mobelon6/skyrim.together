@@ -8,6 +8,8 @@
 #include <Forms/TESQuest.h>
 #include <PlayerCharacter.h>
 #include <QuestPickupPermit.h>
+#include <Services/CityHomeClient.h>
+#include <HomeCityPurchase.h>
 
 bool DeferSharedQuestTurnIn(uint32_t,uint32_t,uint32_t,uint32_t) noexcept;
 
@@ -144,6 +146,25 @@ bool MenuTopicManager::ResumeQuestTurnIn(uint32_t target,uint32_t info,uint32_t 
     return false;
 }
 
+bool MenuTopicManager::ResumeCityHomePurchase(uint32_t target,uint32_t info) noexcept
+{
+    const auto* npc=TESObjectREFR::GetByHandle(speaker.handle.iBits);
+    if(!IsDialogueOpen()||!pOptions||!npc||npc->formID!=target||!HomeCityPurchase::FromInfo(info))return false;
+    int index=-1;
+    for(auto* opt:*pOptions)
+    {
+        ++index;
+        if(opt&&opt->quest&&opt->quest->formID==HomeCityPurchase::Quest&&
+            opt->info&&opt->info->formID==info&&opt->text)
+        {
+            World::Get().GetRunner().Trigger(PlayerDialogueEvent(opt->text,speaker.handle.iBits,info,HomeCityPurchase::Quest));
+            TiltedPhoques::ThisCall(RealPlayDialogueOption,this,index);
+            return true; // native invocation was attempted; never retry blindly
+        }
+    }
+    return false;
+}
+
 bool TP_MAKE_THISCALL(HookPlayDialogueOption, MenuTopicManager, int32_t aIndex)
 {
     if (apThis->pOptions)
@@ -160,6 +181,10 @@ bool TP_MAKE_THISCALL(HookPlayDialogueOption, MenuTopicManager, int32_t aIndex)
                 if (IsHireOption(option->info))
                     if (const auto* npc = TESObjectREFR::GetByHandle(apThis->speaker.handle.iBits))
                         if (World::Get().GetOverlayService().BeginHire(npc->formID, option->info->formID, aIndex))
+                            return false;
+                if(option->quest&&option->info&&apThis->IsDialogueOpen())
+                    if(const auto* npc=TESObjectREFR::GetByHandle(apThis->speaker.handle.iBits))
+                        if(CityHomeClient::DeferPurchase(option->quest->formID,option->info->formID,npc->formID))
                             return false;
                 if (option->quest&&option->info&&apThis->IsDialogueOpen())
                     if (const auto base=TurnInBase(option->info))

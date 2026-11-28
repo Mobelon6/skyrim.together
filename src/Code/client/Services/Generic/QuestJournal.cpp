@@ -253,6 +253,12 @@ std::optional<std::map<std::string,std::array<uint32_t,3>>> CampaignAccess::Home
     return result;
 }
 
+std::optional<HomeCityPurchase::State> CampaignAccess::CityHome(uint64_t campaign,uint32_t cell)
+{
+    if (Mode()!=CampaignReplication::Link::Mode::Ready||campaign!=campaignLink.Campaign) return {};
+    return HomeCityPurchase::Read(campaignLink.Journal,cell);
+}
+
 bool CampaignAccess::TradeEnabled()
 {
     using Mode=CampaignReplication::Link::Mode;

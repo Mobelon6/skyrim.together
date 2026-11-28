@@ -12,6 +12,9 @@
 #include <Services/HomeActorProtection.h>
 #include <Services/HomePlacementClient.h>
 #include <Services/Workbench.h>
+#include <Services/CityHomeClient.h>
+#include <Services/ScriptedTravelClient.h>
+#include <HomeCityPurchase.h>
 #include <Events/ActivateEvent.h>
 #include <Events/InventoryChangeEvent.h>
 #include <Events/ScriptAnimationEvent.h>
@@ -1178,6 +1181,15 @@ bool NativeQuestTransfer(TESObjectREFR* target,ITEM_REMOVE_REASON reason,const I
 BSPointerHandle<TESObjectREFR>*
 TP_MAKE_THISCALL(HookRemoveInventoryItem, TESObjectREFR, BSPointerHandle<TESObjectREFR>* apResult, TESBoundObject* apItem, int32_t aCount, ITEM_REMOVE_REASON aReason, ExtraDataList* apExtraList, TESObjectREFR* apMoveToRef, const NiPoint3* apDropLoc, const NiPoint3* apRotate)
 {
+    // Only the exact native house purchase's gold removal can be waived.
+    const auto city=(apThis==PlayerCharacter::Get()&&apItem&&apItem->formID==HomeCityPurchase::Gold&&
+        aCount>0&&!apMoveToRef&&aReason==ITEM_REMOVE_REASON::kRemove&&!apExtraList)?
+        CityHomeClient::ChargeContext():0;
+    if(city&&CityHomeClient::SkipCharge(city))
+    {
+        if(apResult)apResult->handle.iBits=0;
+        return apResult;
+    }
     if ((!apMoveToRef && aReason==ITEM_REMOVE_REASON::kDropping &&
          HomePlacementClient::InterceptDrop(apThis,apItem,apExtraList,aCount,apDropLoc,apRotate)) ||
         NativeTrade::BlockRemove(apThis,apMoveToRef,apItem,aCount,apExtraList))
@@ -1254,6 +1266,13 @@ TP_MAKE_THISCALL(HookRemoveInventoryItem, TESObjectREFR, BSPointerHandle<TESObje
             const auto actual=before-apThis->GetItemCountInInventory(apItem);
             if (actual>0&&actual<=aCount)
             {
+                if(city)
+                {
+                    const auto epoch=ScriptedTravelEpoch();
+                    World::Get().GetRunner().Queue([city,actual,epoch]{
+                        CityHomeClient::ObservedDebit(city,static_cast<uint32_t>(actual),epoch);
+                    });
+                }
                 item.Count=-static_cast<int32_t>(actual);
                 QueueReferenceInventoryChange(InventoryChangeEvent(apThis->formID,std::move(item)),nullptr);
             }
