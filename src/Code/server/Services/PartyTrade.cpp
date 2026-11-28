@@ -11,6 +11,7 @@
 #include <InventoryEvidence.h>
 #include <Services/HomeVisit.h>
 #include <HomeEstateConstruction.h>
+#include <HomeInn.h>
 
 namespace
 {
@@ -18,7 +19,7 @@ using Clock=std::chrono::steady_clock;
 using namespace std::chrono_literals;
 struct Session {uint32_t a,b; bool open{}; Clock::time_point expires; std::string accountA,accountB;};
 std::map<uint32_t,Session> sessions;
-struct HomeSession {uint32_t Connection{},Slot{};uint64_t Character{};TradeProperties::FormKey Ref;Clock::time_point Until;uint32_t SharedCell{},AssignmentRevision{};};
+struct HomeSession {uint32_t Connection{},Slot{};uint64_t Character{};TradeProperties::FormKey Ref;Clock::time_point Until;uint32_t SharedCell{},AssignmentRevision{};const HomeInn::Room* Inn{};uint64_t InnConnection{},InnLocation{};};
 std::map<uint32_t,HomeSession> homeSessions;
 struct SharedSeedUpload
 {
@@ -103,6 +104,19 @@ void ShowStock(TradeLedger& ledger,Player& p,Player& q,uint32_t session)
 std::optional<HomeSnapshot::Ref> HomeContainer(TradeLedger& ledger,World& world,Player& player,const HomeSession& h)
 {
     const auto& cell=player.GetCellComponent();
+    if(h.Inn)
+    {
+        const auto& room=*h.Inn;
+        if(!HomeEstateConstruction::SharedMode()||h.Connection!=player.GetId()||
+            h.Character!=CampaignAccess::Character(player)||!player.GetCharacter()||
+            h.InnConnection!=uint64_t(player.GetConnectionId())||h.InnLocation!=player.LocationEpoch()||
+            cell.WorldSpaceId||HomeScope::Private(cell.Cell.ModId)||cell.Cell.BaseId!=room.Cell||
+            InventoryEvidence::CanonicalPlugin(Plugin(world,cell.Cell.ModId))!=room.Plugin||
+            !world.GetPartyService().GetPlayerParty(&player))return {};
+        const auto* movement=world.try_get<MovementComponent>(*player.GetCharacter());
+        if(!movement||!HomeInn::Near(room,movement->Position.x,movement->Position.y,movement->Position.z))return {};
+        return ledger.InnContainer(h.Character,room);
+    }
     if(h.SharedCell)
     {
         if(!HomeEstateConstruction::SharedMode()||h.Connection!=player.GetId()||
@@ -346,6 +360,30 @@ void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexc
             {Send(p,{TradeOp::Error,0,0});return;}
             next();return;
         }
+        if(e.Op==TradeOp::InnOpen)
+        {
+            // The local engine owns personal RentRoomScript state in ESS.
+            // The authenticated client requests this only with native bed
+            // ownership. The server independently checks canonical point,
+            // connection/location, distance and character; never accepts an
+            // account supplied by the requester or imports original NPC stock.
+            if(!campaign||!HomeEstateConstruction::SharedMode()||e.Session||e.Peer||e.Count||
+                e.BeforePlusOne||!e.Text.empty()||!e.Variant.empty()||!e.Item.BaseId||
+                ActiveAccount(user)||ledger.HasOutstanding(user))return;
+            const auto& cell=p.GetCellComponent();
+            const auto* room=HomeInn::Storage(InventoryEvidence::CanonicalPlugin(Plugin(m_world,cell.Cell.ModId)),
+                cell.Cell.BaseId,InventoryEvidence::CanonicalPlugin(Plugin(m_world,e.Item.ModId)),e.Item.BaseId);
+            if(!room)return;
+            HomeSession h{id,0,CampaignAccess::Character(p),{std::string(room->Plugin),room->Container},now+20s};
+            h.Inn=room;h.InnConnection=uint64_t(p.GetConnectionId());h.InnLocation=p.LocationEpoch();
+            auto container=HomeContainer(ledger,m_world,p,h);
+            if(!container){Send(p,{TradeOp::Error,0,0});return;}
+            do{if(!++serial)++serial;}while(sessions.count(serial)||homeSessions.count(serial));
+            homeSessions.emplace(serial,std::move(h));
+            PartyTrade open{TradeOp::Open,0,serial,0,0,uuid};open.Item=e.Item;
+            open.Text="Личное хранилище";Send(p,open);
+            ShowHomeStock(p,serial,*container);return;
+        }
         if((e.Op==TradeOp::HomeOpen&&e.Peer==0)||e.Op==TradeOp::HomeStockPart)
         {
             const bool part=e.Op==TradeOp::HomeStockPart;
@@ -452,6 +490,7 @@ void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexc
             h.Until=now+20s;
             if(e.Op==TradeOp::HomePersonal)
             {
+                if(h.Inn){Send(p,{TradeOp::Error,0,e.Session});return;}
                 uint32_t version{};
                 const HomeSharedStorage::Address address{h.SharedCell,h.Ref};
                 const bool ok=h.SharedCell&&e.Peer==h.AssignmentRevision&&e.Count<=1&&
@@ -475,7 +514,8 @@ void OverlayService::OnTrade(const PacketEvent<RequestPartyTrade>& packet) noexc
                 const std::string variant(e.Variant.data(),e.Variant.size());
                 const auto count=(e.Op==TradeOp::Take?1:-1)*int(e.Count);
                 const auto before=int64_t(e.BeforePlusOne)-1;
-                if (!ledger.Ack(user,e.Cursor) || !(h.SharedCell?
+                if (!ledger.Ack(user,e.Cursor) || !(h.Inn?
+                    ledger.CommitInn(h.Character,*h.Inn,key,variant,count,before,e.Cursor):h.SharedCell?
                     ledger.CommitShared(h.Character,{h.SharedCell,h.Ref},key,variant,count,before,e.Cursor):
                     ledger.CommitHome(h.Character,h.Slot,h.Ref,key,variant,count,before,e.Cursor)))
                     Send(p,{TradeOp::Error,0,e.Session});

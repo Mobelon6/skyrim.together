@@ -1,6 +1,7 @@
 #include <TiltedOnlinePCH.h>
 
 #include <Services/ActorValueService.h>
+#include <Services/InnRentalClient.h>
 #include <World.h>
 #include <Forms/ActorValueInfo.h>
 #include <Games/References.h>
@@ -151,7 +152,8 @@ void ActorValueService::BroadcastActorValues() noexcept
 
         for (int i = 0; i < ActorValueInfo::kActorValueCount; i++)
         {
-            if (isPlayer && i == ActorValueInfo::kDragonSouls)
+            if ((isPlayer && i == ActorValueInfo::kDragonSouls)||
+                (i==ActorValueInfo::kVariable09&&InnRentalClient::LocalVariable(pActor)))
                 continue;
             
             float newValue = pActor->GetActorValue(i);
@@ -439,7 +441,8 @@ void ActorValueService::OnActorValueChanges(const NotifyActorValueChanges& acMes
                 pActor->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, key, value);
             continue;
         }
-        if (key == ActorValueInfo::kDragonSouls)
+        if (key == ActorValueInfo::kDragonSouls||
+            (key==ActorValueInfo::kVariable09&&InnRentalClient::LocalVariable(pActor)))
             continue;
 
         spdlog::debug("Actor value update, server ID: {:X}, key: {}, value: {}", acMessage.Id, key, value);
@@ -467,7 +470,8 @@ void ActorValueService::OnActorMaxValueChanges(const NotifyActorMaxValueChanges&
 
     for (const auto& [key, value] : acMessage.Values)
     {
-        if (key == ActorValueInfo::kDragonSouls)
+        if (key == ActorValueInfo::kDragonSouls||
+            (key==ActorValueInfo::kVariable09&&InnRentalClient::LocalVariable(pActor)))
             continue;
 
         spdlog::debug("Actor max value update, server ID: {:X}, key: {}, value: {}", acMessage.Id, key, value);

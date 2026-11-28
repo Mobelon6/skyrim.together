@@ -13,6 +13,8 @@
 #include <TradeLedger.h>
 #include <HomeEstateConstruction.h>
 #include <HomeChestHud.h>
+#include <HomeInn.h>
+#include <Services/InnRentalClient.h>
 #include <Services/PartyService.h>
 #include <Services/PlayerService.h>
 #include <Messages/RequestCoopInteraction.h>
@@ -121,7 +123,8 @@ void ResetNativeIntents()
 // Only a local scratch reference is passed to ContainerMenu; it is never a
 // real escrow or a peer's actor. IDs are looked up anew, pointers are not retained.
 std::atomic_uint32_t proxyId{}, nativeToken{}, sharedTarget{};
-uint32_t sharedOpening{};
+uint32_t sharedOpening{},innTarget{};
+bool innPending{};
 Clock::time_point sharedOpenUntil{};
 struct SharedSeedUpload
 {
@@ -142,9 +145,9 @@ void ResetSharedHud()
     sharedRevision=sharedStockVersion=sharedEligible=sharedMode=0;
     sharedPromptRevision=sharedPromptVersion=sharedExpectedRevision=0;
     sharedPrompt=sharedSwitchPending=sharedSwitchReply=hudAvailable=false;
-    sharedSwitchDeadline={};sharedControlsBlocked=false;hudPhase=0;hudToken=0;
+    sharedSwitchDeadline={};sharedControlsBlocked=false;hudPhase=0;hudToken=0;innTarget=0;
 }
-void CancelSharedOpen(){sharedOpening=0;sharedOpenUntil={};sharedSeed={};}
+void CancelSharedOpen(){sharedOpening=0;innPending=false;sharedOpenUntil={};sharedSeed={};}
 thread_local bool shadowMutation{};
 struct ShadowWrite
 {
@@ -1185,7 +1188,8 @@ std::optional<int64_t> ReceiptCount(World& world,PlayerCharacter& player,const L
 }
 bool SubmitTransfer(World& world,const Wallet& wallet,const LocalItem& key,uint32_t count,bool take)
 {
-    if (sharedControlsBlocked.load() || !tradeOpen || !stockComplete || !count || count>9999 ||
+    if ((innTarget&&!InnRentalClient::RentedRoom(Cast<TESObjectREFR>(TESForm::GetById(innTarget))))||
+        sharedControlsBlocked.load() || !tradeOpen || !stockComplete || !count || count>9999 ||
         (!nativeRequested && !key.second.empty())) return false;
     auto* player=PlayerCharacter::Get();
     const auto properties=TradeProperties::Decode(key.second);
@@ -1814,6 +1818,46 @@ void HomePlacementClient::Update(World& world) noexcept
     }
     catch (...) {spdlog::error("STM: residential placement projection update failed");}
 }
+bool InnRentalClient::LocalVariable(const Actor* actor) noexcept
+{
+    try
+    {
+        if(!actor||!actor->baseForm||!World::Exists()||!HomeEstateConstruction::SharedMode()||
+            CampaignAccess::Mode()==CampaignReplication::Link::Mode::Disabled)return false;
+        const auto key=PropertyKey(actor->baseForm->formID);
+        return key&&HomeInn::Keeper(key->Plugin,key->Local);
+    }
+    catch (...) {return false;}
+}
+const HomeInn::Room* InnRentalClient::RentedRoom(const TESObjectREFR* object) noexcept
+{
+    try
+    {
+        if(!object||!object->baseForm||object->baseForm->formType!=FormType::Container||
+            object->IsTemporary()||object->IsDeleted()||object->IsDisabled()||
+            !World::Exists()||!HomeEstateConstruction::SharedMode()||
+            CampaignAccess::Mode()!=CampaignReplication::Link::Mode::Ready||
+            VersionDb::Get().GetLoadedVersionString()!="1.6.1170.0")return nullptr;
+        auto* player=PlayerCharacter::Get();
+        auto* cell=object->GetParentCellEx();
+        if(!player||!player->baseForm||!cell||cell->worldspace||player->GetParentCellEx()!=cell||
+            HomeInstance::PrivateCell(cell->formID)||HomeInstance::NativeGuestCell(cell->formID))return nullptr;
+        const auto ck=PropertyKey(cell->formID),rk=PropertyKey(object->formID),bk=PropertyKey(object->baseForm->formID);
+        if(!ck||!rk||!bk)return nullptr;
+        const auto* room=HomeInn::Storage(ck->Plugin,ck->Local,rk->Plugin,rk->Local);
+        if(!room||bk->Plugin!="skyrim.esm"||bk->Local!=room->Base||
+            !HomeInn::Near(*room,object->position.x,object->position.y,object->position.z,96.f)||
+            !HomeInn::Near(*room,player->position.x,player->position.y,player->position.z))return nullptr;
+        if(const auto* lock=object->GetLock();lock&&lock->IsLocked())return nullptr;
+        auto* bed=Cast<TESObjectREFR>(ResolvePropertyForm({std::string(room->Plugin),room->Bed}));
+        if(!bed||!bed->baseForm||static_cast<uint32_t>(bed->baseForm->formType)!=40||
+            bed->GetParentCellEx()!=cell||bed->IsDeleted()||bed->IsDisabled())return nullptr;
+        using GetOwner=TESForm*(const TESObjectREFR*);
+        auto* owner=Address<GetOwner>(20194);
+        return owner&&owner(bed)==player->baseForm?room:nullptr;
+    }
+    catch (...) {return nullptr;}
+}
 bool NativeTrade::IsProxy(const TESObjectREFR* object) noexcept
 {
     const auto id=proxyId.load();
@@ -2040,6 +2084,19 @@ bool OverlayService::TryTrade(uint32_t form) noexcept
         request.BeforePlusOne=static_cast<uint32_t>(*before+1);
         if (m_world.GetModSystem().GetServerModId(base->formID,request.Item) && Send(request))
         {walletReady=false;pollAt={};}
+        return true;
+    }
+    if(InnRentalClient::RentedRoom(object))
+    {
+        Wallet w;
+        if(!CampaignAccess::TradeEnabled()||!NativeEnabled()||!m_transport.IsOnline()||
+            !w.Load(m_world)||!Ready(w)||session||m_active||sharedOpening)
+        {pollAt={};Utils::ShowHudMessage("Личное хранилище: ожидается журнал имущества.");return true;}
+        PartyTrade request{TradeOp::InnOpen,0,0,w.Cursor(),0,w.Stream()};
+        if(!m_world.GetModSystem().GetServerModId(object->formID,request.Item))return true;
+        if(Send(request))
+        {sharedOpening=form;innPending=true;sharedOpenUntil=Clock::now()+15s;sharedSeed={};}
+        else Utils::ShowHudMessage("Не удалось открыть личное хранилище.");
         return true;
     }
     if(NativeTrade::IsSharedContainer(object))
@@ -2369,7 +2426,7 @@ void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
     {
         const auto form=m_world.GetModSystem().GetGameId(e.Item);
         auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
-        if(!sharedOpening||sharedOpening!=form||session||!sharedSeed.Bytes.empty()||
+        if(innPending||!sharedOpening||sharedOpening!=form||session||!sharedSeed.Bytes.empty()||
             !NativeTrade::IsSharedContainer(object)||!Ready(w)||e.Cursor!=w.Cursor()||
             !e.Stream||(w.Stream()&&e.Stream!=w.Stream()))return;
         if(!object||object->IsDeleted()||object->IsDisabled()||
@@ -2403,9 +2460,13 @@ void OverlayService::OnTrade(const NotifyPartyTrade& msg) noexcept
         {
             const auto form=m_world.GetModSystem().GetGameId(e.Item);
             auto* object=Cast<TESObjectREFR>(TESForm::GetById(form));
-            if(!sharedOpening||form!=sharedOpening||!NativeTrade::IsSharedContainer(object)||!NativeEnabled())
+            if(!sharedOpening||form!=sharedOpening||!NativeEnabled()||
+                (innPending?!InnRentalClient::RentedRoom(object):!NativeTrade::IsSharedContainer(object)))
             {Send({TradeOp::Close,e.Peer,e.Session});return;}
-            ResetSharedHud();sharedTarget.store(form);CancelSharedOpen();
+            ResetSharedHud();
+            if(innPending){innTarget=form;sharedTarget.store(0);}
+            else sharedTarget.store(form);
+            CancelSharedOpen();
         }
         else if(sharedOpening){Send({TradeOp::Close,e.Peer,e.Session});return;}
         session=e.Session;peer=e.Peer;partner=e.Text.c_str();tradeOpen=e.Op==TradeOp::Open;
@@ -2466,13 +2527,23 @@ void OverlayService::UpdateTrade() noexcept
             CloseRescue();
     }
     if(sharedOpening&&Clock::now()>=sharedOpenUntil)
-    {CancelSharedOpen();Utils::ShowHudMessage("Не удалось открыть общий сундук. Повторите попытку.");}
+    {CancelSharedOpen();Utils::ShowHudMessage("Не удалось открыть хранилище. Повторите попытку.");}
     MaintainShadow();
     HomePlacementClient::Update(m_world);
     if (receiptFailure || !m_transport.IsOnline() || !m_inGame || !CampaignAccess::GameReady())
     {
         ShowChestHud(*this,HomeChestHud::Hidden,0);
-        CancelSharedOpen();walletReady=false;pollAt={};return;
+        CancelSharedOpen();walletReady=false;pollAt={};
+        if(innTarget&&session)ClearTrade();
+        return;
+    }
+    if(innPending&&!InnRentalClient::RentedRoom(Cast<TESObjectREFR>(TESForm::GetById(sharedOpening))))
+        CancelSharedOpen();
+    if(innTarget&&!InnRentalClient::RentedRoom(Cast<TESObjectREFR>(TESForm::GetById(innTarget))))
+    {
+        Send({TradeOp::Close,peer,session});ClearTrade();
+        Utils::ShowHudMessage("Доступ к личному хранилищу закрыт.");
+        return;
     }
     if(sharedOpening&&!sharedSeed.Bytes.empty())
     {

@@ -8,6 +8,7 @@
 #include "HomePlacement.h"
 #include "HomePermissions.h"
 #include "HomeSharedStorage.h"
+#include "HomeInn.h"
 #include <tuple>
 #include <algorithm>
 #include <fstream>
@@ -254,6 +255,32 @@ public:
         if(!authority||!character||!item.Valid()||!SharedContainer(address,character))return false;
         const auto account=PersonalState(address).Owner?PersonalAccount(character):address.Encode();
         return CommitRow({std::to_string(character),account,item.Plugin,item.Local,
+                          count,before,false,std::move(variant)},cursor,true);
+    }
+    // Temporary rental access is authorized by the live session, not a
+    // permanent city assignment. Historical receipts must remain valid
+    // after the rental expires or the last city access point is released.
+    std::optional<HomeSnapshot::Ref> InnContainer(uint64_t character,const HomeInn::Room& room)
+    {
+        if(!authority||!Stream()||!character||!room.Container||
+            HomeInn::Storage(room.Plugin,room.Cell,room.Plugin,room.Container)!=&room)return {};
+        auto* items=LoadHome(PersonalAccount(character),authority->Operations().size()+1);
+        if(!items)return {};
+        HomeSnapshot::Ref row;
+        row.Key={std::string(room.Plugin),room.Container};
+        row.Base={"skyrim.esm",room.Base};row.Type=28;row.Inventory=1;row.Scale=100;
+        for(const auto& [key,count]:*items)
+        {
+            if(count<0||count>INT32_MAX)return {};
+            if(count)row.Items.push_back({{key.first,key.second},static_cast<uint32_t>(count),key.variant});
+        }
+        return row;
+    }
+    bool CommitInn(uint64_t character,const HomeInn::Room& room,const TradeProperties::FormKey& item,
+                   std::string variant,int count,int64_t before,uint32_t cursor)
+    {
+        if(!item.Valid()||!InnContainer(character,room))return false;
+        return CommitRow({std::to_string(character),PersonalAccount(character),item.Plugin,item.Local,
                           count,before,false,std::move(variant)},cursor,true);
     }
     // The same H receipt and ACK govern inventory and placed objects.
@@ -532,8 +559,9 @@ private:
         }
         else if(const auto owner=PersonalOwner(r.peer))
         {
-            if(owner!=character||std::none_of(personalAssignments.begin(),personalAssignments.end(),
-                [owner](const auto& entry){return entry.second.Owner==owner;}))return false;
+            // Live CommitShared/CommitInn entry points enforce access.
+            // A historical H receipt can outlive every access point.
+            if(owner!=character)return false;
         }
         auto* items=LoadHome(r.peer,beforePosition);
         if (!items) return false;

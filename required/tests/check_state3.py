@@ -2365,3 +2365,59 @@ assert 'sharedSwitchPending&&sharedSwitchReply&&sharedRevision==sharedExpectedRe
 assert 'if(!SetShadow(m_world,buffer))' in shared_trade_client or 'if (!SetShadow(m_world,buffer))' in shared_trade_client
 assert 'ContainerChestMessage' in shared_trade_client and 'table[4]' in shared_trade_client
 assert 'sharedControlsBlocked.load()' in shared_trade_client
+
+
+run('inn access: two tenants, one physical reference, independent personal stock and old receipt replay',headers+'''
+#include <TradeLedger.h>
+#include <filesystem>
+int main(){
+ namespace I=HomeInn;namespace C=HomeCityPurchase;namespace S=HomeSharedStorage;
+ const auto path=std::filesystem::temp_directory_path()/"stm-inn-stock";
+ std::filesystem::remove_all(path);
+ CampaignJournal::Journal j;assert(j.Open(path,81,"test",true));
+ const auto& a=I::Rooms[0];const auto& b=I::Rooms[1];const auto& no=I::Rooms[6];
+ assert(I::Storage(a.Plugin,a.Cell,a.Plugin,a.Container)==&a);
+ assert(!I::Storage(a.Plugin,a.Cell,b.Plugin,b.Container));
+ assert(!I::Storage(a.Plugin,a.Cell,"dragonborn.esm",a.Container));
+ assert(I::Keeper(a.Plugin,a.KeeperA)&&!I::Keeper("dragonborn.esm",a.KeeperA));
+ assert(!I::Keeper(a.Plugin,0)&&!I::Storage(no.Plugin,no.Cell,no.Plugin,0));
+ assert(I::Near(a,a.X,a.Y,a.Z)&&!I::Near(a,a.X+421,a.Y,a.Z));
+ TradeLedger ledger(j,81);assert(ledger.Stream()==81);
+ TradeProperties::FormKey sword{"skyrim.esm",400},salt{"skyrim.esm",401};
+ assert(ledger.InnContainer(11,a)->Items.empty()&&ledger.InnContainer(22,a)->Items.empty());
+ assert(!ledger.InnContainer(11,no));
+ assert(ledger.CommitInn(11,a,sword,"",-1,3,0));
+ assert(ledger.InnContainer(11,a)->Items.empty()); // pending deposit
+ assert(ledger.CommitInn(22,a,salt,"",-1,3,0));
+ assert(ledger.Ack("11",1)&&ledger.Ack("22",1));
+ assert(ledger.InnContainer(11,b)->Items[0].Base.Encode()==sword.Encode());
+ assert(ledger.InnContainer(22,a)->Items[0].Base.Encode()==salt.Encode());
+ assert(!ledger.CommitInn(22,a,sword,"",1,0,1));
+ assert(!ledger.Commit({ "22",TradeLedger::PersonalAccount(11),"skyrim.esm",400,1,0,false,{}},1));
+ const auto cell=C::Houses[0].Cell;
+ S::Address city{cell,{"skyrim.esm",12345}};
+ assert(C::Publish(j,{cell,0,5000,11,C::Action::Reserve}));
+ auto reserved=C::Read(j,cell);assert(reserved&&C::Publish(j,{cell,reserved->Revision,5000,11,C::Action::Confirm}));
+ HomeSnapshot::Ref r;r.Key=city.Ref;r.Base={"skyrim.esm",500};r.Type=28;r.Inventory=1;r.Scale=100;
+ HomeSnapshot::State seed;seed.Refs.push_back(r);assert(S::Seed(j,city,seed.Encode()));
+ assert(ledger.SwitchPersonal(11,city,0,true,ledger.HomeStockVersion()));
+ assert(ledger.SharedContainer(city,11)->Items[0].Base.Encode()==sword.Encode());
+ assert(ledger.SwitchPersonal(11,city,1,false,ledger.HomeStockVersion()));
+ assert(ledger.SharedContainer(city)->Items.empty());
+ CampaignJournal::Journal reload;assert(reload.Open(path,81,"test",false));
+ TradeLedger after(reload,81);assert(after.Stream()==81&&after.AcceptCursor("11",81,0));
+ assert(after.MatchesReceipt("11",81,0,1,"skyrim.esm",400,-1,3));
+ assert(after.InnContainer(11,b)->Items[0].Count==1&&after.InnContainer(22,b)->Items[0].Base.Encode()==salt.Encode());
+ assert(after.CommitInn(11,b,sword,"",1,0,1)&&after.Ack("11",2));
+ assert(after.InnContainer(11,a)->Items.empty());
+ std::filesystem::remove_all(path);
+}
+''',['-I'+str(code/'common'),str(code/'common/CampaignJournal.cpp'),str(code/'common/QuestJournalDisk.cpp')])
+assert 'ledger.CommitInn(h.Character,*h.Inn' in shared_trade_server
+assert 'if(innPending){innTarget=form;sharedTarget.store(0);}' in shared_trade_client
+assert 'owner(bed)==player->baseForm' in shared_trade_client
+assert 'if(innPending&&!InnRentalClient::RentedRoom' in shared_trade_client
+assert 'if(innTarget&&!InnRentalClient::RentedRoom' in shared_trade_client
+assert 'if(innPending||!sharedOpening' in shared_trade_client
+assert 'InnRentalClient::LocalVariable(pActor)' in (code/'client/Services/Generic/ActorValueService.cpp').read_text()
+assert 'InnRentalClient::LocalVariable(this)' in (code/'client/Games/Skyrim/Actor.cpp').read_text()

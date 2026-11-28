@@ -28,6 +28,7 @@
 #include <Services/HomeActorProtection.h>
 #include <Services/HomePlacementClient.h>
 #include <Services/NativeTrade.h>
+#include <Services/InnRentalClient.h>
 #include <Services/PapyrusService.h>
 
 #include <Forms/ActorValueInfo.h>
@@ -724,10 +725,14 @@ void Actor::SetMagicEquipment(const MagicEquipment& acEquipment) noexcept
 void Actor::SetActorValues(const ActorValues& acActorValues) noexcept
 {
     for (auto& value : acActorValues.ActorMaxValuesList)
+    {
+        if(value.first==ActorValueInfo::kVariable09&&InnRentalClient::LocalVariable(this))continue;
         ForceActorValue(ActorValueOwner::ForceMode::PERMANENT, value.first, value.second);
+    }
 
     for (auto& value : acActorValues.ActorValuesList)
     {
+        if(value.first==ActorValueInfo::kVariable09&&InnRentalClient::LocalVariable(this))continue;
         // Death is applied from the ownership-checked life state immediately after a snapshot.
         if (value.first == ActorValueInfo::kHealth && GetExtension() && !GetExtension()->IsPlayer() &&
             (!std::isfinite(value.second) || value.second <= 0.f))

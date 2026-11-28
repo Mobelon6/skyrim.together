@@ -2,7 +2,7 @@
 #include <Structs/GameId.h>
 #include <TiltedCore/Serialization.hpp>
 
-enum class TradeOp : uint8_t { Poll, Invite, Offer, Accept, Open, Close, Deposit, Take, Entry, Reset, Receipt, Error, Ready, RecoveryConflict, ReturnOffer, Return, HomeOpen, HomePlace, HomeTake, HomeMove, HomeStockNeeded, HomeStockPart, HomePersonal };
+enum class TradeOp : uint8_t { Poll, Invite, Offer, Accept, Open, Close, Deposit, Take, Entry, Reset, Receipt, Error, Ready, RecoveryConflict, ReturnOffer, Return, HomeOpen, HomePlace, HomeTake, HomeMove, HomeStockNeeded, HomeStockPart, HomePersonal, InnOpen };
 struct PartyTrade
 {
     TradeOp Op{};
